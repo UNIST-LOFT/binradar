@@ -6,8 +6,8 @@ int main(int argc, char *argv[]) {
     }
     char *filename = argv[1];
     FILE *file = fopen(filename, "w");
-    int data[2] = {4, 128 * 4};
-    fwrite(data, sizeof(int), 2, file);
+    int data[4] = {4, 128 * 4, 0, 128};
+    fwrite(data, sizeof(int), 4, file);
     fclose(file);
     return 0;
 }

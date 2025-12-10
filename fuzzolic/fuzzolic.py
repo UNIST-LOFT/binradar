@@ -80,6 +80,11 @@ def main():
         '-k', '--keep-run-dirs', action='store_true', help='keep run directories')
     parser.add_argument(
         '--single-path', action='store_true', help='perform a single-path exploration (first input from the input directory)')
+    parser.add_argument(
+            '--forkserver-entrypoint',
+            help='Override BINRADAR_ENTRYPOINT (hex string). '
+                 'If unset, QEMU will use the ELF entrypoint.',
+            default="")
 
     # required args
     parser.add_argument(
@@ -161,12 +166,17 @@ def main():
         single_path = True
 
     signal.signal(signal.SIGINT, handler)
+    
+    forkserver_entrypoint = args.forkserver_entrypoint
+    if forkserver_entrypoint == "":
+        if "BINRADAR_ENTRYPOINT" in os.environ:
+            forkserver_entrypoint = os.environ["BINRADAR_ENTRYPOINT"]
 
     fuzzolic_executor = executor.Executor(
         binary, input, output_dir, binary_args, debug, afl,
         timeout, fuzzy, optimistic_solving, memory_slice_reasoning,
         address_reasoning, fuzz_expr, input_fixed_name, use_smt_if_empty,
-        symbolic_models, keep_run_dirs, single_path, check_input)
+        symbolic_models, keep_run_dirs, single_path, check_input, forkserver_entrypoint)
     fuzzolic_executor.run()
 
 

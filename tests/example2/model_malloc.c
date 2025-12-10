@@ -3,18 +3,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-int model_malloc_min(int size)
+int model_malloc_min(int size, int index)
 {
     int* res = malloc(size);
     memset((void *)res, 0, size);
-    return res[1];
+    printf("MIN SIZE %d, INDEX %d\n", size / (int)sizeof(int), index);
+    return res[index];
 }
 
-int model_malloc_max(int size)
+int model_malloc_max(int size, int index)
 {
     int* res = malloc(size);
     memset((void *)res, 0, size);
-    return res[128];
+    printf("MAX SIZE %d, INDEX %d\n", size / (int)sizeof(int), index);
+    return res[index];
 }
 
 int model_realloc_min(int size)
@@ -39,10 +41,9 @@ int main(int argc, char* argv[]) {
         printf("Error\n");
         return 1;
     }
-    int data[2];
-    fread(data, 4, 2, file);
-    int *size = (int*)data;
-    model_malloc_min(size[0]);
-    model_malloc_max(size[1]);
+    int data[4];
+    fread(data, 4, 4, file);
+    model_malloc_min(data[0], data[2]);
+    model_malloc_max(data[1], data[3]);
     fclose(file);
 }
