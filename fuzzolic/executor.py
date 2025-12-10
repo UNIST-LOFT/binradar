@@ -288,6 +288,8 @@ class Executor(object):
         self.testcase_from_stdin = '@@' not in self.binary_args
         
         self.binradar_entrypoint = binradar_entrypoint
+        self._forkserver = None
+        self._forkserver_session_log = None
 
         if not os.path.exists(output_dir):
             sys.exit('ERROR: invalid working directory')
@@ -554,7 +556,9 @@ class Executor(object):
 
         # launch tracer
         p_tracer_log_name = run_dir + '/tracer.log'
-        p_tracer_log = open(p_tracer_log_name, 'w')
+        p_tracer = None
+        forkserver_mode = bool(self.binradar_entrypoint)
+        forkserver_result = None
 
         p_tracer_args = []
         if self.debug == 'gdb_tracer':
@@ -563,10 +567,10 @@ class Executor(object):
         p_tracer_args += [TRACER_BIN]
 
         if self.debug != 'gdb_tracer':
-            p_tracer_args += ['-symbolic'] # self.fuzz_expr or 
-            if (self.debug == 'trace'):  # or self.debug == 'no_solver': # self.fuzz_expr or 
+            p_tracer_args += ['-symbolic']
+            if (self.debug == 'trace'):
                 p_tracer_args += ['-d']
-                p_tracer_args += ['in_asm,op,op_opt,out_asm'] # 'in_asm,op_opt,out_asm'
+                p_tracer_args += ['in_asm,op,op_opt,out_asm']
 
         args = self.binary_args
         if not self.testcase_from_stdin:
@@ -582,68 +586,74 @@ class Executor(object):
             env["PLT_INFO_FILE"] = self.plt_info
         logger.info(f"[FUZZOLIC] Starting tracer for {self.binary} with args: {' '.join(p_tracer_args)}")
         start_time = time.time()
-        if self.binradar_entrypoint != "":
-            # Use forkserver
-            # logger.info(f"env: {env}")
+        tracer_returncode = 0
+        if forkserver_mode:
             env["BINRADAR_ENTRYPOINT"] = self.binradar_entrypoint
-            forkserver = ForkserverTracer(p_tracer_args, env, self.output_dir, self.debug, self.testcase_from_stdin, logger, p_tracer_log)
-            forkserver.start()
-            forkserver.run_testcase("/root/fuzzolic/tests/example2/workdir/fuzzolic-00000")
-            forkserver.run_testcase("/root/fuzzolic/tests/example2/workdir/fuzzolic-00000")
-            p_tracer = forkserver.proc
+            if not self._forkserver:
+                if not self._forkserver_session_log:
+                    session_log_path = os.path.join(self.output_dir, 'tracer-forkserver.log')
+                    self._forkserver_session_log = open(session_log_path, 'ab', buffering=0)
+                self._forkserver = ForkserverTracer(
+                    p_tracer_args, env, self.output_dir, self.debug,
+                    self.testcase_from_stdin, logger, self._forkserver_session_log)
+                self._forkserver.start()
+                RUNNING_PROCESSES.append(self._forkserver.proc)
+            forkserver_result = self._forkserver.run_testcase(run_dir)
+            print(f"Run 1: {forkserver_result}")
+            forkserver_result2 = self._forkserver.run_testcase(run_dir)
+            print(f"Run 2: {forkserver_result2}")
+            forkserver_result3 = self._forkserver.run_testcase(run_dir)
+            print(f"Run 3: {forkserver_result3}")
+            tracer_returncode = forkserver_result.returncode
+            logger.info(f"[tracer] [pid {forkserver_result.child_pid}] [time {round(forkserver_result.duration, 3)} secs]")
         else:
+            p_tracer_log = open(p_tracer_log_name, 'w')
             p_tracer = subprocess.Popen(p_tracer_args,
-                                        # stdout=p_tracer_log if not self.debug and not self.fuzz_expr else None,
-                                        # stderr=subprocess.STDOUT if not self.debug and not self.fuzz_expr else None,
                                         stdout=subprocess.DEVNULL if not self.debug and not self.fuzz_expr else None,
                                         stderr=p_tracer_log if not self.debug and not self.fuzz_expr else None,
                                         stdin=subprocess.PIPE if self.testcase_from_stdin or self.debug == 'gdb_tracer' else None,
                                         cwd=run_dir,
                                         env=env,
                                         preexec_fn=setlimits,
-                                        bufsize=0 if self.debug == 'gdb_tracer' else -1,
-                                        #universal_newlines=True if self.debug == 'gdb_tracer' else False
-                                        )
+                                        bufsize=0 if self.debug == 'gdb_tracer' else -1)
 
-        RUNNING_PROCESSES.append(p_tracer)
-        # emit testcate on stdin
-        if self.debug != 'gdb_tracer':
-            if self.testcase_from_stdin:
-                with open(testcase, "rb") as f:
-                    p_tracer.stdin.write(f.read())
-                    p_tracer.stdin.close()
-        else:
-            # -d in_asm,op,op_opt,out_asm
-            gdb_cmd = 'run -d in_asm,op_opt,out_asm -symbolic ' + self.binary + ' ' + ' '.join(args)
-            if self.testcase_from_stdin:
-                gdb_cmd += ' < ' + testcase
-            gdb_cmd += "\n"
-            logger.info("GDB command: %s" % gdb_cmd)
-            p_tracer.stdin.write(gdb_cmd.encode())
-            for line in sys.stdin:
-                #logger.info("Sending to gdb: " + line)
-                p_tracer.stdin.write(line.encode())
-                if 'quit' in line or line.startswith('q'):
-                    logger.info("Closing stdin in gdb")
-                    break
-            p_tracer.stdin.close()
+            RUNNING_PROCESSES.append(p_tracer)
+            if self.debug != 'gdb_tracer':
+                if self.testcase_from_stdin:
+                    with open(testcase, "rb") as f:
+                        p_tracer.stdin.write(f.read())
+                        p_tracer.stdin.close()
+            else:
+                gdb_cmd = 'run -d in_asm,op_opt,out_asm -symbolic ' + self.binary + ' ' + ' '.join(args)
+                if self.testcase_from_stdin:
+                    gdb_cmd += ' < ' + testcase
+                gdb_cmd += "\n"
+                logger.info("GDB command: %s" % gdb_cmd)
+                p_tracer.stdin.write(gdb_cmd.encode())
+                for line in sys.stdin:
+                    p_tracer.stdin.write(line.encode())
+                    if 'quit' in line or line.startswith('q'):
+                        logger.info("Closing stdin in gdb")
+                        break
+                p_tracer.stdin.close()
 
-        try:
-            p_tracer.wait(20)
-        except subprocess.TimeoutExpired:
-            logger.info('[FUZZOLIC] Sending SIGINT to tracer.')
-            p_tracer.send_signal(signal.SIGINT)
             try:
-                p_tracer.wait(1)
+                p_tracer.wait(20)
             except subprocess.TimeoutExpired:
-                logger.info('[FUZZOLIC] Sending SIGKILL to tracer.')
-                p_tracer.send_signal(signal.SIGKILL)
-                p_tracer.wait()
+                logger.info('[FUZZOLIC] Sending SIGINT to tracer.')
+                p_tracer.send_signal(signal.SIGINT)
+                try:
+                    p_tracer.wait(1)
+                except subprocess.TimeoutExpired:
+                    logger.info('[FUZZOLIC] Sending SIGKILL to tracer.')
+                    p_tracer.send_signal(signal.SIGKILL)
+                    p_tracer.wait()
 
-        if p_tracer in RUNNING_PROCESSES:
-            RUNNING_PROCESSES.remove(p_tracer)
-        logger.info(f"[tracer] [time {round(time.time() - start_time, 3)} secs]")
-        p_tracer_log.close()
+            if p_tracer in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(p_tracer)
+            logger.info(f"[tracer] [time {round(time.time() - start_time, 3)} secs]")
+            p_tracer_log.close()
+            tracer_returncode = p_tracer.returncode
 
         if self.debug == 'gdb_solver':
             for line in sys.stdin:
@@ -653,10 +663,10 @@ class Executor(object):
                     break
             p_solver.stdin.close()
 
-        if p_tracer.returncode != 0:
-            returncode_str = "(SIGSEGV)" if p_tracer.returncode == -11 else ""
+        if tracer_returncode != 0:
+            returncode_str = "(SIGSEGV)" if tracer_returncode == -11 else ""
             logger.warning("ERROR: tracer has returned code %d %s" %
-                  (p_tracer.returncode, returncode_str))
+                  (tracer_returncode, returncode_str))
 
         if self.debug != 'no_solver' and self.debug != 'coverage':
             p_solver.send_signal(signal.SIGUSR1)
@@ -665,7 +675,7 @@ class Executor(object):
             p_solver.send_signal(signal.SIGINT)
             time.sleep(1)
             p_solver.send_signal(signal.SIGKILL)
-            sys.exit(p_tracer.returncode)
+            sys.exit(tracer_returncode)
 
         if self.debug != 'no_solver' and self.debug != 'coverage':
             elapsed = 0
@@ -778,7 +788,7 @@ class Executor(object):
 
         os.unlink(global_bitmap_pre_run)
 
-        if p_tracer.returncode == -11:
+        if tracer_returncode == -11:
             with open(p_tracer_log_name, "r") as f:
                 log_lines = f.readlines()
                 qemu_segfault = True
@@ -980,6 +990,15 @@ class Executor(object):
             logger.info(f"[FUZZOLIC] testcase: {testcase}")
 
         logger.info("[FUZZOLIC] no more testcase. Finishing.\n")
+
+        if self._forkserver:
+            if self._forkserver.proc in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(self._forkserver.proc)
+            self._forkserver.stop()
+            self._forkserver = None
+        if self._forkserver_session_log:
+            self._forkserver_session_log.close()
+            self._forkserver_session_log = None
 
         if len(self.__warning_log):
             logger.info()
