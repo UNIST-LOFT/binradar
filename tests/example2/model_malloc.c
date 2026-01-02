@@ -19,18 +19,6 @@ int model_malloc_max(int size, int index)
     return res[index];
 }
 
-int model_realloc_min(int size)
-{
-    void* res = realloc(malloc(8), size);
-    return size == 0;
-}
-
-int model_realloc_max(int size)
-{
-    void* res = realloc(malloc(8), size);
-    return size > 128;
-}
-
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         printf("Error\n");

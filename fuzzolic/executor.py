@@ -52,12 +52,14 @@ class ForkserverRunResult:
     duration: float
     child_pid: int
     timed_out: bool = False
-    def __init__(self, returncode: int, status: int, duration: float, child_pid: int, timed_out: bool):
+    should_halt: bool = False
+    def __init__(self, returncode: int, status: int, duration: float, child_pid: int, timed_out: bool, should_halt: bool):
         self.returncode = returncode
         self.status = status
         self.duration = duration
         self.child_pid = child_pid
         self.timed_out = timed_out
+        self.should_halt = should_halt
 
 
 class ForkserverTracerError(RuntimeError):
@@ -89,7 +91,6 @@ class ForkserverTracer:
         self._session_log = session_log
         self._run_log = None
         self._log_lock = threading.Lock()
-        self._last_run_was_killed = False
         self._timeout = 20
         self._handshake_timeout = 30
 
@@ -142,14 +143,14 @@ class ForkserverTracer:
         with self._log_lock:
             self._run_log = run_log
 
-        was_killed = 1 if self._last_run_was_killed else 0
-        self._last_run_was_killed = False
-        self._write_u32(was_killed)
+        killed = 0
+        self._write_u32(killed)
 
         child_pid = self._read_u32(self._timeout)
         timed_out = False
         try:
             status = self._read_u32(self._timeout)
+            halt_signal = self._read_u32(self._timeout)
         except ForkserverTracerTimeout:
             timed_out = True
             self._logger.warning(
@@ -163,8 +164,8 @@ class ForkserverTracer:
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            self._last_run_was_killed = True
             status = self._read_u32(5)
+            halt_signal = self._read_u32(5)
 
         duration = time.time() - start
         result = ForkserverRunResult(
@@ -173,6 +174,7 @@ class ForkserverTracer:
             duration=duration,
             child_pid=child_pid,
             timed_out=timed_out,
+            should_halt=halt_signal != 0
         )
 
         with self._log_lock:
@@ -598,12 +600,11 @@ class Executor(object):
                     self.testcase_from_stdin, logger, self._forkserver_session_log)
                 self._forkserver.start()
                 RUNNING_PROCESSES.append(self._forkserver.proc)
-            forkserver_result = self._forkserver.run_testcase(run_dir)
-            print(f"Run 1: {forkserver_result}")
-            forkserver_result2 = self._forkserver.run_testcase(run_dir)
-            print(f"Run 2: {forkserver_result2}")
-            forkserver_result3 = self._forkserver.run_testcase(run_dir)
-            print(f"Run 3: {forkserver_result3}")
+            for i in range(4096):
+                forkserver_result = self._forkserver.run_testcase(run_dir)
+                print(f"Run {i}: {forkserver_result}")
+                if forkserver_result.should_halt:
+                    break
             tracer_returncode = forkserver_result.returncode
             logger.info(f"[tracer] [pid {forkserver_result.child_pid}] [time {round(forkserver_result.duration, 3)} secs]")
         else:
@@ -984,6 +985,8 @@ class Executor(object):
             logger.info("Run took %s secs" % round(end-start, 1))
             # if self.debug or self.fuzz_expr or self.single_path:
             #     return
+            if self.binradar_entrypoint != "":
+                return
             self.__check_shutdown_flag()
             testcase, target, force_smt = self.__pick_testcase()
             self.__check_shutdown_flag()

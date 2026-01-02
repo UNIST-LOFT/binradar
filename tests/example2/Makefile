@@ -16,4 +16,4 @@ clean:
 run: model_malloc
 	rm -rf workdir
 	rm -f *.core
-	uv run ../../fuzzolic/fuzzolic.py --forkserver-entrypoint 401200 --keep-run-dirs --address-reasoning --optimistic-solving --timeout 90000 -o ./workdir/ -i ./malloc.in -- ./model_malloc @@
+	ulimit -c 0 && uv run ../../fuzzolic/fuzzolic.py --forkserver-entrypoint 401200 --keep-run-dirs --address-reasoning --optimistic-solving --timeout 90000 -o ./workdir/ -i ./test_case_000_187.dat -- ./model_malloc @@
