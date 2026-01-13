@@ -569,13 +569,13 @@ class Executor(object):
             p_tracer_args += ['gdb']
 
         p_tracer_args += [TRACER_BIN]
+        debug_args = "page"
 
         if self.debug != 'gdb_tracer':
             p_tracer_args += ['-symbolic']
             if (self.debug == 'trace'):
-                p_tracer_args += ['-d']
-                p_tracer_args += ['in_asm,op,op_opt,out_asm']
-
+                debug_args += ['in_asm,op,op_opt,out_asm']
+            p_tracer_args += ['-d', debug_args]
         args = self.binary_args
         if not self.testcase_from_stdin:
             for k in range(len(args)):
