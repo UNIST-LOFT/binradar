@@ -11,4 +11,5 @@ clean:
 run: test
 	rm -rf workdir
 	rm -f *.core
-	uv run ../../fuzzolic/fuzzolic.py --forkserver-entrypoint 4000001229 --keep-run-dirs --address-reasoning --optimistic-solving --timeout 90000 -o ./workdir/ -i ./input.txt -- ./test @@
+	# --forkserver-entrypoint 4000001229
+	uv run ../../fuzzolic/fuzzolic.py --symbolic-models --forkserver-entrypoint 4000001229 --keep-run-dirs --address-reasoning --optimistic-solving --timeout 90000 -o ./workdir/ -i ./input.txt -- ./test @@

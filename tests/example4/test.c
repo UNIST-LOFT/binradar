@@ -29,9 +29,14 @@ static inline uint64_t rotl(uint64_t value, unsigned shift) {
 
 static __attribute__((noinline)) uint64_t crunch_stack(const uint8_t *input, size_t len) {
     uint64_t scratch[STACK_WORDS];
+    struct GlobalNode temp_node;
 
     for (size_t i = 0; i < STACK_WORDS; ++i) {
         scratch[i] = global_accumulator ^ (0x9e3779b185ebca87ULL + i);
+    }
+    temp_node.tag = scratch[0] ^ 0xdeadbeefcafebabeULL;
+    for (size_t i = 0; i < BLOCK_SIZE; ++i) {
+        temp_node.payload[i] = 0xddULL;
     }
 
     for (size_t i = 0; i < len; ++i) {
@@ -42,6 +47,10 @@ static __attribute__((noinline)) uint64_t crunch_stack(const uint8_t *input, siz
     uint64_t acc = 0;
     for (size_t i = 0; i < STACK_WORDS; ++i) {
         acc ^= scratch[i];
+    }
+    acc ^= temp_node.tag;
+    for (size_t i = 0; i < BLOCK_SIZE; ++i) {
+        acc ^= (uint64_t)temp_node.payload[i] << ((i & 7u) * 8);
     }
     return acc;
 }

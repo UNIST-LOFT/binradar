@@ -149,8 +149,9 @@ class ForkserverTracer:
         child_pid = self._read_u32(self._timeout)
         timed_out = False
         try:
-            status = self._read_u32(self._timeout)
-            halt_signal = self._read_u32(self._timeout)
+            res_data = self._read_exact(8)
+            status, halt_signal = struct.unpack('<II', res_data)
+            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [halt_signal {halt_signal}]")
         except ForkserverTracerTimeout:
             timed_out = True
             self._logger.warning(
@@ -164,8 +165,9 @@ class ForkserverTracer:
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            status = self._read_u32(5)
-            halt_signal = self._read_u32(5)
+            res_data = self._read_exact(8)
+            status, halt_signal = struct.unpack('<II', res_data)
+            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [halt_signal {halt_signal}]")
 
         duration = time.time() - start
         result = ForkserverRunResult(
@@ -600,7 +602,7 @@ class Executor(object):
                     self.testcase_from_stdin, logger, self._forkserver_session_log)
                 self._forkserver.start()
                 RUNNING_PROCESSES.append(self._forkserver.proc)
-            for i in range(4096):
+            for i in range(2):
                 forkserver_result = self._forkserver.run_testcase(run_dir)
                 print(f"Run {i}: {forkserver_result}")
                 if forkserver_result.should_halt:
