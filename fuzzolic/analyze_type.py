@@ -1,11 +1,12 @@
 import sbsv
 import os
+from typing import Dict, List, Tuple
 
 class Parser():
     filepath: str
     parser: sbsv.parser
     chunks: dict
-    access_counts: dict
+    access_counts: Dict[Tuple[int, int], int]
     base_addrs: dict
     memcpy: dict
     malloced_sizes: dict
@@ -47,6 +48,33 @@ class Parser():
             if key not in chunks:
                 chunks[key] = len(chunks)
         self.chunks = chunks
+    
+    def find_base_addr_candidates(self, access: Dict[str, int]):
+        addr = access["addr"]
+        size = access["size"]
+        reg_base = access["reg-base"]
+        region = access["reg"]
+        registers = {f"r{i}": access[f"r{i}"] for i in range(16)}
+        candidates = list()
+        for reg, val in registers.items():
+            if region == "stack":
+                if val > reg_base:
+                    continue
+            else:
+                if val < reg_base:
+                    continue
+            if abs(reg_base - val) > 16 * 4096 or abs(addr - val) > 16 * 4096:
+                continue
+            score = 0.0
+            dist = addr - val
+            score = 1.0 / (1 + abs(dist))
+            if val % 8 == 0:
+                score *= 1.5
+            elif val % 4 == 0:
+                score *= 1.2
+            candidates.append((reg, val, dist, score))
+        candidates = sorted(candidates, key=lambda x: x[3], reverse=True)
+        return candidates
 
     def analyze_primitive_facts(self):
         data = self.parser.get_result()
@@ -60,12 +88,18 @@ class Parser():
         for access in data["loadh"] + data["storeh"]:
             addr = access["addr"]
             size = access["size"]
-            key = (addr, size)
-            if key not in self.access_counts:
-                self.access_counts[key] = 0
-            self.access_counts[key] += 1
+            pc = access["pc"]
+            region = access["reg"]
+            base = access["reg-base"]
+            chunk = (addr, size)
+            if chunk not in self.access_counts:
+                self.access_counts[chunk] = 0
+            self.access_counts[chunk] += 1
     
     def analyze(self):
+        self.analyze_primitive_facts()
+        
+        
         data = self.parser.get_result()
         for alloc in data["alloc"]["start"]:
             print(f"Allocation at PC {hex(alloc['pc'])}: Base {hex(alloc['base'])}, Size {hex(alloc['size'])}")
