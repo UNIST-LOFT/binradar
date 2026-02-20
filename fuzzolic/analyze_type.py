@@ -1,124 +1,391 @@
 import sbsv
 import os
-from typing import Dict, List, Tuple
+import sys
+import math
+from typing import Dict, List, Tuple, Set, Optional
+from enum import Enum
+from dataclasses import dataclass
+from collections import defaultdict
+from sortedcontainers import SortedDict
 
-class Parser():
-    filepath: str
+class Type(Enum):
+    UNKNOWN = 0
+    PRIMITIVE = 1  # int
+    POINTER = 2
+    STRUCT = 3
+    ARRAY = 4
+
+class RegionType(Enum):
+    STACK = 0
+    HEAP = 1
+    GLOBAL = 2
+
+@dataclass(frozen=True)
+class MemoryRegion():
+    type: RegionType
+    id: int
+    base_addr: int
+
+    def __repr__(self):
+        return f"Region({self.type.name}, id={self.id:x}, base={self.base_addr:x})"
+
+@dataclass(frozen=True)
+class MemoryChunk():
+    region: MemoryRegion
+    offset: int
+    size: int
+
+    def __repr__(self):
+        return f"Chunk(R={self.region.id:x}, off={self.offset:x}, sz={self.size})"
+
+class LogParser():
     parser: sbsv.parser
-    chunks: dict
-    access_counts: Dict[Tuple[int, int], int]
-    base_addrs: dict
-    memcpy: dict
-    malloced_sizes: dict
-    
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.chunks = dict()
-        self.access_counts = dict()
-        self.base_addrs = dict()
-        self.memcpy = dict()
-        self.malloced_sizes = dict()
-
-    def parse(self):
+    def __init__(self, filepath: str):
         # https://github.com/hsh814/sbsv
         self.parser = sbsv.parser()
         self.parser.add_custom_type("hex", lambda x: int(x, 16))
         self.parser.add_schema("[alloc] [start] [base: hex] [size: hex] [pc: hex]")
+        self.parser.add_schema("[calloc] [size: hex] [pc: hex]")
         self.parser.add_schema("[free] [done] [base: hex] [pc: hex]")
         self.parser.add_schema("[stack] [push] [sp: hex] [size: hex] [pc: hex] [depth: int] [sr-base: hex] [sr-size: hex]")
         self.parser.add_schema("[stack] [pop] [sp: hex] [base: hex] [pc: hex] [depth: int]")
         self.parser.add_schema("[global] [add] [base: hex] [size: hex] [name: str]")
-        self.parser.add_schema("[loadh] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
-        self.parser.add_schema("[storeh] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
-        self.parser.add_schema("[memmoveh] [src: hex] [dst: hex] [size: hex] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
-        with open(self.filepath, 'r') as file:
+        self.parser.add_schema("[loadh] [val] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[loadh] [val-fallback] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[loadh] [inval] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[loadh-error] [pc: hex] [addr: hex] [size: hex]")
+        self.parser.add_schema("[storeh] [val] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[storeh] [val-fallback] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[storeh] [inval] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[memmoveh] [src: hex] [dst: hex] [size: hex] [val: hex] [is-ptr: bool] [src-r: str] [src-rb: hex] [dst-r: str] [dst-rb: hex] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        self.parser.add_schema("[cov] [base] [from: hex] [to: hex] [cnt: int]")
+        self.parser.add_schema("[cov] [update] [from: hex] [to: hex] [cnt: int]")
+        # Read access for pointer
+        # self.parser.add_schema("[rpo] [addr: hex] [target: hex] [pc: hex] [index: int] [id: int]")
+        with open(filepath, 'r') as file:
             self.parser.load(file)
 
-    def analyze_chunks(self):
-        # data = self.parser.get_result_in_order(["[loadh]", "[storeh]"])
-        data = self.parser.get_result()
-        chunks = dict()
-        for access in data["loadh"] + data["storeh"]:
-            region = access["reg"]
-            pc = access["pc"]
-            addr = access["addr"]
-            size = access["size"]
-            reg_base = access["reg-base"]
-            key = (addr, size)
-            if key not in chunks:
-                chunks[key] = len(chunks)
-        self.chunks = chunks
-    
-    def find_base_addr_candidates(self, access: Dict[str, int]):
-        addr = access["addr"]
-        size = access["size"]
-        reg_base = access["reg-base"]
-        region = access["reg"]
-        registers = {f"r{i}": access[f"r{i}"] for i in range(16)}
-        candidates = list()
-        for reg, val in registers.items():
-            if region == "stack":
-                if val > reg_base:
-                    continue
-            else:
-                if val < reg_base:
-                    continue
-            if abs(reg_base - val) > 16 * 4096 or abs(addr - val) > 16 * 4096:
-                continue
-            score = 0.0
-            dist = addr - val
-            score = 1.0 / (1 + abs(dist))
-            if val % 8 == 0:
-                score *= 1.5
-            elif val % 4 == 0:
-                score *= 1.2
-            candidates.append((reg, val, dist, score))
-        candidates = sorted(candidates, key=lambda x: x[3], reverse=True)
-        return candidates
+class PrimitiveFactAnalyzer:
+    parser: sbsv.parser
+    fact_access: Dict[Tuple[int, MemoryChunk], int]
+    base_addr: Dict[MemoryChunk, int]
+    fact_points_to: Dict[MemoryChunk, set]
+    fact_malloc_size: Dict[int, List[int]]
+    fact_mem_copy: Set[Tuple[MemoryChunk, MemoryChunk, int]]  # (src_chunk, dst_chunk, size)
+    active_allocs: Dict[int, MemoryRegion]
+    stack_frames: List[MemoryRegion]
+    global_vars: Dict[int, MemoryRegion]
+    addr_to_chunk: SortedDict[int, MemoryChunk]
+    all_chunks: Set[MemoryChunk]
+    pointer_size: int
+    def __init__(self, parser: sbsv.parser):
+        self.parser = parser
+        
+        # OSPREY Primitive Facts Store
+        # F01: Access(i, v, k) -> (pc, chunk) : count
+        self.fact_access: Dict[Tuple[int, MemoryChunk], int] = defaultdict(int)
+        
+        # F02: BaseAddr(v, a) -> chunk : base_addr
+        self.base_addr: Dict[MemoryChunk, int] = {}
+        
+        # F04: PointsTo(v, a) -> chunk : set(target_chunks)
+        self.fact_points_to: Dict[MemoryChunk, Set[MemoryChunk]] = defaultdict(set)
+        
+        # F05: MallocedSize(i, s)
+        self.fact_malloc_size: Dict[int, List[int]] = defaultdict(list)
+        
+        # F06: MemCopy(src, dst, size)
+        self.fact_mem_copy: Set[Tuple[MemoryChunk, MemoryChunk, int]] = set()
+        
+        # Memory Region Tracking
+        self.active_allocs: Dict[int, MemoryRegion] = {} # addr -> Region
+        self.stack_frames: List[MemoryRegion] = [] 
+        self.global_vars: Dict[int, MemoryRegion] = {}
+        self.addr_to_chunk: SortedDict[int, MemoryChunk] = SortedDict() # addr -> chunk (for quick lookup during memmove)
+        self.all_chunks: Set[MemoryChunk] = set()
+        self.pointer_size = 8  # 64-bit architecture
 
-    def analyze_primitive_facts(self):
-        data = self.parser.get_result()
-        for alloc in data["alloc"]["start"]:
-            base = alloc["base"]
-            size = alloc["size"]
-            pc = alloc["pc"]
-            if pc not in self.malloced_sizes:
-                self.malloced_sizes[pc] = list()
-            self.malloced_sizes[pc].append((base, size))
-        for access in data["loadh"] + data["storeh"]:
-            addr = access["addr"]
-            size = access["size"]
-            pc = access["pc"]
-            region = access["reg"]
-            base = access["reg-base"]
-            chunk = (addr, size)
-            if chunk not in self.access_counts:
-                self.access_counts[chunk] = 0
-            self.access_counts[chunk] += 1
+    def _resolve_memory_region(self, region_type: str, base_addr: int, unknown: bool = False) -> Optional[MemoryRegion]:
+        if unknown:
+            # Check addr_to_chunk
+            if base_addr in self.addr_to_chunk:
+                chunk = self.addr_to_chunk[base_addr]
+                return chunk.region
+            idx = self.addr_to_chunk.bisect_right(base_addr)
+            if idx >= 0:
+                chunk: MemoryChunk = self.addr_to_chunk.peekitem(idx)[1]
+                if chunk.region.type == RegionType.STACK:
+                    if base_addr <= chunk.region.base_addr:
+                        return chunk.region
+                else: # Heap or Global region: base_addr >= region_base_addr
+                    chunk_before = self.addr_to_chunk.peekitem(idx - 1)[1] if idx - 1 >= 0 else None
+                    if chunk_before and chunk_before.region.type != RegionType.STACK and base_addr >= chunk_before.region.base_addr:
+                        return chunk_before.region
+            # Fallback: Check all regions (stack, heap, global) for containing base_addr
+            return None
+                
+        if region_type == "stack":
+            for region in reversed(self.stack_frames):
+                if region.base_addr == base_addr:
+                    return region
+        elif region_type == "heap":
+            if base_addr in self.active_allocs:
+                return self.active_allocs[base_addr]
+        elif region_type == "global":
+            if base_addr in self.global_vars:
+                return self.global_vars[base_addr]
+        return None
+    
+    def run_trace_replay(self):
+        iterator = self.parser.get_result_in_order()
+        
+        for row in iterator:
+            schema = row.schema_name
+            
+            # --- Memory Management Events ---
+            if schema == "alloc$start":
+                base = row["base"]
+                size = row["size"]
+                pc = row["pc"]
+                region = MemoryRegion(RegionType.HEAP, pc, base)
+                self.active_allocs[base] = region
+                self.fact_malloc_size[pc].append(size)
+            elif schema == "calloc":
+                size = row["size"]
+                pc = row["pc"]
+                # calloc returns a zero-initialized chunk, but we don't have the base address until alloc$start
+                # We can track the size and pc for inference, but will need to link it to the actual allocation when we see alloc$start
+                self.fact_malloc_size[pc].append(size)
+                
+            elif schema == "free$done":
+                base = row["base"]
+                if base in self.active_allocs:
+                    del self.active_allocs[base]
+            
+            elif schema == "stack$push":
+                sp = row["sp"]
+                pc = row["pc"]
+                region = MemoryRegion(RegionType.STACK, pc, sp)
+                self.stack_frames.append(region)
+            elif schema == "stack$pop":
+                if self.stack_frames:
+                    self.stack_frames.pop()
+            
+            elif schema == "global$add":
+                base = row["base"]
+                region = MemoryRegion(RegionType.GLOBAL, base, base)
+                self.global_vars[base] = region
+
+            # --- Memory Access Events (F01, F04) ---
+            elif schema in ["loadh$val", "loadh$val-fallback", "loadh$inval", "storeh$val", "storeh$val-fallback", "storeh$inval"]:
+                pc = row["pc"]
+                addr = row["addr"]
+                if schema in ["loadh$inval", "storeh$inval"]:
+                    base_addr = addr
+                    offset = 0
+                else:
+                    base_addr = row["base"]
+                    offset = row["disp"]
+                size = row["size"]
+                region = row["reg"]
+                region_base = row["reg-base"]
+                memory_region = self._resolve_memory_region(region, region_base)
+                if memory_region is None:
+                    print(f"Warning: Could not resolve memory region for addr {addr:x} at PC {pc:x}")
+                    continue
+                chunk = MemoryChunk(memory_region, addr - region_base, size)
+                self.base_addr[chunk] = base_addr
+                self.addr_to_chunk[addr] = chunk
+                self.all_chunks.add(chunk)
+                
+                # 1. Identify which abstract chunk is being accessed
+                # F01: Access Frequency
+                self.fact_access[(pc, chunk)] += 1
+            
+            elif schema == "memmoveh":
+                src = row["src"]
+                dst = row["dst"]
+                size = row["size"]
+                src_region = row["src-r"]
+                src_region_base = row["src-rb"]
+                dst_region = row["dst-r"]
+                dst_region_base = row["dst-rb"]
+                src_memory_region = self._resolve_memory_region(src_region, src_region_base)
+                dst_memory_region = self._resolve_memory_region(dst_region, dst_region_base)
+                if src_memory_region is None or dst_memory_region is None:
+                    print(f"Warning: Could not resolve memory region for memmove")
+                    continue
+                src_chunk = MemoryChunk(src_memory_region, src - src_region_base, size)
+                dst_chunk = MemoryChunk(dst_memory_region, dst - dst_region_base, size)
+                self.fact_mem_copy.add((src_chunk, dst_chunk, size))
+                self.all_chunks.add(src_chunk)
+                self.all_chunks.add(dst_chunk)
+
+class DeterministicInference:
+    analyzer: PrimitiveFactAnalyzer
+    rel_access_single: Set[Tuple[int, MemoryRegion]]
+    rel_access_multi: Set[Tuple[int, MemoryRegion]]
+    rel_alloc_unit: Dict[int, int]
+    rel_data_flow_hint: Set[Tuple[MemoryRegion, MemoryRegion]]
+    rel_unified_access_hint: Set[Tuple[MemoryRegion, MemoryRegion]]
+    def __init__(self, analyzer: PrimitiveFactAnalyzer):
+        self.analyzer = analyzer
+        self.rel_access_single = set()
+        self.rel_access_multi = set()
+        self.rel_alloc_unit = dict()
+        self.rel_data_flow_hint = set()
+        self.rel_unified_access_hint = set()
+
+    def _same_region(self, chunk1: MemoryChunk, chunk2: MemoryChunk) -> bool:
+        return chunk1.region == chunk2.region
+
+    def _offset(self, chunk1: MemoryChunk, chunk2: MemoryChunk) -> int:
+        if self._same_region(chunk1, chunk2):
+            return abs(chunk1.offset - chunk2.offset)
+        return -1
+    
+    def _gcd_list(self, nums: List[int]) -> int:
+        gcd = nums[0]
+        for num in nums[1:]:
+            gcd = math.gcd(gcd, num)
+        return gcd
+    
+    def infer_access_patterns(self):
+        # R03, R04: Access Pattern Analysis
+        # (pc, region) -> set(offsets)
+        access_map: Dict[Tuple[int, MemoryRegion], Set[int]] = defaultdict(set)
+        for (pc, chunk), count in self.analyzer.fact_access.items():
+            access_map[(pc, chunk.region)].add(chunk.offset)
+        
+        for (pc, region), offsets in access_map.items():
+            if len(offsets) == 1: # Single offset access -> scalar
+                self.rel_access_single.add((pc, region))
+            else: # Multiple offsets -> likely array
+                self.rel_access_multi.add((pc, region))
+    
+    def infer_alloc_unit(self):
+        # R08, R09: Allocation Unit Inference
+        for pc, sizes in self.analyzer.fact_malloc_size.items():
+            unique_sizes = sorted(list(set(sizes)))
+            if len(unique_sizes) < 2:
+                continue
+            diffs = [unique_sizes[i+1] - unique_sizes[i] for i in range(len(unique_sizes)-1)]
+            alloc_unit = self._gcd_list(diffs)
+            if alloc_unit > 0:
+                self.rel_alloc_unit[pc] = alloc_unit
+    
+    def infer_data_flow_memcpy(self):
+        # R10: MemCpy -> if same offset, it hints same struct
+        for src_chunk, dst_chunk, size in self.analyzer.fact_mem_copy:
+            if self._same_region(src_chunk, dst_chunk):
+                continue
+            if src_chunk.offset == dst_chunk.offset:
+                self.rel_data_flow_hint.add((src_chunk.region, dst_chunk.region))
+    
+    def infer_unified_access(self):
+        # R11: different access address, same instruction -> likely same type
+        inst_access_map: Dict[Tuple[int, int], Set[MemoryRegion]] = defaultdict(set) # pc -> set(regions)
+        for (pc, chunk), count in self.analyzer.fact_access.items():
+            inst_access_map[(pc, chunk.offset)].add(chunk.region)
+        for (pc, offset), regions in inst_access_map.items():
+            if len(regions) > 1:
+                for r1 in regions:
+                    for r2 in regions:
+                        if r1 != r2:
+                            self.rel_unified_access_hint.add((r1, r2))
+    def infer(self):
+        self.infer_access_patterns()
+        self.infer_alloc_unit()
+        self.infer_data_flow_memcpy()
+        self.infer_unified_access()
+        
+class ProbabilisticInference:
+    deterministic_inference: DeterministicInference
+    type_prob: Dict[MemoryChunk, Dict[Type, float]]
+    def __init__(self, deterministic_inference: DeterministicInference):
+        self.deterministic_inference = deterministic_inference
+        self.type_prob = defaultdict(lambda: {t: 0.25 for t in [Type.PRIMITIVE, Type.POINTER, Type.STRUCT, Type.ARRAY]})
+
+    def _normalize(self, dist: Dict[Type, float]):
+        total = sum(dist.values())
+        if total == 0:
+            return
+        for t in dist:
+            dist[t] /= total
+
+    def _apply_priors(self):
+        primitive_sizes = {1, 2, 4, 8}
+        for chunk in self.deterministic_inference.analyzer.all_chunks:
+            if chunk.size in primitive_sizes:
+                self.type_prob[chunk][Type.PRIMITIVE] += 1.0
+                if chunk.size == self.deterministic_inference.analyzer.pointer_size:
+                    self.type_prob[chunk][Type.POINTER] += 1.0
+            else:
+                self.type_prob[chunk][Type.STRUCT] += 1.0
+                self.type_prob[chunk][Type.ARRAY] += 1.0
+                self.type_prob[chunk][Type.POINTER] = 0.0 
+            self._normalize(self.type_prob[chunk])
+
+    def _update_with_deterministic(self):
+        new_type_prob = {c: d.copy() for c, d in self.type_prob.items()}
+        # 1. Accessed with multiple offsets -> more likely array, less likely primitive
+        for (pc, region) in self.deterministic_inference.rel_access_multi:
+            for (acc_pc, chunk), _ in self.deterministic_inference.analyzer.fact_access.items():
+                if acc_pc == pc and chunk.region == region:
+                    new_type_prob[chunk][Type.ARRAY] *= 1.5
+                    new_type_prob[chunk][Type.PRIMITIVE] *= 0.5
+        # 2. AllocUnit -> if access pattern matches alloc unit, more likely array
+        for pc, alloc_unit in self.deterministic_inference.rel_alloc_unit.items():
+            for chunk in self.type_prob:
+                if chunk.region.type == RegionType.HEAP and chunk.region.id == pc:
+                    if chunk.size == alloc_unit:
+                        new_type_prob[chunk][Type.STRUCT] *= 1.2
+                        new_type_prob[chunk][Type.ARRAY] *= 1.2
+                    elif chunk.size % alloc_unit == 0:
+                        new_type_prob[chunk][Type.ARRAY] *= 1.3
+        # 3. MemCopy data flow hint -> if two chunks are memcpy'd with same offset, they likely have the same type
+        for (src, dst) in self.deterministic_inference.rel_data_flow_hint:
+            if src in self.type_prob and dst in self.type_prob:
+                for t in Type:
+                    if t == Type.UNKNOWN:
+                        continue
+                    avg_prob = (self.type_prob[src][t] + self.type_prob[dst][t]) / 2
+                    new_type_prob[src][t] = avg_prob
+                    new_type_prob[dst][t] = avg_prob
+        # Finished
+        for chunk in new_type_prob:
+            self._normalize(new_type_prob[chunk])
+        self.type_prob = new_type_prob
+
+    def type_infer(self):
+        self._apply_priors()
+        self._update_with_deterministic()
+        
+
+class OspreyAnalyzer:
+    parser: LogParser
+    primitive_analyzer: PrimitiveFactAnalyzer
+    deterministic_inference: DeterministicInference
+    probabilistic_inference: ProbabilisticInference
+    def __init__(self, log_file: str):
+        self.parser = LogParser(log_file)
     
     def analyze(self):
-        self.analyze_primitive_facts()
-        
-        
-        data = self.parser.get_result()
-        for alloc in data["alloc"]["start"]:
-            print(f"Allocation at PC {hex(alloc['pc'])}: Base {hex(alloc['base'])}, Size {hex(alloc['size'])}")
-        for free in data["free"]["done"]:
-            print(f"Free at PC {hex(free['pc'])}: Base {hex(free['base'])}")
-        for stack_push in data["stack"]["push"]:
-            print(f"Stack Push at PC {hex(stack_push['pc'])}: SP {hex(stack_push['sp'])}, Size {hex(stack_push['size'])}, Depth {stack_push['depth']}")
-        for stack_pop in data["stack"]["pop"]:
-            print(f"Stack Pop at PC {hex(stack_pop['pc'])}: SP {hex(stack_pop['sp'])}, Base {hex(stack_pop['base'])}, Depth {stack_pop['depth']}")
-        for global_add in data["global"]["add"]:
-            print(f"Global Variable '{global_add['name']}': Base {hex(global_add['base'])}, Size {hex(global_add['size'])}")
-        for loadh in data["loadh"]:
-            regs = {f"r{i}": loadh[f"r{i}"] for i in range(16)}
-            print(f"LoadH at PC {hex(loadh['pc'])}: Reg {loadh['reg']}, Addr {hex(loadh['addr'])}, Size {hex(loadh['size'])}")
-        for storeh in data["storeh"]:
-            print(f"StoreH at PC {hex(storeh['pc'])}: Reg {storeh['reg']}, Addr {hex(storeh['addr'])}, Size {hex(storeh['size'])}")
-        return data
+        self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser.parser)
+        self.primitive_analyzer.run_trace_replay()
+        self.deterministic_inference = DeterministicInference(self.primitive_analyzer)
+        self.deterministic_inference.infer()
+        self.probabilistic_inference = ProbabilisticInference(self.deterministic_inference)
+        self.probabilistic_inference.type_infer()
 
 if __name__ == "__main__":
-    parser = Parser("/root/fuzzolic/tests/example5/workdir/tracer-forkserver.log")
-    parser.parse()
-    parser.analyze()
+    if len(sys.argv) > 1:
+        log_file = sys.argv[1]
+    else:
+        print("Usage: python analyze_type.py <log_file>")
+        sys.exit(1)
+    if not os.path.exists(log_file):
+        print(f"Log file {log_file} does not exist")
+        sys.exit(1)
+    osprey = OspreyAnalyzer(log_file)
+    osprey.analyze()

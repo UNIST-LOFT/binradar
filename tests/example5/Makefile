@@ -13,3 +13,6 @@ run: test
 	rm -f *.core
 	# --forkserver-entrypoint 4000001229
 	uv run ../../fuzzolic/fuzzolic.py --symbolic-models --forkserver-entrypoint 4000001229 --keep-run-dirs --address-reasoning --optimistic-solving --timeout 90000 -o ./workdir/ -i ./input.txt -- ./test @@
+
+analyze:
+	uv run ../../fuzzolic/analyze_type.py ./workdir/tracer-forkserver.log
