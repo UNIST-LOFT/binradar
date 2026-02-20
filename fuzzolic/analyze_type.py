@@ -2,11 +2,12 @@ import sbsv
 import os
 import sys
 import math
+import bisect
 from typing import Dict, List, Tuple, Set, Optional
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict, SortedList
 
 class Type(Enum):
     UNKNOWN = 0
@@ -69,7 +70,8 @@ class PrimitiveFactAnalyzer:
     parser: sbsv.parser
     fact_access: Dict[Tuple[int, MemoryChunk], int]
     base_addr: Dict[MemoryChunk, int]
-    fact_points_to: Dict[MemoryChunk, set]
+    access_cnt: Dict[MemoryChunk, int]
+    fact_pointers: Set[MemoryChunk]
     fact_malloc_size: Dict[int, List[int]]
     fact_mem_copy: Set[Tuple[MemoryChunk, MemoryChunk, int]]  # (src_chunk, dst_chunk, size)
     active_allocs: Dict[int, MemoryRegion]
@@ -84,12 +86,12 @@ class PrimitiveFactAnalyzer:
         # OSPREY Primitive Facts Store
         # F01: Access(i, v, k) -> (pc, chunk) : count
         self.fact_access: Dict[Tuple[int, MemoryChunk], int] = defaultdict(int)
-        
+        self.access_cnt: Dict[MemoryChunk, int] = defaultdict(int)
         # F02: BaseAddr(v, a) -> chunk : base_addr
         self.base_addr: Dict[MemoryChunk, int] = {}
         
-        # F04: PointsTo(v, a) -> chunk : set(target_chunks)
-        self.fact_points_to: Dict[MemoryChunk, Set[MemoryChunk]] = defaultdict(set)
+        # F04: Pointers: set of chunks that contains valid addresses (from load/store with is-ptr=true)
+        self.fact_pointers: Set[MemoryChunk] = set()
         
         # F05: MallocedSize(i, s)
         self.fact_malloc_size: Dict[int, List[int]] = defaultdict(list)
@@ -189,6 +191,7 @@ class PrimitiveFactAnalyzer:
                 size = row["size"]
                 region = row["reg"]
                 region_base = row["reg-base"]
+                is_ptr = row["is-ptr"]
                 memory_region = self._resolve_memory_region(region, region_base)
                 if memory_region is None:
                     print(f"Warning: Could not resolve memory region for addr {addr:x} at PC {pc:x}")
@@ -201,6 +204,10 @@ class PrimitiveFactAnalyzer:
                 # 1. Identify which abstract chunk is being accessed
                 # F01: Access Frequency
                 self.fact_access[(pc, chunk)] += 1
+                self.access_cnt[chunk] += 1
+                # F04: PointsTo (if it's a pointer access, we can infer points-to relationships)
+                if is_ptr:
+                    self.fact_pointers.add(chunk)
             
             elif schema == "memmoveh":
                 src = row["src"]
@@ -302,9 +309,11 @@ class DeterministicInference:
 class ProbabilisticInference:
     deterministic_inference: DeterministicInference
     type_prob: Dict[MemoryChunk, Dict[Type, float]]
+    region_chunks: Dict[MemoryRegion, SortedList[MemoryChunk]]
     def __init__(self, deterministic_inference: DeterministicInference):
         self.deterministic_inference = deterministic_inference
         self.type_prob = defaultdict(lambda: {t: 0.25 for t in [Type.PRIMITIVE, Type.POINTER, Type.STRUCT, Type.ARRAY]})
+        self.region_chunks = defaultdict(lambda: SortedList(key=lambda c: c.offset))
 
     def _normalize(self, dist: Dict[Type, float]):
         total = sum(dist.values())
@@ -316,6 +325,7 @@ class ProbabilisticInference:
     def _apply_priors(self):
         primitive_sizes = {1, 2, 4, 8}
         for chunk in self.deterministic_inference.analyzer.all_chunks:
+            self.region_chunks[chunk.region].add(chunk)
             if chunk.size in primitive_sizes:
                 self.type_prob[chunk][Type.PRIMITIVE] += 1.0
                 if chunk.size == self.deterministic_inference.analyzer.pointer_size:
@@ -325,16 +335,49 @@ class ProbabilisticInference:
                 self.type_prob[chunk][Type.ARRAY] += 1.0
                 self.type_prob[chunk][Type.POINTER] = 0.0 
             self._normalize(self.type_prob[chunk])
-
-    def _update_with_deterministic(self):
-        new_type_prob = {c: d.copy() for c, d in self.type_prob.items()}
-        # 1. Accessed with multiple offsets -> more likely array, less likely primitive
-        for (pc, region) in self.deterministic_inference.rel_access_multi:
-            for (acc_pc, chunk), _ in self.deterministic_inference.analyzer.fact_access.items():
-                if acc_pc == pc and chunk.region == region:
-                    new_type_prob[chunk][Type.ARRAY] *= 1.5
-                    new_type_prob[chunk][Type.PRIMITIVE] *= 0.5
-        # 2. AllocUnit -> if access pattern matches alloc unit, more likely array
+    
+    def _get_adjacent_chunks(self, chunk: MemoryChunk) -> Tuple[Optional[MemoryChunk], Optional[MemoryChunk]]:
+        chunks = self.region_chunks.get(chunk.region)
+        if not chunks:
+            return None, None
+        left = chunks.bisect_left(chunk)
+        right = chunks.bisect_right(chunk)
+        idx = left
+        if left != right:
+            for i in range(left, right):
+                if chunks[i] == chunk:
+                    idx = i
+                    break
+        prev_chunk = chunks[idx - 1] if idx - 1 >= 0 else None
+        next_chunk = chunks[idx + 1] if idx + 1 < len(chunks) else None
+        return prev_chunk, next_chunk
+    
+    # C_A: Access Patterns for primitive types
+    def _apply_rules_CA(self, new_type_prob: Dict[MemoryChunk, Dict[Type, float]]):
+        # C_A01: Access(i, v, k) -> PrimitiveVar(v)
+        # C_A02: AdjacentChunk(v_1, v_2) && PrimitiveVar(v_1) -> PrimitiveVar(v_2)
+        # C_A03: OverlappingChunk(v_1, v_2) -> PrimitiveVar(v_1) and PrimitiveVar(v_2)
+        # C_A06: AccessSingleChunk(i, v.a.r) -> PrimitiveVar(v)
+        for chunk, prob in self.type_prob.items():
+            access_count = self.deterministic_inference.analyzer.access_cnt.get(chunk, 0)
+            if access_count > 10: # C_A01: Frequently accessed chunk is likely primitive
+                new_type_prob[chunk][Type.PRIMITIVE] *= 1.2
+            # C_A02: If adjacent chunk is primitive, this chunk is more likely primitive
+            prev_chunk, next_chunk = self._get_adjacent_chunks(chunk)
+            new_type_prob[chunk][Type.PRIMITIVE] += 0.2 * (self.type_prob[prev_chunk][Type.PRIMITIVE] if prev_chunk else 0)
+            new_type_prob[chunk][Type.PRIMITIVE] += 0.2 * (self.type_prob[next_chunk][Type.PRIMITIVE] if next_chunk else 0)
+            # C_A03: If overlapping chunk is primitive, this chunk is likely primitive
+            # pass
+            # C_A06: If accessed with single offset, more likely primitive
+            for (pc, region) in self.deterministic_inference.rel_access_single:
+                if chunk.region == region:
+                    new_type_prob[chunk][Type.PRIMITIVE] *= 1.3
+                    new_type_prob[chunk][Type.ARRAY] *= 0.7
+                    new_type_prob[chunk][Type.STRUCT] *= 0.7
+    
+    # C_B: Access Patterns for array
+    def _apply_rules_CB(self, new_type_prob: Dict[MemoryChunk, Dict[Type, float]]):
+        # C_B01: AllocUnit -> if access pattern matches alloc unit, more likely array
         for pc, alloc_unit in self.deterministic_inference.rel_alloc_unit.items():
             for chunk in self.type_prob:
                 if chunk.region.type == RegionType.HEAP and chunk.region.id == pc:
@@ -343,7 +386,21 @@ class ProbabilisticInference:
                         new_type_prob[chunk][Type.ARRAY] *= 1.2
                     elif chunk.size % alloc_unit == 0:
                         new_type_prob[chunk][Type.ARRAY] *= 1.3
-        # 3. MemCopy data flow hint -> if two chunks are memcpy'd with same offset, they likely have the same type
+        # C_B02: AccessMultiChunk(i, v.a.r) -> ArrayVar(v)
+        # Accessed with multiple offsets -> more likely array, less likely primitive
+        for (pc, region) in self.deterministic_inference.rel_access_multi:
+            for (acc_pc, chunk), _ in self.deterministic_inference.analyzer.fact_access.items():
+                if acc_pc == pc and chunk.region == region:
+                    new_type_prob[chunk][Type.ARRAY] *= 1.5
+                    new_type_prob[chunk][Type.PRIMITIVE] *= 0.5
+        
+    # C_C: Heap structure
+    def _apply_rules_CC(self, new_type_prob: Dict[MemoryChunk, Dict[Type, float]]):
+        pass
+    
+    # C_D: Struct, Pointer
+    def _apply_rules_CD(self, new_type_prob: Dict[MemoryChunk, Dict[Type, float]]):
+        # C_D01: DataFlowHint(Memcpy) -> SameType
         for (src, dst) in self.deterministic_inference.rel_data_flow_hint:
             if src in self.type_prob and dst in self.type_prob:
                 for t in Type:
@@ -352,6 +409,17 @@ class ProbabilisticInference:
                     avg_prob = (self.type_prob[src][t] + self.type_prob[dst][t]) / 2
                     new_type_prob[src][t] = avg_prob
                     new_type_prob[dst][t] = avg_prob
+        # C_D11: PointsTo(v, a) -> PointerVar(v)
+        for chunk in self.deterministic_inference.analyzer.fact_pointers:
+            new_type_prob[chunk][Type.POINTER] *= 2.0
+            new_type_prob[chunk][Type.PRIMITIVE] *= 0.1
+        
+    def _update_with_deterministic(self):
+        new_type_prob = {c: d.copy() for c, d in self.type_prob.items()}
+        self._apply_rules_CA(new_type_prob)
+        self._apply_rules_CB(new_type_prob)
+        self._apply_rules_CC(new_type_prob)
+        self._apply_rules_CD(new_type_prob)
         # Finished
         for chunk in new_type_prob:
             self._normalize(new_type_prob[chunk])
