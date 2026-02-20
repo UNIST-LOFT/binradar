@@ -29,6 +29,9 @@ class MemoryRegion():
 
     def __repr__(self):
         return f"Region({self.type.name}, id={self.id:x}, base={self.base_addr:x})"
+    
+    def __lt__(self, other):
+        return self.base_addr < other.base_addr
 
 @dataclass(frozen=True)
 class MemoryChunk():
@@ -38,6 +41,11 @@ class MemoryChunk():
 
     def __repr__(self):
         return f"Chunk(R={self.region.id:x}, off={self.offset:x}, sz={self.size})"
+    
+    def __lt__(self, other):
+        if self.region == other.region:
+            return self.offset < other.offset
+        return self.region < other.region
 
 class LogParser():
     parser: sbsv.parser
@@ -107,25 +115,7 @@ class PrimitiveFactAnalyzer:
         self.all_chunks: Set[MemoryChunk] = set()
         self.pointer_size = 8  # 64-bit architecture
 
-    def _resolve_memory_region(self, region_type: str, base_addr: int, unknown: bool = False) -> Optional[MemoryRegion]:
-        if unknown:
-            # Check addr_to_chunk
-            if base_addr in self.addr_to_chunk:
-                chunk = self.addr_to_chunk[base_addr]
-                return chunk.region
-            idx = self.addr_to_chunk.bisect_right(base_addr)
-            if idx >= 0:
-                chunk: MemoryChunk = self.addr_to_chunk.peekitem(idx)[1]
-                if chunk.region.type == RegionType.STACK:
-                    if base_addr <= chunk.region.base_addr:
-                        return chunk.region
-                else: # Heap or Global region: base_addr >= region_base_addr
-                    chunk_before = self.addr_to_chunk.peekitem(idx - 1)[1] if idx - 1 >= 0 else None
-                    if chunk_before and chunk_before.region.type != RegionType.STACK and base_addr >= chunk_before.region.base_addr:
-                        return chunk_before.region
-            # Fallback: Check all regions (stack, heap, global) for containing base_addr
-            return None
-                
+    def _resolve_memory_region(self, region_type: str, base_addr: int) -> Optional[MemoryRegion]:
         if region_type == "stack":
             for region in reversed(self.stack_frames):
                 if region.base_addr == base_addr:
@@ -144,7 +134,6 @@ class PrimitiveFactAnalyzer:
         for row in iterator:
             schema = row.schema_name
             
-            # --- Memory Management Events ---
             if schema == "alloc$start":
                 base = row["base"]
                 size = row["size"]
@@ -220,7 +209,7 @@ class PrimitiveFactAnalyzer:
                 src_memory_region = self._resolve_memory_region(src_region, src_region_base)
                 dst_memory_region = self._resolve_memory_region(dst_region, dst_region_base)
                 if src_memory_region is None or dst_memory_region is None:
-                    print(f"Warning: Could not resolve memory region for memmove")
+                    # print(f"Warning: Could not resolve memory region for memmove")
                     continue
                 src_chunk = MemoryChunk(src_memory_region, src - src_region_base, size)
                 dst_chunk = MemoryChunk(dst_memory_region, dst - dst_region_base, size)
@@ -310,11 +299,13 @@ class ProbabilisticInference:
     deterministic_inference: DeterministicInference
     type_prob: Dict[MemoryChunk, Dict[Type, float]]
     region_chunks: Dict[MemoryRegion, SortedList[MemoryChunk]]
+    overlapping_chunks: Dict[MemoryChunk, Set[MemoryChunk]]
     def __init__(self, deterministic_inference: DeterministicInference):
         self.deterministic_inference = deterministic_inference
         self.type_prob = defaultdict(lambda: {t: 0.25 for t in [Type.PRIMITIVE, Type.POINTER, Type.STRUCT, Type.ARRAY]})
         self.region_chunks = defaultdict(lambda: SortedList(key=lambda c: c.offset))
-
+        self.overlapping_chunks = defaultdict(set)
+    
     def _normalize(self, dist: Dict[Type, float]):
         total = sum(dist.values())
         if total == 0:
@@ -348,8 +339,22 @@ class ProbabilisticInference:
                 if chunks[i] == chunk:
                     idx = i
                     break
-        prev_chunk = chunks[idx - 1] if idx - 1 >= 0 else None
-        next_chunk = chunks[idx + 1] if idx + 1 < len(chunks) else None
+        prev_chunk = None
+        next_chunk = None
+        if idx > 0:
+            prev_chunk: MemoryChunk = chunks[idx - 1]
+            if prev_chunk.offset + prev_chunk.size < chunk.offset:
+                prev_chunk = None # Not adjacent
+            elif prev_chunk.offset + prev_chunk.size > chunk.offset:
+                prev_chunk = None # Overlapping
+                self.overlapping_chunks[chunk].add(prev_chunk)
+        elif idx + 1 < len(chunks):
+            next_chunk: MemoryChunk = chunks[idx + 1]
+            if next_chunk.offset > chunk.offset + chunk.size:
+                next_chunk = None # Not adjacent
+            elif next_chunk.offset  < chunk.offset + chunk.size:
+                next_chunk = None # Overlapping
+                self.overlapping_chunks[chunk].add(next_chunk)
         return prev_chunk, next_chunk
     
     # C_A: Access Patterns for primitive types
@@ -366,14 +371,16 @@ class ProbabilisticInference:
             prev_chunk, next_chunk = self._get_adjacent_chunks(chunk)
             new_type_prob[chunk][Type.PRIMITIVE] += 0.2 * (self.type_prob[prev_chunk][Type.PRIMITIVE] if prev_chunk else 0)
             new_type_prob[chunk][Type.PRIMITIVE] += 0.2 * (self.type_prob[next_chunk][Type.PRIMITIVE] if next_chunk else 0)
-            # C_A03: If overlapping chunk is primitive, this chunk is likely primitive
-            # pass
             # C_A06: If accessed with single offset, more likely primitive
             for (pc, region) in self.deterministic_inference.rel_access_single:
                 if chunk.region == region:
                     new_type_prob[chunk][Type.PRIMITIVE] *= 1.3
                     new_type_prob[chunk][Type.ARRAY] *= 0.7
                     new_type_prob[chunk][Type.STRUCT] *= 0.7
+        # C_A03: If overlapping chunk is primitive, this chunk is likely primitive
+        for chunk in self.overlapping_chunks:
+            overlap_chunk = self.overlapping_chunks.get(chunk, [])
+            new_type_prob[chunk][Type.PRIMITIVE] *= 1.0 + min(0.2 * len(overlap_chunk), 1.0)    
     
     # C_B: Access Patterns for array
     def _apply_rules_CB(self, new_type_prob: Dict[MemoryChunk, Dict[Type, float]]):
@@ -424,10 +431,18 @@ class ProbabilisticInference:
         for chunk in new_type_prob:
             self._normalize(new_type_prob[chunk])
         self.type_prob = new_type_prob
+    
+    def dump_results(self):
+        for region, chunks in self.region_chunks.items():
+            for chunk in chunks:
+                prob = self.type_prob[chunk]
+                inferred_type = max(prob, key=prob.get)
+                print(f"[osprey] [reg {region}] [chunk off={chunk.offset:x} sz={chunk.size}] [type {inferred_type.name}] [prob {prob}]")
 
     def type_infer(self):
         self._apply_priors()
         self._update_with_deterministic()
+        self.dump_results()
         
 
 class OspreyAnalyzer:
