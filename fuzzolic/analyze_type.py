@@ -2,12 +2,33 @@ import sbsv
 import os
 import sys
 import math
-import bisect
 from typing import Dict, List, Tuple, Set, Optional
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
 from sortedcontainers import SortedDict, SortedList
+
+# OSPREY-style probabilistic weights
+P_UP = 0.8
+P_DOWN = 0.2
+LOGIT_CLAMP = 8.0
+
+
+def logit(p: float) -> float:
+    p = max(min(p, 0.999), 0.001)
+    return math.log(p / (1 - p))
+
+
+def expit(l: float) -> float:
+    return 1 / (1 + math.exp(-l))
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+W_UP = logit(P_UP)
+W_DOWN = logit(P_DOWN)
 
 class ValueKind(Enum):
     PRIMITIVE = 0  # int
@@ -73,7 +94,7 @@ class MemoryChunk():
     size: int
 
     def __repr__(self):
-        return f"Chunk(R={self.region.id:x}, off={self.offset:x}, sz={self.size})"
+        return f"Chunk([RT {self.region.type.name[0]}] [RB {self.region.region_base:x}] [RI {self.region.id:x}], off={self.offset:x}, sz={self.size})"
     
     def __lt__(self, other):
         if self.region == other.region:
@@ -103,6 +124,7 @@ class LogParser():
         self.parser.add_schema("[stack] [push] [sp: hex] [size: hex] [pc: hex] [depth: int] [sr-base: hex] [sr-size: hex]")
         self.parser.add_schema("[stack] [pop] [sp: hex] [base: hex] [pc: hex] [depth: int]")
         self.parser.add_schema("[global] [add] [base: hex] [size: hex] [name: str]")
+        # loadh/storeh: val - successfully detect base address, val-fallback - fallback to register value, inval - failed to detect base address, only have access addr
         self.parser.add_schema("[loadh] [val] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
         self.parser.add_schema("[loadh] [val-fallback] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
         self.parser.add_schema("[loadh] [inval] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
@@ -110,7 +132,9 @@ class LogParser():
         self.parser.add_schema("[storeh] [val] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
         self.parser.add_schema("[storeh] [val-fallback] [reg: str] [pc: hex] [addr: hex] [base: hex] [disp: int] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
         self.parser.add_schema("[storeh] [inval] [reg: str] [pc: hex] [addr: hex] [reg-base: hex] [size: hex] [val: hex] [is-ptr: bool] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        # memmoveh: this include register copy, memcpy, memmove, strcpy
         self.parser.add_schema("[memmoveh] [src: hex] [dst: hex] [size: hex] [val: hex] [is-ptr: bool] [src-r: str] [src-rb: hex] [dst-r: str] [dst-rb: hex] [r0: hex] [r1: hex] [r2: hex] [r3: hex] [r4: hex] [r5: hex] [r6: hex] [r7: hex] [r8: hex] [r9: hex] [r10: hex] [r11: hex] [r12: hex] [r13: hex] [r14: hex] [r15: hex]")
+        # cov: edge coverage
         self.parser.add_schema("[cov] [base] [from: hex] [to: hex] [cnt: int]")
         self.parser.add_schema("[cov] [update] [from: hex] [to: hex] [cnt: int]")
         # Read access for pointer
@@ -381,11 +405,11 @@ class DeterministicInference:
                     c2 = chunks[j]
                     if self._same_region(c1, c2):
                         continue
-                    # if c1.offset != c2.offset:
-                    #     continue
                     if c2 < c1:
                         c1, c2 = c2, c1
                     offset_diff = c2.offset - c1.offset
+                    if offset_diff != 0: # Fix
+                        continue
                     layout_matches[(c1.region, c2.region)][offset_diff].add((c1, c2))
         # Find homosegments
         for (r1, r2), offset_diffs in layout_matches.items():
@@ -439,232 +463,271 @@ class DeterministicInference:
         self.infer_homoseg_from_memcpy()
         self.infer_homoseg_from_unified_access()
         self.infer_arrays_from_access()
-        
-class ProbabilisticInference:
-    deterministic_inference: DeterministicInference
-    kind_prob: Dict[MemoryChunk, Dict[ValueKind, float]]
-    role_prob: Dict[MemoryChunk, Dict[Role, float]]
-    # struct
-    fieldof_prob: Dict[FieldOfRelation, float] # (field, base) -> probability of field_of relation
-    homoseg_prob: Dict[HomoSegmentRelation, float] # (chunk1, chunk2) -> probability of being in the same struct
-    # array
-    array_start_prob: Dict[MemoryAddress, float]
-    array_prob: Dict[ArrayRelation, float]
-    # etc
-    region_chunks: Dict[MemoryRegion, SortedList[MemoryChunk]]
-    overlapping_chunks: Dict[MemoryChunk, Set[MemoryChunk]]
-    
-    def __init__(self, deterministic_inference: DeterministicInference):
-        self.deterministic_inference = deterministic_inference
-        self.kind_prob = defaultdict(lambda: self._uniform_dist(ValueKind))
-        self.role_prob = defaultdict(lambda: self._uniform_dist(Role))
-        self.fieldof_prob = defaultdict(float)
-        self.homoseg_prob = defaultdict(float)
-        self.array_start_prob = defaultdict(float)
-        self.array_prob = defaultdict(float)
-        self.region_chunks = defaultdict(lambda: SortedList(key=lambda c: (c.offset, c.size)))
-        self.overlapping_chunks = defaultdict(set)
-        
-    def _uniform_dist(self, enum_cls: Enum) -> Dict[Enum, float]:
-        n = len(enum_cls)
-        return {e: 1.0 / n for e in enum_cls}
-    
-    def _normalize(self, dist: Dict[Enum, float]):
-        total = sum(dist.values())
-        if total == 0:
-            return
-        for t in dist:
-            dist[t] /= total
-    
-    def _merge_prob_dist(self, dist1: Dict[Enum, float], dist2: Dict[Enum, float], weight: float = 0.5) -> Dict[Enum, float]:
-        epsilon = 1e-9
-        merged = {t: dist1[t] * weight + dist2[t] * (1 - weight) + epsilon for t in dist1}
-        self._normalize(merged)
-        return merged
 
-    def _apply_priors(self):
-        primitive_sizes = {1, 2, 4, 8}
-        for chunk in self.deterministic_inference.analyzer.all_chunks:
-            self.region_chunks[chunk.region].add(chunk)
-            kp = self.kind_prob[chunk]
-            rp = self.role_prob[chunk]
-            if chunk.size in primitive_sizes:
-                kp[ValueKind.PRIMITIVE] += 1.0
-                if chunk.size == self.deterministic_inference.analyzer.pointer_size:
-                    kp[ValueKind.POINTER] += 1.0
-            else:
-                kp[ValueKind.OTHER] += 1.0
-            self._normalize(kp)
-            rp[Role.SCALAR] += 0.2
-            self._normalize(rp)
+class NodeType(Enum):
+    PRIMITIVE_VAR = 0
+    SCALAR = 1
+    POINTER = 2
+    ARRAY_ELEM = 3
+    ARRAY = 4
+    FIELD_OF = 5
+    HOMO_SEGMENT = 6
+
+@dataclass(frozen=True)
+class Node:
+    type: NodeType
+
+@dataclass(frozen=True)
+class SingleNode(Node):
+    chunk: MemoryChunk
+
+@dataclass(frozen=True)
+class ArrayRelNode(Node):
+    array_relation: ArrayRelation
     
-    def _get_adjacent_chunks(self, chunk: MemoryChunk) -> Tuple[Optional[MemoryChunk], Optional[MemoryChunk]]:
-        chunks = self.region_chunks.get(chunk.region)
-        if not chunks:
-            return None, None
-        left = chunks.bisect_left(chunk)
-        right = chunks.bisect_right(chunk)
-        idx = left
-        if left != right:
-            for i in range(left, right):
-                if chunks[i] == chunk:
-                    idx = i
-                    break
-        prev_chunk = None
-        next_chunk = None
-        if idx > 0:
-            prev_chunk: MemoryChunk = chunks[idx - 1]
-            if prev_chunk.offset + prev_chunk.size < chunk.offset:
-                prev_chunk = None # Not adjacent
-            elif prev_chunk.offset + prev_chunk.size > chunk.offset:
-                self.overlapping_chunks[chunk].add(prev_chunk)
-                prev_chunk = None # Overlapping
-        if idx + 1 < len(chunks):
-            next_chunk: MemoryChunk = chunks[idx + 1]
-            if next_chunk.offset > chunk.offset + chunk.size:
-                next_chunk = None # Not adjacent
-            elif next_chunk.offset  < chunk.offset + chunk.size:
-                self.overlapping_chunks[chunk].add(next_chunk)
-                next_chunk = None # Overlapping
-        return prev_chunk, next_chunk
-    
-    # C_A: Access Patterns for primitive types
-    def _apply_rules_CA(self):
-        # C_A01: Access(i, v, k) -> PrimitiveVar(v)
-        # C_A02: AdjacentChunk(v_1, v_2) && PrimitiveVar(v_1) -> PrimitiveVar(v_2)
-        # C_A03: OverlappingChunk(v_1, v_2) -> PrimitiveVar(v_1) and PrimitiveVar(v_2)
-        # C_A06: AccessSingleChunk(i, v.a.r) -> PrimitiveVar(v)
-        for chunk in self.deterministic_inference.analyzer.all_chunks:
-            access_count = self.deterministic_inference.analyzer.access_cnt.get(chunk, 0)
-            # C_A01: Frequently accessed chunk is likely primitive
-            if access_count > 10:
-                self.kind_prob[chunk][ValueKind.PRIMITIVE] *= 1.2
-            # C_A02: If adjacent chunk is primitive, this chunk is more likely primitive
-            prev_chunk, next_chunk = self._get_adjacent_chunks(chunk)
-            if prev_chunk and self.kind_prob[prev_chunk][ValueKind.PRIMITIVE] > 0.5:
-                self.kind_prob[chunk][ValueKind.PRIMITIVE] *= 1.2
-            if next_chunk and self.kind_prob[next_chunk][ValueKind.PRIMITIVE] > 0.5:
-                self.kind_prob[chunk][ValueKind.PRIMITIVE] *= 1.2
-        # C_A03: If overlapping chunk is primitive, this chunk is likely primitive
-        for chunk in self.overlapping_chunks:
-            overlap_chunk = self.overlapping_chunks.get(chunk, [])
-            if overlap_chunk:
-                self.kind_prob[chunk][ValueKind.PRIMITIVE] *= 1.0 + min(0.2 * len(overlap_chunk), 1.0)
-        # C_A06: If accessed with single offset, more likely scalar
-        for (pc, region, chunks) in self.deterministic_inference.rel_access_single:
-            for chunk in chunks:
-                self.role_prob[chunk][Role.SCALAR] *= 1.5
-                self.role_prob[chunk][Role.FIELD] *= 0.7
-                self.role_prob[chunk][Role.ARRAY_ELEM] *= 0.5
-    
-    # C_B: Access Patterns for array
-    def _apply_rules_CB(self):
-        # C_B01: MayArray -> Array, ArrayStart
-        for arr in self.deterministic_inference.rel_may_array:
+@dataclass(frozen=True)
+class HomoSegNode(Node):
+    segment: HomoSegmentRelation
+
+@dataclass(frozen=True)
+class PointerNode(Node):
+    chunk: MemoryChunk
+    target: MemoryAddress
+
+@dataclass(frozen=True)
+class FieldOfNode(Node):
+    field: MemoryChunk
+    base: MemoryAddress
+
+class ProbabilisticInference:
+    det: DeterministicInference
+    analyzer: PrimitiveFactAnalyzer
+    nodes: Set[Node]
+    prior_logits: Dict[Node, float]
+    edges: Dict[Node, List[Tuple[Node, float]]]
+    degree: Dict[Node, int]
+    beliefs: Dict[Node, float]
+    # cache
+    field_nodes: Dict[MemoryChunk, Set[Node]]
+
+    def __init__(self, deterministic_inference: DeterministicInference):
+        self.det = deterministic_inference
+        self.analyzer = deterministic_inference.analyzer
+        self.nodes = set()
+        self.prior_logits = defaultdict(float)
+        self.edges = defaultdict(list)
+        self.degree = defaultdict(int)
+        self.beliefs = dict()
+        self.field_nodes = defaultdict(set)
+
+    def _add_node(self, node: Node, prior_prob: float):
+        if node.type == NodeType.FIELD_OF and isinstance(node, FieldOfNode):
+            self.field_nodes[node.field].add(node)
+        prior = logit(prior_prob)
+        if node in self.nodes:
+            self.prior_logits[node] = 0.5 * (self.prior_logits[node] + prior)
+        else:
+            self.nodes.add(node)
+            self.prior_logits[node] = prior
+
+    def _add_edge(self, src: Node, dst: Node, weight: float, bidirectional: bool = False):
+        self.nodes.add(src)
+        self.nodes.add(dst)
+        self.edges[dst].append((src, weight))
+        self.degree[src] += 1
+        self.degree[dst] += 1
+        if bidirectional:
+            self.edges[src].append((dst, weight))
+            self.degree[src] += 1
+            self.degree[dst] += 1
+
+    def _softmax_by_logits(self, logits: List[float]) -> List[float]:
+        if not logits:
+            return []
+        m = max(logits)
+        exps = [math.exp(x - m) for x in logits]
+        s = sum(exps)
+        if s == 0:
+            return [1.0 / len(logits)] * len(logits)
+        return [x / s for x in exps]
+
+    def _build_factor_graph(self):
+        chunks_by_region: Dict[MemoryRegion, List[MemoryChunk]] = defaultdict(list)
+        for chunk in self.analyzer.all_chunks:
+            chunks_by_region[chunk.region].append(chunk)
+        for region in chunks_by_region:
+            chunks_by_region[region].sort(key=lambda c: (c.offset, c.size))
+
+        field_candidates_by_chunk: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
+        for rel in self.det.rel_fieldof:
+            field_candidates_by_chunk[rel.field].add(rel.base)
+            self._add_node(FieldOfNode(type=NodeType.FIELD_OF, field=rel.field, base=rel.base), 0.6)
+            
+        for region, chunks in chunks_by_region.items():
+            for i, chunk in enumerate(chunks):
+                node_prim = SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk)
+                node_scalar = SingleNode(type=NodeType.SCALAR, chunk=chunk)
+                node_arr_elem = SingleNode(type=NodeType.ARRAY_ELEM, chunk=chunk)
+
+                k = self.analyzer.access_cnt.get(chunk, 0)
+                p_k = 0.5 + 0.4 * (1 - math.exp(-0.1 * k))
+                self._add_node(node_prim, p_k)
+                self._add_node(node_scalar, 0.35)
+                self._add_node(node_arr_elem, 0.25)
+
+                for base_addr in field_candidates_by_chunk.get(chunk, set()):
+                    node_field = FieldOfNode(type=NodeType.FIELD_OF, field=chunk, base=base_addr)
+                    self._add_edge(node_prim, node_field, W_UP)
+                    self._add_edge(node_field, node_scalar, W_DOWN)
+
+                for j in range(i + 1, len(chunks)):
+                    nxt = chunks[j]
+                    node_next_prim = SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=nxt)
+                    if nxt.offset < chunk.offset + chunk.size:
+                        self._add_edge(node_prim, node_next_prim, W_DOWN, bidirectional=True)
+                    elif nxt.offset == chunk.offset + chunk.size:
+                        self._add_edge(node_prim, node_next_prim, logit(0.6), bidirectional=True)
+                        break
+                    else:
+                        break
+
+        for _, _, chunks in self.det.rel_access_single:
+            for c in chunks:
+                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=c), SingleNode(type=NodeType.SCALAR, chunk=c), W_UP)
+
+        for arr in self.det.rel_may_array:
             if not arr.valid():
                 continue
-            self.array_prob[arr] += 0.8
-            head = MemoryAddress(arr.region, arr.lo)
-            self.array_start_prob[head] += 0.8
-        # C_B01: AllocUnit -> if access pattern matches alloc unit, more likely array
-        pc_to_chunks: Dict[int, List[MemoryChunk]] = defaultdict(list)
-        for (pc, chunk), _ in self.deterministic_inference.analyzer.fact_access.items():
-            pc_to_chunks[pc].append(chunk)
-        for pc, alloc_unit in self.deterministic_inference.rel_alloc_unit.items():
-            if pc in pc_to_chunks:
-                for chunk in pc_to_chunks[pc]:
-                    if (chunk.size == alloc_unit) or (chunk.size % alloc_unit == 0):
-                        self.role_prob[chunk][Role.ARRAY_ELEM] *= 1.5
-                        self.role_prob[chunk][Role.SCALAR] *= 0.5
-        # C_B02: AccessMultiChunk(i, v.a.r) -> ArrayVar(v)
-        # Accessed with multiple offsets -> more likely array, less likely primitive
-        for (pc, region, chunks) in self.deterministic_inference.rel_access_multi:
-            for chunk in chunks:
-                self.role_prob[chunk][Role.ARRAY_ELEM] *= 1.5
-                self.role_prob[chunk][Role.SCALAR] *= 0.5
-            # self.array_start_prob
-            
-        
-    # C_C: Heap structure
-    def _apply_rules_CC(self):
-        # Fold/Unfold
-        for chunk, prob in self.role_prob.items():
-            if chunk.region.type == RegionType.HEAP:
-                # If likely struct, its fields are likely field_of
-                prob[Role.FIELD] *= 1.5
-                prob[Role.ARRAY_ELEM] *= 1.2
-                prob[Role.SCALAR] *= 0.7
-                
-    # C_D: Struct, Pointer
-    def _apply_rules_CD(self):
-        # C_D01: DataFlowHint(Memcpy) -> HomoSegment
-        # C_D03: UnifiedAccessPntHint -> HomoSegment / FieldOf
-        for homoseg, (src_chunks, dst_chunks) in self.deterministic_inference.rel_homoseg.items():
-            self.homoseg_prob[homoseg] += 0.8
-            # C_D08: HomoSegment -> FieldOf
-            for c in src_chunks:
-                self.role_prob[c][Role.FIELD] *= 1.2
-            for c in dst_chunks:
-                self.role_prob[c][Role.FIELD] *= 1.2
+            node_arr = ArrayRelNode(type=NodeType.ARRAY, array_relation=arr)
+            self._add_node(node_arr, 0.7)
+            for chunk in chunks_by_region[arr.region]:
+                if chunk.offset >= arr.lo and (chunk.offset + chunk.size) <= arr.hi:
+                    self._add_edge(node_arr, SingleNode(type=NodeType.ARRAY_ELEM, chunk=chunk), W_UP)
+                    self._add_edge(SingleNode(type=NodeType.SCALAR, chunk=chunk), node_arr, W_DOWN, bidirectional=True)
 
-        for (r1, r2), hints in self.deterministic_inference.rel_unified_access_hint.items():
-            for (c1, c2, seg_size, pair_count) in hints:
-                rp1 = self.role_prob[c1]
-                rp1[Role.FIELD] *= 1.5
-                rp1[Role.ARRAY_ELEM] *= 0.9
-                rp1[Role.SCALAR] *= 0.7
-                rp2 = self.role_prob[c2]
-                rp2[Role.FIELD] *= 1.5
-                rp2[Role.ARRAY_ELEM] *= 0.9
-                rp2[Role.SCALAR] *= 0.7
-        # C_D06: BaseAddr -> FieldOf struct
-        for rel in self.deterministic_inference.rel_fieldof:
-            self.fieldof_prob[rel] += 0.8
-            rp = self.role_prob[rel.field]
-            rp[Role.FIELD] *= 1.5
-            rp[Role.SCALAR] *= 0.7
-            rp[Role.ARRAY_ELEM] *= 0.9
-            
-        # C_D11: PointsTo(v, a) -> PointerVar(v)
-        for chunk, target_addr in self.deterministic_inference.analyzer.fact_pointers.items():
-            kp = self.kind_prob[chunk]
-            kp[ValueKind.POINTER] *= 1.5
-            if target_addr in self.deterministic_inference.analyzer.addr_to_chunk:
-                target_chunk: MemoryChunk = self.deterministic_inference.analyzer.addr_to_chunk[target_addr]
-                self.array_start_prob[target_chunk.get_address()] += 0.2
-            # TODO: C_D02: PointsToHint() -> HomoSegment
-    
-    def _update_with_deterministic(self):
-        self._apply_rules_CA()
-        self._apply_rules_CB()
-        self._apply_rules_CC()
-        self._apply_rules_CD()
-        # Finished
-        for chunk, prob in self.kind_prob.items():
-            self._normalize(prob)
-        for chunk, prob in self.role_prob.items():
-            self._normalize(prob)
-    
-    def dump_results(self):
-        for region, chunks in self.region_chunks.items():
-            for chunk in chunks:
-                kind_prob = self.kind_prob[chunk]
-                role_prob = self.role_prob[chunk]
-                inferred_kind = max(kind_prob, key=kind_prob.get)
-                inferred_role = max(role_prob, key=role_prob.get)
-                inferred_type = f"{inferred_kind.name}_{inferred_role.name}"
-                print(f"[osprey] [reg {region}] [chunk off={chunk.offset:x} sz={chunk.size}] [type {inferred_type}] [kind-prob {kind_prob}] [role-prob {role_prob}]")
-        for rel, prob in self.fieldof_prob.items():
-            print(f"[osprey] [fieldof] [field {rel.field}] [base {rel.base}] [prob {prob:.2f}]")
-        for rel, prob in self.homoseg_prob.items():
-            print(f"[osprey] [homoseg] [a1 {rel.a1}] [a2 {rel.a2}] [size {rel.size}] [prob {prob:.2f}]")
-        for arr, prob in self.array_prob.items():
-            print(f"[osprey] [array] [region {arr.region}] [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {arr.elem}] [prob {prob:.2f}]")
-        
-    def type_infer(self):
-        self._apply_priors()
-        self._update_with_deterministic()
+        for rel, (src_chunks, dst_chunks) in self.det.rel_homoseg.items():
+            node_h = HomoSegNode(type=NodeType.HOMO_SEGMENT, segment=rel)
+            self._add_node(node_h, 0.65)
+            src_fields: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
+            dst_fields: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
+            for relf in self.det.rel_fieldof:
+                if relf.field in src_chunks:
+                    src_fields[relf.field].add(relf.base)
+                if relf.field in dst_chunks:
+                    dst_fields[relf.field].add(relf.base)
+
+            for c1, b1s in src_fields.items():
+                for b1 in b1s:
+                    n1 = FieldOfNode(type=NodeType.FIELD_OF, field=c1, base=b1)
+                    self._add_edge(node_h, n1, logit(0.65))
+                    for c2, b2s in dst_fields.items():
+                        for b2 in b2s:
+                            n2 = FieldOfNode(type=NodeType.FIELD_OF, field=c2, base=b2)
+                            self._add_edge(n1, n2, logit(0.65), bidirectional=True)
+
+        for chunk, target_addr in self.analyzer.fact_pointers.items():
+            if target_addr in self.analyzer.addr_to_chunk:
+                target_key: MemoryAddress = self.analyzer.addr_to_chunk[target_addr].get_address()
+                node_ptr = PointerNode(type=NodeType.POINTER, chunk=chunk, target=target_key)
+                self._add_node(node_ptr, 0.8)
+                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk), node_ptr, W_UP)
+
+    def _normalize_local_constraints(self, logits: Dict[Node, float]):
+
+        for c in self.analyzer.all_chunks:
+            field_nodes = self.field_nodes[c]
+
+            field_score = logit(0.2)
+            if field_nodes:
+                field_score = max(logits.get(n, logit(0.2)) for n in field_nodes)
+
+            role_logits = [
+                logits.get(SingleNode(type=NodeType.SCALAR, chunk=c), logit(0.34)),
+                field_score,
+                logits.get(SingleNode(type=NodeType.ARRAY_ELEM, chunk=c), logit(0.33)),
+            ]
+            probs = self._softmax_by_logits(role_logits)
+            logits[SingleNode(type=NodeType.SCALAR, chunk=c)] = clamp(logit(probs[0]), -LOGIT_CLAMP, LOGIT_CLAMP)
+            logits[SingleNode(type=NodeType.ARRAY_ELEM, chunk=c)] = clamp(logit(probs[2]), -LOGIT_CLAMP, LOGIT_CLAMP)
+
+            if field_nodes:
+                base_logits = [logits.get(n, logit(0.2)) for n in field_nodes]
+                base_probs = self._softmax_by_logits(base_logits)
+                for n, p in zip(field_nodes, base_probs):
+                    logits[n] = clamp(logit(p), -LOGIT_CLAMP, LOGIT_CLAMP)
+
+    def type_infer(self, max_iter: int = 30, tolerance: float = 1e-3, alpha: float = 0.35):
+        print("[*] Building Probabilistic Factor Graph...")
+        self._build_factor_graph()
+        edge_count = sum(len(v) for v in self.edges.values())
+        print(f"[*] Starting Inference on {len(self.nodes)} variables and {edge_count} edges...")
+
+        current_logits = {n: self.prior_logits[n] for n in self.nodes}
+        for n in self.nodes:
+            current_logits[n] = clamp(current_logits[n], -LOGIT_CLAMP, LOGIT_CLAMP)
+
+        for iteration in range(max_iter):
+            next_logits: Dict[Node, float] = {}
+            max_diff = 0.0
+            for target_node in self.nodes:
+                msg_sum = 0.0
+                deg_t = max(1, self.degree.get(target_node, 1))
+                for src_node, weight in self.edges[target_node]:
+                    p_src = expit(current_logits[src_node])
+                    evidence = p_src - 0.5
+                    deg_s = max(1, self.degree.get(src_node, 1))
+                    msg_sum += weight * evidence / math.sqrt(deg_s * deg_t)
+                target_prior = self.prior_logits[target_node]
+                blended = (1 - alpha) * current_logits[target_node] + alpha * (target_prior + msg_sum)
+                new_logit = clamp(blended, -LOGIT_CLAMP, LOGIT_CLAMP)
+                next_logits[target_node] = new_logit
+                max_diff = max(max_diff, abs(new_logit - current_logits[target_node]))
+
+            self._normalize_local_constraints(next_logits)
+            current_logits = next_logits
+
+            if max_diff < tolerance:
+                print(f"[*] Inference converged at iteration {iteration + 1}")
+                break
+
+        self.beliefs = {n: expit(l) for n, l in current_logits.items()}
         self.dump_results()
+
+    def dump_results(self, threshold: float = 0.6):
+        print("\n" + "=" * 50)
+        print(" OSPREY RECOVERY RESULTS (Confidence > {:.1f}%)".format(threshold * 100))
+        print("=" * 50)
+
+        by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
+        for node, prob in self.beliefs.items():
+            if prob >= threshold:
+                by_type[node.type].append((node, prob))
+
+        if NodeType.FIELD_OF in by_type:
+            print("\n[+] Recovered Fields:")
+            rows = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
+            for node, prob in rows:
+                chunk = node.field
+                base = node.base
+                print(f"  - {chunk} base={base} -> Prob: {prob:.4f}")
+
+        if NodeType.ARRAY in by_type:
+            print("\n[+] Recovered Arrays:")
+            rows = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
+            for arr, prob in rows:
+                print(f"  - Region:{arr.array_relation.region.id:x}[offset {arr.array_relation.lo:x} ~ {arr.array_relation.hi:x}], element_size:{arr.array_relation.elem} -> Prob: {prob:.4f}")
+
+        if NodeType.SCALAR in by_type:
+            print("\n[+] Recovered Scalar Variables:")
+            scalar_rows = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            for node, prob in scalar_rows:
+                print(f"  - {node.chunk} -> Prob: {prob:.4f}")
+
+        if NodeType.POINTER in by_type:
+            print("\n[+] Recovered Pointer Candidates:")
+            ptr_rows = sorted(by_type[NodeType.POINTER], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            for node, prob in ptr_rows:
+                print(f"  - {node.chunk} -> target={node.target} Prob: {prob:.4f}")
         
 
 class OspreyAnalyzer:
