@@ -44,6 +44,7 @@ class RegionType(Enum):
     STACK = 0
     HEAP = 1
     GLOBAL = 2
+    UNKNOWN = 3
 
 @dataclass(frozen=True)
 class MemoryRegion():
@@ -162,6 +163,8 @@ class PrimitiveFactAnalyzer:
     addr_to_chunk: SortedDict[int, MemoryChunk]
     all_chunks: Set[MemoryChunk]
     pointer_size: int
+    pointer_pcs: Set[int]
+    null_ptr_candiates: Set[MemoryChunk] # (chunk) where val is 0 and possibly a pointer
     def __init__(self, parser: sbsv.parser):
         self.parser = parser
         
@@ -188,6 +191,8 @@ class PrimitiveFactAnalyzer:
         self.addr_to_chunk: SortedDict[int, MemoryChunk] = SortedDict() # addr -> chunk (for quick lookup during memmove)
         self.all_chunks: Set[MemoryChunk] = set()
         self.pointer_size = 8  # 64-bit architecture
+        self.pointer_pcs = set() # PCs that have pointer accesses
+        self.null_ptr_candiates = set() # (chunk) where val is 0 and possibly a pointer
 
     def _resolve_memory_region(self, region_type: str, region_base: int) -> Optional[MemoryRegion]:
         if region_type == "stack":
@@ -272,6 +277,10 @@ class PrimitiveFactAnalyzer:
                 # F04: PointsTo (if it's a pointer access, we can infer points-to relationships)
                 if is_ptr:
                     self.fact_pointers[chunk] = val
+                    self.pointer_pcs.add(pc)
+                if size == self.pointer_size and val == 0:
+                    if pc in self.pointer_pcs:
+                        self.null_ptr_candiates.add(chunk)
             
             elif schema == "memmoveh":
                 src = row["src"]
@@ -636,6 +645,11 @@ class ProbabilisticInference:
                 target_key: MemoryAddress = self.analyzer.addr_to_chunk[target_addr].get_address()
                 node_ptr = PointerNode(type=NodeType.POINTER, chunk=chunk, target=target_key)
                 self._add_node(node_ptr, 0.8)
+                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk), node_ptr, W_UP)
+        for chunk in self.analyzer.null_ptr_candiates:
+            if chunk not in self.analyzer.fact_pointers:
+                node_ptr = PointerNode(type=NodeType.POINTER, chunk=chunk, target=MemoryAddress(MemoryRegion(RegionType.UNKNOWN, 0, 0), 0))
+                self._add_node(node_ptr, 0.7)
                 self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk), node_ptr, W_UP)
 
     def _normalize_local_constraints(self, logits: Dict[Node, float]):
