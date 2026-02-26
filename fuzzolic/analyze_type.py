@@ -56,6 +56,9 @@ class MemoryRegion():
     
     def __lt__(self, other):
         return self.region_base < other.region_base
+    
+    def get_str(self) -> str:
+        return f"[RT {self.type.name[0]}] [RB {self.region_base:x}] [RI {self.id:x}]"
 
 @dataclass(frozen=True)
 class MemoryAddress():
@@ -94,7 +97,7 @@ class MemoryChunk():
     size: int
 
     def __repr__(self):
-        return f"Chunk([RT {self.region.type.name[0]}] [RB {self.region.region_base:x}] [RI {self.region.id:x}], off={self.offset:x}, sz={self.size})"
+        return f"Chunk({self.region.get_str()}, off={self.offset:x}, sz={self.size})"
     
     def __lt__(self, other):
         if self.region == other.region:
@@ -103,6 +106,9 @@ class MemoryChunk():
     
     def get_address(self) -> MemoryAddress:
         return MemoryAddress(self.region, self.offset)
+    
+    def get_str(self) -> str:
+        return f"{self.region.get_str()} [off {self.offset:x}] [sz {self.size:x}]"
 
 @dataclass(frozen=True)
 class FieldOfRelation():
@@ -704,30 +710,30 @@ class ProbabilisticInference:
                 by_type[node.type].append((node, prob))
 
         if NodeType.FIELD_OF in by_type:
-            print("\n[+] Recovered Fields:")
-            rows = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
+            print(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
+            rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
             for node, prob in rows:
-                chunk = node.field
-                base = node.base
-                print(f"  - {chunk} base={base} -> Prob: {prob:.4f}")
+                chunk: MemoryChunk = node.field
+                base: MemoryAddress = node.base
+                print(f"[field] {chunk.get_str()} [base {base.offset:x}] -> [P {prob:.4f}]")
 
         if NodeType.ARRAY in by_type:
-            print("\n[+] Recovered Arrays:")
-            rows = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
+            print(f"\n[array-meta] [cnt {len(by_type[NodeType.ARRAY])}]")
+            rows: List[Tuple[ArrayRelNode, float]] = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
             for arr, prob in rows:
-                print(f"  - Region:{arr.array_relation.region.id:x}[offset {arr.array_relation.lo:x} ~ {arr.array_relation.hi:x}], element_size:{arr.array_relation.elem} -> Prob: {prob:.4f}")
+                print(f"[array] {arr.array_relation.region.get_str()} [lo {arr.array_relation.lo:x}] [hi {arr.array_relation.hi:x}] [elem {arr.array_relation.elem}] -> [P {prob:.4f}]")
 
         if NodeType.SCALAR in by_type:
-            print("\n[+] Recovered Scalar Variables:")
-            scalar_rows = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            print(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
+            scalar_rows: List[Tuple[SingleNode, float]] = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in scalar_rows:
-                print(f"  - {node.chunk} -> Prob: {prob:.4f}")
+                print(f"[scalar] {node.chunk.get_str()} -> [P {prob:.4f}]")
 
         if NodeType.POINTER in by_type:
-            print("\n[+] Recovered Pointer Candidates:")
-            ptr_rows = sorted(by_type[NodeType.POINTER], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            print(f"\n[pointer-meta] [cnt {len(by_type[NodeType.POINTER])}]")
+            ptr_rows: List[Tuple[PointerNode, float]] = sorted(by_type[NodeType.POINTER], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in ptr_rows:
-                print(f"  - {node.chunk} -> target={node.target} Prob: {prob:.4f}")
+                print(f"[pointer] {node.chunk.get_str()} -> [target {node.target.region.region_base + node.target.offset:x}] [P {prob:.4f}]")
         
 
 class OspreyAnalyzer:
