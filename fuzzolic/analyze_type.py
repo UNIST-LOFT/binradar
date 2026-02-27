@@ -423,24 +423,30 @@ class DeterministicInference:
                     if c2 < c1:
                         c1, c2 = c2, c1
                     offset_diff = c2.offset - c1.offset
-                    if offset_diff != 0: # Fix
-                        continue
+                    # if offset_diff != 0:
+                    #     continue
                     layout_matches[(c1.region, c2.region)][offset_diff].add((c1, c2))
         # Find homosegments
         for (r1, r2), offset_diffs in layout_matches.items():
+            # Select offset diff with maximum chunk pairs
+            max_chunk_pairs: Set[Tuple[MemoryChunk, MemoryChunk]] = set()
             for diff, chunk_pairs in offset_diffs.items():
                 if len(chunk_pairs) < 2: # At least 2 matching access patterns
                     continue
-                pairs = sorted(list(chunk_pairs), key=lambda x: x[0].offset)
-                base_c1 = pairs[0][0]
-                base_c2 = pairs[0][1]
-                last_c1 = pairs[-1][0]
-                seg_size = last_c1.offset - base_c1.offset + last_c1.size
-                self.rel_unified_access_hint[(r1, r2)].add((base_c1, base_c2, seg_size, len(pairs)))
-                c1_chunks, c2_chunks = self.rel_homoseg[HomoSegmentRelation(base_c1.get_address(), base_c2.get_address(), seg_size)]
-                for c1, c2 in pairs:
-                    c1_chunks.add(c1)
-                    c2_chunks.add(c2)
+                if len(chunk_pairs) > len(max_chunk_pairs):
+                    max_chunk_pairs = chunk_pairs
+            if len(max_chunk_pairs) < 2:
+                continue
+            pairs = sorted(max_chunk_pairs, key=lambda x: x[0].offset)
+            base_c1 = pairs[0][0]
+            base_c2 = pairs[0][1]
+            last_c1 = pairs[-1][0]
+            seg_size = last_c1.offset - base_c1.offset + last_c1.size
+            self.rel_unified_access_hint[(r1, r2)].add((base_c1, base_c2, seg_size, len(pairs)))
+            c1_chunks, c2_chunks = self.rel_homoseg[HomoSegmentRelation(base_c1.get_address(), base_c2.get_address(), seg_size)]
+            for c1, c2 in pairs:
+                c1_chunks.add(c1)
+                c2_chunks.add(c2)
     
     def infer_arrays_from_access(self):
         # multi-chunk -> array
@@ -707,19 +713,18 @@ class ProbabilisticInference:
                 for n, p in zip(field_nodes, base_probs):
                     logits[n] = clamp(logit(p), -LOGIT_CLAMP, LOGIT_CLAMP)
 
-    def type_infer(self, max_iter: int = 30, tolerance: float = 1e-3, alpha: float = 0.35):
+    def type_infer(self, max_iter: int = 30, tolerance: float = 1e-3, alpha: float = 0.1):
         print("[*] Building Probabilistic Factor Graph...")
         self._build_factor_graph()
         edge_count = sum(len(v) for v in self.edges.values())
         print(f"[*] Starting Inference on {len(self.nodes)} variables and {edge_count} edges...")
 
-        current_logits = dict()
+        current_logits: Dict[Node, float] = dict()
         for n in self.nodes:
             current_logits[n] = clamp(self.prior_logits[n], -LOGIT_CLAMP, LOGIT_CLAMP)
 
         for iteration in range(max_iter):
             next_logits: Dict[Node, float] = {}
-            max_diff = 0.0
             for target_node in self.nodes:
                 msg_sum = 0.0
                 deg_t = max(1, self.degree.get(target_node, 1))
@@ -730,12 +735,16 @@ class ProbabilisticInference:
                     msg_sum += weight * evidence / math.sqrt(deg_s * deg_t)
                 target_prior = self.prior_logits[target_node]
                 blended = (1 - alpha) * current_logits[target_node] + alpha * (target_prior + msg_sum)
-                new_logit = clamp(blended, -LOGIT_CLAMP, LOGIT_CLAMP)
-                next_logits[target_node] = new_logit
-                max_diff = max(max_diff, abs(new_logit - current_logits[target_node]))
-
+                next_logits[target_node] = clamp(blended, -LOGIT_CLAMP, LOGIT_CLAMP)
+                
             self._normalize_local_constraints(next_logits)
+            max_diff = 0.0
+            for n in self.nodes:
+                diff = abs(next_logits[n] - current_logits[n])
+                if diff > max_diff:
+                    max_diff = diff
             current_logits = next_logits
+            print(f"Iteration {iteration + 1}: max logit change = {max_diff:.6f}")
 
             if max_diff < tolerance:
                 print(f"[*] Inference converged at iteration {iteration + 1}")
