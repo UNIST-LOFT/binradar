@@ -154,7 +154,7 @@ class PrimitiveFactAnalyzer:
     fact_access: Dict[Tuple[int, MemoryChunk], int]
     base_addr: Dict[MemoryChunk, int]
     access_cnt: Dict[MemoryChunk, int]
-    fact_pointers: Dict[MemoryChunk, int]
+    fact_pointers: Dict[MemoryChunk, Set[int]]
     fact_malloc_size: Dict[int, List[int]]
     fact_mem_copy: Set[Tuple[MemoryChunk, MemoryChunk, int]]  # (src_chunk, dst_chunk, size)
     active_allocs: Dict[int, MemoryRegion]
@@ -176,7 +176,7 @@ class PrimitiveFactAnalyzer:
         self.base_addr: Dict[MemoryChunk, int] = {}
         
         # F04: Pointers: set of chunks that contains valid addresses (from load/store with is-ptr=true)
-        self.fact_pointers: Dict[MemoryChunk, int] = defaultdict(int)
+        self.fact_pointers: Dict[MemoryChunk, Set[int]] = defaultdict(set)
         
         # F05: MallocedSize(i, s)
         self.fact_malloc_size: Dict[int, List[int]] = defaultdict(list)
@@ -276,11 +276,12 @@ class PrimitiveFactAnalyzer:
                 self.access_cnt[chunk] += 1
                 # F04: PointsTo (if it's a pointer access, we can infer points-to relationships)
                 if is_ptr:
-                    self.fact_pointers[chunk] = val
+                    self.fact_pointers[chunk].add(val)
                     self.pointer_pcs.add(pc)
                 if size == self.pointer_size and val == 0:
                     if pc in self.pointer_pcs:
                         self.null_ptr_candiates.add(chunk)
+                        self.fact_pointers[chunk].add(val)
             
             elif schema == "memmoveh":
                 src = row["src"]
@@ -476,6 +477,26 @@ class DeterministicInference:
             arr = ArrayRelation(region, lo, hi, elem)
             if arr.valid():
                 self.rel_may_array.add(arr)
+    
+    def infer_points_to_hint(self):
+        for ptr_chunk, target_addrs in self.analyzer.fact_pointers.items():
+            valid_targets: List[MemoryChunk] = list()
+            for addr in target_addrs:
+                if addr != 0 and addr in self.analyzer.addr_to_chunk:
+                    valid_targets.append(self.analyzer.addr_to_chunk[addr])
+            for i in range(len(valid_targets)):
+                for j in range(i + 1, len(valid_targets)):
+                    c1 = valid_targets[i]
+                    c2 = valid_targets[j]
+                    if self._same_region(c1, c2):
+                        continue
+                    if c2 < c1:
+                        c1, c2 = c2, c1
+                    if c1.size != c2.size:
+                        continue
+                    c1_chunks, c2_chunks = self.rel_homoseg[HomoSegmentRelation(c1.get_address(), c2.get_address(), c1.size)]
+                    c1_chunks.add(c1)
+                    c2_chunks.add(c2)
 
     def infer(self):
         self.infer_fieldof()
@@ -484,6 +505,7 @@ class DeterministicInference:
         self.infer_homoseg_from_memcpy()
         self.infer_homoseg_from_unified_access()
         self.infer_arrays_from_access()
+        self.infer_points_to_hint()
 
 class NodeType(Enum):
     PRIMITIVE_VAR = 0
@@ -677,12 +699,13 @@ class ProbabilisticInference:
                             n2 = FieldOfNode(field=c2, base=b2)
                             self._add_edge(n1, n2, logit(0.65), bidirectional=True)
 
-        for chunk, target_addr in self.analyzer.fact_pointers.items():
-            if target_addr in self.analyzer.addr_to_chunk:
-                target_key: MemoryAddress = self.analyzer.addr_to_chunk[target_addr].get_address()
-                node_ptr = PointerNode(chunk=chunk, target=target_key)
-                self._add_node(node_ptr, 0.8)
-                self._add_edge(PrimitiveVarNode(chunk=chunk), node_ptr, W_UP)
+        for chunk, target_addrs in self.analyzer.fact_pointers.items():
+            for target_addr in target_addrs:
+                if target_addr in self.analyzer.addr_to_chunk:
+                    target_key: MemoryAddress = self.analyzer.addr_to_chunk[target_addr].get_address()
+                    node_ptr = PointerNode(chunk=chunk, target=target_key)
+                    self._add_node(node_ptr, 0.8)
+                    self._add_edge(PrimitiveVarNode(chunk=chunk), node_ptr, W_UP)
         for chunk in self.analyzer.null_ptr_candiates:
             if chunk not in self.analyzer.fact_pointers:
                 node_ptr = PointerNode(chunk=chunk, target=MemoryAddress(MemoryRegion(RegionType.UNKNOWN, 0, 0), 0))
@@ -761,7 +784,74 @@ class ProbabilisticInference:
         for node, prob in self.beliefs.items():
             if prob >= threshold:
                 by_type[node.type()].append((node, prob))
+        
+        inferred_struct_bases: Set[MemoryAddress] = set()
+        struct_fields: Dict[MemoryAddress, List[MemoryChunk]] = defaultdict(list)
+        inferred_array_starts: Set[ArrayRelation] = set()
+        inferred_scalars: Set[MemoryAddress] = set()
+        
+        inferred_ptr_chunks: Dict[MemoryChunk, MemoryAddress] = dict()
+        inferred_arr_elem_chunks: Set[MemoryChunk] = set()
+        inferred_scalar_chunks: Set[MemoryChunk] = set()
+        
+        for node, prob in by_type.get(NodeType.FIELD_OF, []):
+            inferred_struct_bases.add(node.base)
+            struct_fields[node.base].append(node.field)
+        for base in struct_fields:
+            struct_fields[base].sort(key=lambda c: c.offset)
+        for node, prob in by_type.get(NodeType.POINTER, []):
+            inferred_ptr_chunks[node.chunk] = node.target
+        for node, prob in by_type.get(NodeType.SCALAR, []):
+            inferred_scalars.add(node.chunk.get_address())
+            inferred_scalar_chunks.add(node.chunk)
+        for node, prob in by_type.get(NodeType.ARRAY, []):
+            inferred_array_starts.add(node.array_relation)
+        for node, prob in by_type.get(NodeType.ARRAY_ELEM, []):
+            inferred_arr_elem_chunks.add(node.chunk)
+        
+        inferred_type_cache: Dict[MemoryChunk, str] = dict()
+            
+        def get_type_str(chunk: MemoryChunk, visiting_chunks: Set[MemoryChunk], current_struct_base: MemoryAddress = None) -> str:
+            if chunk is None:
+                return "UNKNOWN"
+            if chunk in inferred_type_cache:
+                return inferred_type_cache[chunk]
+            if chunk in visiting_chunks:
+                return "CIRCULAR"
+            visiting_chunks.add(chunk)
+            types = list()
+            chunk_addr = chunk.get_address()
 
+            if chunk in inferred_ptr_chunks:
+                target_addr = inferred_ptr_chunks[chunk]
+                target_addr_int = target_addr.region.region_base + target_addr.offset
+                target_chunk = self.analyzer.addr_to_chunk.get(target_addr_int, None)
+                
+                pointed_type = get_type_str(target_chunk, visiting_chunks, current_struct_base=None)
+                types.append(f"PTR->{pointed_type}")
+
+            if chunk_addr in inferred_struct_bases and chunk_addr != current_struct_base:
+                field_strs = list()
+                fields = struct_fields[chunk_addr]
+                for f in fields:
+                    f_type = get_type_str(f, visiting_chunks, current_struct_base=chunk_addr)
+                    rel_off = f.offset - chunk.offset
+                    field_strs.append(f"[F {rel_off:x}({f.size}B):{f_type}]")
+                types.append("STRUCT(" + " ".join(field_strs) + ")")
+
+            if chunk in inferred_arr_elem_chunks:
+                types.append("ARRAY_ELEM")
+            
+            if not types:
+                if chunk in inferred_scalar_chunks:
+                    types.append(f"SCALAR[{chunk.size}B]")
+                else:
+                    types.append(f"DATA[{chunk.size}B]") 
+            type_str = " | ".join(types)
+            inferred_type_cache[chunk] = type_str
+            visiting_chunks.remove(chunk)
+            return type_str
+        
         if NodeType.FIELD_OF in by_type:
             print(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
             fieldof_rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
@@ -786,8 +876,11 @@ class ProbabilisticInference:
             print(f"\n[pointer-meta] [cnt {len(by_type[NodeType.POINTER])}]")
             ptr_rows: List[Tuple[PointerNode, float]] = sorted(by_type[NodeType.POINTER], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in ptr_rows:
-                print(f"[pointer] {node.chunk.get_str()} -> [target {node.target.region.region_base + node.target.offset:x}] [P {prob:.4f}]")
-        
+                target_addr = node.target
+                target_addr_int = target_addr.region.region_base + target_addr.offset
+                target_chunk = self.analyzer.addr_to_chunk.get(target_addr_int, None)
+                target_type = get_type_str(target_chunk, set(), current_struct_base=None)
+                print(f"[pointer] {node.chunk.get_str()} -> [target {target_addr_int:x}] [type {target_type}][P {prob:.4f}]")
 
 class OspreyAnalyzer:
     parser: LogParser
