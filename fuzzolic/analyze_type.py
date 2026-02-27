@@ -490,29 +490,60 @@ class NodeType(Enum):
 
 @dataclass(frozen=True)
 class Node:
-    type: NodeType
+    
+    def type(self) -> NodeType:
+        raise NotImplementedError()
 
 @dataclass(frozen=True)
-class SingleNode(Node):
+class PrimitiveVarNode(Node):
     chunk: MemoryChunk
+    
+    def type(self) -> NodeType:
+        return NodeType.PRIMITIVE_VAR
+
+@dataclass(frozen=True)
+class ScalarNode(Node):
+    chunk: MemoryChunk
+    
+    def type(self) -> NodeType:
+        return NodeType.SCALAR
+
+@dataclass(frozen=True)
+class ArrayElemNode(Node):
+    chunk: MemoryChunk
+    
+    def type(self) -> NodeType:
+        return NodeType.ARRAY_ELEM
 
 @dataclass(frozen=True)
 class ArrayRelNode(Node):
     array_relation: ArrayRelation
     
+    def type(self) -> NodeType:
+        return NodeType.ARRAY
+    
 @dataclass(frozen=True)
 class HomoSegNode(Node):
     segment: HomoSegmentRelation
+    
+    def type(self) -> NodeType:
+        return NodeType.HOMO_SEGMENT
 
 @dataclass(frozen=True)
 class PointerNode(Node):
     chunk: MemoryChunk
     target: MemoryAddress
+    
+    def type(self) -> NodeType:
+        return NodeType.POINTER
 
 @dataclass(frozen=True)
 class FieldOfNode(Node):
     field: MemoryChunk
     base: MemoryAddress
+    
+    def type(self) -> NodeType:
+        return NodeType.FIELD_OF
 
 class ProbabilisticInference:
     det: DeterministicInference
@@ -536,7 +567,7 @@ class ProbabilisticInference:
         self.field_nodes = defaultdict(set)
 
     def _add_node(self, node: Node, prior_prob: float):
-        if node.type == NodeType.FIELD_OF and isinstance(node, FieldOfNode):
+        if isinstance(node, FieldOfNode):
             self.field_nodes[node.field].add(node)
         prior = logit(prior_prob)
         if node in self.nodes:
@@ -576,13 +607,13 @@ class ProbabilisticInference:
         field_candidates_by_chunk: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
         for rel in self.det.rel_fieldof:
             field_candidates_by_chunk[rel.field].add(rel.base)
-            self._add_node(FieldOfNode(type=NodeType.FIELD_OF, field=rel.field, base=rel.base), 0.6)
+            self._add_node(FieldOfNode(field=rel.field, base=rel.base), 0.6)
             
         for region, chunks in chunks_by_region.items():
             for i, chunk in enumerate(chunks):
-                node_prim = SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk)
-                node_scalar = SingleNode(type=NodeType.SCALAR, chunk=chunk)
-                node_arr_elem = SingleNode(type=NodeType.ARRAY_ELEM, chunk=chunk)
+                node_prim = PrimitiveVarNode(chunk=chunk)
+                node_scalar = ScalarNode(chunk=chunk)
+                node_arr_elem = ArrayElemNode(chunk=chunk)
 
                 k = self.analyzer.access_cnt.get(chunk, 0)
                 p_k = 0.5 + 0.4 * (1 - math.exp(-0.1 * k))
@@ -591,13 +622,13 @@ class ProbabilisticInference:
                 self._add_node(node_arr_elem, 0.25)
 
                 for base_addr in field_candidates_by_chunk.get(chunk, set()):
-                    node_field = FieldOfNode(type=NodeType.FIELD_OF, field=chunk, base=base_addr)
+                    node_field = FieldOfNode(field=chunk, base=base_addr)
                     self._add_edge(node_prim, node_field, W_UP)
                     self._add_edge(node_field, node_scalar, W_DOWN)
 
                 for j in range(i + 1, len(chunks)):
                     nxt = chunks[j]
-                    node_next_prim = SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=nxt)
+                    node_next_prim = PrimitiveVarNode(chunk=nxt)
                     if nxt.offset < chunk.offset + chunk.size:
                         self._add_edge(node_prim, node_next_prim, W_DOWN, bidirectional=True)
                     elif nxt.offset == chunk.offset + chunk.size:
@@ -608,20 +639,20 @@ class ProbabilisticInference:
 
         for _, _, chunks in self.det.rel_access_single:
             for c in chunks:
-                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=c), SingleNode(type=NodeType.SCALAR, chunk=c), W_UP)
+                self._add_edge(PrimitiveVarNode(chunk=c), ScalarNode(chunk=c), W_UP)
 
         for arr in self.det.rel_may_array:
             if not arr.valid():
                 continue
-            node_arr = ArrayRelNode(type=NodeType.ARRAY, array_relation=arr)
+            node_arr = ArrayRelNode(array_relation=arr)
             self._add_node(node_arr, 0.7)
             for chunk in chunks_by_region[arr.region]:
                 if chunk.offset >= arr.lo and (chunk.offset + chunk.size) <= arr.hi:
-                    self._add_edge(node_arr, SingleNode(type=NodeType.ARRAY_ELEM, chunk=chunk), W_UP)
-                    self._add_edge(SingleNode(type=NodeType.SCALAR, chunk=chunk), node_arr, W_DOWN, bidirectional=True)
+                    self._add_edge(node_arr, ArrayElemNode(chunk=chunk), W_UP)
+                    self._add_edge(ScalarNode(chunk=chunk), node_arr, W_DOWN, bidirectional=True)
 
         for rel, (src_chunks, dst_chunks) in self.det.rel_homoseg.items():
-            node_h = HomoSegNode(type=NodeType.HOMO_SEGMENT, segment=rel)
+            node_h = HomoSegNode(segment=rel)
             self._add_node(node_h, 0.65)
             src_fields: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
             dst_fields: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
@@ -633,24 +664,24 @@ class ProbabilisticInference:
 
             for c1, b1s in src_fields.items():
                 for b1 in b1s:
-                    n1 = FieldOfNode(type=NodeType.FIELD_OF, field=c1, base=b1)
+                    n1 = FieldOfNode(field=c1, base=b1)
                     self._add_edge(node_h, n1, logit(0.65))
                     for c2, b2s in dst_fields.items():
                         for b2 in b2s:
-                            n2 = FieldOfNode(type=NodeType.FIELD_OF, field=c2, base=b2)
+                            n2 = FieldOfNode(field=c2, base=b2)
                             self._add_edge(n1, n2, logit(0.65), bidirectional=True)
 
         for chunk, target_addr in self.analyzer.fact_pointers.items():
             if target_addr in self.analyzer.addr_to_chunk:
                 target_key: MemoryAddress = self.analyzer.addr_to_chunk[target_addr].get_address()
-                node_ptr = PointerNode(type=NodeType.POINTER, chunk=chunk, target=target_key)
+                node_ptr = PointerNode(chunk=chunk, target=target_key)
                 self._add_node(node_ptr, 0.8)
-                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk), node_ptr, W_UP)
+                self._add_edge(PrimitiveVarNode(chunk=chunk), node_ptr, W_UP)
         for chunk in self.analyzer.null_ptr_candiates:
             if chunk not in self.analyzer.fact_pointers:
-                node_ptr = PointerNode(type=NodeType.POINTER, chunk=chunk, target=MemoryAddress(MemoryRegion(RegionType.UNKNOWN, 0, 0), 0))
+                node_ptr = PointerNode(chunk=chunk, target=MemoryAddress(MemoryRegion(RegionType.UNKNOWN, 0, 0), 0))
                 self._add_node(node_ptr, 0.7)
-                self._add_edge(SingleNode(type=NodeType.PRIMITIVE_VAR, chunk=chunk), node_ptr, W_UP)
+                self._add_edge(PrimitiveVarNode(chunk=chunk), node_ptr, W_UP)
 
     def _normalize_local_constraints(self, logits: Dict[Node, float]):
 
@@ -662,13 +693,13 @@ class ProbabilisticInference:
                 field_score = max(logits.get(n, logit(0.2)) for n in field_nodes)
 
             role_logits = [
-                logits.get(SingleNode(type=NodeType.SCALAR, chunk=c), logit(0.34)),
+                logits.get(ScalarNode(chunk=c), logit(0.34)),
                 field_score,
-                logits.get(SingleNode(type=NodeType.ARRAY_ELEM, chunk=c), logit(0.33)),
+                logits.get(ArrayElemNode(chunk=c), logit(0.33)),
             ]
             probs = self._softmax_by_logits(role_logits)
-            logits[SingleNode(type=NodeType.SCALAR, chunk=c)] = clamp(logit(probs[0]), -LOGIT_CLAMP, LOGIT_CLAMP)
-            logits[SingleNode(type=NodeType.ARRAY_ELEM, chunk=c)] = clamp(logit(probs[2]), -LOGIT_CLAMP, LOGIT_CLAMP)
+            logits[ScalarNode(chunk=c)] = clamp(logit(probs[0]), -LOGIT_CLAMP, LOGIT_CLAMP)
+            logits[ArrayElemNode(chunk=c)] = clamp(logit(probs[2]), -LOGIT_CLAMP, LOGIT_CLAMP)
 
             if field_nodes:
                 base_logits = [logits.get(n, logit(0.2)) for n in field_nodes]
@@ -682,9 +713,9 @@ class ProbabilisticInference:
         edge_count = sum(len(v) for v in self.edges.values())
         print(f"[*] Starting Inference on {len(self.nodes)} variables and {edge_count} edges...")
 
-        current_logits = {n: self.prior_logits[n] for n in self.nodes}
+        current_logits = dict()
         for n in self.nodes:
-            current_logits[n] = clamp(current_logits[n], -LOGIT_CLAMP, LOGIT_CLAMP)
+            current_logits[n] = clamp(self.prior_logits[n], -LOGIT_CLAMP, LOGIT_CLAMP)
 
         for iteration in range(max_iter):
             next_logits: Dict[Node, float] = {}
@@ -711,7 +742,6 @@ class ProbabilisticInference:
                 break
 
         self.beliefs = {n: expit(l) for n, l in current_logits.items()}
-        self.dump_results()
 
     def dump_results(self, threshold: float = 0.6):
         print("\n" + "=" * 50)
@@ -721,25 +751,25 @@ class ProbabilisticInference:
         by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
         for node, prob in self.beliefs.items():
             if prob >= threshold:
-                by_type[node.type].append((node, prob))
+                by_type[node.type()].append((node, prob))
 
         if NodeType.FIELD_OF in by_type:
             print(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
-            rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
-            for node, prob in rows:
+            fieldof_rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
+            for node, prob in fieldof_rows:
                 chunk: MemoryChunk = node.field
                 base: MemoryAddress = node.base
                 print(f"[field] {chunk.get_str()} [base {base.offset:x}] -> [P {prob:.4f}]")
 
         if NodeType.ARRAY in by_type:
             print(f"\n[array-meta] [cnt {len(by_type[NodeType.ARRAY])}]")
-            rows: List[Tuple[ArrayRelNode, float]] = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
-            for arr, prob in rows:
+            array_rows: List[Tuple[ArrayRelNode, float]] = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
+            for arr, prob in array_rows:
                 print(f"[array] {arr.array_relation.region.get_str()} [lo {arr.array_relation.lo:x}] [hi {arr.array_relation.hi:x}] [elem {arr.array_relation.elem}] -> [P {prob:.4f}]")
 
         if NodeType.SCALAR in by_type:
             print(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
-            scalar_rows: List[Tuple[SingleNode, float]] = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            scalar_rows: List[Tuple[ScalarNode, float]] = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in scalar_rows:
                 print(f"[scalar] {node.chunk.get_str()} -> [P {prob:.4f}]")
 
@@ -765,6 +795,7 @@ class OspreyAnalyzer:
         self.deterministic_inference.infer()
         self.probabilistic_inference = ProbabilisticInference(self.deterministic_inference)
         self.probabilistic_inference.type_infer()
+        self.probabilistic_inference.dump_results()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
