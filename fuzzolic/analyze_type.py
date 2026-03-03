@@ -2,7 +2,8 @@ import sbsv
 import os
 import sys
 import math
-from typing import Dict, List, Tuple, Set, Optional
+import re
+from typing import Dict, List, Tuple, Set, Optional, TextIO
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
@@ -121,7 +122,7 @@ class FieldOfRelation():
 
 class LogParser():
     parser: sbsv.parser
-    def __init__(self, filepath: str):
+    def __init__(self, fp: TextIO):
         # https://github.com/hsh814/sbsv
         self.parser = sbsv.parser()
         self.parser.add_custom_type("hex", lambda x: int(x, 16))
@@ -146,8 +147,7 @@ class LogParser():
         self.parser.add_schema("[cov] [update] [from: hex] [to: hex] [cnt: int]")
         # Read access for pointer
         # self.parser.add_schema("[rpo] [addr: hex] [target: hex] [pc: hex] [index: int] [id: int]")
-        with open(filepath, 'r') as file:
-            self.parser.load(file)
+        self.parser.load(fp)
 
 class PrimitiveFactAnalyzer:
     parser: sbsv.parser
@@ -809,48 +809,102 @@ class ProbabilisticInference:
         for node, prob in by_type.get(NodeType.ARRAY_ELEM, []):
             inferred_arr_elem_chunks.add(node.chunk)
         
-        inferred_type_cache: Dict[MemoryChunk, str] = dict()
-            
-        def get_type_str(chunk: MemoryChunk, visiting_chunks: Set[MemoryChunk], current_struct_base: MemoryAddress = None) -> str:
-            if chunk is None:
-                return "UNKNOWN"
-            if chunk in inferred_type_cache:
-                return inferred_type_cache[chunk]
-            if chunk in visiting_chunks:
-                return "CIRCULAR"
-            visiting_chunks.add(chunk)
-            types = list()
-            chunk_addr = chunk.get_address()
+        struct_bases_sorted = sorted(inferred_struct_bases, key=lambda a: (a.region.id, a.region.region_base, a.offset))
+        struct_base_to_id: Dict[MemoryAddress, str] = {}
+        for i, base in enumerate(struct_bases_sorted):
+            struct_base_to_id[base] = f"T_STRUCT_{i}"
 
-            if chunk in inferred_ptr_chunks:
-                target_addr = inferred_ptr_chunks[chunk]
-                target_addr_int = target_addr.region.region_base + target_addr.offset
-                target_chunk = self.analyzer.addr_to_chunk.get(target_addr_int, None)
-                
-                pointed_type = get_type_str(target_chunk, visiting_chunks, current_struct_base=None)
-                types.append(f"PTR->{pointed_type}")
+        field_base_scores: Dict[MemoryChunk, List[Tuple[MemoryAddress, float]]] = defaultdict(list)
+        for node, prob in by_type.get(NodeType.FIELD_OF, []):
+            field_base_scores[node.field].append((node.base, prob))
 
-            if chunk_addr in inferred_struct_bases and chunk_addr != current_struct_base:
-                field_strs = list()
-                fields = struct_fields[chunk_addr]
-                for f in fields:
-                    f_type = get_type_str(f, visiting_chunks, current_struct_base=chunk_addr)
-                    rel_off = f.offset - chunk.offset
-                    field_strs.append(f"[F {rel_off:x}({f.size}B):{f_type}]")
-                types.append("STRUCT(" + " ".join(field_strs) + ")")
+        field_to_best_base: Dict[MemoryChunk, MemoryAddress] = {}
+        for chunk, candidates in field_base_scores.items():
+            best_base, _ = max(candidates, key=lambda x: x[1])
+            field_to_best_base[chunk] = best_base
 
-            if chunk in inferred_arr_elem_chunks:
-                types.append("ARRAY_ELEM")
-            
-            if not types:
-                if chunk in inferred_scalar_chunks:
-                    types.append(f"SCALAR[{chunk.size}B]")
+        array_sorted = sorted(inferred_array_starts, key=lambda a: (a.region.id, a.lo, a.hi, a.elem))
+        array_to_id: Dict[ArrayRelation, str] = {}
+        for i, arr in enumerate(array_sorted):
+            array_to_id[arr] = f"T_ARRAY_{i}"
+
+        pointer_rows: List[Tuple[PointerNode, float]] = sorted(
+            by_type.get(NodeType.POINTER, []),
+            key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset, x[0].target.region.id, x[0].target.offset),
+        )
+        ptr_best: Dict[MemoryChunk, Tuple[MemoryAddress, float]] = {}
+        for node, prob in pointer_rows:
+            prev = ptr_best.get(node.chunk)
+            if prev is None or prob > prev[1]:
+                ptr_best[node.chunk] = (node.target, prob)
+
+        primitive_type_by_size: Dict[int, str] = {}
+        for sz in sorted({c.size for c in inferred_scalar_chunks}):
+            primitive_type_by_size[sz] = f"T_I{sz * 8}"
+
+        pointer_ids: Dict[MemoryChunk, str] = {}
+        pointer_target_type: Dict[MemoryChunk, str] = {}
+        ptr_chunks_sorted = sorted(ptr_best.keys(), key=lambda c: (c.region.id, c.offset, c.size))
+        for i, chunk in enumerate(ptr_chunks_sorted):
+            pointer_ids[chunk] = f"T_PTR_{i}"
+
+        for chunk in ptr_chunks_sorted:
+            target_addr, _ = ptr_best[chunk]
+            if target_addr.region.type == RegionType.UNKNOWN:
+                pointer_target_type[chunk] = "T_UNKNOWN"
+                continue
+            if target_addr in struct_base_to_id:
+                pointer_target_type[chunk] = struct_base_to_id[target_addr]
+                continue
+            target_type = None
+            for arr in array_sorted:
+                if arr.region == target_addr.region and arr.lo <= target_addr.offset < arr.hi:
+                    target_type = array_to_id[arr]
+                    break
+            if target_type is None and target_addr.region.region_base + target_addr.offset in self.analyzer.addr_to_chunk:
+                t_chunk = self.analyzer.addr_to_chunk[target_addr.region.region_base + target_addr.offset]
+                if t_chunk in field_to_best_base:
+                    b = field_to_best_base[t_chunk]
+                    target_type = struct_base_to_id.get(b)
+                if target_type is None:
+                    target_type = primitive_type_by_size.get(t_chunk.size, "T_UNKNOWN")
+            pointer_target_type[chunk] = target_type if target_type is not None else "T_UNKNOWN"
+
+        print("\n[type-meta]")
+        type_count = len(primitive_type_by_size) + len(array_to_id) + len(struct_base_to_id) + len(pointer_ids)
+        print(f"[type-count] {type_count}")
+        for sz, tid in sorted(((k, v) for k, v in primitive_type_by_size.items()), key=lambda x: x[0]):
+            print(f"[type-def] [id {tid}] [kind primitive] [size {sz}] [body int{sz * 8}_t]")
+
+        for arr in array_sorted:
+            tid = array_to_id[arr]
+            elem_tid = primitive_type_by_size.get(arr.elem, f"T_I{arr.elem * 8}")
+            cnt = (arr.hi - arr.lo) // arr.elem if arr.elem > 0 else 0
+            print(
+                f"[type-def] [id {tid}] [kind array] "
+                f"[region {arr.region.get_str()}] [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {elem_tid}] [count {cnt}]"
+            )
+
+        for base in struct_bases_sorted:
+            tid = struct_base_to_id[base]
+            fields = struct_fields.get(base, [])
+            field_desc: List[str] = []
+            for f in fields:
+                if f in pointer_ids:
+                    f_tid = pointer_ids[f]
                 else:
-                    types.append(f"DATA[{chunk.size}B]") 
-            type_str = " | ".join(types)
-            inferred_type_cache[chunk] = type_str
-            visiting_chunks.remove(chunk)
-            return type_str
+                    f_tid = primitive_type_by_size.get(f.size, f"T_I{f.size * 8}")
+                field_desc.append(f"{f.offset:x}({f.size:x}B):{f_tid}")
+            body = ",".join(field_desc) if field_desc else "empty"
+            print(
+                f"[type-def] [id {tid}] [kind struct] "
+                f"[region {base.region.get_str()}] [base {base.offset:x}] [fields {body}]"
+            )
+
+        for chunk in ptr_chunks_sorted:
+            tid = pointer_ids[chunk]
+            to_tid = pointer_target_type.get(chunk, "T_UNKNOWN")
+            print(f"[type-def] [id {tid}] [kind pointer] [to {to_tid}]")
         
         if NodeType.FIELD_OF in by_type:
             print(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
@@ -878,17 +932,16 @@ class ProbabilisticInference:
             for node, prob in ptr_rows:
                 target_addr = node.target
                 target_addr_int = target_addr.region.region_base + target_addr.offset
-                target_chunk = self.analyzer.addr_to_chunk.get(target_addr_int, None)
-                target_type = get_type_str(target_chunk, set(), current_struct_base=None)
-                print(f"[pointer] {node.chunk.get_str()} -> [target {target_addr_int:x}] [type {target_type}][P {prob:.4f}]")
+                ptr_tid = pointer_ids.get(node.chunk, "T_PTR_UNKNOWN")
+                print(f"[pointer] {node.chunk.get_str()} -> [target {target_addr_int:x}] [type-id {ptr_tid}] [P {prob:.4f}]")
 
 class OspreyAnalyzer:
     parser: LogParser
     primitive_analyzer: PrimitiveFactAnalyzer
     deterministic_inference: DeterministicInference
     probabilistic_inference: ProbabilisticInference
-    def __init__(self, log_file: str):
-        self.parser = LogParser(log_file)
+    def __init__(self, log_fp: TextIO):
+        self.parser = LogParser(log_fp)
     
     def analyze(self):
         self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser.parser)
@@ -908,5 +961,6 @@ if __name__ == "__main__":
     if not os.path.exists(log_file):
         print(f"Log file {log_file} does not exist")
         sys.exit(1)
-    osprey = OspreyAnalyzer(log_file)
+    with open(log_file, "r") as f:
+        osprey = OspreyAnalyzer(f)
     osprey.analyze()
