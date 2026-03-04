@@ -2,12 +2,20 @@ import sbsv
 import os
 import sys
 import math
-import re
+import logging
 from typing import Dict, List, Tuple, Set, Optional, TextIO
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
 from sortedcontainers import SortedDict, SortedList
+
+logger: logging.Logger = logging.getLogger("fuzzolic.analyze_type.error")
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+logger.addHandler(ch)
+fmt = logging.Formatter("%(message)s")
+ch.setFormatter(fmt)
+logger.setLevel(logging.DEBUG)
 
 # OSPREY-style probabilistic weights
 P_UP = 0.8
@@ -263,7 +271,7 @@ class PrimitiveFactAnalyzer:
                 val = row["val"] # If is_ptr is true, val is the dereferenced value, which is a potential pointer target
                 memory_region = self._resolve_memory_region(region, region_base)
                 if memory_region is None:
-                    print(f"Warning: Could not resolve memory region for addr {addr:x} at PC {pc:x}")
+                    logger.debug(f"Warning: Could not resolve memory region for addr {addr:x} at PC {pc:x}")
                     continue
                 chunk = MemoryChunk(memory_region, addr - region_base, size)
                 self.base_addr[chunk] = base_addr
@@ -294,7 +302,7 @@ class PrimitiveFactAnalyzer:
                 src_memory_region = self._resolve_memory_region(src_region, src_region_base)
                 dst_memory_region = self._resolve_memory_region(dst_region, dst_region_base)
                 if src_memory_region is None or dst_memory_region is None:
-                    # print(f"Warning: Could not resolve memory region for memmove")
+                    # logger.debug(f"Warning: Could not resolve memory region for memmove")
                     continue
                 src_chunk = MemoryChunk(src_memory_region, src - src_region_base, size)
                 dst_chunk = MemoryChunk(dst_memory_region, dst - dst_region_base, size)
@@ -737,10 +745,10 @@ class ProbabilisticInference:
                     logits[n] = clamp(logit(p), -LOGIT_CLAMP, LOGIT_CLAMP)
 
     def type_infer(self, max_iter: int = 30, tolerance: float = 1e-3, alpha: float = 0.1):
-        print("[*] Building Probabilistic Factor Graph...")
+        logger.debug("[*] Building Probabilistic Factor Graph...")
         self._build_factor_graph()
         edge_count = sum(len(v) for v in self.edges.values())
-        print(f"[*] Starting Inference on {len(self.nodes)} variables and {edge_count} edges...")
+        logger.debug(f"[*] Starting Inference on {len(self.nodes)} variables and {edge_count} edges...")
 
         current_logits: Dict[Node, float] = dict()
         for n in self.nodes:
@@ -767,18 +775,18 @@ class ProbabilisticInference:
                 if diff > max_diff:
                     max_diff = diff
             current_logits = next_logits
-            print(f"Iteration {iteration + 1}: max logit change = {max_diff:.6f}")
+            logger.debug(f"Iteration {iteration + 1}: max logit change = {max_diff:.6f}")
 
             if max_diff < tolerance:
-                print(f"[*] Inference converged at iteration {iteration + 1}")
+                logger.debug(f"[*] Inference converged at iteration {iteration + 1}")
                 break
 
         self.beliefs = {n: expit(l) for n, l in current_logits.items()}
 
-    def dump_results(self, threshold: float = 0.6):
-        print("\n" + "=" * 50)
-        print(" OSPREY RECOVERY RESULTS (Confidence > {:.1f}%)".format(threshold * 100))
-        print("=" * 50)
+    def dump_results(self, output_logger: logging.Logger, threshold: float = 0.6):
+        output_logger.info("\n" + "=" * 50)
+        output_logger.info(" OSPREY RECOVERY RESULTS (Confidence > {:.1f}%)".format(threshold * 100))
+        output_logger.info("=" * 50)
 
         by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
         for node, prob in self.beliefs.items():
@@ -870,17 +878,17 @@ class ProbabilisticInference:
                     target_type = primitive_type_by_size.get(t_chunk.size, "T_UNKNOWN")
             pointer_target_type[chunk] = target_type if target_type is not None else "T_UNKNOWN"
 
-        print("\n[type-meta]")
+        output_logger.info("\n[type-meta]")
         type_count = len(primitive_type_by_size) + len(array_to_id) + len(struct_base_to_id) + len(pointer_ids)
-        print(f"[type-count] {type_count}")
+        output_logger.info(f"[type-count] {type_count}")
         for sz, tid in sorted(((k, v) for k, v in primitive_type_by_size.items()), key=lambda x: x[0]):
-            print(f"[type-def] [id {tid}] [kind primitive] [size {sz}] [body int{sz * 8}_t]")
+            output_logger.info(f"[type-def] [id {tid}] [kind primitive] [size {sz}] [body int{sz * 8}_t]")
 
         for arr in array_sorted:
             tid = array_to_id[arr]
             elem_tid = primitive_type_by_size.get(arr.elem, f"T_I{arr.elem * 8}")
             cnt = (arr.hi - arr.lo) // arr.elem if arr.elem > 0 else 0
-            print(
+            output_logger.info(
                 f"[type-def] [id {tid}] [kind array] "
                 f"[region {arr.region.get_str()}] [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {elem_tid}] [count {cnt}]"
             )
@@ -896,7 +904,7 @@ class ProbabilisticInference:
                     f_tid = primitive_type_by_size.get(f.size, f"T_I{f.size * 8}")
                 field_desc.append(f"{f.offset:x}({f.size:x}B):{f_tid}")
             body = ",".join(field_desc) if field_desc else "empty"
-            print(
+            output_logger.info(
                 f"[type-def] [id {tid}] [kind struct] "
                 f"[region {base.region.get_str()}] [base {base.offset:x}] [fields {body}]"
             )
@@ -904,45 +912,55 @@ class ProbabilisticInference:
         for chunk in ptr_chunks_sorted:
             tid = pointer_ids[chunk]
             to_tid = pointer_target_type.get(chunk, "T_UNKNOWN")
-            print(f"[type-def] [id {tid}] [kind pointer] [to {to_tid}]")
+            output_logger.info(f"[type-def] [id {tid}] [kind pointer] [to {to_tid}]")
         
         if NodeType.FIELD_OF in by_type:
-            print(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
+            output_logger.info(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
             fieldof_rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
             for node, prob in fieldof_rows:
                 chunk: MemoryChunk = node.field
                 base: MemoryAddress = node.base
-                print(f"[field] {chunk.get_str()} [base {base.offset:x}] -> [P {prob:.4f}]")
+                output_logger.info(f"[field] {chunk.get_str()} [base {base.offset:x}] -> [P {prob:.4f}]")
 
         if NodeType.ARRAY in by_type:
-            print(f"\n[array-meta] [cnt {len(by_type[NodeType.ARRAY])}]")
+            output_logger.info(f"\n[array-meta] [cnt {len(by_type[NodeType.ARRAY])}]")
             array_rows: List[Tuple[ArrayRelNode, float]] = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
             for arr, prob in array_rows:
-                print(f"[array] {arr.array_relation.region.get_str()} [lo {arr.array_relation.lo:x}] [hi {arr.array_relation.hi:x}] [elem {arr.array_relation.elem}] -> [P {prob:.4f}]")
+                output_logger.info(f"[array] {arr.array_relation.region.get_str()} [lo {arr.array_relation.lo:x}] [hi {arr.array_relation.hi:x}] [elem {arr.array_relation.elem}] -> [P {prob:.4f}]")
 
         if NodeType.SCALAR in by_type:
-            print(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
+            output_logger.info(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
             scalar_rows: List[Tuple[ScalarNode, float]] = sorted(by_type[NodeType.SCALAR], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in scalar_rows:
-                print(f"[scalar] {node.chunk.get_str()} -> [P {prob:.4f}]")
+                output_logger.info(f"[scalar] {node.chunk.get_str()} -> [P {prob:.4f}]")
 
         if NodeType.POINTER in by_type:
-            print(f"\n[pointer-meta] [cnt {len(by_type[NodeType.POINTER])}]")
+            output_logger.info(f"\n[pointer-meta] [cnt {len(by_type[NodeType.POINTER])}]")
             ptr_rows: List[Tuple[PointerNode, float]] = sorted(by_type[NodeType.POINTER], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
             for node, prob in ptr_rows:
                 target_addr = node.target
                 target_addr_int = target_addr.region.region_base + target_addr.offset
                 ptr_tid = pointer_ids.get(node.chunk, "T_PTR_UNKNOWN")
-                print(f"[pointer] {node.chunk.get_str()} -> [target {target_addr_int:x}] [type-id {ptr_tid}] [P {prob:.4f}]")
+                output_logger.info(f"[pointer] {node.chunk.get_str()} -> [target {target_addr_int:x}] [type-id {ptr_tid}] [P {prob:.4f}]")
 
 class OspreyAnalyzer:
+    output_logger: logging.Logger
     parser: LogParser
     primitive_analyzer: PrimitiveFactAnalyzer
     deterministic_inference: DeterministicInference
     probabilistic_inference: ProbabilisticInference
-    def __init__(self, log_fp: TextIO):
+    def __init__(self, log_fp: TextIO, out_fp: Optional[TextIO] = None):
         self.parser = LogParser(log_fp)
-    
+        if out_fp is None:
+            out_fp = sys.stdout
+        self.output_logger = logging.getLogger("fuzzolic.analyze_type")
+        ch = logging.StreamHandler(out_fp)
+        ch.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(message)s")
+        ch.setFormatter(fmt)
+        self.output_logger.addHandler(ch)
+        self.output_logger.setLevel(logging.DEBUG)
+
     def analyze(self):
         self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser.parser)
         self.primitive_analyzer.run_trace_replay()
@@ -950,16 +968,16 @@ class OspreyAnalyzer:
         self.deterministic_inference.infer()
         self.probabilistic_inference = ProbabilisticInference(self.deterministic_inference)
         self.probabilistic_inference.type_infer()
-        self.probabilistic_inference.dump_results()
+        self.probabilistic_inference.dump_results(self.output_logger)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         log_file = sys.argv[1]
     else:
-        print("Usage: python analyze_type.py <log_file>")
+        logger.info("Usage: python analyze_type.py <log_file>")
         sys.exit(1)
     if not os.path.exists(log_file):
-        print(f"Log file {log_file} does not exist")
+        logger.info(f"Log file {log_file} does not exist")
         sys.exit(1)
     with open(log_file, "r") as f:
         osprey = OspreyAnalyzer(f)
