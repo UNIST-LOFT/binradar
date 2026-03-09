@@ -21,6 +21,8 @@ import struct
 import select
 import threading
 
+import io
+import analyze_type
 import minimizer_qsym
 import minimizer
 import logger
@@ -53,13 +55,15 @@ class ForkserverRunResult:
     child_pid: int
     timed_out: bool = False
     should_halt: bool = False
-    def __init__(self, returncode: int, status: int, duration: float, child_pid: int, timed_out: bool, should_halt: bool):
+    remaining_modifications: int = 0
+    def __init__(self, returncode: int, status: int, duration: float, child_pid: int, timed_out: bool, should_halt: bool, remaining_modifications: int):
         self.returncode = returncode
         self.status = status
         self.duration = duration
         self.child_pid = child_pid
         self.timed_out = timed_out
         self.should_halt = should_halt
+        self.remaining_modifications = remaining_modifications
 
 
 class ForkserverTracerError(RuntimeError):
@@ -71,6 +75,7 @@ class ForkserverTracerTimeout(ForkserverTracerError):
 class ForkserverTracer:
     _HANDSHAKE_EXPECTED = 0x41464C00
     _CTRL_FD = 198
+    iter: int
 
     def __init__(self, args, env, cwd, debug, testcase_from_stdin, logger, session_log):
         if debug == 'gdb_tracer':
@@ -93,6 +98,7 @@ class ForkserverTracer:
         self._log_lock = threading.Lock()
         self._timeout = 20
         self._handshake_timeout = 30
+        self.iter = 0
 
     def start(self):
         ctl_r, ctl_w = os.pipe()
@@ -137,7 +143,8 @@ class ForkserverTracer:
             raise ForkserverTracerError('Forkserver handshake failed')
         self._logger.info('[forkserver] handshake complete')
 
-    def run_testcase(self, run_dir):
+    def run_testcase(self, run_dir: str) -> ForkserverRunResult:
+        self.iter += 1
         run_log = open(os.path.join(run_dir, 'tracer.log'), 'wb', buffering=0)
         start = time.time()
         with self._log_lock:
@@ -149,9 +156,32 @@ class ForkserverTracer:
         child_pid = self._read_u32(self._timeout)
         timed_out = False
         try:
-            res_data = self._read_exact(8)
-            status, halt_signal = struct.unpack('<II', res_data)
-            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [halt_signal {halt_signal}]")
+            status = self._read_u32(self._timeout)
+            # Analyze type
+            analyze_result = b""
+            if self.iter == 1:
+                out_buf = io.StringIO()
+                try:
+                    analyze_start = time.time()
+                    self._session_log.flush()
+                    with open(self._session_log.name, 'r', encoding='utf-8', errors='ignore') as log_fp:
+                        analyzer = analyze_type.OspreyAnalyzer(log_fp, out_buf)
+                        analyzer.analyze()
+                    analyze_result = out_buf.getvalue().encode('utf-8')
+                    analyze_result_file = os.path.join(run_dir, f'analyze-result-{self.iter}.sbsv')
+                    with open(analyze_result_file, 'wb') as f:
+                        f.write(analyze_result)
+                    self._logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start, 3)}] [saved {analyze_result_file}]")
+                except Exception as e:
+                    self._logger.error(f"[osprey-analyzer] [it {self.iter}] Error occurred: {e}")
+            analyze_result_size = len(analyze_result)
+            # result should be less than 4GB
+            if analyze_result_size > 0xFFFFFFFF:
+                raise ForkserverTracerError("Analyze result too large")
+            self._write_u32(len(analyze_result)) 
+            self._write_exact(analyze_result)
+            remaining_modifications = self._read_u32(self._timeout)
+            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [remaining {remaining_modifications}]")
         except ForkserverTracerTimeout:
             timed_out = True
             self._logger.warning(
@@ -165,9 +195,10 @@ class ForkserverTracer:
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            res_data = self._read_exact(8)
-            status, halt_signal = struct.unpack('<II', res_data)
-            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [halt_signal {halt_signal}]")
+            status = self._read_u32(self._timeout)
+            self._write_u32(0) # skip analysis
+            remaining_modifications = self._read_u32(self._timeout)
+            self._logger.info(f"[forkserver] [pid {child_pid}] [time {round(time.time() - start, 3)}] [status {status}] [remaining {remaining_modifications}]")
 
         duration = time.time() - start
         result = ForkserverRunResult(
@@ -176,7 +207,8 @@ class ForkserverTracer:
             duration=duration,
             child_pid=child_pid,
             timed_out=timed_out,
-            should_halt=halt_signal != 0
+            should_halt=remaining_modifications == 0,
+            remaining_modifications=remaining_modifications
         )
 
         with self._log_lock:
@@ -247,6 +279,17 @@ class ForkserverTracer:
         
         data = self._read_exact(4)
         return struct.unpack('<I', data)[0]
+    
+    def _write_exact(self, data: bytes):
+        total_written = 0
+        while total_written < len(data):
+            try:
+                written = os.write(self._ctl_w, data[total_written:])
+                total_written += written
+            except BrokenPipeError:
+                raise ForkserverTracerError("Forkserver pipe broken (write)")
+            except BlockingIOError:
+                continue
 
     def _read_exact(self, length: int) -> bytes:
         data = b''
@@ -596,7 +639,7 @@ class Executor(object):
             if not self._forkserver:
                 if not self._forkserver_session_log:
                     session_log_path = os.path.join(self.output_dir, 'tracer-forkserver.log')
-                    self._forkserver_session_log = open(session_log_path, 'ab', buffering=0)
+                    self._forkserver_session_log = open(session_log_path, 'ab')
                 self._forkserver = ForkserverTracer(
                     p_tracer_args, env, self.output_dir, self.debug,
                     self.testcase_from_stdin, logger, self._forkserver_session_log)
@@ -604,7 +647,7 @@ class Executor(object):
                 RUNNING_PROCESSES.append(self._forkserver.proc)
             for i in range(2):
                 forkserver_result = self._forkserver.run_testcase(run_dir)
-                print(f"Run {i}: {forkserver_result}")
+                logger.info(f"Run {i}: {forkserver_result}")
                 if forkserver_result.should_halt:
                     break
             tracer_returncode = forkserver_result.returncode

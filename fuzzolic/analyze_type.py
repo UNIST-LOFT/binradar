@@ -9,13 +9,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from sortedcontainers import SortedDict, SortedList
 
-logger: logging.Logger = logging.getLogger("fuzzolic.analyze_type.error")
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-logger.addHandler(ch)
-fmt = logging.Formatter("%(message)s")
-ch.setFormatter(fmt)
-logger.setLevel(logging.DEBUG)
+import logger
 
 # OSPREY-style probabilistic weights
 P_UP = 0.8
@@ -882,15 +876,15 @@ class ProbabilisticInference:
         type_count = len(primitive_type_by_size) + len(array_to_id) + len(struct_base_to_id) + len(pointer_ids)
         output_logger.info(f"[type-count] {type_count}")
         for sz, tid in sorted(((k, v) for k, v in primitive_type_by_size.items()), key=lambda x: x[0]):
-            output_logger.info(f"[type-def] [id {tid}] [kind primitive] [size {sz}] [body int{sz * 8}_t]")
+            output_logger.info(f"[type-def] [primitive] [id {tid}] [size {sz}] [body int{sz * 8}_t]")
 
         for arr in array_sorted:
             tid = array_to_id[arr]
             elem_tid = primitive_type_by_size.get(arr.elem, f"T_I{arr.elem * 8}")
             cnt = (arr.hi - arr.lo) // arr.elem if arr.elem > 0 else 0
             output_logger.info(
-                f"[type-def] [id {tid}] [kind array] "
-                f"[region {arr.region.get_str()}] [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {elem_tid}] [count {cnt}]"
+                f"[type-def] [array] [id {tid}] "
+                f"{arr.region.get_str()} [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {elem_tid}] [count {cnt}]"
             )
 
         for base in struct_bases_sorted:
@@ -905,14 +899,14 @@ class ProbabilisticInference:
                 field_desc.append(f"{f.offset:x}({f.size:x}B):{f_tid}")
             body = ",".join(field_desc) if field_desc else "empty"
             output_logger.info(
-                f"[type-def] [id {tid}] [kind struct] "
-                f"[region {base.region.get_str()}] [base {base.offset:x}] [fields {body}]"
+                f"[type-def] [struct] [id {tid}] "
+                f"{base.region.get_str()} [base {base.offset:x}] [fields {body}]"
             )
 
         for chunk in ptr_chunks_sorted:
             tid = pointer_ids[chunk]
             to_tid = pointer_target_type.get(chunk, "T_UNKNOWN")
-            output_logger.info(f"[type-def] [id {tid}] [kind pointer] [to {to_tid}]")
+            output_logger.info(f"[type-def] [pointer] [id {tid}] [to {to_tid}]")
         
         if NodeType.FIELD_OF in by_type:
             output_logger.info(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
@@ -951,13 +945,12 @@ class OspreyAnalyzer:
     probabilistic_inference: ProbabilisticInference
     def __init__(self, log_fp: TextIO, out_fp: Optional[TextIO] = None):
         self.parser = LogParser(log_fp)
+        self.output_logger = logging.getLogger("fuzzolic.analyze_type")
         if out_fp is None:
             out_fp = sys.stdout
-        self.output_logger = logging.getLogger("fuzzolic.analyze_type")
         ch = logging.StreamHandler(out_fp)
         ch.setLevel(logging.DEBUG)
-        fmt = logging.Formatter("%(message)s")
-        ch.setFormatter(fmt)
+        ch.setFormatter(logging.Formatter("%(message)s"))
         self.output_logger.addHandler(ch)
         self.output_logger.setLevel(logging.DEBUG)
 
