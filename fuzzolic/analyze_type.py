@@ -781,20 +781,33 @@ class ProbabilisticInference:
         output_logger.info("\n" + "=" * 50)
         output_logger.info(" OSPREY RECOVERY RESULTS (Confidence > {:.1f}%)".format(threshold * 100))
         output_logger.info("=" * 50)
+        
+        chunk_roles = defaultdict(lambda: {NodeType.SCALAR: 0.0, NodeType.FIELD_OF: 0.0, NodeType.ARRAY_ELEM: 0.0})
+        chunk_values = defaultdict(lambda: {NodeType.PRIMITIVE_VAR: 0.0, NodeType.POINTER: 0.0})
 
         by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
         for node, prob in self.beliefs.items():
             if prob >= threshold:
                 by_type[node.type()].append((node, prob))
+            if isinstance(node, PrimitiveVarNode):
+                chunk_values[node.chunk][NodeType.PRIMITIVE_VAR] = prob
+            elif isinstance(node, PointerNode):
+                chunk_values[node.chunk][NodeType.POINTER] = prob
+            elif isinstance(node, ScalarNode):
+                chunk_roles[node.chunk][NodeType.SCALAR] = prob
+            elif isinstance(node, FieldOfNode):
+                chunk_roles[node.field][NodeType.FIELD_OF] = prob
+            elif isinstance(node, ArrayElemNode):
+                chunk_roles[node.chunk][NodeType.ARRAY_ELEM] = prob
         
         inferred_struct_bases: Set[MemoryAddress] = set()
-        struct_fields: Dict[MemoryAddress, List[MemoryChunk]] = defaultdict(list)
         inferred_array_starts: Set[ArrayRelation] = set()
-        inferred_scalars: Set[MemoryAddress] = set()
         
+        inferred_scalars: Set[MemoryAddress] = set()
         inferred_ptr_chunks: Dict[MemoryChunk, MemoryAddress] = dict()
         inferred_arr_elem_chunks: Set[MemoryChunk] = set()
         inferred_scalar_chunks: Set[MemoryChunk] = set()
+        struct_fields: Dict[MemoryAddress, List[MemoryChunk]] = defaultdict(list)
         
         for node, prob in by_type.get(NodeType.FIELD_OF, []):
             inferred_struct_bases.add(node.base)
@@ -908,19 +921,35 @@ class ProbabilisticInference:
             to_tid = pointer_target_type.get(chunk, "T_UNKNOWN")
             output_logger.info(f"[type-def] [pointer] [id {tid}] [to {to_tid}]")
         
+        for base in inferred_struct_bases:
+            tid = struct_base_to_id[base]
+            output_logger.info(f"[struct] [base {base.region.region_base:x}] [offset {base.offset:x}] [type {tid}]")
+        
         if NodeType.FIELD_OF in by_type:
             output_logger.info(f"\n[field-meta] [cnt {len(by_type[NodeType.FIELD_OF])}]")
             fieldof_rows: List[Tuple[FieldOfNode, float]] = sorted(by_type[NodeType.FIELD_OF], key=lambda x: (x[0].field.region.id, x[0].field.offset, x[0].base.offset))
             for node, prob in fieldof_rows:
                 chunk: MemoryChunk = node.field
                 base: MemoryAddress = node.base
-                output_logger.info(f"[field] {chunk.get_str()} [base {base.offset:x}] -> [P {prob:.4f}]")
+                type_id = "T_UNKNOWN"
+                if chunk in pointer_ids:
+                    type_id = pointer_ids[chunk]
+                output_logger.info(f"[field] {chunk.get_str()} [base {base.offset:x}] [type {type_id}] -> [P {prob:.4f}]")
 
         if NodeType.ARRAY in by_type:
             output_logger.info(f"\n[array-meta] [cnt {len(by_type[NodeType.ARRAY])}]")
             array_rows: List[Tuple[ArrayRelNode, float]] = sorted(by_type[NodeType.ARRAY], key=lambda x: (x[0].array_relation.region.id, x[0].array_relation.lo))
             for arr, prob in array_rows:
                 output_logger.info(f"[array] {arr.array_relation.region.get_str()} [lo {arr.array_relation.lo:x}] [hi {arr.array_relation.hi:x}] [elem {arr.array_relation.elem}] -> [P {prob:.4f}]")
+
+        if NodeType.ARRAY_ELEM in by_type:
+            array_elem_rows: List[Tuple[ArrayElemNode, float]] = sorted(by_type[NodeType.ARRAY_ELEM], key=lambda x: (x[0].chunk.region.id, x[0].chunk.offset))
+            output_logger.info(f"\n[array-elem-meta] [cnt {len(array_elem_rows)}]")
+            for node, prob in array_elem_rows:
+                type_id = "T_UNKNOWN"
+                if node.chunk in pointer_ids:
+                    type_id = pointer_ids[node.chunk]
+                output_logger.info(f"[array-elem] {node.chunk.get_str()} [type {type_id}] -> [P {prob:.4f}]")
 
         if NodeType.SCALAR in by_type:
             output_logger.info(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
@@ -945,7 +974,7 @@ class OspreyAnalyzer:
     probabilistic_inference: ProbabilisticInference
     def __init__(self, log_fp: TextIO, out_fp: Optional[TextIO] = None):
         self.parser = LogParser(log_fp)
-        self.output_logger = logging.getLogger("fuzzolic.analyze_type")
+        self.output_logger = logging.getLogger("osprey-analyzer")
         if out_fp is None:
             out_fp = sys.stdout
         ch = logging.StreamHandler(out_fp)

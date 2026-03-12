@@ -96,7 +96,7 @@ class ForkserverTracer:
         self._session_log = session_log
         self._run_log = None
         self._log_lock = threading.Lock()
-        self._timeout = 20
+        self._timeout = 60
         self._handshake_timeout = 30
         self.iter = 0
 
@@ -835,7 +835,8 @@ class Executor(object):
         os.unlink(global_bitmap_pre_run)
 
         if tracer_returncode == -11:
-            with open(p_tracer_log_name, "r") as f:
+            self._forkserver_session_log.flush()
+            with open(self._forkserver_session_log.name, "r") as f:
                 log_lines = f.readlines()
                 qemu_segfault = True
                 for line in log_lines:
