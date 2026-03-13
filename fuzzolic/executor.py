@@ -165,8 +165,9 @@ class ForkserverTracer:
                     analyze_start = time.time()
                     self._session_log.flush()
                     with open(self._session_log.name, 'r', encoding='utf-8', errors='ignore') as log_fp:
-                        analyzer = analyze_type.OspreyAnalyzer(log_fp, out_buf)
-                        analyzer.analyze()
+                        osprey = analyze_type.OspreyAnalyzer(log_fp, out_buf)
+                        osprey.analyze()
+                        osprey.dump_results(dump_mode="best")
                     analyze_result = out_buf.getvalue().encode('utf-8')
                     analyze_result_file = os.path.join(run_dir, f'analyze-result-{self.iter}.sbsv')
                     with open(analyze_result_file, 'wb') as f:

@@ -583,7 +583,6 @@ class ProbabilisticInference:
     edges: Dict[Node, List[Tuple[Node, float]]]
     degree: Dict[Node, int]
     beliefs: Dict[Node, float]
-    # cache
     field_nodes: Dict[MemoryChunk, Set[Node]]
 
     def __init__(self, deterministic_inference: DeterministicInference):
@@ -595,6 +594,56 @@ class ProbabilisticInference:
         self.degree = defaultdict(int)
         self.beliefs = dict()
         self.field_nodes = defaultdict(set)
+
+    def _collect_candidates(self, threshold: float) -> Tuple[Dict[NodeType, List[Tuple[Node, float]]], Dict[MemoryChunk, Dict[NodeType, Tuple[Node, float]]], Dict[MemoryChunk, Dict[NodeType, Tuple[Node, float]]]]:
+        by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
+        chunk_roles: Dict[MemoryChunk, Dict[NodeType, Tuple[Node, float]]] = defaultdict(lambda: {NodeType.SCALAR: (None, 0.0), NodeType.FIELD_OF: (None, 0.0), NodeType.ARRAY_ELEM: (None, 0.0)})
+        chunk_values: Dict[MemoryChunk, Dict[NodeType, Tuple[Node, float]]] = defaultdict(lambda: {NodeType.PRIMITIVE_VAR: (None, 0.0), NodeType.POINTER: (None, 0.0)})
+        for node, prob in self.beliefs.items():
+            if prob < threshold: continue
+            by_type[node.type()].append((node, prob))
+            if isinstance(node, PrimitiveVarNode):
+                if prob > chunk_values[node.chunk][NodeType.PRIMITIVE_VAR][1]:
+                    chunk_values[node.chunk][NodeType.PRIMITIVE_VAR] = (node, prob)
+            elif isinstance(node, PointerNode):
+                if prob > chunk_values[node.chunk][NodeType.POINTER][1]:
+                    chunk_values[node.chunk][NodeType.POINTER] = (node, prob)
+            elif isinstance(node, ScalarNode):
+                if prob > chunk_roles[node.chunk][NodeType.SCALAR][1]:
+                    chunk_roles[node.chunk][NodeType.SCALAR] = (node, prob)
+            elif isinstance(node, FieldOfNode):
+                if prob > chunk_roles[node.field][NodeType.FIELD_OF][1]:
+                    chunk_roles[node.field][NodeType.FIELD_OF] = (node, prob)
+            elif isinstance(node, ArrayElemNode):
+                if prob > chunk_roles[node.chunk][NodeType.ARRAY_ELEM][1]:
+                    chunk_roles[node.chunk][NodeType.ARRAY_ELEM] = (node, prob)
+        return by_type, chunk_roles, chunk_values
+
+    def _select_dump_nodes(self, threshold: float, dump_mode: str = "all") -> Dict[NodeType, List[Tuple[Node, float]]]:
+        if dump_mode not in ("all", "best"):
+            raise ValueError(f"Unsupported dump_mode: {dump_mode} - use 'all' or 'best'")
+
+        candidates, chunk_roles, chunk_values = self._collect_candidates(threshold)
+        if dump_mode == "all":
+            return candidates
+
+        by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
+        by_type[NodeType.HOMO_SEGMENT] = candidates[NodeType.HOMO_SEGMENT]
+        by_type[NodeType.ARRAY] = candidates[NodeType.ARRAY]
+
+        for chunk in sorted(self.analyzer.all_chunks, key=lambda c: (c.region.region_base, c.offset)):
+            roles = chunk_roles[chunk]
+            values = chunk_values[chunk]
+            best_role_type, (best_role_node, best_role_prob) = max(roles.items(), key=lambda x: x[1][1])
+            if values[NodeType.POINTER][1] >= threshold:
+                best_value = values[NodeType.POINTER]
+                by_type[NodeType.POINTER].append((best_value[0], best_value[1]))
+            elif values[NodeType.PRIMITIVE_VAR][1] >= threshold:
+                best_value = values[NodeType.PRIMITIVE_VAR]
+                by_type[NodeType.PRIMITIVE_VAR].append((best_value[0], best_value[1]))
+            if best_role_node is not None and best_role_prob > threshold:
+                by_type[best_role_type].append((best_role_node, best_role_prob))
+        return by_type
 
     def _add_node(self, node: Node, prior_prob: float):
         if isinstance(node, FieldOfNode):
@@ -757,7 +806,7 @@ class ProbabilisticInference:
                     p_src = expit(current_logits[src_node])
                     evidence = p_src - 0.5
                     deg_s = max(1, self.degree.get(src_node, 1))
-                    msg_sum += weight * evidence / math.sqrt(deg_s * deg_t)
+                    msg_sum += weight * evidence / math.sqrt(min(deg_s, 5) * min(deg_t, 5))
                 target_prior = self.prior_logits[target_node]
                 blended = (1 - alpha) * current_logits[target_node] + alpha * (target_prior + msg_sum)
                 next_logits[target_node] = clamp(blended, -LOGIT_CLAMP, LOGIT_CLAMP)
@@ -777,65 +826,12 @@ class ProbabilisticInference:
 
         self.beliefs = {n: expit(l) for n, l in current_logits.items()}
 
-    def dump_results(self, output_logger: logging.Logger, threshold: float = 0.6):
+    def dump_results(self, output_logger: logging.Logger, threshold: float = 0.6, dump_mode: str = "all"):
         output_logger.info("\n" + "=" * 50)
         output_logger.info(" OSPREY RECOVERY RESULTS (Confidence > {:.1f}%)".format(threshold * 100))
         output_logger.info("=" * 50)
         
-        chunk_roles: Dict[MemoryChunk, Dict[NodeType, float]] = defaultdict(lambda: {NodeType.SCALAR: 0.0, NodeType.FIELD_OF: 0.0, NodeType.ARRAY_ELEM: 0.0})
-        chunk_values: Dict[MemoryChunk, Dict[NodeType, float]] = defaultdict(lambda: {NodeType.PRIMITIVE_VAR: 0.0, NodeType.POINTER: 0.0})
-        struct_bases: Dict[MemoryAddress, float] = defaultdict(float)
-        array_starts: Dict[MemoryAddress, float] = defaultdict(float)
-        array_info: Dict[MemoryAddress, ArrayRelation] = dict()
-        
-        by_type: Dict[NodeType, List[Tuple[Node, float]]] = defaultdict(list)
-        for node, prob in self.beliefs.items():
-            if prob >= threshold:
-                by_type[node.type()].append((node, prob))
-            if isinstance(node, PrimitiveVarNode):
-                chunk_values[node.chunk][NodeType.PRIMITIVE_VAR] = prob
-            elif isinstance(node, PointerNode):
-                chunk_values[node.chunk][NodeType.POINTER] = prob
-            elif isinstance(node, ScalarNode):
-                chunk_roles[node.chunk][NodeType.SCALAR] = prob
-            elif isinstance(node, FieldOfNode):
-                chunk_roles[node.field][NodeType.FIELD_OF] = prob
-                if prob > struct_bases[node.base]:
-                    struct_bases[node.base] = prob
-            elif isinstance(node, ArrayElemNode):
-                chunk_roles[node.chunk][NodeType.ARRAY_ELEM] = prob
-            elif isinstance(node, ArrayRelNode):
-                arr = node.array_relation
-                base_addr = MemoryAddress(arr.region, arr.lo)
-                if array_starts[base_addr] < prob:
-                    array_info[base_addr] = arr
-                    array_starts[base_addr] = prob
-        
-        # for chunk in sorted(self.analyzer.all_chunks, key=lambda c: (c.region.id, c.offset)):
-        #     roles = chunk_roles[chunk]
-        #     values = chunk_values[chunk]
-        #     best_role = max(roles.items(), key=lambda x: x[1])
-        #     value_str = ""
-        #     if values[NodeType.POINTER] >= threshold:
-        #         value_str = "POINTER"
-        #     elif values[NodeType.PRIMITIVE_VAR] >= threshold:
-        #         value_str = "PRIMITIVE_VAR"
-        #     else:
-        #         value_str = "UNKNOWN"
-        #     if best_role[1] >= threshold or value_str != "UNKNOWN":
-        #         output_logger.info(f"[chunk] {chunk.get_str()} [role {best_role[0].name}] [value {value_str}] [roles {roles}] [values {values}]")
-        
-        # all_struct_array_bases = set(struct_bases.keys()) | set(array_info.keys())
-        # for addr in sorted(all_struct_array_bases, key=lambda a: (a.region.region_base, a.offset)):
-        #     struct_prob = struct_bases.get(addr, 0.0)
-        #     arr_prob = array_starts.get(addr, 0.0)
-        #     if struct_prob >= threshold or arr_prob >= threshold:
-        #         if struct_prob >= arr_prob:
-        #             output_logger.info(f"[struct-base] [base {addr.region.region_base:x}] [offset {addr.offset:x}]")
-        #         else:
-        #             arr = array_info[addr]
-        #             output_logger.info(f"[array-info] {arr.region.get_str()} [lo {arr.lo:x}] [hi {arr.hi:x}] [elem {arr.elem}]")
-        
+        by_type: Dict[NodeType, List[Tuple[Node, float]]] = self._select_dump_nodes(threshold, dump_mode)
         
         inferred_struct_bases: Set[MemoryAddress] = set()
         inferred_array_starts: Set[ArrayRelation] = set()
@@ -1017,13 +1013,13 @@ class ProbabilisticInference:
                 array_id = "T_UNKNOWN"
                 idx = -1
                 base_off = 0
-                for arr in array_by_region.get(chunk.region, []):
-                    if arr.lo <= chunk.offset and chunk.offset + chunk.size <= arr.hi:
+                for arr in array_by_region.get(node.chunk.region, []):
+                    if arr.lo <= node.chunk.offset and node.chunk.offset + node.chunk.size <= arr.hi:
                         array_id = array_to_id.get(arr, "T_UNKNOWN")
-                        idx = (chunk.offset - arr.lo) // arr.elem
+                        idx = (node.chunk.offset - arr.lo) // arr.elem
                         base_off = arr.lo
                         break
-                output_logger.info(f"[array-elem] {node.chunk.get_str()} [type {type_id:x}] [array-offset {base_off:x}] [array-id {array_id}] [idx {idx}] -> [P {prob:.4f}]")
+                output_logger.info(f"[array-elem] {node.chunk.get_str()} [type {type_id}] [array-offset {base_off:x}] [array-id {array_id}] [idx {idx}] -> [P {prob:.4f}]")
 
         if NodeType.SCALAR in by_type:
             output_logger.info(f"\n[scalar-meta] [cnt {len(by_type[NodeType.SCALAR])}]")
@@ -1069,7 +1065,9 @@ class OspreyAnalyzer:
         self.deterministic_inference.infer()
         self.probabilistic_inference = ProbabilisticInference(self.deterministic_inference)
         self.probabilistic_inference.type_infer()
-        self.probabilistic_inference.dump_results(self.output_logger)
+    
+    def dump_results(self, threshold: float = 0.6, dump_mode: str = "all"):
+        self.probabilistic_inference.dump_results(self.output_logger, threshold, dump_mode)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
@@ -1083,3 +1081,4 @@ if __name__ == "__main__":
     with open(log_file, "r") as f:
         osprey = OspreyAnalyzer(f)
     osprey.analyze()
+    osprey.dump_results() # dump_mode="best"
