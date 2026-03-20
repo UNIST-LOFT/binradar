@@ -4,6 +4,7 @@ project(Solver)
 
 # fuzzy-sat
 add_subdirectory(fuzzy-sat)
+add_subdirectory(libsbsv)
 
 add_executable(solver-smt main.c i386.c branch_coverage.c opts.c xxHash/xxhash.c)
 add_executable(solver-fuzzy main.c i386.c branch_coverage.c opts.c xxHash/xxhash.c)
@@ -14,8 +15,8 @@ target_compile_definitions(solver-fuzzy PRIVATE USE_FUZZY_SOLVER=1)
 # Link against the modified Z3 built by fuzzolic-z3 (target name is libz3)
 # and the fuzzy-sat library target (Z3Fuzzy_static) created by fuzzy-sat/lib.
 # Ensure order: Z3Fuzzy_static may depend on libz3.
-target_link_libraries(solver-smt PRIVATE libz3 Z3Fuzzy_static)
-target_link_libraries(solver-fuzzy PRIVATE libz3 Z3Fuzzy_static)
+target_link_libraries(solver-smt PRIVATE libz3 Z3Fuzzy_static sbsv)
+target_link_libraries(solver-fuzzy PRIVATE libz3 Z3Fuzzy_static sbsv)
 
 # If you still want to link system z3 instead, remove libz3 above and use z3.
 # But here we want the modified internal Z3, so link the lib built from fuzzolic-z3.

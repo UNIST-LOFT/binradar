@@ -2,7 +2,7 @@
 
 import os
 import sys
-import json
+import sbsv
 import glob
 import filecmp
 import subprocess
@@ -338,6 +338,7 @@ class Executor(object):
         self.binradar_entrypoint = binradar_entrypoint
         self._forkserver = None
         self._forkserver_session_log = None
+        self._binradar_probe_hit_count = 0
 
         if not os.path.exists(output_dir):
             sys.exit('ERROR: invalid working directory')
@@ -490,6 +491,88 @@ class Executor(object):
             logger.info("Using SMT solver")
             return SOLVER_SMT_BIN
 
+    def _build_tracer_args(self, testcase):
+        p_tracer_args = []
+        if self.debug == 'gdb_tracer':
+            p_tracer_args += ['gdb']
+
+        p_tracer_args += [TRACER_BIN]
+        debug_args = "page"
+
+        if self.debug != 'gdb_tracer':
+            p_tracer_args += ['-symbolic']
+            if (self.debug == 'trace'):
+                debug_args = 'in_asm,op,op_opt,out_asm'
+            p_tracer_args += ['-d', debug_args]
+
+        args = self.binary_args.copy()
+        if not self.testcase_from_stdin:
+            for k in range(len(args)):
+                if args[k] == '@@':
+                    args[k] = testcase
+
+        if self.debug != 'gdb_tracer':
+            p_tracer_args += [self.binary]
+            p_tracer_args += args
+
+        return p_tracer_args
+
+    def _run_binradar_probe(self, testcase, run_dir, env) -> int:
+        probe_log_name = os.path.join(run_dir, 'tracer-probe.log')
+        probe_file = os.path.join(run_dir, "binradar-probe.sbsv")
+        probe_env = env.copy()
+        probe_env['BINRADAR_FORKSERVER_ENABLE'] = '0'
+        probe_env['BINRADAR_FORKSERVER_TARGET_HIT_COUNT'] = '0'
+        probe_env['BINRADAR_PROBE_FILE'] = probe_file
+        probe_env['COVERAGE_TRACER'] = os.path.join(run_dir, 'probe-bitmap')
+        probe_env['COVERAGE_TRACER_LOG'] = os.path.join(run_dir, 'probe-coverage.log')
+        probe_env['COVERAGE_TRACER_LOG_EDGES'] = os.path.join(run_dir, 'probe-edges.log')
+
+        probe_args = self._build_tracer_args(testcase)
+        logger.info(f"[FUZZOLIC] Probe tracer for crash-call discovery: {' '.join(probe_args)}")
+
+        with open(probe_log_name, 'w') as probe_log:
+            p_probe = subprocess.Popen(
+                probe_args,
+                stdout=subprocess.DEVNULL if not self.debug else None,
+                stderr=probe_log if not self.debug else None,
+                stdin=subprocess.PIPE if self.testcase_from_stdin else None,
+                cwd=run_dir,
+                env=probe_env,
+                preexec_fn=setlimits)
+
+            RUNNING_PROCESSES.append(p_probe)
+
+            if self.testcase_from_stdin:
+                with open(testcase, "rb") as f:
+                    p_probe.stdin.write(f.read())
+                    p_probe.stdin.close()
+
+            try:
+                p_probe.wait(20)
+            except subprocess.TimeoutExpired:
+                logger.info('[FUZZOLIC] Probe timeout. Sending SIGINT/SIGKILL to tracer.')
+                p_probe.send_signal(signal.SIGINT)
+                try:
+                    p_probe.wait(1)
+                except subprocess.TimeoutExpired:
+                    p_probe.send_signal(signal.SIGKILL)
+                    p_probe.wait()
+
+            if p_probe in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(p_probe)
+
+        if os.path.exists(probe_file):
+            logger.info(f"[binradar] [probe] [done] [file {probe_file}]")
+            with open(probe_file, 'r') as pf:
+                parser = sbsv.parser()
+                parser.add_schema("[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: str] [guest_cs_base: str] [fault_addr: str] [host_fault_addr: str]")
+                result = parser.load(pf)
+                return result["snapshot"]["crash"][-1]["hit-count"]
+        else:
+            logger.error(f"[binradar] [error] crash call index file not found: {probe_file}. Using default=1")
+            exit(1)
+
     def fuzz_one(self, testcase, target, force_smt=False):
 
         global RUNNING_PROCESSES
@@ -514,6 +597,13 @@ class Executor(object):
             env['COVERAGE_TRACER'] = self.output_dir + '/fuzzolic-bitmap'
             env['COVERAGE_TRACER_LOG'] = self.output_dir + \
                 '/fuzzolic-coverage.out'
+
+        forkserver_mode = bool(self.binradar_entrypoint)
+        if forkserver_mode:
+            if self._binradar_probe_hit_count == 0:
+                self._binradar_probe_hit_count = self._run_binradar_probe(testcase, run_dir, env)
+            env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
+            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)
 
         # generate random shm keys
         env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
@@ -605,30 +695,13 @@ class Executor(object):
         # launch tracer
         p_tracer_log_name = run_dir + '/tracer.log'
         p_tracer = None
-        forkserver_mode = bool(self.binradar_entrypoint)
         forkserver_result = None
-
-        p_tracer_args = []
-        if self.debug == 'gdb_tracer':
-            p_tracer_args += ['gdb']
-
-        p_tracer_args += [TRACER_BIN]
-        debug_args = "page"
-
-        if self.debug != 'gdb_tracer':
-            p_tracer_args += ['-symbolic']
-            if (self.debug == 'trace'):
-                debug_args += ['in_asm,op,op_opt,out_asm']
-            p_tracer_args += ['-d', debug_args]
-        args = self.binary_args
+        p_tracer_args = self._build_tracer_args(testcase)
+        args = self.binary_args.copy()
         if not self.testcase_from_stdin:
             for k in range(len(args)):
                 if args[k] == '@@':
                     args[k] = testcase
-
-        if self.debug != 'gdb_tracer':
-            p_tracer_args += [self.binary]
-            p_tracer_args += args
 
         if self.plt_info:
             env["PLT_INFO_FILE"] = self.plt_info
@@ -637,6 +710,10 @@ class Executor(object):
         tracer_returncode = 0
         if forkserver_mode:
             env["BINRADAR_ENTRYPOINT"] = self.binradar_entrypoint
+            env["BINRADAR_FORKSERVER_ENABLE"] = "1"
+            binradar_query_window_file = os.path.join(run_dir, 'binradar-query-window.sbsv')
+            env["BINRADAR_QUERY_WINDOW_FILE"] = binradar_query_window_file
+            env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
             if not self._forkserver:
                 if not self._forkserver_session_log:
                     session_log_path = os.path.join(self.output_dir, 'tracer-forkserver.log')
@@ -646,7 +723,7 @@ class Executor(object):
                     self.testcase_from_stdin, logger, self._forkserver_session_log)
                 self._forkserver.start()
                 RUNNING_PROCESSES.append(self._forkserver.proc)
-            for i in range(2):
+            for i in range(1):
                 forkserver_result = self._forkserver.run_testcase(run_dir)
                 logger.info(f"Run {i}: {forkserver_result}")
                 if forkserver_result.should_halt:
