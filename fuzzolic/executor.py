@@ -524,9 +524,9 @@ class Executor(object):
         probe_env['BINRADAR_FORKSERVER_ENABLE'] = '0'
         probe_env['BINRADAR_FORKSERVER_TARGET_HIT_COUNT'] = '0'
         probe_env['BINRADAR_PROBE_FILE'] = probe_file
-        probe_env['COVERAGE_TRACER'] = os.path.join(run_dir, 'probe-bitmap')
-        probe_env['COVERAGE_TRACER_LOG'] = os.path.join(run_dir, 'probe-coverage.log')
-        probe_env['COVERAGE_TRACER_LOG_EDGES'] = os.path.join(run_dir, 'probe-edges.log')
+        # probe_env['COVERAGE_TRACER'] = os.path.join(run_dir, 'probe-bitmap')
+        # probe_env['COVERAGE_TRACER_LOG'] = os.path.join(run_dir, 'probe-coverage.log')
+        # probe_env['COVERAGE_TRACER_LOG_EDGES'] = os.path.join(run_dir, 'probe-edges.log')
 
         probe_args = self._build_tracer_args(testcase)
         logger.info(f"[FUZZOLIC] Probe tracer for crash-call discovery: {' '.join(probe_args)}")
@@ -568,7 +568,12 @@ class Executor(object):
                 parser = sbsv.parser()
                 parser.add_schema("[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: str] [guest_cs_base: str] [fault_addr: str] [host_fault_addr: str]")
                 result = parser.load(pf)
-                return result["snapshot"]["crash"][-1]["hit-count"]
+                crash = result["snapshot"]["crash"]
+                if len(crash) == 0:
+                    logger.error(f"[binradar] [error] no crash found in probe result.")
+                    exit(1)
+                else:
+                    return crash[-1]["hit-count"]
         else:
             logger.error(f"[binradar] [error] crash call index file not found: {probe_file}. Using default=1")
             exit(1)
@@ -597,14 +602,7 @@ class Executor(object):
             env['COVERAGE_TRACER'] = self.output_dir + '/fuzzolic-bitmap'
             env['COVERAGE_TRACER_LOG'] = self.output_dir + \
                 '/fuzzolic-coverage.out'
-
-        forkserver_mode = bool(self.binradar_entrypoint)
-        if forkserver_mode:
-            if self._binradar_probe_hit_count == 0:
-                self._binradar_probe_hit_count = self._run_binradar_probe(testcase, run_dir, env)
-            env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
-            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)
-
+        
         # generate random shm keys
         env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
         env['QUERY_SHM_KEY'] = hex(random.getrandbits(32))
@@ -619,12 +617,16 @@ class Executor(object):
             assert('DEBUG_FUZZ_EXPR_VALUE' in env)
 
         self.__check_shutdown_flag()
+        
+        forkserver_mode = bool(self.binradar_entrypoint)
 
         _, global_bitmap_pre_run = tempfile.mkstemp()
         os.system("cp " + self.global_bitmap + " " + global_bitmap_pre_run)
 
         p_solver_log_name = run_dir + '/solver.log'
         p_solver_log = open(p_solver_log_name, 'w')
+        p_solver = None
+        solver_signaled = False
 
         # launch solver
         if self.debug != 'no_solver' and self.debug != 'coverage':
@@ -705,11 +707,16 @@ class Executor(object):
 
         if self.plt_info:
             env["PLT_INFO_FILE"] = self.plt_info
+        
         logger.info(f"[FUZZOLIC] Starting tracer for {self.binary} with args: {' '.join(p_tracer_args)}")
         start_time = time.time()
         tracer_returncode = 0
         if forkserver_mode:
             env["BINRADAR_ENTRYPOINT"] = self.binradar_entrypoint
+            if self._binradar_probe_hit_count == 0:
+                self._binradar_probe_hit_count = self._run_binradar_probe(testcase, run_dir, env)
+            env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
+            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
             binradar_query_window_file = os.path.join(run_dir, 'binradar-query-window.sbsv')
             env["BINRADAR_QUERY_WINDOW_FILE"] = binradar_query_window_file
@@ -723,11 +730,21 @@ class Executor(object):
                     self.testcase_from_stdin, logger, self._forkserver_session_log)
                 self._forkserver.start()
                 RUNNING_PROCESSES.append(self._forkserver.proc)
-            for i in range(1):
+            i = 0
+            while True:
                 forkserver_result = self._forkserver.run_testcase(run_dir)
                 logger.info(f"Run {i}: {forkserver_result}")
+                if (self.debug != 'no_solver' and self.debug != 'coverage' and
+                        p_solver is not None and not solver_signaled):
+                    logger.info('[FUZZOLIC] Triggering solver during forkserver session.')
+                    p_solver.send_signal(signal.SIGUSR1)
+                    solver_signaled = True
+                    self._wait_solver(p_solver)
+                    if p_solver in RUNNING_PROCESSES:
+                        RUNNING_PROCESSES.remove(p_solver)
                 if forkserver_result.should_halt:
                     break
+                i += 1
             tracer_returncode = forkserver_result.returncode
             logger.info(f"[tracer] [pid {forkserver_result.child_pid}] [time {round(forkserver_result.duration, 3)} secs]")
         else:
@@ -792,8 +809,9 @@ class Executor(object):
             logger.warning("ERROR: tracer has returned code %d %s" %
                   (tracer_returncode, returncode_str))
 
-        if self.debug != 'no_solver' and self.debug != 'coverage':
+        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None and not solver_signaled:
             p_solver.send_signal(signal.SIGUSR1)
+            solver_signaled = True
 
         if self.fuzz_expr:
             p_solver.send_signal(signal.SIGINT)
@@ -801,32 +819,10 @@ class Executor(object):
             p_solver.send_signal(signal.SIGKILL)
             sys.exit(tracer_returncode)
 
-        if self.debug != 'no_solver' and self.debug != 'coverage':
-            elapsed = 0
-            timeout = False
-            while not SHUTDOWN:
-                try:
-                    p_solver.wait(SOLVER_TIMEOUT / 1000)
-                    break
-                except subprocess.TimeoutExpired:
-                    # logger.info("Elapsed %s secs (timeout: %s, elapsed: %s)"  % ((SOLVER_TIMEOUT / 1000), self.timeout, elapsed)) 
-                    pass
-                elapsed += SOLVER_TIMEOUT
-                if self.timeout > 0 and elapsed > (self.timeout + 10000):
-                    timeout = True
-                    break
+        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
+            self._wait_solver(p_solver)
 
-            if SHUTDOWN or timeout:
-                logger.info('[FUZZOLIC] Solver is taking too long. Let us stop it.')
-                p_solver.send_signal(signal.SIGUSR2)
-                try:
-                    p_solver.wait(SOLVER_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    logger.info('[FUZZOLIC] Solver will be killed.')
-                    p_solver.send_signal(signal.SIGKILL)
-                    p_solver.wait()
-
-        if self.debug != 'no_solver' and self.debug != 'coverage':
+        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
             if p_solver in RUNNING_PROCESSES:
                 RUNNING_PROCESSES.remove(p_solver)
 
@@ -1097,6 +1093,30 @@ class Executor(object):
                       key=functools.cmp_to_key(
                           minimizer_qsym.testcase_compare),
                       reverse=True)
+
+    def _wait_solver(self, p_solver):
+        elapsed = 0
+        timeout = False
+        while not SHUTDOWN:
+            try:
+                p_solver.wait(SOLVER_TIMEOUT / 1000)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            elapsed += SOLVER_TIMEOUT
+            if self.timeout > 0 and elapsed > (self.timeout + 10000):
+                timeout = True
+                break
+
+        if SHUTDOWN or timeout:
+            logger.info('[FUZZOLIC] Solver is taking too long. Let us stop it.')
+            p_solver.send_signal(signal.SIGUSR2)
+            try:
+                p_solver.wait(SOLVER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                logger.info('[FUZZOLIC] Solver will be killed.')
+                p_solver.send_signal(signal.SIGKILL)
+                p_solver.wait()
 
     def run(self):
 

@@ -11,8 +11,11 @@ int model_malloc_max(int size)
 {
     int* res = malloc(MAX_INPUT);
     memset((void *)res, size, MAX_INPUT);
-    printf("MAX SIZE %d\n", size / (int)sizeof(int));
-    return res[size];
+    if (size > MAX_INPUT) {
+        free(res);
+    }
+    printf("MAX SIZE %d\n", MAX_INPUT / size);
+    return res[MAX_INPUT / size];
 }
 
 

@@ -174,16 +174,16 @@ static uint64_t eval_data[MAX_INPUTS_EXPRS];
 uint64_t conc_query_eval_value(Z3_context ctx, Z3_ast query, uint64_t* data,
                                uint8_t* symbols_sizes, size_t size, uint32_t* depth);
 
-static void load_query_window_config(void)
+static int load_query_window_config(void)
 {
     const char* path = getenv("BINRADAR_QUERY_WINDOW_FILE");
     if (!path || !path[0]) {
-        return;
+        return 0;
     }
 
     FILE* fp = fopen(path, "r");
     if (!fp) {
-        return;
+        return 0;
     }
 
     sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
@@ -192,29 +192,32 @@ static void load_query_window_config(void)
         fclose(fp);
         fprintf(stderr, "[solver] [query-window] failed to load query window config from %s \n- %s\n", path, sbsv_parser_last_error(parser));
         sbsv_parser_free(parser);
-        return;
+        return 0;
     }
 
     const sbsv_row** rows = NULL;
     size_t num_rows = 0;
     int valid = 1;
     if (sbsv_parser_get_rows(parser, "[query-window]", &rows, &num_rows) != SBSV_OK || num_rows == 0) {
-        fprintf(stderr, "[solver] [query-window] no valid row found in query window config %s\n", path);
         valid = 0;
     }
     if (valid) {
         // Get most recent row
         const sbsv_row* row = rows[num_rows - 1];
         int64_t pre_target = sbsv_row_get_int(row, "pre-target", &valid);
-        query_pre_target_range = pre_target - 1;
+        if (valid && pre_target > 0) {
+            query_pre_target_range = pre_target - 1;
+        } else {
+            valid = 0;
+        }
     }
     if (!valid) {
-        fprintf(stderr, "[solver] [query-window] invalid row found in query window config %s\n", path);
         query_pre_target_range = -1;
     }
     sbsv_free_row_ref_array(rows);
     sbsv_parser_free(parser);
     fclose(fp);
+    return valid ? 1 : 0;
 }
 
 static void exitf(const char* message)
@@ -7522,6 +7525,9 @@ int main(int argc, char* argv[])
 #if 0
             SAYF("Got a query... %p\n", next_query);
 #endif
+            if (query_pre_target_range < 0) {
+                load_query_window_config();
+            }
             smt_query(&next_query[0]);
             next_query++;
 #if 0
