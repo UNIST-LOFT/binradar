@@ -77,7 +77,8 @@ class ForkserverTracer:
     _CTRL_FD = 198
     iter: int
 
-    def __init__(self, args, env, cwd, debug, testcase_from_stdin, logger, session_log):
+    def __init__(self, args, env, cwd, debug, testcase_from_stdin, logger, session_log,
+                 analyze_on_first_iteration=True):
         if debug == 'gdb_tracer':
             raise ForkserverTracerError(
                 'Forkserver mode does not support --debug gdb_tracer.')
@@ -99,6 +100,7 @@ class ForkserverTracer:
         self._timeout = 60
         self._handshake_timeout = 30
         self.iter = 0
+        self._analyze_on_first_iteration = analyze_on_first_iteration
 
     def start(self):
         ctl_r, ctl_w = os.pipe()
@@ -159,7 +161,7 @@ class ForkserverTracer:
             status = self._read_u32(self._timeout)
             # Analyze type
             analyze_result = b""
-            if self.iter == 1:
+            if self._analyze_on_first_iteration and self.iter == 1:
                 out_buf = io.StringIO()
                 try:
                     analyze_start = time.time()
@@ -491,6 +493,164 @@ class Executor(object):
             logger.info("Using SMT solver")
             return SOLVER_SMT_BIN
 
+    def _assign_random_shm_keys(self, env):
+        env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
+        env['QUERY_SHM_KEY'] = hex(random.getrandbits(32))
+        env['BITMAP_SHM_KEY'] = hex(random.getrandbits(32))
+
+    def _cleanup_shm_for_env(self, env):
+        if 'EXPR_POOL_SHM_KEY' not in env or 'QUERY_SHM_KEY' not in env or 'BITMAP_SHM_KEY' not in env:
+            return
+
+        IPC_RMID = 0
+        shm_keys = [
+            int(env['EXPR_POOL_SHM_KEY'], 16),
+            int(env['QUERY_SHM_KEY'], 16),
+            int(env['BITMAP_SHM_KEY'], 16),
+        ]
+        for shm_key in shm_keys:
+            shm_id = self.libc.shmget(ctypes.c_int(shm_key), ctypes.c_int(1), ctypes.c_int(0))
+            if shm_id > 0:
+                r = self.libc.shmctl(ctypes.c_int(shm_id), ctypes.c_int(IPC_RMID), ctypes.c_int(0))
+                logger.info("Shared memory detach on (%s, %s): %s" % (shm_key, shm_id, r))
+
+    def _run_forkserver_phase(self, phase_name, testcase, run_dir, p_tracer_args,
+                              base_env, force_smt=False, analyze_on_first_iteration=True):
+        env = base_env.copy()
+        self._assign_random_shm_keys(env)
+
+        p_solver_log_name = run_dir + f'/solver-{phase_name}.log'
+        p_solver_log = open(p_solver_log_name, 'w')
+        p_solver = None
+        solver_signaled = False
+        tracer_returncode = 0
+        forkserver_result = None
+        session_log_path = os.path.join(run_dir, f'tracer-forkserver-{phase_name}.log')
+        session_log = open(session_log_path, 'ab')
+        forkserver = None
+
+        try:
+            if self.debug != 'no_solver' and self.debug != 'coverage':
+                p_solver_args = []
+                p_solver_args += ['stdbuf', '-o0']
+                p_solver_args += [self.get_solver_bin(force_smt)]
+                p_solver_args += ['-i', testcase]
+                p_solver_args += ['-t', self.__get_testcases_dir()]
+                p_solver_args += ['-o', run_dir]
+
+                if not force_smt:
+                    p_solver_args += ['-b', self.global_bitmap]
+                    if self.use_smt_if_empty:
+                        env['BITMAP_ALT'] = str(self.global_alt_bitmap)
+                else:
+                    p_solver_args += ['-b', self.global_alt_bitmap]
+                    if self.use_smt_if_empty:
+                        env['BITMAP_ALT'] = str(self.global_bitmap)
+
+                p_solver_args += ['-c', self.__get_root_dir() + '/context_bitmap']
+                p_solver_args += ['-m', self.__get_root_dir() + '/memory_bitmap']
+
+                if self.optimistic_solving:
+                    p_solver_args += ['-p']
+                if self.memory_slice_reasoning:
+                    p_solver_args += ['-s']
+                if self.address_reasoning:
+                    p_solver_args += ['-a']
+
+                logger.info(f"[FUZZOLIC] [{phase_name}] Starting solver with args: {' '.join(p_solver_args)}")
+
+                if self.debug == 'gdb_solver':
+                    p_solver = subprocess.Popen(['gdb'] + p_solver_args[0:1],
+                                                stdout=p_solver_log if not self.debug else None,
+                                                stderr=subprocess.STDOUT if not self.debug else None,
+                                                stdin=subprocess.PIPE,
+                                                cwd=run_dir,
+                                                bufsize=0,
+                                                env=env)
+
+                    RUNNING_PROCESSES.append(p_solver)
+
+                    gdb_cmd = 'run ' + ' '.join(p_solver_args[1:])
+                    gdb_cmd += "\n"
+                    try:
+                        p_solver.wait(5)
+                    except:
+                        pass
+                    logger.info("GDB command: %s" % gdb_cmd)
+                    p_solver.stdin.write("break exit\n".encode())
+                    p_solver.stdin.write(gdb_cmd.encode())
+                    time.sleep(2)
+                else:
+                    p_solver = subprocess.Popen(p_solver_args,
+                                                stdout=p_solver_log if not self.debug else None,
+                                                stderr=subprocess.STDOUT if not self.debug else None,
+                                                cwd=run_dir,
+                                                preexec_fn=setlimits,
+                                                env=env)
+                    RUNNING_PROCESSES.append(p_solver)
+
+                time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
+
+            logger.info(f"[FUZZOLIC] [{phase_name}] Starting tracer for {self.binary} with args: {' '.join(p_tracer_args)}")
+            forkserver = ForkserverTracer(
+                p_tracer_args, env, self.output_dir, self.debug,
+                self.testcase_from_stdin, logger, session_log,
+                analyze_on_first_iteration=analyze_on_first_iteration)
+            forkserver.start()
+            RUNNING_PROCESSES.append(forkserver.proc)
+
+            i = 0
+            while True:
+                forkserver_result = forkserver.run_testcase(run_dir)
+                logger.info(f"[{phase_name}] Run {i}: {forkserver_result}")
+                if (self.debug != 'no_solver' and self.debug != 'coverage' and
+                        p_solver is not None and not solver_signaled):
+                    logger.info(f'[FUZZOLIC] [{phase_name}] Triggering solver during forkserver session.')
+                    p_solver.send_signal(signal.SIGUSR1)
+                    solver_signaled = True
+                    self._wait_solver(p_solver)
+                    if p_solver in RUNNING_PROCESSES:
+                        RUNNING_PROCESSES.remove(p_solver)
+
+                if forkserver_result.should_halt:
+                    break
+                i += 1
+
+            tracer_returncode = forkserver_result.returncode
+
+            if self.debug == 'gdb_solver' and p_solver is not None:
+                for line in sys.stdin:
+                    p_solver.stdin.write(line.encode())
+                    if 'quit' in line or line.startswith('q'):
+                        logger.info("Closing stdin in gdb")
+                        break
+                p_solver.stdin.close()
+
+            if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None and not solver_signaled:
+                p_solver.send_signal(signal.SIGUSR1)
+                solver_signaled = True
+
+            if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
+                self._wait_solver(p_solver)
+                if p_solver in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(p_solver)
+
+        finally:
+            if forkserver and forkserver.proc in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(forkserver.proc)
+            if forkserver:
+                forkserver.stop()
+
+            if p_solver is not None and p_solver in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(p_solver)
+
+            if not p_solver_log.closed:
+                p_solver_log.close()
+
+            self._cleanup_shm_for_env(env)
+
+        return tracer_returncode, p_solver_log_name, session_log_path
+
     def _build_tracer_args(self, testcase):
         p_tracer_args = []
         if self.debug == 'gdb_tracer':
@@ -519,8 +679,10 @@ class Executor(object):
 
     def _run_binradar_probe(self, testcase, run_dir, env) -> int:
         probe_log_name = os.path.join(run_dir, 'tracer-probe.log')
+        probe_solver_log_name = os.path.join(run_dir, 'solver-probe.log')
         probe_file = os.path.join(run_dir, "binradar-probe.sbsv")
         probe_env = env.copy()
+        self._assign_random_shm_keys(probe_env)
         probe_env['BINRADAR_FORKSERVER_ENABLE'] = '0'
         probe_env['BINRADAR_FORKSERVER_TARGET_HIT_COUNT'] = '0'
         probe_env['BINRADAR_PROBE_FILE'] = probe_file
@@ -531,36 +693,87 @@ class Executor(object):
         probe_args = self._build_tracer_args(testcase)
         logger.info(f"[FUZZOLIC] Probe tracer for crash-call discovery: {' '.join(probe_args)}")
 
-        with open(probe_log_name, 'w') as probe_log:
-            p_probe = subprocess.Popen(
-                probe_args,
-                stdout=subprocess.DEVNULL if not self.debug else None,
-                stderr=probe_log if not self.debug else None,
-                stdin=subprocess.PIPE if self.testcase_from_stdin else None,
-                cwd=run_dir,
-                env=probe_env,
-                preexec_fn=setlimits)
+        probe_solver = None
+        probe_solver_log = open(probe_solver_log_name, 'w')
+        probe_tests_dir = os.path.join(run_dir, 'probe-tests')
+        os.makedirs(probe_tests_dir, exist_ok=True)
+        probe_bitmap = os.path.join(run_dir, 'probe-branch-bitmap')
+        probe_context_bitmap = os.path.join(run_dir, 'probe-context-bitmap')
+        probe_memory_bitmap = os.path.join(run_dir, 'probe-memory-bitmap')
+        open(probe_bitmap, 'a').close()
+        open(probe_context_bitmap, 'a').close()
+        open(probe_memory_bitmap, 'a').close()
 
-            RUNNING_PROCESSES.append(p_probe)
+        probe_solver_args = [
+            'stdbuf', '-o0', self.get_solver_bin(False),
+            '-i', testcase,
+            '-t', probe_tests_dir,
+            '-o', run_dir,
+            '-b', probe_bitmap,
+            '-c', probe_context_bitmap,
+            '-m', probe_memory_bitmap,
+        ]
 
-            if self.testcase_from_stdin:
-                with open(testcase, "rb") as f:
-                    p_probe.stdin.write(f.read())
-                    p_probe.stdin.close()
+        logger.info(f"[FUZZOLIC] Probe solver for shared-memory setup: {' '.join(probe_solver_args)}")
+        probe_solver = subprocess.Popen(
+            probe_solver_args,
+            stdout=probe_solver_log if not self.debug else None,
+            stderr=subprocess.STDOUT if not self.debug else None,
+            cwd=run_dir,
+            env=probe_env,
+            preexec_fn=setlimits)
+        RUNNING_PROCESSES.append(probe_solver)
+        time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
 
-            try:
-                p_probe.wait(20)
-            except subprocess.TimeoutExpired:
-                logger.info('[FUZZOLIC] Probe timeout. Sending SIGINT/SIGKILL to tracer.')
-                p_probe.send_signal(signal.SIGINT)
+        try:
+            with open(probe_log_name, 'w') as probe_log:
+                p_probe = subprocess.Popen(
+                    probe_args,
+                    stdout=subprocess.DEVNULL if not self.debug else None,
+                    stderr=probe_log if not self.debug else None,
+                    stdin=subprocess.PIPE if self.testcase_from_stdin else None,
+                    cwd=run_dir,
+                    env=probe_env,
+                    preexec_fn=setlimits)
+
+                RUNNING_PROCESSES.append(p_probe)
+
+                if self.testcase_from_stdin:
+                    with open(testcase, "rb") as f:
+                        p_probe.stdin.write(f.read())
+                        p_probe.stdin.close()
+
                 try:
-                    p_probe.wait(1)
+                    p_probe.wait(20)
                 except subprocess.TimeoutExpired:
-                    p_probe.send_signal(signal.SIGKILL)
-                    p_probe.wait()
+                    logger.info('[FUZZOLIC] Probe timeout. Sending SIGINT/SIGKILL to tracer.')
+                    p_probe.send_signal(signal.SIGINT)
+                    try:
+                        p_probe.wait(1)
+                    except subprocess.TimeoutExpired:
+                        p_probe.send_signal(signal.SIGKILL)
+                        p_probe.wait()
 
-            if p_probe in RUNNING_PROCESSES:
-                RUNNING_PROCESSES.remove(p_probe)
+                if p_probe in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(p_probe)
+        finally:
+            if probe_solver is not None:
+                try:
+                    probe_solver.send_signal(signal.SIGUSR1)
+                    self._wait_solver(probe_solver)
+                except Exception:
+                    try:
+                        probe_solver.send_signal(signal.SIGKILL)
+                        probe_solver.wait()
+                    except Exception:
+                        pass
+                if probe_solver in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(probe_solver)
+
+            if not probe_solver_log.closed:
+                probe_solver_log.close()
+
+            self._cleanup_shm_for_env(probe_env)
 
         if os.path.exists(probe_file):
             logger.info(f"[binradar] [probe] [done] [file {probe_file}]")
@@ -603,10 +816,10 @@ class Executor(object):
             env['COVERAGE_TRACER_LOG'] = self.output_dir + \
                 '/fuzzolic-coverage.out'
         
-        # generate random shm keys
-        env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
-        env['QUERY_SHM_KEY'] = hex(random.getrandbits(32))
-        env['BITMAP_SHM_KEY'] = hex(random.getrandbits(32))
+        forkserver_mode = bool(self.binradar_entrypoint)
+
+        if not forkserver_mode:
+            self._assign_random_shm_keys(env)
         if self.timeout > 0:
             # logger.info("Setting solving timeout: %s" % self.timeout)
             env['SOLVER_TIMEOUT'] = str(self.timeout)
@@ -618,18 +831,20 @@ class Executor(object):
 
         self.__check_shutdown_flag()
         
-        forkserver_mode = bool(self.binradar_entrypoint)
-
         _, global_bitmap_pre_run = tempfile.mkstemp()
         os.system("cp " + self.global_bitmap + " " + global_bitmap_pre_run)
 
-        p_solver_log_name = run_dir + '/solver.log'
-        p_solver_log = open(p_solver_log_name, 'w')
+        p_solver_log_name = None
+        solver_log_files = []
         p_solver = None
         solver_signaled = False
+        forkserver_session_log_path = None
 
         # launch solver
-        if self.debug != 'no_solver' and self.debug != 'coverage':
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage':
+            p_solver_log_name = run_dir + '/solver.log'
+            p_solver_log = open(p_solver_log_name, 'w')
+            solver_log_files.append(p_solver_log_name)
             p_solver_args = []
             p_solver_args += ['stdbuf', '-o0']  # No buffering on stdout
             p_solver_args += [self.get_solver_bin(force_smt)]
@@ -713,41 +928,34 @@ class Executor(object):
         tracer_returncode = 0
         if forkserver_mode:
             env["BINRADAR_ENTRYPOINT"] = self.binradar_entrypoint
+            self._assign_random_shm_keys(env)
             if self._binradar_probe_hit_count == 0:
                 self._binradar_probe_hit_count = self._run_binradar_probe(testcase, run_dir, env)
-            env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
-            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)
-            env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-            binradar_query_window_file = os.path.join(run_dir, 'binradar-query-window.sbsv')
-            env["BINRADAR_QUERY_WINDOW_FILE"] = binradar_query_window_file
-            env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
-            if not self._forkserver:
-                if not self._forkserver_session_log:
-                    session_log_path = os.path.join(self.output_dir, 'tracer-forkserver.log')
-                    self._forkserver_session_log = open(session_log_path, 'ab')
-                self._forkserver = ForkserverTracer(
-                    p_tracer_args, env, self.output_dir, self.debug,
-                    self.testcase_from_stdin, logger, self._forkserver_session_log)
-                self._forkserver.start()
-                RUNNING_PROCESSES.append(self._forkserver.proc)
-            i = 0
-            while True:
-                forkserver_result = self._forkserver.run_testcase(run_dir)
-                logger.info(f"Run {i}: {forkserver_result}")
-                if (self.debug != 'no_solver' and self.debug != 'coverage' and
-                        p_solver is not None and not solver_signaled):
-                    logger.info('[FUZZOLIC] Triggering solver during forkserver session.')
-                    p_solver.send_signal(signal.SIGUSR1)
-                    solver_signaled = True
-                    self._wait_solver(p_solver)
-                    if p_solver in RUNNING_PROCESSES:
-                        RUNNING_PROCESSES.remove(p_solver)
-                if forkserver_result.should_halt:
-                    break
-                i += 1
-            tracer_returncode = forkserver_result.returncode
-            logger.info(f"[tracer] [pid {forkserver_result.child_pid}] [time {round(forkserver_result.duration, 3)} secs]")
+            phase_env = env.copy()
+            phase_env["BINRADAR_FORKSERVER_ENABLE"] = "1"
+            phase_env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)
+            phase_env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
+            phase_env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
+
+            logger.info("[FUZZOLIC] [forkserver] Phase 2/3: seed generation (without analyze_type)")
+            seed_rc, seed_solver_log, seed_session_log = self._run_forkserver_phase(
+                phase_name='seed', testcase=testcase, run_dir=run_dir,
+                p_tracer_args=p_tracer_args, base_env=phase_env,
+                force_smt=force_smt, analyze_on_first_iteration=False)
+            solver_log_files.append(seed_solver_log)
+
+            logger.info("[FUZZOLIC] [forkserver] Phase 3/3: memory modification (with analyze_type)")
+            mem_rc, mem_solver_log, mem_session_log = self._run_forkserver_phase(
+                phase_name='memory', testcase=testcase, run_dir=run_dir,
+                p_tracer_args=p_tracer_args, base_env=phase_env,
+                force_smt=force_smt, analyze_on_first_iteration=True)
+            solver_log_files.append(mem_solver_log)
+
+            tracer_returncode = mem_rc if mem_rc != 0 else seed_rc
+            forkserver_session_log_path = mem_session_log
+            logger.info(f"[tracer] [seed rc {seed_rc}] [memory rc {mem_rc}]")
         else:
+            p_solver_log = None
             p_tracer_log = open(p_tracer_log_name, 'w')
             p_tracer = subprocess.Popen(p_tracer_args,
                                         stdout=subprocess.DEVNULL if not self.debug and not self.fuzz_expr else None,
@@ -796,7 +1004,7 @@ class Executor(object):
             p_tracer_log.close()
             tracer_returncode = p_tracer.returncode
 
-        if self.debug == 'gdb_solver':
+        if not forkserver_mode and self.debug == 'gdb_solver':
             for line in sys.stdin:
                 p_solver.stdin.write(line.encode())
                 if 'quit' in line or line.startswith('q'):
@@ -809,7 +1017,7 @@ class Executor(object):
             logger.warning("ERROR: tracer has returned code %d %s" %
                   (tracer_returncode, returncode_str))
 
-        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None and not solver_signaled:
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None and not solver_signaled:
             p_solver.send_signal(signal.SIGUSR1)
             solver_signaled = True
 
@@ -819,30 +1027,19 @@ class Executor(object):
             p_solver.send_signal(signal.SIGKILL)
             sys.exit(tracer_returncode)
 
-        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
             self._wait_solver(p_solver)
 
-        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
             if p_solver in RUNNING_PROCESSES:
                 RUNNING_PROCESSES.remove(p_solver)
 
-        p_solver_log.close()
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver_log_name:
+            p_solver_log.close()
 
         # delete shared memory (solver may have crashed)
-        IPC_RMID = 0
-        shm_keys = [
-            int(env['EXPR_POOL_SHM_KEY'], 16),
-            int(env['QUERY_SHM_KEY'], 16),
-            int(env['BITMAP_SHM_KEY'], 16),
-        ]
-        for shm_key in shm_keys:
-            shm_id = self.libc.shmget(ctypes.c_int(
-                shm_key), ctypes.c_int(1), ctypes.c_int(0))
-            if shm_id > 0:
-                r = self.libc.shmctl(ctypes.c_int(
-                    shm_id), ctypes.c_int(IPC_RMID), ctypes.c_int(0))
-                logger.info("Shared memory detach on (%s, %s): %s" %
-                      (shm_key, shm_id, r))
+        if not forkserver_mode:
+            self._cleanup_shm_for_env(env)
 
         # parse tracer logs for known errors/warnings
         input_timeout = False
@@ -856,16 +1053,17 @@ class Executor(object):
                             self.__warning_log.add(
                                 "[tracer warning]: %s" % line)
             """
-            with open(p_solver_log_name, 'r', encoding="utf8", errors='ignore') as log:
-                for line in log:
-                    """
-                    if 'PROGRAM ABORT' in line:
-                        if line not in self.__warning_log:
-                            self.__warning_log.add(
-                                "[solver warning]: %s" % line)
-                    """
-                    if "Solving time exceded budget" in line:
-                        input_timeout = True
+            for solver_log_name in solver_log_files:
+                with open(solver_log_name, 'r', encoding="utf8", errors='ignore') as log:
+                    for line in log:
+                        """
+                        if 'PROGRAM ABORT' in line:
+                            if line not in self.__warning_log:
+                                self.__warning_log.add(
+                                    "[solver warning]: %s" % line)
+                        """
+                        if "Solving time exceded budget" in line:
+                            input_timeout = True
 
         if input_timeout:
             os.system("cp " + testcase + " " + self.__get_timeout_dir() + "/" + target)
@@ -908,9 +1106,8 @@ class Executor(object):
 
         os.unlink(global_bitmap_pre_run)
 
-        if tracer_returncode == -11:
-            self._forkserver_session_log.flush()
-            with open(self._forkserver_session_log.name, "r") as f:
+        if tracer_returncode == -11 and forkserver_mode and forkserver_session_log_path:
+            with open(forkserver_session_log_path, "r") as f:
                 log_lines = f.readlines()
                 qemu_segfault = True
                 for line in log_lines:
@@ -921,7 +1118,7 @@ class Executor(object):
                 if qemu_segfault:
                     logger.info("[FUZZOLIC] [error] QEMU tracer crashed with SIGSEGV.")
                     sys.exit(-11)
-        if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver.returncode == -6:
+        if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver.returncode == -6:
             sys.exit(-11)
 
     def __check_testcase(self, t, run_id, k, target, global_bitmap_pre_run):
