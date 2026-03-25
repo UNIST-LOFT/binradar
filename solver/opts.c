@@ -77,6 +77,13 @@ void parse_opts(int argc, char* argv[], Config* config)
     }
     assert(config->query_shm_key != 0 && "Missing QUERY_SHM_KEY");
 
+    var = getenv("MUTATION_REQ_SHM_KEY");
+    if (var) {
+        config->mutation_req_shm_key = (uintptr_t)strtoull(var, NULL, 16);
+        assert(config->mutation_req_shm_key != ULLONG_MAX);
+    }
+    assert(config->mutation_req_shm_key != 0 && "Missing MUTATION_REQ_SHM_KEY");
+
 #if BRANCH_COVERAGE == FUZZOLIC
     var = getenv("BITMAP_SHM_KEY");
     if (var) {

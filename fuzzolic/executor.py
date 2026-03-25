@@ -497,9 +497,11 @@ class Executor(object):
         env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
         env['QUERY_SHM_KEY'] = hex(random.getrandbits(32))
         env['BITMAP_SHM_KEY'] = hex(random.getrandbits(32))
+        env['MUTATION_REQ_SHM_KEY'] = hex(random.getrandbits(32))
 
     def _cleanup_shm_for_env(self, env):
-        if 'EXPR_POOL_SHM_KEY' not in env or 'QUERY_SHM_KEY' not in env or 'BITMAP_SHM_KEY' not in env:
+        if ('EXPR_POOL_SHM_KEY' not in env or 'QUERY_SHM_KEY' not in env or
+            'BITMAP_SHM_KEY' not in env or 'MUTATION_REQ_SHM_KEY' not in env):
             return
 
         IPC_RMID = 0
@@ -507,6 +509,7 @@ class Executor(object):
             int(env['EXPR_POOL_SHM_KEY'], 16),
             int(env['QUERY_SHM_KEY'], 16),
             int(env['BITMAP_SHM_KEY'], 16),
+            int(env['MUTATION_REQ_SHM_KEY'], 16),
         ]
         for shm_key in shm_keys:
             shm_id = self.libc.shmget(ctypes.c_int(shm_key), ctypes.c_int(1), ctypes.c_int(0))
@@ -518,6 +521,9 @@ class Executor(object):
                               base_env, force_smt=False, analyze_on_first_iteration=True):
         env = base_env.copy()
         self._assign_random_shm_keys(env)
+        if phase_name == 'memory':
+            env['BINRADAR_SOLVER_MUTATION_MODE'] = '1'
+            env['BINRADAR_PRESERVE_CHILD_QUERIES'] = '0'
 
         p_solver_log_name = run_dir + f'/solver-{phase_name}.log'
         p_solver_log = open(p_solver_log_name, 'w')
@@ -599,6 +605,13 @@ class Executor(object):
             forkserver.start()
             RUNNING_PROCESSES.append(forkserver.proc)
 
+            if (phase_name == 'memory' and self.debug != 'no_solver' and
+                    self.debug != 'coverage' and p_solver is not None and
+                    not solver_signaled):
+                logger.info(f'[FUZZOLIC] [{phase_name}] Triggering solver before first forkserver run.')
+                p_solver.send_signal(signal.SIGUSR1)
+                solver_signaled = True
+
             i = 0
             while True:
                 forkserver_result = forkserver.run_testcase(run_dir)
@@ -608,11 +621,12 @@ class Executor(object):
                     logger.info(f'[FUZZOLIC] [{phase_name}] Triggering solver during forkserver session.')
                     p_solver.send_signal(signal.SIGUSR1)
                     solver_signaled = True
-                    self._wait_solver(p_solver)
-                    if p_solver in RUNNING_PROCESSES:
-                        RUNNING_PROCESSES.remove(p_solver)
+                    if phase_name != 'memory':
+                        self._wait_solver(p_solver)
+                        if p_solver in RUNNING_PROCESSES:
+                            RUNNING_PROCESSES.remove(p_solver)
 
-                if forkserver_result.should_halt:
+                if phase_name == "seed" or forkserver_result.should_halt:
                     break
                 i += 1
 
@@ -631,6 +645,8 @@ class Executor(object):
                 solver_signaled = True
 
             if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
+                if phase_name == 'memory':
+                    p_solver.send_signal(signal.SIGUSR2)
                 self._wait_solver(p_solver)
                 if p_solver in RUNNING_PROCESSES:
                     RUNNING_PROCESSES.remove(p_solver)
@@ -786,7 +802,11 @@ class Executor(object):
                     logger.error(f"[binradar] [error] no crash found in probe result.")
                     exit(1)
                 else:
-                    return crash[-1]["hit-count"]
+                    hit_count = int(crash[-1]["hit-count"])
+                    if hit_count <= 0:
+                        logger.warning(f"[binradar] [probe] invalid hit-count={hit_count}. Falling back to 1.")
+                        return 1
+                    return hit_count
         else:
             logger.error(f"[binradar] [error] crash call index file not found: {probe_file}. Using default=1")
             exit(1)
@@ -931,6 +951,9 @@ class Executor(object):
             self._assign_random_shm_keys(env)
             if self._binradar_probe_hit_count == 0:
                 self._binradar_probe_hit_count = self._run_binradar_probe(testcase, run_dir, env)
+                if self._binradar_probe_hit_count <= 0:
+                    logger.warning(f"[binradar] [probe] non-positive target hit count={self._binradar_probe_hit_count}. Using 1.")
+                    self._binradar_probe_hit_count = 1
             phase_env = env.copy()
             phase_env["BINRADAR_FORKSERVER_ENABLE"] = "1"
             phase_env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self._binradar_probe_hit_count)

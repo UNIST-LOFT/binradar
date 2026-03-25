@@ -85,6 +85,7 @@ typedef struct Config {
     //
     uint64_t    expr_pool_shm_key;
     uint64_t    query_shm_key;
+    uint64_t    mutation_req_shm_key;
 #if BRANCH_COVERAGE == FUZZOLIC
     uint64_t    bitmap_shm_key;
 #endif

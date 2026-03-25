@@ -59,6 +59,10 @@ Expr*      pool;
 static int    query_shm_id = -1;
 static Query* next_query;
 static Query* query_queue;
+static int mutation_req_shm_id = -1;
+static MutationRequestShm* mutation_req_shm = NULL;
+static MutationRequestShm* mutation_resp_shm = NULL;
+static int mutation_mode_enabled = 0;
 
 uint8_t printed[MAX_PRINT_CHECK];
 static ssize_t query_pre_target_range = -1;
@@ -173,6 +177,8 @@ static uint64_t eval_data[MAX_INPUTS_EXPRS];
 
 uint64_t conc_query_eval_value(Z3_context ctx, Z3_ast query, uint64_t* data,
                                uint8_t* symbols_sizes, size_t size, uint32_t* depth);
+Z3_ast smt_query_to_z3_wrapper(Expr* query, uintptr_t is_const_value,
+                               size_t width, GHashTable** inputs);
 
 static int load_query_window_config(void)
 {
@@ -218,6 +224,135 @@ static int load_query_window_config(void)
     sbsv_parser_free(parser);
     fclose(fp);
     return valid ? 1 : 0;
+}
+
+typedef struct MutationAliasResult {
+    uint64_t value;
+    uint32_t size;
+    uint8_t  ok;
+} MutationAliasResult;
+
+static int mutation_eval_candidate_expr(Expr* expr, uint32_t size, uint64_t* out_value)
+{
+    if (expr == NULL || out_value == NULL || size == 0 || size > 8) {
+        return 0;
+    }
+
+    if (expr < pool || expr >= (pool + EXPR_POOL_CAPACITY)) {
+        return 0;
+    }
+
+    GHashTable* inputs = NULL;
+    Z3_ast z3_expr = smt_query_to_z3_wrapper(expr, 0, size * 8, &inputs);
+    if (inputs) {
+        g_hash_table_destroy(inputs);
+    }
+    if (!z3_expr) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < testcase.size; i++) {
+        eval_data[i] = testcase.data[i];
+    }
+
+    *out_value = conc_query_eval_value(smt_solver.ctx, z3_expr, eval_data,
+                                       symbols_sizes, symbols_count, NULL);
+    return 1;
+}
+
+static int mutation_service_once(void)
+{
+    if (!mutation_mode_enabled || mutation_req_shm == NULL || mutation_resp_shm == NULL) {
+        return 0;
+    }
+
+    if (mutation_req_shm->state != MUTATION_CH_READY) {
+        return 0;
+    }
+
+    mutation_req_shm->state = MUTATION_CH_BUSY;
+    MEM_BARRIER();
+
+    mutation_resp_shm->version = MUTATION_IPC_VERSION;
+    mutation_resp_shm->seq = mutation_req_shm->seq;
+
+    uint32_t count = mutation_req_shm->count;
+    if (count > MUTATION_MAX_ITEMS) {
+        count = MUTATION_MAX_ITEMS;
+    }
+    mutation_resp_shm->count = count;
+
+    GHashTable* alias_cache = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                                    NULL, g_free);
+
+    for (uint32_t i = 0; i < count; i++) {
+        MutationCandidate* cand = &mutation_req_shm->items[i];
+        MutationWritePlan* out = &mutation_resp_shm->items[i];
+        out->addr = cand->addr;
+        out->size = cand->size;
+        out->kind = 0;
+        out->expr = cand->expr;
+        memset(out->value, 0, sizeof(out->value));
+
+        uint32_t sz = cand->size;
+        if (sz > sizeof(out->value)) {
+            sz = sizeof(out->value);
+        }
+
+        uint64_t solved_value = 0;
+        int solved = 0;
+        if (cand->expr != NULL && sz > 0) {
+            MutationAliasResult* cached =
+                (MutationAliasResult*)g_hash_table_lookup(alias_cache, cand->expr);
+            if (cached != NULL && cached->size == sz && cached->ok) {
+                solved_value = cached->value;
+                solved = 1;
+            } else {
+                MutationAliasResult* updated = cached;
+                if (updated == NULL) {
+                    updated = g_new0(MutationAliasResult, 1);
+                    g_hash_table_insert(alias_cache, cand->expr, updated);
+                }
+                updated->size = sz;
+                updated->ok = mutation_eval_candidate_expr(cand->expr, sz, &updated->value);
+                if (updated->ok) {
+                    solved_value = updated->value;
+                    solved = 1;
+                }
+            }
+        }
+
+        if (sz > 0) {
+            if (solved) {
+                memcpy(out->value, &solved_value, sz);
+                out->kind = 1;
+            } else {
+                memcpy(out->value, cand->value, sz);
+            }
+        }
+    }
+
+    g_hash_table_destroy(alias_cache);
+
+    MEM_BARRIER();
+    mutation_resp_shm->state = MUTATION_CH_READY;
+    mutation_req_shm->state = MUTATION_CH_EMPTY;
+    MEM_BARRIER();
+    return 1;
+}
+
+static void mutation_service_loop(struct timespec* polling_time)
+{
+    if (!mutation_mode_enabled) {
+        return;
+    }
+
+    printf("[SOLVER] Entering mutation service loop...\n");
+    while (1) {
+        if (!mutation_service_once()) {
+            nanosleep(polling_time, NULL);
+        }
+    }
 }
 
 static void exitf(const char* message)
@@ -5296,7 +5431,7 @@ static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs
     int is_sat = 0;
 #if !DISABLE_SMT
 #if VERBOSE
-    printf("Running a query with Z3 %u...\n", GET_QUERY_IDX(q));
+    printf("Running a query with Z3 %lu...\n", GET_QUERY_IDX(q));
     print_z3_ast(z3_neg_query);
 #endif
     is_sat = smt_query_check(solver, GET_QUERY_IDX(q), 0);
@@ -7216,7 +7351,7 @@ static void smt_query(Query* q)
         print_expr(q->query);
     }
 #endif
-    fprintf(stderr, "[query] [index %lu] [addr %p] [op %s] [model %d]\n",  
+    fprintf(stderr, "[query] [index %lu] [addr %lx] [op %s] [model %d]\n",  
         GET_QUERY_IDX(q), q->address,
         opkind_to_str(q->query->opkind), q->model);
     print_expr(q->query);
@@ -7278,6 +7413,9 @@ static void cleanup(void)
     if (query_shm_id > 0) {
         // printf("DELETING SHM: %u %lu\n", config.query_shm_key, query_shm_id);
         shmctl(query_shm_id, IPC_RMID, NULL);
+    }
+    if (mutation_req_shm_id > 0) {
+        shmctl(mutation_req_shm_id, IPC_RMID, NULL);
     }
 #if BRANCH_COVERAGE == FUZZOLIC
     if (bitmap_shm_id) {
@@ -7365,6 +7503,9 @@ int main(int argc, char* argv[])
 {
     parse_opts(argc, argv, &config);
 
+    const char* mutation_mode = getenv("BINRADAR_SOLVER_MUTATION_MODE");
+    mutation_mode_enabled = (mutation_mode && mutation_mode[0] && strcmp(mutation_mode, "0") != 0) ? 1 : 0;
+
     load_initial_testcase();
 
     smt_init();
@@ -7403,6 +7544,13 @@ int main(int argc, char* argv[])
     if (query_shm_id < 0)
         PFATAL("shmget() failed");
 
+    printf("[SOLVER] Creating mutation SHM request (key=%lu)...\n", config.mutation_req_shm_key);
+    mutation_req_shm_id = shmget(config.mutation_req_shm_key,
+                                 sizeof(MutationRequestShm) * 2,
+                                 IPC_CREAT | 0666);
+    if (mutation_req_shm_id < 0)
+        PFATAL("shmget() failed");
+
 #if BRANCH_COVERAGE == FUZZOLIC
     bitmap_shm_id = shmget(config.bitmap_shm_key, // IPC_PRIVATE,
                            sizeof(uint8_t) * BRANCH_BITMAP_SIZE,
@@ -7430,6 +7578,12 @@ int main(int argc, char* argv[])
     if (!next_query)
         PFATAL("shmat() failed");
 
+    mutation_req_shm = shmat(mutation_req_shm_id, NULL, 0);
+    if (mutation_req_shm == (void*)-1)
+        PFATAL("shmat() failed");
+
+    mutation_resp_shm = mutation_req_shm + 1;
+
     printf("[SOLVER] Attached to shared memories...\n");
 
     next_query[0].query = 0;
@@ -7447,6 +7601,13 @@ int main(int argc, char* argv[])
     // reset pool and query queue (this may take some time...)
     memset(pool, 0, sizeof(Expr) * EXPR_POOL_CAPACITY);
     memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
+    memset(mutation_req_shm, 0, sizeof(MutationRequestShm) * 2);
+    memset(mutation_resp_shm, 0, sizeof(MutationRequestShm));
+
+    mutation_req_shm->version = MUTATION_IPC_VERSION;
+    mutation_req_shm->state = MUTATION_CH_EMPTY;
+    mutation_resp_shm->version = MUTATION_IPC_VERSION;
+    mutation_resp_shm->state = MUTATION_CH_EMPTY;
 
     next_query[0].query = (void*)SHM_READY;
 
@@ -7483,6 +7644,8 @@ int main(int argc, char* argv[])
     get_time(&start);
 
     while (1) {
+        mutation_service_once();
+
         if (next_query[0].query == NULL) {
 #if 0
             nanosleep(&polling_time, NULL);
@@ -7539,6 +7702,8 @@ int main(int argc, char* argv[])
 #endif
         }
     }
+
+    mutation_service_loop(&polling_time);
 
     return 0;
 }
