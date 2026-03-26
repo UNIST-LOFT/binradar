@@ -174,11 +174,18 @@ static uint64_t symbols_count = 0;
 static uint64_t unsat_time    = 0;
 static uint64_t unsat_count   = 0;
 static uint64_t eval_data[MAX_INPUTS_EXPRS];
+static uint32_t mutation_rand_state = 0;
 
 uint64_t conc_query_eval_value(Z3_context ctx, Z3_ast query, uint64_t* data,
                                uint8_t* symbols_sizes, size_t size, uint32_t* depth);
 Z3_ast smt_query_to_z3_wrapper(Expr* query, uintptr_t is_const_value,
                                size_t width, GHashTable** inputs);
+static int smt_query_check_eval_uint64(Z3_solver solver, size_t idx, Z3_ast e,
+                                       uintptr_t* value, uintptr_t dump_idx);
+static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver,
+                                      int skip_expr);
+static inline void add_deps_to_solver_upto(GHashTable* inputs, Z3_solver solver,
+                                           ssize_t max_query_idx, int skip_expr);
 
 static int load_query_window_config(void)
 {
@@ -226,15 +233,56 @@ static int load_query_window_config(void)
     return valid ? 1 : 0;
 }
 
+static uint32_t mutation_next_seed(void)
+{
+    if (mutation_rand_state == 0) {
+        mutation_rand_state = (uint32_t)time(NULL) ^ (uint32_t)getpid() ^
+                              (uint32_t)(uintptr_t)&mutation_rand_state;
+    }
+    mutation_rand_state = mutation_rand_state * 1664525u + 1013904223u;
+    return mutation_rand_state;
+}
+
+static Z3_solver mutation_new_solver(uint32_t random_seed)
+{
+    Z3_solver solver = Z3_mk_solver(smt_solver.ctx);
+    Z3_solver_inc_ref(smt_solver.ctx, solver);
+
+    Z3_params params = Z3_mk_params(smt_solver.ctx);
+    Z3_symbol timeout = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
+    Z3_symbol seed = Z3_mk_string_symbol(smt_solver.ctx, "random_seed");
+    Z3_params_set_uint(smt_solver.ctx, params, timeout, SOLVER_TIMEOUT_Z3_MS);
+    Z3_params_set_uint(smt_solver.ctx, params, seed, random_seed);
+    Z3_solver_set_params(smt_solver.ctx, solver, params);
+    return solver;
+}
+
+static void mutation_del_solver(Z3_solver solver)
+{
+    if (solver) {
+        Z3_solver_dec_ref(smt_solver.ctx, solver);
+    }
+}
+
 typedef struct MutationAliasResult {
     uint64_t value;
     uint32_t size;
     uint8_t  ok;
 } MutationAliasResult;
 
-static int mutation_eval_candidate_expr(Expr* expr, uint32_t size, uint64_t* out_value)
+static uint64_t mutation_req_total = 0;
+static uint64_t mutation_item_total = 0;
+static uint64_t mutation_solved_total = 0;
+static uint64_t mutation_fallback_total = 0;
+static uint64_t mutation_alias_hit_total = 0;
+static uint64_t mutation_alias_miss_total = 0;
+
+static int mutation_eval_candidate_expr(Expr* expr, uint32_t size,
+                                        const uint8_t* original_value,
+                                        uint64_t* out_value)
 {
-    if (expr == NULL || out_value == NULL || size == 0 || size > 8) {
+    if (expr == NULL || out_value == NULL || original_value == NULL ||
+        size == 0 || size > 8) {
         return 0;
     }
 
@@ -244,19 +292,43 @@ static int mutation_eval_candidate_expr(Expr* expr, uint32_t size, uint64_t* out
 
     GHashTable* inputs = NULL;
     Z3_ast z3_expr = smt_query_to_z3_wrapper(expr, 0, size * 8, &inputs);
-    if (inputs) {
-        g_hash_table_destroy(inputs);
-    }
     if (!z3_expr) {
+        if (inputs) {
+            g_hash_table_destroy(inputs);
+        }
         return 0;
     }
 
-    for (size_t i = 0; i < testcase.size; i++) {
-        eval_data[i] = testcase.data[i];
+    uint64_t original_u64 = 0;
+    memcpy(&original_u64, original_value, size);
+
+    Z3_solver solver = mutation_new_solver(mutation_next_seed());
+    if (inputs) {
+        if (query_pre_target_range >= 0) {
+            add_deps_to_solver_upto(inputs, solver, query_pre_target_range, -1);
+        } else {
+            add_deps_to_solver(inputs, solver, -1);
+        }
     }
 
-    *out_value = conc_query_eval_value(smt_solver.ctx, z3_expr, eval_data,
-                                       symbols_sizes, symbols_count, NULL);
+    Z3_ast orig_const = smt_new_const(original_u64, size * 8);
+    Z3_ast neq = Z3_mk_not(smt_solver.ctx,
+                           Z3_mk_eq(smt_solver.ctx, z3_expr, orig_const));
+    Z3_solver_assert(smt_solver.ctx, solver, neq);
+
+    uintptr_t solved = 0;
+    int sat = smt_query_check_eval_uint64(solver, 0, z3_expr, &solved, 0);
+
+    mutation_del_solver(solver);
+    if (inputs) {
+        g_hash_table_destroy(inputs);
+    }
+
+    if (!sat) {
+        return 0;
+    }
+
+    *out_value = solved;
     return 1;
 }
 
@@ -281,6 +353,11 @@ static int mutation_service_once(void)
         count = MUTATION_MAX_ITEMS;
     }
     mutation_resp_shm->count = count;
+
+    uint32_t solved_count = 0;
+    uint32_t fallback_count = 0;
+    uint32_t alias_hit_count = 0;
+    uint32_t alias_miss_count = 0;
 
     GHashTable* alias_cache = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                                     NULL, g_free);
@@ -307,6 +384,7 @@ static int mutation_service_once(void)
             if (cached != NULL && cached->size == sz && cached->ok) {
                 solved_value = cached->value;
                 solved = 1;
+                alias_hit_count += 1;
             } else {
                 MutationAliasResult* updated = cached;
                 if (updated == NULL) {
@@ -314,11 +392,14 @@ static int mutation_service_once(void)
                     g_hash_table_insert(alias_cache, cand->expr, updated);
                 }
                 updated->size = sz;
-                updated->ok = mutation_eval_candidate_expr(cand->expr, sz, &updated->value);
+                updated->ok = mutation_eval_candidate_expr(cand->expr, sz,
+                                                           cand->value,
+                                                           &updated->value);
                 if (updated->ok) {
                     solved_value = updated->value;
                     solved = 1;
                 }
+                alias_miss_count += 1;
             }
         }
 
@@ -326,13 +407,27 @@ static int mutation_service_once(void)
             if (solved) {
                 memcpy(out->value, &solved_value, sz);
                 out->kind = 1;
+                solved_count += 1;
             } else {
                 memcpy(out->value, cand->value, sz);
+                fallback_count += 1;
             }
         }
     }
 
     g_hash_table_destroy(alias_cache);
+
+    mutation_req_total += 1;
+    mutation_item_total += count;
+    mutation_solved_total += solved_count;
+    mutation_fallback_total += fallback_count;
+    mutation_alias_hit_total += alias_hit_count;
+    mutation_alias_miss_total += alias_miss_count;
+
+    fprintf(stderr,
+            "[mutation] [seq %lu] [count %u] [solved %u] [fallback %u] [alias-hit %u] [alias-miss %u] [pre-target %ld]\n",
+            mutation_req_shm->seq, count, solved_count, fallback_count,
+            alias_hit_count, alias_miss_count, query_pre_target_range);
 
     MEM_BARRIER();
     mutation_resp_shm->state = MUTATION_CH_READY;
@@ -353,6 +448,19 @@ static void mutation_service_loop(struct timespec* polling_time)
             nanosleep(polling_time, NULL);
         }
     }
+}
+
+static void mutation_log_summary(void)
+{
+    if (!mutation_mode_enabled) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[mutation] [summary] [req %lu] [items %lu] [solved %lu] [fallback %lu] [alias-hit %lu] [alias-miss %lu] [pre-target %ld]\n",
+            mutation_req_total, mutation_item_total, mutation_solved_total,
+            mutation_fallback_total, mutation_alias_hit_total,
+            mutation_alias_miss_total, query_pre_target_range);
 }
 
 static void exitf(const char* message)
@@ -723,6 +831,44 @@ static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver, int 
                 g_hash_table_add(added_exprs, key);
                 size_t query_dep_idx = (size_t)key;
                 if (skip_expr == query_dep_idx) {
+                    continue;
+                }
+                assert(z3_ast_exprs[query_dep_idx]);
+                Z3_solver_assert(smt_solver.ctx, solver,
+                                 z3_ast_exprs[query_dep_idx]);
+            }
+        }
+    }
+
+    f_hash_table_destroy(added_exprs);
+}
+
+static inline void add_deps_to_solver_upto(GHashTable* inputs, Z3_solver solver,
+                                           ssize_t max_query_idx, int skip_expr)
+{
+    GHashTableIter iter, iter2;
+    gpointer       key, value;
+
+    GHashTable* added_exprs = f_hash_table_new(NULL, NULL);
+
+    g_hash_table_iter_init(&iter, inputs);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        size_t      input_idx = (size_t)key;
+        Dependency* dep       = dependency_graph[input_idx];
+
+        if (!dep) {
+            continue;
+        }
+
+        g_hash_table_iter_init(&iter2, dep->exprs);
+        while (g_hash_table_iter_next(&iter2, &key, &value)) {
+            if (g_hash_table_contains(added_exprs, key) != TRUE) {
+                g_hash_table_add(added_exprs, key);
+                size_t query_dep_idx = (size_t)key;
+                if (skip_expr == (int)query_dep_idx) {
+                    continue;
+                }
+                if (max_query_idx >= 0 && (ssize_t)query_dep_idx > max_query_idx) {
                     continue;
                 }
                 assert(z3_ast_exprs[query_dep_idx]);
@@ -7404,6 +7550,7 @@ static void cleanup(void)
     need_to_clean = 0;
 
     SAYF("Cleaning up...\n");
+    mutation_log_summary();
     smt_destroy();
 
     if (expr_pool_shm_id > 0) {
@@ -7602,7 +7749,6 @@ int main(int argc, char* argv[])
     memset(pool, 0, sizeof(Expr) * EXPR_POOL_CAPACITY);
     memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
     memset(mutation_req_shm, 0, sizeof(MutationRequestShm) * 2);
-    memset(mutation_resp_shm, 0, sizeof(MutationRequestShm));
 
     mutation_req_shm->version = MUTATION_IPC_VERSION;
     mutation_req_shm->state = MUTATION_CH_EMPTY;
