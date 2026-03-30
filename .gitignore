@@ -5,6 +5,7 @@ workdir*
 build
 *.out
 *.log
+*.diff
 logs
 utils/AFLplusplus/
 solver/solver-fuzzy

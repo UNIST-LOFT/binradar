@@ -20,8 +20,6 @@ int model_malloc_max(int size)
 
 
 int main(int argc, char* argv[]) {
-    uint8_t input[MAX_INPUT];
-    memset(input, 0, MAX_INPUT);
     if (argc != 2) {
         printf("Error\n");
         return 1;
@@ -31,14 +29,10 @@ int main(int argc, char* argv[]) {
         printf("Error\n");
         return 1;
     }
-    ssize_t consumed = fread(input, 1, sizeof input, file);
-    if (consumed <= 0) {
-        return 0;
-    }
 
-    size_t len = (size_t)consumed;
     int result;
-    sscanf(input, "%d", &result);
+    fread(&result, sizeof(result), 1, file);
     model_malloc_max(result);
+    fclose(file);
     return 0;
 }

@@ -14,6 +14,7 @@
 #include "i386.h"
 #include "fuzzy-sat/lib/z3-fuzzy.h"
 #include "libsbsv/include/sbsv.h"
+#include "xxHash/xxhash.h"
 
 
 #define EXPR_QUEUE_POLLING_TIME_SECS 0
@@ -59,10 +60,6 @@ Expr*      pool;
 static int    query_shm_id = -1;
 static Query* next_query;
 static Query* query_queue;
-static int mutation_req_shm_id = -1;
-static MutationRequestShm* mutation_req_shm = NULL;
-static MutationRequestShm* mutation_resp_shm = NULL;
-static int mutation_mode_enabled = 0;
 
 uint8_t printed[MAX_PRINT_CHECK];
 static ssize_t query_pre_target_range = -1;
@@ -233,13 +230,13 @@ static int load_query_window_config(void)
     return valid ? 1 : 0;
 }
 
+static uint32_t hash_u32(uint32_t x) {
+    return XXH32(&x, sizeof(x), 42);
+}
+
 static uint32_t mutation_next_seed(void)
 {
-    if (mutation_rand_state == 0) {
-        mutation_rand_state = (uint32_t)time(NULL) ^ (uint32_t)getpid() ^
-                              (uint32_t)(uintptr_t)&mutation_rand_state;
-    }
-    mutation_rand_state = mutation_rand_state * 1664525u + 1013904223u;
+    mutation_rand_state = hash_u32(mutation_rand_state + 1);
     return mutation_rand_state;
 }
 
@@ -276,192 +273,6 @@ static uint64_t mutation_solved_total = 0;
 static uint64_t mutation_fallback_total = 0;
 static uint64_t mutation_alias_hit_total = 0;
 static uint64_t mutation_alias_miss_total = 0;
-
-static int mutation_eval_candidate_expr(Expr* expr, uint32_t size,
-                                        const uint8_t* original_value,
-                                        uint64_t* out_value)
-{
-    if (expr == NULL || out_value == NULL || original_value == NULL ||
-        size == 0 || size > 8) {
-        return 0;
-    }
-
-    if (expr < pool || expr >= (pool + EXPR_POOL_CAPACITY)) {
-        return 0;
-    }
-
-    GHashTable* inputs = NULL;
-    Z3_ast z3_expr = smt_query_to_z3_wrapper(expr, 0, size * 8, &inputs);
-    if (!z3_expr) {
-        if (inputs) {
-            g_hash_table_destroy(inputs);
-        }
-        return 0;
-    }
-
-    uint64_t original_u64 = 0;
-    memcpy(&original_u64, original_value, size);
-
-    Z3_solver solver = mutation_new_solver(mutation_next_seed());
-    if (inputs) {
-        if (query_pre_target_range >= 0) {
-            add_deps_to_solver_upto(inputs, solver, query_pre_target_range, -1);
-        } else {
-            add_deps_to_solver(inputs, solver, -1);
-        }
-    }
-
-    Z3_ast orig_const = smt_new_const(original_u64, size * 8);
-    Z3_ast neq = Z3_mk_not(smt_solver.ctx,
-                           Z3_mk_eq(smt_solver.ctx, z3_expr, orig_const));
-    Z3_solver_assert(smt_solver.ctx, solver, neq);
-
-    uintptr_t solved = 0;
-    int sat = smt_query_check_eval_uint64(solver, 0, z3_expr, &solved, 0);
-
-    mutation_del_solver(solver);
-    if (inputs) {
-        g_hash_table_destroy(inputs);
-    }
-
-    if (!sat) {
-        return 0;
-    }
-
-    *out_value = solved;
-    return 1;
-}
-
-static int mutation_service_once(void)
-{
-    if (!mutation_mode_enabled || mutation_req_shm == NULL || mutation_resp_shm == NULL) {
-        return 0;
-    }
-
-    if (mutation_req_shm->state != MUTATION_CH_READY) {
-        return 0;
-    }
-
-    mutation_req_shm->state = MUTATION_CH_BUSY;
-    MEM_BARRIER();
-
-    mutation_resp_shm->version = MUTATION_IPC_VERSION;
-    mutation_resp_shm->seq = mutation_req_shm->seq;
-
-    uint32_t count = mutation_req_shm->count;
-    if (count > MUTATION_MAX_ITEMS) {
-        count = MUTATION_MAX_ITEMS;
-    }
-    mutation_resp_shm->count = count;
-
-    uint32_t solved_count = 0;
-    uint32_t fallback_count = 0;
-    uint32_t alias_hit_count = 0;
-    uint32_t alias_miss_count = 0;
-
-    GHashTable* alias_cache = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                                    NULL, g_free);
-
-    for (uint32_t i = 0; i < count; i++) {
-        MutationCandidate* cand = &mutation_req_shm->items[i];
-        MutationWritePlan* out = &mutation_resp_shm->items[i];
-        out->addr = cand->addr;
-        out->size = cand->size;
-        out->kind = 0;
-        out->expr = cand->expr;
-        memset(out->value, 0, sizeof(out->value));
-
-        uint32_t sz = cand->size;
-        if (sz > sizeof(out->value)) {
-            sz = sizeof(out->value);
-        }
-
-        uint64_t solved_value = 0;
-        int solved = 0;
-        if (cand->expr != NULL && sz > 0) {
-            MutationAliasResult* cached =
-                (MutationAliasResult*)g_hash_table_lookup(alias_cache, cand->expr);
-            if (cached != NULL && cached->size == sz && cached->ok) {
-                solved_value = cached->value;
-                solved = 1;
-                alias_hit_count += 1;
-            } else {
-                MutationAliasResult* updated = cached;
-                if (updated == NULL) {
-                    updated = g_new0(MutationAliasResult, 1);
-                    g_hash_table_insert(alias_cache, cand->expr, updated);
-                }
-                updated->size = sz;
-                updated->ok = mutation_eval_candidate_expr(cand->expr, sz,
-                                                           cand->value,
-                                                           &updated->value);
-                if (updated->ok) {
-                    solved_value = updated->value;
-                    solved = 1;
-                }
-                alias_miss_count += 1;
-            }
-        }
-
-        if (sz > 0) {
-            if (solved) {
-                memcpy(out->value, &solved_value, sz);
-                out->kind = 1;
-                solved_count += 1;
-            } else {
-                memcpy(out->value, cand->value, sz);
-                fallback_count += 1;
-            }
-        }
-    }
-
-    g_hash_table_destroy(alias_cache);
-
-    mutation_req_total += 1;
-    mutation_item_total += count;
-    mutation_solved_total += solved_count;
-    mutation_fallback_total += fallback_count;
-    mutation_alias_hit_total += alias_hit_count;
-    mutation_alias_miss_total += alias_miss_count;
-
-    fprintf(stderr,
-            "[mutation] [seq %lu] [count %u] [solved %u] [fallback %u] [alias-hit %u] [alias-miss %u] [pre-target %ld]\n",
-            mutation_req_shm->seq, count, solved_count, fallback_count,
-            alias_hit_count, alias_miss_count, query_pre_target_range);
-
-    MEM_BARRIER();
-    mutation_resp_shm->state = MUTATION_CH_READY;
-    mutation_req_shm->state = MUTATION_CH_EMPTY;
-    MEM_BARRIER();
-    return 1;
-}
-
-static void mutation_service_loop(struct timespec* polling_time)
-{
-    if (!mutation_mode_enabled) {
-        return;
-    }
-
-    printf("[SOLVER] Entering mutation service loop...\n");
-    while (1) {
-        if (!mutation_service_once()) {
-            nanosleep(polling_time, NULL);
-        }
-    }
-}
-
-static void mutation_log_summary(void)
-{
-    if (!mutation_mode_enabled) {
-        return;
-    }
-
-    fprintf(stderr,
-            "[mutation] [summary] [req %lu] [items %lu] [solved %lu] [fallback %lu] [alias-hit %lu] [alias-miss %lu] [pre-target %ld]\n",
-            mutation_req_total, mutation_item_total, mutation_solved_total,
-            mutation_fallback_total, mutation_alias_hit_total,
-            mutation_alias_miss_total, query_pre_target_range);
-}
 
 static void exitf(const char* message)
 {
@@ -741,6 +552,9 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
         g_hash_table_iter_init(&iter, current->exprs);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             size_t query_dep_idx = (size_t)key;
+            if (query_dep_idx >= EXPR_QUERY_CAPACITY) {
+                continue;
+            }
             assert(z3_ast_exprs[query_dep_idx]);
             Z3_solver_assert(
                 smt_solver.ctx, solver,
@@ -766,8 +580,11 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
                 // printf("Adding expr %lu for %lu\n", query_dep_idx,
                 // query_idx);
             }
-            *deps = Z3_mk_and(smt_solver.ctx, g_hash_table_size(current->exprs),
-                              and_args);
+            if (k > 0) {
+                *deps = Z3_mk_and(smt_solver.ctx, k, and_args);
+            } else {
+                *deps = Z3_mk_true(smt_solver.ctx);
+            }
             free(and_args);
         } else {
             *deps = Z3_mk_true(smt_solver.ctx);
@@ -830,6 +647,9 @@ static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver, int 
             if (g_hash_table_contains(added_exprs, key) != TRUE) {
                 g_hash_table_add(added_exprs, key);
                 size_t query_dep_idx = (size_t)key;
+                if (query_dep_idx >= EXPR_QUERY_CAPACITY) {
+                    continue;
+                }
                 if (skip_expr == query_dep_idx) {
                     continue;
                 }
@@ -916,6 +736,9 @@ static inline Z3_ast get_deps(GHashTable* inputs)
             if (g_hash_table_contains(added_exprs, key) != TRUE) {
                 g_hash_table_add(added_exprs, key);
                 size_t query_dep_idx = (size_t)key;
+                if (query_dep_idx >= EXPR_QUERY_CAPACITY) {
+                    continue;
+                }
                 assert(z3_ast_exprs[query_dep_idx]);
 #if 0
                 for (size_t i = 0; i < testcase.size; i++) {
@@ -7550,7 +7373,6 @@ static void cleanup(void)
     need_to_clean = 0;
 
     SAYF("Cleaning up...\n");
-    mutation_log_summary();
     smt_destroy();
 
     if (expr_pool_shm_id > 0) {
@@ -7560,9 +7382,6 @@ static void cleanup(void)
     if (query_shm_id > 0) {
         // printf("DELETING SHM: %u %lu\n", config.query_shm_key, query_shm_id);
         shmctl(query_shm_id, IPC_RMID, NULL);
-    }
-    if (mutation_req_shm_id > 0) {
-        shmctl(mutation_req_shm_id, IPC_RMID, NULL);
     }
 #if BRANCH_COVERAGE == FUZZOLIC
     if (bitmap_shm_id) {
@@ -7586,9 +7405,19 @@ void sig_handler(int signo)
 void sig_segfault(int signo)
 {
     printf("\n[SOLVER] Received SIGSEGV\n\n");
+    print_trace();
     save_bitmaps();
     cleanup();
     exit(139); // SIGSEGV
+}
+
+void sig_abort(int signo)
+{
+    printf("\n[SOLVER] Received SIGABRT\n\n");
+    print_trace();
+    save_bitmaps();
+    cleanup();
+    exit(134); // SIGABRT
 }
 
 void sig_usr1(int signo)
@@ -7650,9 +7479,6 @@ int main(int argc, char* argv[])
 {
     parse_opts(argc, argv, &config);
 
-    const char* mutation_mode = getenv("BINRADAR_SOLVER_MUTATION_MODE");
-    mutation_mode_enabled = (mutation_mode && mutation_mode[0] && strcmp(mutation_mode, "0") != 0) ? 1 : 0;
-
     load_initial_testcase();
 
     smt_init();
@@ -7661,6 +7487,7 @@ int main(int argc, char* argv[])
     signal(SIGUSR2, sig_usr2);   // we use this as an alternative
     signal(SIGTERM, sig_handler);
     signal(SIGSEGV, sig_segfault);
+    signal(SIGABRT, sig_abort);
     signal(SIGUSR1, sig_usr1);
 
     concretized_bytes = f_hash_table_new(NULL, NULL);
@@ -7691,13 +7518,6 @@ int main(int argc, char* argv[])
     if (query_shm_id < 0)
         PFATAL("shmget() failed");
 
-    printf("[SOLVER] Creating mutation SHM request (key=%lu)...\n", config.mutation_req_shm_key);
-    mutation_req_shm_id = shmget(config.mutation_req_shm_key,
-                                 sizeof(MutationRequestShm) * 2,
-                                 IPC_CREAT | 0666);
-    if (mutation_req_shm_id < 0)
-        PFATAL("shmget() failed");
-
 #if BRANCH_COVERAGE == FUZZOLIC
     bitmap_shm_id = shmget(config.bitmap_shm_key, // IPC_PRIVATE,
                            sizeof(uint8_t) * BRANCH_BITMAP_SIZE,
@@ -7725,12 +7545,6 @@ int main(int argc, char* argv[])
     if (!next_query)
         PFATAL("shmat() failed");
 
-    mutation_req_shm = shmat(mutation_req_shm_id, NULL, 0);
-    if (mutation_req_shm == (void*)-1)
-        PFATAL("shmat() failed");
-
-    mutation_resp_shm = mutation_req_shm + 1;
-
     printf("[SOLVER] Attached to shared memories...\n");
 
     next_query[0].query = 0;
@@ -7748,12 +7562,6 @@ int main(int argc, char* argv[])
     // reset pool and query queue (this may take some time...)
     memset(pool, 0, sizeof(Expr) * EXPR_POOL_CAPACITY);
     memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
-    memset(mutation_req_shm, 0, sizeof(MutationRequestShm) * 2);
-
-    mutation_req_shm->version = MUTATION_IPC_VERSION;
-    mutation_req_shm->state = MUTATION_CH_EMPTY;
-    mutation_resp_shm->version = MUTATION_IPC_VERSION;
-    mutation_resp_shm->state = MUTATION_CH_EMPTY;
 
     next_query[0].query = (void*)SHM_READY;
 
@@ -7790,7 +7598,6 @@ int main(int argc, char* argv[])
     get_time(&start);
 
     while (1) {
-        mutation_service_once();
 
         if (next_query[0].query == NULL) {
 #if 0
@@ -7848,8 +7655,6 @@ int main(int argc, char* argv[])
 #endif
         }
     }
-
-    mutation_service_loop(&polling_time);
 
     return 0;
 }

@@ -497,11 +497,10 @@ class Executor(object):
         env['EXPR_POOL_SHM_KEY'] = hex(random.getrandbits(32))
         env['QUERY_SHM_KEY'] = hex(random.getrandbits(32))
         env['BITMAP_SHM_KEY'] = hex(random.getrandbits(32))
-        env['MUTATION_REQ_SHM_KEY'] = hex(random.getrandbits(32))
 
     def _cleanup_shm_for_env(self, env):
         if ('EXPR_POOL_SHM_KEY' not in env or 'QUERY_SHM_KEY' not in env or
-            'BITMAP_SHM_KEY' not in env or 'MUTATION_REQ_SHM_KEY' not in env):
+            'BITMAP_SHM_KEY' not in env):
             return
 
         IPC_RMID = 0
@@ -509,7 +508,6 @@ class Executor(object):
             int(env['EXPR_POOL_SHM_KEY'], 16),
             int(env['QUERY_SHM_KEY'], 16),
             int(env['BITMAP_SHM_KEY'], 16),
-            int(env['MUTATION_REQ_SHM_KEY'], 16),
         ]
         for shm_key in shm_keys:
             shm_id = self.libc.shmget(ctypes.c_int(shm_key), ctypes.c_int(1), ctypes.c_int(0))
@@ -522,7 +520,6 @@ class Executor(object):
         env = base_env.copy()
         self._assign_random_shm_keys(env)
         if phase_name == 'memory':
-            env['BINRADAR_SOLVER_MUTATION_MODE'] = '1'
             env['BINRADAR_PRESERVE_CHILD_QUERIES'] = '0'
 
         p_solver_log_name = run_dir + f'/solver-{phase_name}.log'
@@ -1036,8 +1033,12 @@ class Executor(object):
             p_solver.stdin.close()
 
         if tracer_returncode != 0:
-            returncode_str = "(SIGSEGV)" if tracer_returncode == -11 else ""
-            logger.warning("ERROR: tracer has returned code %d %s" %
+            returncode_str = ""
+            if tracer_returncode < 0:
+                returncode_str = f"(guest killed by signal {-tracer_returncode})"
+            else:
+                returncode_str = f"(tracer killed by signal {tracer_returncode})"
+            logger.warning("tracer has returned code %d %s" %
                   (tracer_returncode, returncode_str))
 
         if not forkserver_mode and self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None and not solver_signaled:
