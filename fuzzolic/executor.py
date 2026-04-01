@@ -957,12 +957,12 @@ class Executor(object):
             phase_env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
             phase_env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
 
-            logger.info("[FUZZOLIC] [forkserver] Phase 2/3: seed generation (without analyze_type)")
-            seed_rc, seed_solver_log, seed_session_log = self._run_forkserver_phase(
-                phase_name='seed', testcase=testcase, run_dir=run_dir,
-                p_tracer_args=p_tracer_args, base_env=phase_env,
-                force_smt=force_smt, analyze_on_first_iteration=False)
-            solver_log_files.append(seed_solver_log)
+            # logger.info("[FUZZOLIC] [forkserver] Phase 2/3: seed generation (without analyze_type)")
+            # seed_rc, seed_solver_log, seed_session_log = self._run_forkserver_phase(
+            #     phase_name='seed', testcase=testcase, run_dir=run_dir,
+            #     p_tracer_args=p_tracer_args, base_env=phase_env,
+            #     force_smt=force_smt, analyze_on_first_iteration=False)
+            # solver_log_files.append(seed_solver_log)
 
             logger.info("[FUZZOLIC] [forkserver] Phase 3/3: memory modification (with analyze_type)")
             mem_rc, mem_solver_log, mem_session_log = self._run_forkserver_phase(
@@ -971,9 +971,9 @@ class Executor(object):
                 force_smt=force_smt, analyze_on_first_iteration=True)
             solver_log_files.append(mem_solver_log)
 
-            tracer_returncode = mem_rc if mem_rc != 0 else seed_rc
+            tracer_returncode = mem_rc
             forkserver_session_log_path = mem_session_log
-            logger.info(f"[tracer] [seed rc {seed_rc}] [memory rc {mem_rc}]")
+            logger.info(f"[tracer] [memory {mem_rc}]")
         else:
             p_solver_log = None
             p_tracer_log = open(p_tracer_log_name, 'w')

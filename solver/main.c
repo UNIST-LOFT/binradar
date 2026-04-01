@@ -62,7 +62,30 @@ static Query* next_query;
 static Query* query_queue;
 
 uint8_t printed[MAX_PRINT_CHECK];
-static ssize_t query_pre_target_range = -1;
+static ssize_t query_start_idx = -1;
+static ssize_t query_end_idx = -1;
+enum query_range_mode {
+    QUERY_DEFAULT = 0,
+    QUERY_ADD_DEP = 1,
+    QUERY_NEGATE = 2,
+    QUERY_IGNORE = 3,
+};
+static enum query_range_mode get_query_range_mode(ssize_t idx) {
+    if (idx < 0 || query_start_idx < 0 || query_end_idx < 0) {
+        return QUERY_DEFAULT;
+    } else if (idx < query_start_idx) {
+        return QUERY_ADD_DEP;
+    } else if (idx <= query_end_idx) {
+        return QUERY_NEGATE;
+    } else {
+        return QUERY_IGNORE;
+    }
+}
+enum query_mode {
+    QUERY_MODE_ORIGINAL = 0,
+    QUERY_MODE_BINRADAR = 1,
+};
+static enum query_mode current_query_mode = QUERY_MODE_ORIGINAL;
 
 uint8_t* branch_bitmap = NULL;
 
@@ -197,7 +220,7 @@ static int load_query_window_config(void)
     }
 
     sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
-    sbsv_parser_add_schema(parser, "[query-window] [pre-target: int]");
+    sbsv_parser_add_schema(parser, "[query-window] [start: int] [end: int]");
     if (sbsv_parser_load_file(parser, fp) != SBSV_OK) {
         fclose(fp);
         fprintf(stderr, "[solver] [query-window] failed to load query window config from %s \n- %s\n", path, sbsv_parser_last_error(parser));
@@ -214,15 +237,18 @@ static int load_query_window_config(void)
     if (valid) {
         // Get most recent row
         const sbsv_row* row = rows[num_rows - 1];
-        int64_t pre_target = sbsv_row_get_int(row, "pre-target", &valid);
-        if (valid && pre_target > 0) {
-            query_pre_target_range = pre_target - 1;
+        int64_t start = sbsv_row_get_int(row, "start", &valid);
+        int64_t end = sbsv_row_get_int(row, "end", &valid);
+        if (valid && start >= 0 && end > start) {
+            query_start_idx = start;
+            query_end_idx = end;
         } else {
             valid = 0;
         }
     }
     if (!valid) {
-        query_pre_target_range = -1;
+        query_start_idx = -1;
+        query_end_idx = -1;
     }
     sbsv_free_row_ref_array(rows);
     sbsv_parser_free(parser);
@@ -5516,16 +5542,26 @@ static void smt_branch_query(Query* q)
     }
 
     uintptr_t query_idx = GET_QUERY_IDX(q);
-    if (has_real_inputs && query_pre_target_range >= 0 &&
-    (ssize_t)query_idx > query_pre_target_range) {
-    update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
-#if USE_FUZZY_SOLVER
-    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, z3_query);
-#endif
-#if CHECK_SAT_PI
-    check_pi(inputs, query_idx);
-#endif
-    return;
+    if (has_real_inputs && query_start_idx >= 0) {
+        switch (get_query_range_mode(query_idx)) {
+            case QUERY_DEFAULT:
+                break;
+            case QUERY_ADD_DEP:
+                update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
+                return;
+            case QUERY_NEGATE: {
+                Z3_solver solver = smt_new_solver();
+                add_deps_to_solver(inputs, solver, query_idx);
+                Z3_solver_assert(smt_solver.ctx, solver, z3_neg_query);
+                smt_dump_solver(solver, query_idx);
+                smt_del_solver(solver);
+
+                update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
+                return;
+            }
+            case QUERY_IGNORE:
+                return;
+        }
     }
 
     if (has_real_inputs) {
@@ -6741,6 +6777,59 @@ static void smt_mem_concr_query(Query* q, OPKIND opkind)
 #endif
 }
 
+static inline uint64_t u64_mask_bits(size_t n_bits)
+{
+    if (n_bits >= 64) {
+        return UINT64_MAX;
+    }
+    return (1ULL << n_bits) - 1ULL;
+}
+
+static void smt_binradar_concr_query(Query* q)
+{
+    GHashTable* inputs = NULL;
+    Z3_ast memory_expr = smt_query_to_z3_wrapper(q->query->op1, 0, 0, &inputs);
+
+    if (!inputs) {
+        return;
+    }
+
+    size_t concrete_n_bytes = CONST(q->query->op3);
+    if (concrete_n_bytes == 0 || concrete_n_bytes > sizeof(uint64_t)) {
+        ABORT("Invalid BINRADAR concretization size: %lu", concrete_n_bytes);
+    }
+
+    size_t concrete_n_bits = concrete_n_bytes * 8;
+    size_t expr_n_bits     = SIZE(memory_expr);
+    uint64_t concrete_val  = (uint64_t)CONST(q->query->op2);
+    concrete_val &= u64_mask_bits(concrete_n_bits);
+
+    if (q->query->op1 && q->query->op1->opkind == SEXT &&
+        concrete_n_bits < expr_n_bits && concrete_n_bits < 64) {
+        uint64_t sign_bit = 1ULL << (concrete_n_bits - 1);
+        if (concrete_val & sign_bit) {
+            concrete_val |= ~u64_mask_bits(concrete_n_bits);
+        }
+    }
+
+    if (expr_n_bits < 64) {
+        concrete_val &= u64_mask_bits(expr_n_bits);
+    }
+
+    Z3_ast c = Z3_mk_eq(smt_solver.ctx, memory_expr,
+                        smt_new_const(concrete_val, expr_n_bits));
+
+    z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+    update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
+#if USE_FUZZY_SOLVER
+    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, c);
+#endif
+
+#if CHECK_SAT_PI
+    check_pi(inputs, GET_QUERY_IDX(q));
+#endif
+}
+
 static void smt_consistency_expr(Query* q)
 {
     static int check_expr_consistency = -1;
@@ -7358,6 +7447,9 @@ static void smt_query(Query* q)
         case MODEL:
             smt_model_expr(q);
             break;
+        case BINRADAR_CONCRETIZATION:
+            smt_binradar_concr_query(q);
+            break;
         default:
             // printf("\nBranch at 0x%lx\n", q->address);
             smt_branch_query(q);
@@ -7434,6 +7526,12 @@ void sig_usr2(int signo)
     exit(0);
 }
 
+static inline int is_forkserver_mode(void)
+{
+    const char* env = getenv("BINRADAR_FORKSERVER_ENABLE");
+    return env && atoi(env) != 0;
+}
+
 static inline void load_initial_testcase()
 {
     printf("Loading testcase: %s\n", config.testcase_path);
@@ -7475,6 +7573,224 @@ static void run_query_from_file(const char* path)
     exit(0);
 }
 
+static inline void reset_solver_session(void)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+    GHashTable* inputs_ht = f_hash_table_new(NULL, NULL);
+
+    if (cached_solver) {
+        Z3_solver_reset(smt_solver.ctx, cached_solver);
+    }
+
+    /* z3_expr_cache owns CachedExpr* values, but ce->inputs may be shared. */
+    if (z3_expr_cache) {
+        g_hash_table_iter_init(&iter, z3_expr_cache);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            CachedExpr* ce = (CachedExpr*)value;
+            if (ce) {
+                if (ce->inputs) {
+                    g_hash_table_add(inputs_ht, ce->inputs);
+                }
+                free(ce);
+            }
+        }
+
+        f_hash_table_destroy(z3_expr_cache);
+        z3_expr_cache = f_hash_table_new(NULL, NULL);
+    }
+
+    if (z3_opt_cache) {
+        f_hash_table_destroy(z3_opt_cache);
+        z3_opt_cache = f_hash_table_new(NULL, NULL);
+    }
+
+     /* dependency_graph entries may point to the same Dependency object,
+         and dep->inputs may overlap with ce->inputs collected above. */
+    {
+        GHashTable* to_remove = f_hash_table_new(NULL, NULL);
+
+        for (size_t i = 0; i < MAX_INPUT_SIZE * 2; i++) {
+            Dependency* dep = dependency_graph[i];
+            if (dep == NULL) continue;
+            g_hash_table_add(to_remove, dep);
+            dependency_graph[i] = NULL;
+        }
+
+        g_hash_table_iter_init(&iter, to_remove);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            Dependency* dep = (Dependency*)key;
+            if (dep->inputs && !g_hash_table_contains(inputs_ht, dep->inputs)) {
+                f_hash_table_destroy(dep->inputs);
+            }
+            if (dep->exprs)  f_hash_table_destroy(dep->exprs);
+            free(dep);
+        }
+
+        f_hash_table_destroy(to_remove);
+    }
+
+    g_hash_table_iter_init(&iter, inputs_ht);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        GHashTable* ht = (GHashTable*)key;
+        f_hash_table_destroy(ht);
+    }
+    f_hash_table_destroy(inputs_ht);
+
+    if (concretized_bytes) {
+        f_hash_table_destroy(concretized_bytes);
+    }
+    concretized_bytes = f_hash_table_new(NULL, NULL);
+
+    if (sloads_exprs) {
+        g_slist_free_full(sloads_exprs, free);
+        sloads_exprs = NULL;
+    }
+
+    memset(input_exprs, 0, sizeof(input_exprs));
+    memset(z3_ast_exprs, 0, sizeof(z3_ast_exprs));
+    memset(concretized_sloads, 0, sizeof(concretized_sloads));
+    memset(concretized_iloads, 0, sizeof(concretized_iloads));
+
+    memset(symbols_sizes, 0, sizeof(symbols_sizes));
+    symbols_count = 0;
+    memset(eval_data, 0, sizeof(eval_data));
+
+    memset(mutations, 0, sizeof(mutations));
+    mutations[0].type = NO_MUTATION;
+
+    expr_annotation_addr = NULL;
+    expr_annotation = NULL;
+
+    conc_eval_time  = 0;
+    conc_eval_count = 0;
+    unsat_time      = 0;
+    unsat_count     = 0;
+
+    smt_solver.sat_count           = 0;
+    smt_solver.sat_time            = 0;
+    smt_solver.unsat_count         = 0;
+    smt_solver.unsat_time          = 0;
+    smt_solver.unknown_count       = 0;
+    smt_solver.unknown_time        = 0;
+    smt_solver.translation_time    = 0;
+    smt_solver.expr_visit_time     = 0;
+    smt_solver.slice_reasoning_time = 0;
+
+#if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+    z3fuzz_free(&smt_solver.fuzzy_ctx);
+    z3fuzz_init(&smt_solver.fuzzy_ctx, smt_solver.ctx,
+                (char*)config.testcase_path, NULL, &conc_query_eval_value,
+                SOLVER_TIMEOUT_FUZZY_MS);
+#endif
+
+    fuzzy_query_dump = NULL;
+#if ADDRESS_REASONING == FUZZ_GD
+    gd_solution_info = NULL;
+#endif
+    count_addr_testcase = 0;
+    sub_idx_offset = 0;
+}
+
+int handle_query_original() {
+    current_query_mode = QUERY_MODE_ORIGINAL;
+    struct timespec start, current;
+    get_time(&start);
+    while (1) {
+        if (next_query[0].query == NULL) {
+            // tracer may have crashed
+            break;
+        } else {
+            if (next_query[0].query == FINAL_QUERY) {
+                SAYF("\n\nReached final query. Exiting...\n");
+
+                printf("Translation time: %lu usecs\n",
+                       smt_solver.translation_time);
+                printf("Slice reasoning time: %lu usecs\n",
+                       smt_solver.slice_reasoning_time);
+
+                save_bitmaps();
+                return 0;
+            }
+
+            if (config.timeout > 0) {
+                get_time(&current);
+                uint64_t total_solving_time = get_diff_time_microsec(&start, &current);
+                total_solving_time /= 1000;
+                //printf("solving time: %lu timeout: %lu \n",
+                // total_solving_time, config.timeout);
+                if (total_solving_time > config.timeout) {
+                    SAYF("\n\nSolving time exceded budget time. Exiting...\n");
+
+                    printf("Translation time: %lu usecs\n",
+                           smt_solver.translation_time);
+                    printf("Slice reasoning time: %lu usecs\n",
+                       smt_solver.slice_reasoning_time);
+
+                    save_bitmaps();
+                    return 1;
+                }
+            }
+            if (query_start_idx < 0) {
+                load_query_window_config();
+            }
+            smt_query(&next_query[0]);
+            next_query++;
+        }
+    }
+    return 0;
+}
+
+int handle_query_binradar() {
+    current_query_mode = QUERY_MODE_BINRADAR;
+    struct timespec start, current;
+    get_time(&start);
+    while (1) {
+        if (next_query[0].query == NULL) {
+            // tracer may have crashed
+            break;
+        } else {
+            if (next_query[0].query == FINAL_QUERY) {
+                SAYF("\n\nReached final query. Exiting...\n");
+
+                printf("Translation time: %lu usecs\n",
+                       smt_solver.translation_time);
+                printf("Slice reasoning time: %lu usecs\n",
+                       smt_solver.slice_reasoning_time);
+
+                save_bitmaps();
+                return 0;
+            }
+
+            if (config.timeout > 0) {
+                get_time(&current);
+                uint64_t total_solving_time = get_diff_time_microsec(&start, &current);
+                total_solving_time /= 1000;
+                //printf("solving time: %lu timeout: %lu \n",
+                // total_solving_time, config.timeout);
+                if (total_solving_time > config.timeout) {
+                    SAYF("\n\nSolving time exceded budget time. Exiting...\n");
+
+                    printf("Translation time: %lu usecs\n",
+                           smt_solver.translation_time);
+                    printf("Slice reasoning time: %lu usecs\n",
+                       smt_solver.slice_reasoning_time);
+
+                    save_bitmaps();
+                    return 1;
+                }
+            }
+            if (query_start_idx < 0) {
+                load_query_window_config();
+            }
+            smt_query(&next_query[0]);
+            next_query++;
+        }
+    }
+    return 0;
+}
+
+
 int main(int argc, char* argv[])
 {
     parse_opts(argc, argv, &config);
@@ -7491,16 +7807,6 @@ int main(int argc, char* argv[])
     signal(SIGUSR1, sig_usr1);
 
     concretized_bytes = f_hash_table_new(NULL, NULL);
-
-#if 0
-    run_query_from_file("/home/ercoppa/Desktop/code/fuzzolic/test_case_31.query");
-#endif
-
-#if 0
-    printf("Expression size: %lu\n", sizeof(Expr));
-    printf("Allocating %lu MB for expression pool\n", (sizeof(Expr) * EXPR_POOL_CAPACITY) / (1024 * 1024));
-    printf("Allocating %lu MB for query queue\n", (sizeof(Expr*) * EXPR_QUERY_CAPACITY) / (1024 * 1024));
-#endif
 
     printf("[SOLVER] Creating shared memory #1 (key=%lu)...\n", config.expr_pool_shm_key);
 
@@ -7573,89 +7879,44 @@ int main(int argc, char* argv[])
 
     printf("[SOLVER] Waiting for the tracer...\n");
 
-    // wait tracer to finish its job
+    int persistent_mode = is_forkserver_mode();
     while (1) {
-        if (go_signal) {
-            break;
-        } else if (next_query[0].query != (void*)SHM_DONE) {
+        // wait tracer to finish one run and executor to trigger solving
+        while (1) {
+            if (go_signal) {
+                go_signal = 0;
+                break;
+            }
+            if (!persistent_mode && next_query[0].query == (void*)SHM_DONE) {
+                break;
+            }
             nanosleep(&polling_time, NULL);
-        } else {
-            // printf("Tracer has finished\n");
+        }
+
+        next_query = query_queue + 1;
+        MEM_BARRIER();
+
+        load_query_window_config();
+
+        // 1. generate inputs using original method
+        reset_solver_session();
+        Query *original_next_query = next_query;
+        handle_query_original();
+        next_query = original_next_query;
+
+        // 2. generate inputs using binradar method
+        reset_solver_session();
+        handle_query_binradar();
+
+        if (!persistent_mode) {
             break;
         }
+
+        next_query = query_queue;
+        memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
+        next_query[0].query = (void*)SHM_READY;
+        MEM_BARRIER();
     }
-    next_query++;
-
-    load_query_window_config();
-
-    MEM_BARRIER();
-
-#if 0
-    SAYF("[SOLVER] Waiting for queries...\n");
-#endif
-
-    struct timespec start, current;
-    get_time(&start);
-
-    while (1) {
-
-        if (next_query[0].query == NULL) {
-#if 0
-            nanosleep(&polling_time, NULL);
-#else
-            // tracer may have crashed
-            break;
-#endif
-        } else {
-            if (next_query[0].query == FINAL_QUERY) {
-                SAYF("\n\nReached final query. Exiting...\n");
-
-                printf("Translation time: %lu usecs\n",
-                       smt_solver.translation_time);
-                printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                save_bitmaps();
-                exit(0);
-            }
-
-            if (config.timeout > 0) {
-                get_time(&current);
-                uint64_t total_solving_time = get_diff_time_microsec(&start, &current);
-                total_solving_time /= 1000;
-                //printf("solving time: %lu timeout: %lu \n",
-                // total_solving_time, config.timeout);
-                if (total_solving_time > config.timeout) {
-                    SAYF("\n\nSolving time exceded budget time. Exiting...\n");
-
-                    printf("Translation time: %lu usecs\n",
-                           smt_solver.translation_time);
-                    printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                    save_bitmaps();
-                    exit(0);
-                }
-            }
-
-#if 0
-            SAYF("Got a query... %p\n", next_query);
-#endif
-            if (query_pre_target_range < 0) {
-                load_query_window_config();
-            }
-            smt_query(&next_query[0]);
-            next_query++;
-#if 0
-            if (GET_QUERY_IDX(next_query) > 10) {
-                printf("Exiting...\n");
-                save_bitmaps();
-                exit(0);
-            }
-#endif
-        }
-    }
-
     return 0;
 }
 
