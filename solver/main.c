@@ -86,6 +86,16 @@ enum query_mode {
     QUERY_MODE_BINRADAR = 1,
 };
 static enum query_mode current_query_mode = QUERY_MODE_ORIGINAL;
+const char* query_mode_to_str(enum query_mode mode) {
+    switch (mode) {
+        case QUERY_MODE_ORIGINAL:
+            return "original";
+        case QUERY_MODE_BINRADAR:
+            return "binradar";
+        default:
+            return "unknown";
+    }
+}
 
 uint8_t* branch_bitmap = NULL;
 
@@ -869,7 +879,8 @@ static void perform_mutations(size_t idx,
     int mutation_count = 0;
     while (mutations[mutation_count].type != NO_MUTATION) {
         int  n = snprintf(testcase_name, sizeof(testcase_name),
-                     "test_case_%lu_%lu.dat", idx, ++sub_idx + sub_idx_offset);
+                     "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, ++sub_idx + sub_idx_offset);
+        fprintf(stderr, "[dump] [mutation] [name %s]\n", testcase_name);
 #if 0
         printf("Running mutation: %s\n", testcase_name);
 #endif
@@ -983,8 +994,9 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
     } else
 #endif
     snprintf(testcase_name, sizeof(testcase_name),
-        "test_case_%lu_%lu.dat", idx, sub_idx + sub_idx_offset);
+        "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
 
+    fprintf(stderr, "[dump] [solution] [name %s]\n", testcase_name);
 #if 0
     SAYF("Dumping solution into %s\n", testcase_name);
 #endif
@@ -1047,13 +1059,13 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
 {
     char testcase_name[128];
     int  n = snprintf(testcase_name, sizeof(testcase_name),
-                    "test_case_%lu_%lu.dat", idx, sub_idx + sub_idx_offset);
+                    "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
     assert(n > 0 && n < sizeof(testcase_name) && "test case name too long");
 
 #if 0
     SAYF("Dumping solution into %s\n", testcase_name);
 #endif
-
+    fprintf(stderr, "[dump] [byte] [name %s]\n", testcase_name);
     FILE* fp = fopen(testcase_name, "w");
     for (size_t i = 0; i < size * stride; i += stride) {
         uint8_t byte = data[i];
@@ -5542,21 +5554,15 @@ static void smt_branch_query(Query* q)
     }
 
     uintptr_t query_idx = GET_QUERY_IDX(q);
-    if (has_real_inputs && query_start_idx >= 0) {
+    if (has_real_inputs && query_start_idx >= 0 && current_query_mode == QUERY_MODE_BINRADAR) {
         switch (get_query_range_mode(query_idx)) {
             case QUERY_DEFAULT:
                 break;
             case QUERY_ADD_DEP:
-                update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
-                return;
+                // update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
+                break;
             case QUERY_NEGATE: {
-                Z3_solver solver = smt_new_solver();
-                add_deps_to_solver(inputs, solver, query_idx);
-                Z3_solver_assert(smt_solver.ctx, solver, z3_neg_query);
-                smt_dump_solver(solver, query_idx);
-                smt_del_solver(solver);
-
-                update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
+                smt_check_z3(1, z3_neg_query, inputs, 2);
                 return;
             }
             case QUERY_IGNORE:
@@ -6653,7 +6659,7 @@ static void smt_expr_query(Query* q, OPKIND opkind)
             inputs_are_concretized = 0;
             // printf("Byte %lu is not in concretized bytes.\n", (size_t) key);
 
-            if (opkind == SYMBOLIC_LOAD || opkind == SYMBOLIC_STORE) {
+            if (current_query_mode != QUERY_MODE_BINRADAR && (opkind == SYMBOLIC_LOAD || opkind == SYMBOLIC_STORE)) {
                 // printf("Adding byte %lu to concretized bytes.\n", (size_t)
                 // key);
                 gboolean res = g_hash_table_add(concretized_bytes, key);
@@ -6674,6 +6680,35 @@ static void smt_expr_query(Query* q, OPKIND opkind)
     }
 #endif
     uintptr_t solution = (uintptr_t)q->query->op2;
+
+    if (current_query_mode == QUERY_MODE_BINRADAR) {
+        switch (get_query_range_mode(GET_QUERY_IDX(q))) {
+        case QUERY_DEFAULT:
+            break;
+        case QUERY_ADD_DEP:
+            break;
+        case QUERY_NEGATE: {
+            if (count_addr_testcase > 1000) {
+                break;
+            }
+            GHashTable *solutions = f_hash_table_new(NULL, NULL);
+            g_hash_table_add(solutions, (gpointer) solution);
+            // Z3_ast c = Z3_mk_eq(smt_solver.ctx, z3_query,
+            //             smt_new_const(solution, sizeof(uintptr_t) * 8));
+            // Z3_ast neg_c = Z3_mk_not(smt_solver.ctx, c);
+            fuzz_query_eval(inputs, z3_query, solutions, GET_QUERY_IDX(q), 0, 0);
+            int n_solutions = g_hash_table_size(solutions);
+            printf("Found %d solution for %s expr.\n", n_solutions - 1,
+                   opkind_to_str(opkind));
+            count_addr_testcase += n_solutions - 1;
+            f_hash_table_destroy(solutions);
+            break;
+        }
+        case QUERY_IGNORE:
+            return;
+        }
+        return;
+    }
 
     if (config.address_reasoning 
             && is_interesting_memory(solution) 
@@ -6794,6 +6829,8 @@ static void smt_binradar_concr_query(Query* q)
         return;
     }
 
+    if (current_query_mode == QUERY_MODE_ORIGINAL) return;
+
     size_t concrete_n_bytes = CONST(q->query->op3);
     if (concrete_n_bytes == 0 || concrete_n_bytes > sizeof(uint64_t)) {
         ABORT("Invalid BINRADAR concretization size: %lu", concrete_n_bytes);
@@ -6819,15 +6856,48 @@ static void smt_binradar_concr_query(Query* q)
     Z3_ast c = Z3_mk_eq(smt_solver.ctx, memory_expr,
                         smt_new_const(concrete_val, expr_n_bits));
 
-    z3_ast_exprs[GET_QUERY_IDX(q)] = c;
-    update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
-#if USE_FUZZY_SOLVER
-    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, c);
-#endif
+    if (current_query_mode == QUERY_MODE_BINRADAR) {
+        // Negate the check for BINRADAR mode to find out-of-bounds accesses.
+        switch (get_query_range_mode(GET_QUERY_IDX(q))) {
+            case QUERY_DEFAULT:
+                break;
+            case QUERY_ADD_DEP:
+                break;
+            case QUERY_NEGATE: {
+                Z3_ast modify = Z3_mk_not(smt_solver.ctx, c);
+                smt_check_z3(q, modify, inputs, 2);
+                return;
+            }
+            case QUERY_IGNORE:
+                return;
+        }
+    }
 
-#if CHECK_SAT_PI
-    check_pi(inputs, GET_QUERY_IDX(q));
-#endif
+}
+
+static void smt_binradar_heap_bound_check(Query* q)
+{
+    GHashTable* inputs = NULL;
+    Z3_ast offset_expr = smt_query_to_z3_wrapper(q->query->op1, 0, 0, &inputs);
+    Z3_ast size_expr   = smt_query_to_z3_wrapper(q->query->op2, 0, 0, NULL);
+    Z3_ast check = Z3_mk_lt(smt_solver.ctx, offset_expr, size_expr);
+    if (current_query_mode == QUERY_MODE_BINRADAR) {
+        // Negate the check for BINRADAR mode to find out-of-bounds accesses.
+        switch (get_query_range_mode(GET_QUERY_IDX(q))) {
+            case QUERY_DEFAULT:
+                break;
+            case QUERY_ADD_DEP:
+                break;
+            case QUERY_NEGATE: {
+                Z3_ast may_crash = Z3_mk_not(smt_solver.ctx, check);
+                smt_check_z3(q, may_crash, inputs, 2);
+                return;
+            }
+            case QUERY_IGNORE:
+                return;
+        }
+    }
+    update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
 }
 
 static void smt_consistency_expr(Query* q)
@@ -7404,11 +7474,6 @@ static void smt_model_expr(Query* q)
 
 static void smt_query(Query* q)
 {
-#if 0
-    if (GET_QUERY_IDX(q) >= 92) {
-        print_expr(q->query);
-    }
-#endif
     fprintf(stderr, "[query] [index %lu] [addr %lx] [op %s] [model %d]\n",  
         GET_QUERY_IDX(q), q->address,
         opkind_to_str(q->query->opkind), q->model);
@@ -7449,6 +7514,9 @@ static void smt_query(Query* q)
             break;
         case BINRADAR_CONCRETIZATION:
             smt_binradar_concr_query(q);
+            break;
+        case BINRADAR_HEAP_BOUND_CHECK:
+            smt_binradar_heap_bound_check(q);
             break;
         default:
             // printf("\nBranch at 0x%lx\n", q->address);

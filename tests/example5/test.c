@@ -32,6 +32,14 @@ int main(int argc, char* argv[]) {
 
     int result;
     fread(&result, sizeof(result), 1, file);
+    if (result > 1024) {
+        printf("Error\n");
+        return 1;
+    }
+    if (result < 0) {
+        printf("Error\n");
+        return 1;
+    }
     model_malloc_max(result);
     fclose(file);
     return 0;
