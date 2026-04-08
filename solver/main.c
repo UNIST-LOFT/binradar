@@ -219,15 +219,28 @@ static inline void add_deps_to_solver_upto(GHashTable* inputs, Z3_solver solver,
 
 static int load_query_window_config(void)
 {
+    static int warned_missing_env = 0;
+    static int warned_open_fail = 0;
+
     const char* path = getenv("BINRADAR_QUERY_WINDOW_FILE");
     if (!path || !path[0]) {
+        if (!warned_missing_env) {
+            fprintf(stderr, "[solver] [query-window] BINRADAR_QUERY_WINDOW_FILE is not set. query-window config disabled.\n");
+            warned_missing_env = 1;
+        }
         return 0;
     }
+    warned_missing_env = 0;
 
     FILE* fp = fopen(path, "r");
     if (!fp) {
+        if (!warned_open_fail) {
+            fprintf(stderr, "[solver] [query-window] query-window file is not ready yet: %s\n", path);
+            warned_open_fail = 1;
+        }
         return 0;
     }
+    warned_open_fail = 0;
 
     sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     sbsv_parser_add_schema(parser, "[query-window] [start: int] [end: int]");
@@ -260,6 +273,7 @@ static int load_query_window_config(void)
         query_start_idx = -1;
         query_end_idx = -1;
     }
+    fprintf(stderr, "[solver] [query-window] [start %ld] [end %ld] [file %s]\n", query_start_idx, query_end_idx, path);
     sbsv_free_row_ref_array(rows);
     sbsv_parser_free(parser);
     fclose(fp);
@@ -5562,7 +5576,7 @@ static void smt_branch_query(Query* q)
                 // update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
                 break;
             case QUERY_NEGATE: {
-                smt_check_z3(1, z3_neg_query, inputs, 2);
+                smt_check_z3(q, z3_neg_query, inputs, 2);
                 return;
             }
             case QUERY_IGNORE:
@@ -6464,7 +6478,10 @@ static void smt_slice_query(Query* q)
 #endif
         symbols_sizes[scale_sload_index(s_load_id)]     = s_load_size * 8;
         symbols_sizes[scale_sload_index(s_load_id) + 1] = sizeof(uintptr_t) * 8;
-        symbols_count += 2;
+        size_t sload_end = scale_sload_index(s_load_id) + 2;
+        if (symbols_count < sload_end) {
+            symbols_count = sload_end;
+        }
 #if 0
         printf("symbols_sizes[%lu] = %lu %p\n", scale_sload_index(s_load_id), s_load_size * 8, symbols_sizes);
         printf("symbols_sizes[%lu] = %lu %p\n", scale_sload_index(s_load_id) + 1, sizeof(uintptr_t) * 8, symbols_sizes);
@@ -6585,7 +6602,10 @@ static void smt_slice_query(Query* q)
 
     symbols_sizes[scale_sload_index(s_load_id) + 1] = sizeof(uintptr_t) * 8;
     symbols_sizes[scale_sload_index(s_load_id)]     = s_load_size * 8;
-    symbols_count += 2;
+    size_t sload_end = scale_sload_index(s_load_id) + 2;
+    if (symbols_count < sload_end) {
+        symbols_count = sload_end;
+    }
 #if 0
     printf("symbols_sizes[%lu] = %lu %p\n", scale_sload_index(s_load_id), s_load_size * 8, symbols_sizes);
     printf("symbols_sizes[%lu] = %lu %p\n", scale_sload_index(s_load_id) + 1, sizeof(uintptr_t) * 8, symbols_sizes);
@@ -6879,8 +6899,11 @@ static void smt_binradar_heap_bound_check(Query* q)
 {
     GHashTable* inputs = NULL;
     Z3_ast offset_expr = smt_query_to_z3_wrapper(q->query->op1, 0, 0, &inputs);
-    Z3_ast size_expr   = smt_query_to_z3_wrapper(q->query->op2, 0, 0, NULL);
-    Z3_ast check = Z3_mk_lt(smt_solver.ctx, offset_expr, size_expr);
+    GHashTable* size_inputs = NULL;
+    Z3_ast size_expr   = smt_query_to_z3_wrapper(q->query->op2, 0, 0, &size_inputs);
+    smt_bv_resize(&offset_expr, &size_expr, 0);
+    Z3_ast check = Z3_mk_bvult(smt_solver.ctx, offset_expr, size_expr);
+    inputs = merge_inputs(inputs, size_inputs);
     if (current_query_mode == QUERY_MODE_BINRADAR) {
         // Negate the check for BINRADAR mode to find out-of-bounds accesses.
         switch (get_query_range_mode(GET_QUERY_IDX(q))) {
@@ -7721,7 +7744,10 @@ static inline void reset_solver_session(void)
     memset(concretized_iloads, 0, sizeof(concretized_iloads));
 
     memset(symbols_sizes, 0, sizeof(symbols_sizes));
-    symbols_count = 0;
+    for (size_t i = 0; i < testcase.size; i++) {
+        symbols_sizes[i] = 8;
+    }
+    symbols_count = testcase.size;
     memset(eval_data, 0, sizeof(eval_data));
 
     memset(mutations, 0, sizeof(mutations));
@@ -7984,6 +8010,7 @@ int main(int argc, char* argv[])
         memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
         next_query[0].query = (void*)SHM_READY;
         MEM_BARRIER();
+        break;
     }
     return 0;
 }

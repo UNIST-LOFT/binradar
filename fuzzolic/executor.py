@@ -38,7 +38,7 @@ else:
     AFL_PATH = os.environ['AFL_PATH']
 
 SOLVER_WAIT_TIME_AT_STARTUP = 0.0010
-SOLVER_TIMEOUT = 1000
+SOLVER_TIMEOUT = 10000
 SHUTDOWN = False
 
 RUNNING_PROCESSES = []
@@ -605,9 +605,7 @@ class Executor(object):
             if (phase_name == 'memory' and self.debug != 'no_solver' and
                     self.debug != 'coverage' and p_solver is not None and
                     not solver_signaled):
-                logger.info(f'[FUZZOLIC] [{phase_name}] Triggering solver before first forkserver run.')
-                p_solver.send_signal(signal.SIGUSR1)
-                solver_signaled = True
+                logger.info(f'[FUZZOLIC] [{phase_name}] Deferring solver trigger until after first forkserver run to wait for query-window dump.')
 
             i = 0
             while True:
@@ -642,8 +640,6 @@ class Executor(object):
                 solver_signaled = True
 
             if self.debug != 'no_solver' and self.debug != 'coverage' and p_solver is not None:
-                if phase_name == 'memory':
-                    p_solver.send_signal(signal.SIGUSR2)
                 self._wait_solver(p_solver)
                 if p_solver in RUNNING_PROCESSES:
                     RUNNING_PROCESSES.remove(p_solver)
@@ -1315,7 +1311,7 @@ class Executor(object):
                           minimizer_qsym.testcase_compare),
                       reverse=True)
 
-    def _wait_solver(self, p_solver):
+    def _wait_solver(self, p_solver: subprocess.Popen):
         elapsed = 0
         timeout = False
         while not SHUTDOWN:
