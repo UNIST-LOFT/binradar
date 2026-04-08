@@ -103,4 +103,12 @@ void parse_opts(int argc, char* argv[], Config* config)
     if (var) {
         config->branch_alt_bitmap_path = var;
     }
+
+    var = getenv("BINRADAR_SOLVER_CONCRETE_OUTDIR");
+    if (var) {
+        config->concrete_outdir = var;
+    } else {
+        config->concrete_outdir = ".";
+    }
+
 }

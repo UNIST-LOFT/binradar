@@ -889,11 +889,11 @@ static void perform_mutations(size_t idx,
                               size_t size,
                               int stride)
 {
-    char testcase_name[128];
+    char testcase_name[256];
     int mutation_count = 0;
     while (mutations[mutation_count].type != NO_MUTATION) {
         int  n = snprintf(testcase_name, sizeof(testcase_name),
-                     "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, ++sub_idx + sub_idx_offset);
+                     "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, ++sub_idx + sub_idx_offset);
         fprintf(stderr, "[dump] [mutation] [name %s]\n", testcase_name);
 #if 0
         printf("Running mutation: %s\n", testcase_name);
@@ -996,7 +996,7 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
 {
     size_t input_size = testcase.size;
 
-    char testcase_name[128];
+    char testcase_name[256];
 #if DEBUG_CHECK_INPUTS
     if (check_input == 1) {
         if (sub_idx + sub_idx_offset == 0) {
@@ -1008,7 +1008,7 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
     } else
 #endif
     snprintf(testcase_name, sizeof(testcase_name),
-        "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
+        "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
 
     fprintf(stderr, "[dump] [solution] [name %s]\n", testcase_name);
 #if 0
@@ -1071,9 +1071,9 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
 static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
                               size_t idx, size_t sub_idx)
 {
-    char testcase_name[128];
+    char testcase_name[256];
     int  n = snprintf(testcase_name, sizeof(testcase_name),
-                    "test_case_%s_%lu_%lu.dat", query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
+                    "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
     assert(n > 0 && n < sizeof(testcase_name) && "test case name too long");
 
 #if 0
@@ -1219,7 +1219,7 @@ static void inline smt_dump_debug_query(Z3_solver solver, Z3_ast expr, uint64_t 
         assert(current_value != value);
         current_value = value;
         
-        static char testcase_name[128];
+        static char testcase_name[256];
         snprintf(testcase_name, sizeof(testcase_name),
             "debug_%05ld_%lx.dat", idx, current_value);
 
@@ -1261,9 +1261,9 @@ static void inline smt_dump_debug_query(Z3_solver solver, Z3_ast expr, uint64_t 
 static void inline smt_dump_solver(Z3_solver solver, size_t idx)
 {
     Z3_string s_query = Z3_solver_to_string(smt_solver.ctx, solver);
-    char      test_case_name[128];
+    char      test_case_name[256];
     int       n = snprintf(test_case_name, sizeof(test_case_name),
-                     "test_case_%lu.query", idx);
+                     "%s/test_case_%lu.query", config.concrete_outdir, idx);
     assert(n > 0 && n < sizeof(test_case_name) && "test case name too long");
     // SAYF("Dumping solution into %s\n", test_case_name);
     FILE* fp = fopen(test_case_name, "w");
@@ -7973,7 +7973,7 @@ int main(int argc, char* argv[])
 
     printf("[SOLVER] Waiting for the tracer...\n");
 
-    int persistent_mode = is_forkserver_mode();
+    int forkserver_mode = is_forkserver_mode();
     while (1) {
         // wait tracer to finish one run and executor to trigger solving
         while (1) {
@@ -7981,7 +7981,7 @@ int main(int argc, char* argv[])
                 go_signal = 0;
                 break;
             }
-            if (!persistent_mode && next_query[0].query == (void*)SHM_DONE) {
+            if (!forkserver_mode && next_query[0].query == (void*)SHM_DONE) {
                 break;
             }
             nanosleep(&polling_time, NULL);
@@ -7993,19 +7993,16 @@ int main(int argc, char* argv[])
         load_query_window_config();
 
         // 1. generate inputs using original method
-        reset_solver_session();
         Query *original_next_query = next_query;
-        handle_query_original();
-        next_query = original_next_query;
-
         // 2. generate inputs using binradar method
-        reset_solver_session();
-        handle_query_binradar();
-
-        if (!persistent_mode) {
+        if (forkserver_mode) {
+            // reset_solver_session();
+            handle_query_binradar();
+        } else {
+            handle_query_original();
             break;
         }
-
+        next_query = original_next_query;
         next_query = query_queue;
         memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
         next_query[0].query = (void*)SHM_READY;

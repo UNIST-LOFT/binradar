@@ -518,6 +518,8 @@ class Executor(object):
     def _run_forkserver_phase(self, phase_name, testcase, run_dir, p_tracer_args,
                               base_env, force_smt=False, analyze_on_first_iteration=True):
         env = base_env.copy()
+        env["BINRADAR_SOLVER_CONCRETE_OUTDIR"] = os.path.join(run_dir, f"solver-out-{phase_name}")
+        os.makedirs(env["BINRADAR_SOLVER_CONCRETE_OUTDIR"], exist_ok=True)
         self._assign_random_shm_keys(env)
         if phase_name == 'memory':
             env['BINRADAR_PRESERVE_CHILD_QUERIES'] = '0'
@@ -695,6 +697,8 @@ class Executor(object):
         probe_env['BINRADAR_FORKSERVER_ENABLE'] = '0'
         probe_env['BINRADAR_FORKSERVER_TARGET_HIT_COUNT'] = '0'
         probe_env['BINRADAR_PROBE_FILE'] = probe_file
+        probe_env["BINRADAR_SOLVER_CONCRETE_OUTDIR"] = os.path.join(run_dir, "solver-out-probe")
+        os.makedirs(probe_env["BINRADAR_SOLVER_CONCRETE_OUTDIR"], exist_ok=True)
         # probe_env['COVERAGE_TRACER'] = os.path.join(run_dir, 'probe-bitmap')
         # probe_env['COVERAGE_TRACER_LOG'] = os.path.join(run_dir, 'probe-coverage.log')
         # probe_env['COVERAGE_TRACER_LOG_EDGES'] = os.path.join(run_dir, 'probe-edges.log')
@@ -772,10 +776,11 @@ class Executor(object):
                     self._wait_solver(probe_solver)
                 except Exception:
                     try:
+                        probe_solver.send_signal(signal.SIGUSR2)
+                        probe_solver.wait(1)
+                    except Exception:
                         probe_solver.send_signal(signal.SIGKILL)
                         probe_solver.wait()
-                    except Exception:
-                        pass
                 if probe_solver in RUNNING_PROCESSES:
                     RUNNING_PROCESSES.remove(probe_solver)
 
