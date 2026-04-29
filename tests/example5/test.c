@@ -30,17 +30,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int result;
-    fread(&result, sizeof(result), 1, file);
-    if (result > 1024) {
+    char result[64];
+    fread(&result, 1, sizeof(result), file);
+    int size = atoi(result);
+    if (size > 1024) {
         printf("Error\n");
         return 1;
     }
-    if (result < 0) {
+    if (size < 0) {
         printf("Error\n");
         return 1;
     }
-    model_malloc_max(result);
+    model_malloc_max(size);
     fclose(file);
     return 0;
 }

@@ -22,7 +22,14 @@ MODELS = [
     "memcpy",
     "__memcpy_chk",
     "strcpy",
-    "strncpy"
+    "strncpy",
+    "atoi",
+    "atol",
+    "atoll",
+    "strtol",
+    "strtoul",
+    "strtoll",
+    "strtoull",
 ]
 
 def run(args):

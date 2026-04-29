@@ -5048,6 +5048,18 @@ Z3_ast smt_query_to_z3(Expr* query, uintptr_t is_const_value, size_t width,
             r = Z3_mk_bvnand(smt_solver.ctx, op1, op2);
             break;
         }
+        case MODEL:
+            if (query->op1) {
+                op1 = smt_query_to_z3(query->op1, query->op1_is_const, 0,
+                                      &op1_inputs);
+            }
+            if (query->op2_is_const) {
+                r = smt_new_const(CONST(query->op2), sizeof(uintptr_t) * 8);
+            } else {
+                r = smt_query_to_z3(query->op2, query->op2_is_const, 0,
+                                    &op2_inputs);
+            }
+            break;
         // x86 specific
         case RCL:
         case CMP_EQ:
@@ -7116,6 +7128,113 @@ static void strcmp_s1_symbolic(Query* q,
     }
 }
 
+static int64_t get_min_input_index(GHashTable* inputs)
+{
+    if (!inputs) {
+        return -1;
+    }
+
+    int64_t min_index = -1;
+    GHashTableIter iter;
+    gpointer key, value;
+
+    g_hash_table_iter_init(&iter, inputs);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        int64_t index = (int64_t)key;
+        if (min_index < 0 || index < min_index) {
+            min_index = index;
+        }
+    }
+    return min_index;
+}
+
+static Z3_ast model_string_to_bv(const char* text, size_t width)
+{
+    if (width == 0) {
+        width = 1;
+    }
+
+    Z3_ast bv = NULL;
+    size_t text_len = strlen(text);
+    for (ssize_t i = (ssize_t)width - 1; i >= 0; i--) {
+        uint8_t byte = 0;
+        if ((size_t)i < text_len) {
+            byte = (uint8_t)text[i];
+        }
+        Z3_ast z3_byte = smt_new_const(byte, 8);
+        if (!bv) {
+            bv = z3_byte;
+        } else {
+            bv = Z3_mk_concat(smt_solver.ctx, bv, z3_byte);
+        }
+    }
+    return bv;
+}
+
+static void smt_model_numeric_mutations(Query* q, int is_signed)
+{
+    GHashTable* inputs = NULL;
+    smt_query_to_z3_wrapper(q->query->op1, 0, 0, &inputs);
+    if (!inputs || g_hash_table_size(inputs) == 0) {
+        return;
+    }
+
+    size_t query_idx = GET_QUERY_IDX(q);
+    z3_ast_exprs[query_idx] = Z3_mk_true(smt_solver.ctx);
+    update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
+
+    int64_t min_index = get_min_input_index(inputs);
+    if (min_index < 0) {
+        return;
+    }
+
+    size_t width = UNPACK_0(CONST(q->query->op3));
+    if (width == 0) {
+        width = 1;
+    }
+    if (width > 64) {
+        width = 64;
+    }
+
+    uintptr_t base = UNPACK_1(CONST(q->query->op3));
+    static const char* candidates_signed_dec[] = {
+        "0", "1", "-1", "2", "7", "10", "99", "100", "127", "128",
+        "1024", "65536", "2147483647", "-2147483648"
+    };
+    static const char* candidates_unsigned_dec[] = {
+        "0", "1", "2", "7", "10", "42", "99", "100",
+        "255", "1024", "4096", "65535", "4294967295"
+    };
+    static const char* candidates_hex[] = {
+        "0", "1", "7", "a", "f", "10", "7f", "ff",
+        "100", "400", "1000", "7fffffff"
+    };
+
+    const char** candidates = is_signed ? candidates_signed_dec : candidates_unsigned_dec;
+    size_t candidates_count = is_signed
+        ? sizeof(candidates_signed_dec) / sizeof(candidates_signed_dec[0])
+        : sizeof(candidates_unsigned_dec) / sizeof(candidates_unsigned_dec[0]);
+    if (base == 16) {
+        candidates = candidates_hex;
+        candidates_count = sizeof(candidates_hex) / sizeof(candidates_hex[0]);
+    }
+
+    size_t mutation_count = 0;
+    for (size_t i = 0; i < candidates_count; i++) {
+        if (mutation_count >= (sizeof(mutations) / sizeof(mutations[0])) - 1) {
+            break;
+        }
+        mutations[mutation_count].type = REPLACE;
+        mutations[mutation_count].offset = (size_t)min_index;
+        mutations[mutation_count].len = width;
+        mutations[mutation_count].data = model_string_to_bv(candidates[i], width);
+        mutation_count += 1;
+    }
+    mutations[mutation_count].type = NO_MUTATION;
+
+    perform_mutations(query_idx, 999, testcase.data, testcase.size, 1);
+}
+
 static void smt_model_expr(Query* q)
 {
     uintptr_t pc = q->address;
@@ -7487,6 +7606,20 @@ static void smt_model_expr(Query* q)
                 model_to_str(q->model));
             f_hash_table_destroy(solutions);
         }        
+    } else if (q->model == MODEL_ATOI ||
+               q->model == MODEL_ATOL ||
+               q->model == MODEL_ATOLL ||
+               q->model == MODEL_STRTOL ||
+               q->model == MODEL_STRTOLL ||
+               q->model == MODEL_STRTOUL ||
+               q->model == MODEL_STRTOULL) {
+
+        int is_signed = (q->model == MODEL_ATOI ||
+                         q->model == MODEL_ATOL ||
+                         q->model == MODEL_ATOLL ||
+                         q->model == MODEL_STRTOL ||
+                         q->model == MODEL_STRTOLL);
+        smt_model_numeric_mutations(q, is_signed);
     
     } else {
         ABORT("Not yet implemented");

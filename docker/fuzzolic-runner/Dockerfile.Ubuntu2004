@@ -2,36 +2,42 @@ FROM ubuntu:20.04
 
 RUN sed -i -- 's/# deb-src/deb-src/g' /etc/apt/sources.list && cat /etc/apt/sources.list
 
+WORKDIR /tmp
 # dependencies
 RUN apt update -y && \
-	DEBIAN_FRONTEND=noninteractive apt-get build-dep -y qemu-user && \ 
-	DEBIAN_FRONTEND=noninteractive apt install -y \
-	clang emacs curl \
+	DEBIAN_FRONTEND=noninteractive apt-get build-dep -y && DEBIAN_FRONTEND=noninteractive apt install -y qemu-user lsb-release wget software-properties-common gnupg
+
+RUN wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 18
+	
+RUN DEBIAN_FRONTEND=noninteractive apt install -y \
+	emacs curl \
 	qemu-user git libglib2.0-dev libfdt-dev \
 	libpixman-1-dev zlib1g-dev libcapstone-dev \
-	strace cmake python3 libprotobuf-dev \
+	strace cmake python3 python3-pip libprotobuf-dev \
 	libibverbs-dev libjpeg62-dev \
 	libpng16-16 libjbig-dev \
 	build-essential libtool-bin python3-dev \
 	automake flex bison libglib2.0-dev \
 	libpixman-1-dev \
-	python3-setuptools llvm wget \
-	llvm-dev g++ g++-multilib python3 \
-	python3-pip lsb-release gcc \
-	llvm cmake libc6 libstdc++6 \
+	python3-setuptools wget \
+	g++ g++-multilib \
+	gcc cmake libc6 libstdc++6 \
 	linux-libc-dev gcc-multilib \
-	apt-transport-https libtool \
-        libtool-bin wget \
-        automake autoconf \
-        bison git gdb dumb-init valgrind ninja-build \
-	time xxd python3-pip && \
+	apt-transport-https libtool libtool-bin \
+  automake autoconf \
+  bison git gdb dumb-init valgrind ninja-build \
+	time xxd && \
 	apt clean && \
 	rm -rf /var/lib/apt/lists/*
 
 
-# Install uv
+# Install uv and rustup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/root/.local/bin:/usr/local/cargo/bin:$PATH
+
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 
 WORKDIR /root/fuzzolic
 COPY pyproject.toml uv.lock ./
