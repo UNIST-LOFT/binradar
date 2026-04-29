@@ -1,0 +1,83 @@
+FROM ubuntu:22.04
+
+ENV PATH=/root/.local/bin:/root/.cargo/bin:$PATH
+
+RUN sed -i -- 's/# deb-src/deb-src/g' /etc/apt/sources.list && cat /etc/apt/sources.list
+
+# dependencies
+RUN apt update -y && \
+	DEBIAN_FRONTEND=noninteractive apt-get build-dep -y qemu-user && DEBIAN_FRONTEND=noninteractive apt install -y lsb-release wget software-properties-common gnupg
+
+RUN wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 18 && \
+	update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 50 && \
+	update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-18 50 && \
+	update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 50 && \
+	update-alternatives --install /usr/bin/llvm-as llvm-as /usr/bin/llvm-as-18 50 && \
+	update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-18 50 && \
+	update-alternatives --install /usr/bin/llvm-dis llvm-dis /usr/bin/llvm-dis-18 50 && \
+	update-alternatives --install /usr/bin/llvm-link llvm-link /usr/bin/llvm-link-18 50 && \
+	update-alternatives --install /usr/bin/lld lld /usr/bin/lld-18 50
+	
+RUN DEBIAN_FRONTEND=noninteractive apt install -y \
+	emacs curl \
+	qemu-user libglib2.0-dev libfdt-dev \
+	libpixman-1-dev zlib1g-dev libcapstone-dev \
+	strace cmake python3 python3-pip python3-tomli python3-venv libprotobuf-dev \
+	libibverbs-dev libjpeg62-dev \
+	libpng16-16 libjbig-dev \
+	build-essential libtool-bin python3-dev \
+	automake flex bison libglib2.0-dev \
+	libpixman-1-dev \
+	python3-setuptools wget \
+	g++ g++-multilib \
+	gcc cmake libc6 libstdc++6 \
+	linux-libc-dev gcc-multilib \
+	apt-transport-https libtool libtool-bin autoconf \
+    git gdb dumb-init valgrind ninja-build \
+	time xxd openssh-server && \
+	apt clean && \
+	rm -rf /var/lib/apt/lists/*
+
+WORKDIR /root/prog
+RUN /root/.cargo/bin/cargo install just
+RUN git clone https://github.com/git/git.git && cd git && git checkout v2.54.0 && make configure && ./configure && make -j 32 && make install
+RUN git clone https://github.com/Kitware/CMake.git && cd CMake && git checkout v3.31.12 && ./bootstrap && make -j 32 && make install
+
+# Install uv and rustup
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+
+# Cache deps for fuzzolic
+WORKDIR /root/fuzzolic
+COPY pyproject.toml uv.lock ./
+
+RUN uv venv && uv sync
+
+ENV VIRTUAL_ENV=/root/fuzzolic/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# fuzzolic
+COPY . .
+
+# Build QEMU tracer
+RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && make -j 32 
+
+# Build custom Z3
+RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
+
+# Build LibAFL
+RUN cd LibAFL && /root/.cargo/bin/cargo build --release
+
+# Build AFL++
+# RUN cd utils && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
+# 	cd AFLplusplus && git checkout 2dac4e7 && \
+# 	git apply ../afl-showmap.c.patch && \
+# 	make -j `nproc` all && cd qemu_mode && ./build_qemu_support.sh
+# ENV AFL_PATH=/root/fuzzolic/utils/AFLplusplus
+# RUN echo "export AFL_PATH=/root/fuzzolic/utils/AFLplusplus" >> $BASH_ENV
+
+# Build fuzzolic tests
+RUN cd tests && make
+
+CMD bash

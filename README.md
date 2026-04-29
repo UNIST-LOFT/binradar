@@ -2,6 +2,14 @@
 
 Please refer to the documentation in the `docs` directory for build and usage instructions. You can also find it online on https://season-lab.github.io/fuzzolic/.
 
+## Build
+```
+git clone https://github.com/hsh814/fuzzolic.git
+cd fuzzolic
+git submodule update --init --recursive
+docker build -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204 .
+```
+
 
 ## Status
 ### Fuzzolic
