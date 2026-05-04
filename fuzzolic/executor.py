@@ -1369,7 +1369,5 @@ class Executor(object):
             self._forkserver_session_log.close()
             self._forkserver_session_log = None
 
-        if len(self.__warning_log):
-            logger.info()
         for w in self.__warning_log:
             logger.info(w)
