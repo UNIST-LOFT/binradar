@@ -25,6 +25,7 @@ import io
 import analyze_type
 import minimizer_qsym
 import minimizer
+import binradar_minimizer
 import logger
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -368,11 +369,9 @@ class Executor(object):
             #  self.minimizer = minimizer.TestcaseMinimizer([binary] + binary_args, self.global_bitmap)
         else:
             self.afl = None
-            if minimizer_qsym.is_afl_showmap_available():
-                self.minimizer = minimizer_qsym.TestcaseMinimizer(
-                    [binary] + binary_args, AFL_PATH, output_dir, True, input_fixed_name)
-            else:
-                self.minimizer = minimizer.TestcaseMinimizer([binary] + binary_args, self.global_bitmap)
+            self.minimizer = binradar_minimizer.TestcaseMinimizer(
+                [binary] + binary_args, self.global_bitmap
+            )
 
         self.afl_processed_testcases = set()
         self.afl_alt_processed_testcases = set()

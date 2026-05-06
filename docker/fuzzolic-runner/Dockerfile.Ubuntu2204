@@ -1,7 +1,5 @@
 FROM ubuntu:22.04
 
-ENV PATH=/root/.local/bin:/root/.cargo/bin:$PATH
-
 RUN sed -i -- 's/# deb-src/deb-src/g' /etc/apt/sources.list && cat /etc/apt/sources.list
 
 # dependencies
@@ -51,10 +49,11 @@ RUN /root/.cargo/bin/cargo install just
 WORKDIR /root/fuzzolic
 COPY pyproject.toml uv.lock ./
 
-RUN uv venv && uv sync
+RUN /root/.local/bin/uv venv && /root/.local/bin/uv sync
 
 ENV VIRTUAL_ENV=/root/fuzzolic/.venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PATH="$VIRTUAL_ENV/bin:/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN echo export PATH="$VIRTUAL_ENV/bin:/root/.local/bin:/root/.cargo/bin:\$PATH" >> $BASH_ENV
 
 # fuzzolic
 COPY . .
@@ -66,7 +65,7 @@ RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-li
 RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 
 # Build LibAFL
-RUN cd LibAFL && /root/.cargo/bin/cargo build --release
+RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace && /root/.cargo/bin/cargo build --release
 
 # Build AFL++
 # RUN cd utils && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
