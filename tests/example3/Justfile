@@ -1,4 +1,4 @@
-import "../../../Justfile"
+import "../../Justfile"
 set dotenv-filename := "config.env"
 set dotenv-load
 
@@ -14,8 +14,8 @@ workdir := justfile_dir()
 
 objdump:
     objdump -d {{binary}}.orig > {{binary}}.orig.asm
-    objdump -d {{binary}}.good > {{binary}}.good.asm
-    objdump -d {{binary}}.bad > {{binary}}.bad.asm
+    # objdump -d {{binary}}.good > {{binary}}.good.asm
+    # objdump -d {{binary}}.bad > {{binary}}.bad.asm
 
 show:
     echo "libafl_dir: {{LIBAFL_PATH}}"

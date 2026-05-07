@@ -2,6 +2,7 @@ old
 driver
 example/example
 tmp/
+out/
 
 *.o
 *.asm

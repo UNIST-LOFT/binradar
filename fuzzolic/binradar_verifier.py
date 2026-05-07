@@ -19,14 +19,29 @@ def execute_async(command: List[str], env: Optional[Dict[str, str]] = None, cwd:
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd, start_new_session=True)
     return process
 
-def execute(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0) -> Tuple[bool, int, str, str]:
-    """
-    Executes a command and returns the exit code, stdout, and stderr.
-    """
-    process = execute_async(command, env=env, cwd=cwd, timeout=timeout)
+class ExecutionResult:
+    def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str):
+        self.success = success
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> ExecutionResult:
+    
+    def decode_output(data) -> str:
+        if data is None:
+            return ""
+        if isinstance(data, bytes):
+            return data.decode(errors="ignore")
+        return str(data)
+    
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-        return True, process.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
+        return ExecutionResult(
+            success=True,
+            exit_code=process.returncode,
+            stdout=decode_output(stdout),
+            stderr=decode_output(stderr))
     except Exception as e:
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -41,8 +56,16 @@ def execute(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optio
                 pass
             stdout, stderr = process.communicate()
         stdout, stderr = process.communicate()
-        logger.debug(f"Command failed: {' '.join(command)} Error: {str(e)}")
-        return False, process.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
+        logger.debug(f"Command failed: Error: {str(e)}")
+        return ExecutionResult(
+            success=False,
+            exit_code=process.returncode,
+            stdout=decode_output(stdout),
+            stderr=decode_output(stderr))
+
+def execute(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0) -> ExecutionResult:
+    process = execute_async(command, env=env, cwd=cwd, timeout=timeout)
+    return execute_await(process, timeout=timeout)
 
 def load_env(file: str) -> Dict[str, str]:
     """
@@ -74,7 +97,7 @@ class BinRadarVerifier:
     test_cmd: str
     target_function_entry: str
     patch_loc: str
-    run_results: Optional[Tuple[bool, int, str, str]]
+    run_results: Optional[ExecutionResult]
     def __init__(self, dir: str, binary: str, poc_input: str, test_cmd: str, target_function_entry: str, patch_loc: str):
         self.dir = dir
         self.binary = binary
@@ -113,14 +136,13 @@ class BinRadarVerifier:
     def parse_results(self):
         if self.run_results is None:
             raise ValueError("No results to parse. Please run the test first.")
-        success, exit_code, stdout, stderr = self.run_results
-        if not success:
+        if not self.run_results.success:
             logger.error("Failed to execute the command.")
             return
-        print(f"Success: {success}")
-        print(f"Exit code: {exit_code}")
-        print(f"Stdout: {stdout}")
-        print(f"Stderr: {stderr}")
+        print(f"Success: {self.run_results.success}")
+        print(f"Exit code: {self.run_results.exit_code}")
+        print(f"Stdout: {self.run_results.stdout}")
+        print(f"Stderr: {self.run_results.stderr}")
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[patch-info] [set: bool] [location: hex]")
@@ -128,14 +150,7 @@ class BinRadarVerifier:
         parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol: str]")
         parser.add_schema("[patch-cov] [location: hex] [covered: bool] [hits: int]")
         parser.add_schema("[patch-func] [location: hex] [entry-cnt: int] [entry: str] [hits: int]")
-        result = parser.loads(stderr)
-        
-    
-
-test = BinRadarVerifier.init("/root/fuzzolic/tests/example7/CVE-2017-15025")
-test.test_with_original()
-
-
+        result = parser.loads(self.run_results.stderr)
 
 
 

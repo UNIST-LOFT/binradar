@@ -68,12 +68,14 @@ RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace && /root/.cargo/bin/cargo build --release
 
 # Build AFL++
-# RUN cd utils && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
-# 	cd AFLplusplus && git checkout 2dac4e7 && \
-# 	git apply ../afl-showmap.c.patch && \
-# 	make -j `nproc` all && cd qemu_mode && ./build_qemu_support.sh
-# ENV AFL_PATH=/root/fuzzolic/utils/AFLplusplus
-# RUN echo "export AFL_PATH=/root/fuzzolic/utils/AFLplusplus" >> $BASH_ENV
+RUN cd utils && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
+	cd AFLplusplus && git checkout 2dac4e7 && \
+	git apply ../afl-showmap.c.patch && \
+	make -j `nproc` all 
+RUN cd utils/AFLplusplus/qemu_mode && /root/.local/bin/uvx virtualenv venv && source venv/bin/activate && \
+    pip install "meson==0.56.2" && ./build_qemu_support.sh
+ENV AFL_PATH=/root/fuzzolic/utils/AFLplusplus
+RUN echo "export AFL_PATH=/root/fuzzolic/utils/AFLplusplus" >> $BASH_ENV
 
 # Build fuzzolic tests
 RUN cd tests && make
