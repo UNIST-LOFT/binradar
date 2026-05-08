@@ -2,7 +2,7 @@ import subprocess
 import os
 import signal
 import shlex
-from typing import List, Set, Tuple, Dict, Optional
+from typing import List, Set, Tuple, Dict, Optional, Any
 
 import sbsv
 
@@ -140,13 +140,14 @@ class BinRadarVerifier:
     def test_with_original(self):
         command = self.get_qemu_stacktrace_command(self.original_binary(), self.poc_input)
         self.run_results = execute(command, cwd=self.dir)
+        parsed = self.parse_results(self.run_results.stderr)
     
-    def parse_results(self):
+    def parse_results(self, log: str) -> Dict[str, Any]:
         if self.run_results is None:
             raise ValueError("No results to parse. Please run the test first.")
         if not self.run_results.success:
             logger.error("Failed to execute the command.")
-            return
+            return {}
         print(f"Success: {self.run_results.success}")
         print(f"Exit code: {self.run_results.exit_code}")
         print(f"Stdout: {self.run_results.stdout}")
@@ -158,7 +159,7 @@ class BinRadarVerifier:
         parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol: str]")
         parser.add_schema("[patch-cov] [location: hex] [covered: bool] [hits: int]")
         parser.add_schema("[patch-func] [location: hex] [entry-cnt: int] [entry: str] [hits: int]")
-        result = parser.loads(self.run_results.stderr)
-
+        result = parser.loads(log)
+        return result
 
 

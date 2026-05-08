@@ -25,8 +25,8 @@ SOLVER_SMT_BIN = SCRIPT_DIR + "/../solver/build/solver-smt"
 TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
-SOLVER_WAIT_TIME_AT_STARTUP = 1000 # ms
-SOLVER_TIMEOUT = 60000 # ms
+SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
+SOLVER_TIMEOUT = 10 # s
 SHUTDOWN = False
 ABORTING_COUNT = 0
 
@@ -139,11 +139,15 @@ class TracerExecutor:
         self.run_result = None
     
     def start(self):
+        """ 
+        Start the tracer process and set up forkserver communication if enabled. 
+        Should be called after SolverExecutor.start() - shared memory is set in solver process
+        """
         self.start_time = time.time()
         if not self.forkserver_mode:
             self.process = subprocess.Popen(
                 self.command,
-                stdout=None,
+                stdout=subprocess.DEVNULL,
                 stderr=self.log_fp,
                 cwd=self.workdir,
                 env=self.env,
@@ -167,7 +171,7 @@ class TracerExecutor:
         
         self.process = subprocess.Popen(
             self.command,
-            stdout=None,
+            stdout=subprocess.DEVNULL,
             stderr=self.log_fp,
             cwd=self.workdir,
             env=self.env,
@@ -201,6 +205,7 @@ class TracerExecutor:
             logger.info(f"[TRACER] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success
         self._write_u32(0)  # Send run command to forkserver
+        is_timeout = False
         child_pid = self._read_u32(self.timeout)
         try:
             status = self._read_u32(self.timeout)
@@ -220,6 +225,7 @@ class TracerExecutor:
                 logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - start_time, 3)}] [saved {analyze_result_file}]")
             logger.info(f"[TRACER] Target process finished with status {status:#x}")
         except Exception as e:
+            is_timeout = True
             logger.error(f"Error while waiting for tracer forkserver: {str(e)}")
             self.process.send_signal(signal.SIGINT)
             self.process.wait()
@@ -229,7 +235,7 @@ class TracerExecutor:
             raise ValueError("Analyze result too large")
         self._write_u32(len(analyze_result))
         self._write(analyze_result)
-        return int((time.time() - start_time) * 1000), self.run_result.success
+        return int((time.time() - start_time) * 1000), is_timeout
     
     def stop(self):
         if self.ctrl_w != 0:
@@ -325,6 +331,7 @@ class SolverExecutor:
     
     def start(self):
         logger.info(f"[SOLVER] Starting solver with command: {' '.join(self.command)}")
+        logger.debug(f"[SOLVER] timeout set to {self.timeout} seconds")
         self.process = subprocess.Popen(
             self.command,
             stdout=self.log_fp,
@@ -335,7 +342,7 @@ class SolverExecutor:
             start_new_session=True)
         RUNNING_PROCESSES.append(self.process)
         # Give the solver some time to start up and create shared memories
-        time.sleep(SOLVER_WAIT_TIME_AT_STARTUP / 1000)
+        time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
     
     def create_inputs(self):
         if self.process is None:
@@ -351,22 +358,22 @@ class SolverExecutor:
         is_timeout = False
         while True:
             try:
-                self.process.wait(self.timeout)
+                self.process.wait(SOLVER_TIMEOUT)
                 break
             except subprocess.TimeoutExpired:
                 pass
             elapsed += SOLVER_TIMEOUT
-            if self.timeout > 0 and elapsed > (self.timeout + 10000):
+            if self.timeout > 0 and elapsed > (self.timeout + 10):
                 is_timeout = True
                 break
         if is_timeout:
             logger.info("[SOLVER] Solver is taking too long. Let us stop it.")
             self.process.send_signal(signal.SIGUSR2)
             try:
-                self.process.wait(SOLVER_TIMEOUT / 1000)
+                self.process.wait(SOLVER_TIMEOUT)
             except subprocess.TimeoutExpired:
                 logger.info("[SOLVER] Solver will be killed.")
-                binradar_verifier.execute_await(self.process, timeout=0.1)
+                binradar_verifier.execute_await(self.process, timeout=1)
         return int((time.time() - start_time) * 1000), is_timeout
 
     def stop(self):
@@ -549,7 +556,7 @@ class BinRadarExecutor:
         self.config["SYMBOLIC_TESTCASE_NAME"] = testcase
         self.config["BINRADAR_ENTRYPOINT"] = self.target_function_entry
         if self.timeout > 0:
-            self.config["SOLVER_TIMEOUT"] = str(self.timeout)
+            self.config["SOLVER_TIMEOUT"] = str(int(self.timeout * 1000))
         self.config["PLT_INFO_FILE"] = self.set_plt_info(os.path.join(self.outdir, "plt_info.txt"))
     
     def get_env(self, mode: str, run_dir: str) -> Dict[str, str]:
