@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
 import binradar_verifier
+import binradar_utils
 import logger
 import sbsv
 
@@ -116,7 +117,7 @@ class TracerExecutor:
     ctrl_w: int
     stat_r: int
     iter: int
-    run_result: Optional[binradar_verifier.ExecutionResult]
+    run_result: Optional[binradar_utils.ExecutionResult]
     def __init__(self, mode: str, env: Dict[str, str], workdir: str, rundir: str, binary: str, test_cmd: str, testcase: str, timeout: float):
         self.command = [TRACER_BIN, "-symbolic", "-d", "page", binary] + shlex.split(test_cmd.replace("@@", testcase))
         self.mode = mode
@@ -197,7 +198,7 @@ class TracerExecutor:
         start_time = time.time()
         self.iter += 1
         if not self.forkserver_mode:
-            self.run_result = binradar_verifier.execute_await(self.process, timeout=self.timeout)
+            self.run_result = binradar_utils.execute_await(self.process, timeout=self.timeout)
             logger.info(f"[TRACER] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
         self._write_u32(0)  # Send run command to forkserver
@@ -243,7 +244,7 @@ class TracerExecutor:
             self.stat_r = 0
         if self.process is not None:
             logger.info("[TRACER] Stopping tracer process...")
-            self.run_result = binradar_verifier.execute_await(self.process, timeout=5)
+            self.run_result = binradar_utils.execute_await(self.process, timeout=5)
             RUNNING_PROCESSES.remove(self.process)
             self.process = None
         if not self.log_fp.closed:
@@ -300,7 +301,7 @@ class SolverExecutor:
     log_fp: BinaryIO
     process: Optional[subprocess.Popen]
     timeout: float
-    run_result: Optional[binradar_verifier.ExecutionResult]
+    run_result: Optional[binradar_utils.ExecutionResult]
     def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float):
         testcase_dir = os.path.join(run_dir, f"{mode}-tests")
         os.makedirs(testcase_dir, exist_ok=True)
@@ -370,7 +371,7 @@ class SolverExecutor:
                 self.process.wait(SOLVER_TIMEOUT)
             except subprocess.TimeoutExpired:
                 logger.info("[SOLVER] Solver will be killed.")
-                binradar_verifier.execute_await(self.process, timeout=1)
+                binradar_utils.execute_await(self.process, timeout=1)
         return int((time.time() - start_time) * 1000), is_timeout
 
     def stop(self):
@@ -482,7 +483,7 @@ class BinRadarExecutor:
 
     @staticmethod
     def init(workdir: str) -> "BinRadarExecutor":
-        env = binradar_verifier.load_env(os.path.join(workdir, "config.env"))
+        env = binradar_utils.load_env(os.path.join(workdir, "config.env"))
         return BinRadarExecutor.init_from_env(workdir, env)
 
     @staticmethod
@@ -500,7 +501,7 @@ class BinRadarExecutor:
         # Backup config.env to run_dir
         config_file = os.path.join(binradar.run_dir, "config.env")
         if not os.path.exists(config_file):
-            binradar_verifier.save_env(env, config_file)
+            binradar_utils.save_env(env, config_file)
         return binradar
 
     def elapsed_time_ms(self) -> int:
@@ -519,7 +520,7 @@ class BinRadarExecutor:
         if os.path.exists(plt_info):
             logger.info(f"PLT info file already exists: {plt_info}")
             return plt_info
-        plt_result = binradar_verifier.execute([FIND_MODELS_BIN, "-o", plt_info, self.original_binary()])
+        plt_result = binradar_utils.execute([FIND_MODELS_BIN, "-o", plt_info, self.original_binary()])
         if not plt_result.success:
             logger.warning("Failed to find PLT info. PLT-based optimizations will be disabled.")
             sys.exit(plt_result.exit_code)
@@ -751,7 +752,7 @@ def main():
     if not os.path.exists(args.workdir):
         sys.exit(f"ERROR: workdir {args.workdir} does not exist.")
 
-    env = binradar_verifier.load_env(os.path.join(args.workdir, "config.env"))
+    env = binradar_utils.load_env(os.path.join(args.workdir, "config.env"))
     if args.target_function_entry:
         env["TARGET_FUNCTION_ENTRY"] = args.target_function_entry
     if args.patch_loc:
