@@ -27,8 +27,6 @@ FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
 SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
 SOLVER_TIMEOUT = 10 # s
-SHUTDOWN = False
-ABORTING_COUNT = 0
 
 RUNNING_PROCESSES = []
 MAX_VIRTUAL_MEMORY = 16 * 1024 * 1024 * 1024  # 16 GB
@@ -73,10 +71,7 @@ def handler(signo, stackframe):
             if proc in RUNNING_PROCESSES:
                 RUNNING_PROCESSES.remove(proc)
 
-    global ABORTING_COUNT
-    ABORTING_COUNT += 1
-    if ABORTING_COUNT >= 3:
-        sys.exit("Killing binradar without cleanup. Not good.")
+    sys.exit(f"Aborted binradar with cleanup.")
 
 class SharedMemoryManager:
     def __init__(self, env: Dict[str, str]):
@@ -196,14 +191,15 @@ class TracerExecutor:
             raise RuntimeError(f"Unexpected forkserver ack: {ack:#x}")
         logger.info("[TRACER] Tracer forkserver started successfully.")
         
-    def run(self) -> Tuple[int, bool]: # synchronous run, wait for target binary to finish
+    def run(self) -> Tuple[int, bool, int]: # synchronous run, wait for target binary to finish
         if self.process is None:
             raise RuntimeError("Tracer process not started")
         start_time = time.time()
+        self.iter += 1
         if not self.forkserver_mode:
             self.run_result = binradar_verifier.execute_await(self.process, timeout=self.timeout)
             logger.info(f"[TRACER] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
-            return int((time.time() - start_time) * 1000), self.run_result.success
+            return int((time.time() - start_time) * 1000), self.run_result.success, 0
         self._write_u32(0)  # Send run command to forkserver
         is_timeout = False
         child_pid = self._read_u32(self.timeout)
@@ -235,7 +231,8 @@ class TracerExecutor:
             raise ValueError("Analyze result too large")
         self._write_u32(len(analyze_result))
         self._write(analyze_result)
-        return int((time.time() - start_time) * 1000), is_timeout
+        remaining = self._read_u32(self.timeout)
+        return int((time.time() - start_time) * 1000), is_timeout, remaining
     
     def stop(self):
         if self.ctrl_w != 0:
@@ -257,7 +254,7 @@ class TracerExecutor:
         Determine if type analysis is needed:
         - It has large overhead, so we only want to run it when necessary.
         """
-        return self.mode == "memory" and self.iter == 0
+        return self.mode == "binradar" and self.iter == 1
     
     def _write_u32(self, value: int):
         self._write(value.to_bytes(4, byteorder="little"))
@@ -578,7 +575,6 @@ class BinRadarExecutor:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
         # Solver
         env["BINRADAR_SOLVER_CONCRETE_OUTDIR"] = os.path.join(run_dir, f"solver-out-{mode}")
-        env["SOLVER_TIMEOUT"] = str(SOLVER_TIMEOUT + 10000)
         os.makedirs(env["BINRADAR_SOLVER_CONCRETE_OUTDIR"], exist_ok=True)
         return env
 
@@ -601,22 +597,22 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(probe_env)
         shm.assign_random_keys()
         
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, probe_env, self.workdir, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, probe_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
+        
         try:
-            solver = SolverExecutor(exec_mode, testcase, self.run_dir, probe_env, self.workdir, timeout=self.timeout)
             solver.start()
-            tracer = TracerExecutor(exec_mode, probe_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
             tracer.start()
-            try:
-                tracer_time, tracer_success = tracer.run()
-                self.save_progress(f"[probe] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
-                solver.create_inputs()
-                solver_time, solver_success = solver.wait()
-                self.save_progress(f"[probe] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
-            except Exception as e:
-                logger.error(f"Error during probe execution: {str(e)}")
-                tracer.stop()
-                solver.stop()
-                raise e
+            tracer_time, tracer_success, _ = tracer.run()
+            self.save_progress(f"[probe] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            solver.create_inputs()
+            solver_time, solver_success = solver.wait()
+            self.save_progress(f"[probe] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+        except Exception as e:
+            logger.error(f"Error during probe execution: {str(e)}")
+            tracer.stop()
+            solver.stop()
+            raise e
         finally:
             shm.cleanup()
 
@@ -657,26 +653,67 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(directed_env)
         shm.assign_random_keys()
         
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
         try:
-            solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout)
             solver.start()
-            tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
             tracer.start()
-            try:
-                tracer_time, tracer_success = tracer.run()
-                self.save_progress(f"[directed] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
-                solver.create_inputs()
-                solver_time, solver_success = solver.wait()
-                self.save_progress(f"[directed] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
-            except Exception as e:
-                logger.error(f"Error during directed execution: {str(e)}")
-                tracer.stop()
-                solver.stop()
-                raise e
+            tracer_time, tracer_success, _ = tracer.run()
+            self.save_progress(f"[directed] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            solver.create_inputs()
+            solver_time, solver_success = solver.wait()
+            self.save_progress(f"[directed] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+        except Exception as e:
+            logger.error(f"Error during directed execution: {str(e)}")
+            tracer.stop()
+            solver.stop()
+            raise e
         finally:
             shm.cleanup()
 
         self.save_progress(f"[directed] [done] [id {self.run_id}]")
+    
+    def run_binradar(self):
+        testcase = self.resolved_poc_input()
+        if not os.path.exists(self.original_binary()):
+            sys.exit("ERROR: binary does not exist.")
+        if not os.path.exists(testcase):
+            sys.exit("ERROR: input does not exist.")
+        # TODO: support stdin
+        if "@@" not in self.test_cmd:
+            sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
+
+        exec_mode = "binradar"
+        shutil.copy2(testcase, self.run_dir)
+        logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
+        self.save_progress(f"[binradar] [start] [id {self.run_id}]")
+        
+        binradar_env = self.get_env(exec_mode, self.run_dir)
+        shm = SharedMemoryManager(binradar_env)
+        shm.assign_random_keys()
+        
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
+        
+        try:
+            solver.start()
+            tracer.start()
+            remaining = 1
+            while remaining > 0:
+                # TODO: implement behavior comparison
+                tracer_time, tracer_success, remaining = tracer.run()
+                self.save_progress(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            # TODO: we can generate more inputs - currently, we don't utilize collected constraints
+            solver.stop()
+        except Exception as e:
+            logger.error(f"Error during binradar execution: {str(e)}")
+            tracer.stop()
+            solver.stop()
+            raise e
+        finally:
+            shm.cleanup()
+
+        self.save_progress(f"[binradar] [done] [id {self.run_id}]")
     
     def done(self):
         self.save_progress(f"[rundir] [done] [id {self.run_id}] [dir {self.run_dir}]")
@@ -735,6 +772,7 @@ def main():
     executor = BinRadarExecutor.init_from_env(args.workdir, env)
     executor.run_probe()
     executor.run_directed()
+    # executor.run_binradar()
     executor.done()
 
 
