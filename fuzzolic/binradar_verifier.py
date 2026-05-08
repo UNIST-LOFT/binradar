@@ -25,6 +25,13 @@ class ExecutionResult:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+    
+    def decode_status(self) -> int:
+        if os.WIFEXITED(self.exit_code):
+            return os.WEXITSTATUS(self.exit_code)
+        elif os.WIFSIGNALED(self.exit_code):
+            return -os.WTERMSIG(self.exit_code)
+        return 0
 
 def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> ExecutionResult:
     
@@ -35,6 +42,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> Execution
             return data.decode(errors="ignore")
         return str(data)
     
+    logger.debug(f"Awaiting process with PID {process.pid} for up to {timeout} seconds")
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         return ExecutionResult(
