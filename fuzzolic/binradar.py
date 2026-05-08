@@ -13,7 +13,7 @@ import sys
 import select
 import io
 import time
-from typing import Dict, List, Tuple, Set, Optional, BinaryIO
+from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
 import binradar_verifier
@@ -149,7 +149,7 @@ class TracerExecutor:
                 preexec_fn=setlimits,
                 start_new_session=True)
             RUNNING_PROCESSES.append(self.process)
-            logger.info("[TRACER] Started tracer without forkserver mode.")
+            logger.info(f"[TRACER] Started tracer without forkserver mode. {' '.join(self.command)}")
             return
 
         # Set up pipes for forkserver communication
@@ -196,6 +196,7 @@ class TracerExecutor:
             raise RuntimeError("Tracer process not started")
         if not self.forkserver_mode:
             self.run_result = binradar_verifier.execute_await(self.process, timeout=self.timeout)
+            logger.info(f"[TRACER] Target process finished with exit code {self.run_result.exit_code}")
             return
         self._write_u32(0)  # Send run command to forkserver
         child_pid = self._read_u32(self.timeout)
@@ -239,7 +240,7 @@ class TracerExecutor:
             self.run_result = binradar_verifier.execute_await(self.process, timeout=5)
             RUNNING_PROCESSES.remove(self.process)
             self.process = None
-        if self.log_fp is not None:
+        if not self.log_fp.closed:
             self.log_fp.close()
         
     def _need_type_analysis(self) -> bool:
@@ -374,8 +375,56 @@ class SolverExecutor:
                 self.process.wait()
             RUNNING_PROCESSES.remove(self.process)
             self.process = None
-        if self.log_fp is not None:
+        if not self.log_fp.closed:
             self.log_fp.close()
+
+class BinRadarProgress:
+    run_id: int
+    run_dir: str
+    probe_done: bool
+    directed_done: bool
+    done: bool
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, directed_done: bool, done: bool):
+        self.run_id = run_id
+        self.run_dir = run_dir
+        self.probe_done = probe_done
+        self.directed_done = directed_done
+        self.done = done
+    
+    @staticmethod
+    def from_progress_file(file: str) -> Optional["BinRadarProgress"]:
+        if not os.path.exists(file):
+            return None
+        parser = sbsv.parser()
+        parser.add_schema("[rundir] [set] [id: int] [dir: str]")
+        parser.add_schema("[rundir] [done] [id: int] [dir: str]")
+        parser.add_schema("[probe] [done] [id: int] [hit-count: int]")
+        parser.add_schema("[directed] [done] [id: int]")
+        with open(file, "r", encoding="utf-8") as f:
+            parser.load(f)
+        rundir = parser.get_result()["rundir"]["set"]
+        if len(rundir) == 0:
+            return None
+        last_rundir = rundir[-1]
+        run_id = int(last_rundir["id"])
+        run_dir = last_rundir["dir"]
+        
+        probe_done = False
+        directed_done = False
+        done = False
+        for probe in parser.get_result()["probe"]["done"]:
+            if int(probe["id"]) == run_id:
+                probe_done = True
+                break
+        for directed in parser.get_result()["directed"]["done"]:
+            if int(directed["id"]) == run_id:
+                directed_done = True
+                break
+        for done_item in parser.get_result()["rundir"]["done"]:
+            if int(done_item["id"]) == run_id:
+                done = True
+                break
+        return BinRadarProgress(run_id, run_dir, probe_done, directed_done, done)
 
 class BinRadarExecutor:
     # Config from config.env and command line arguments
@@ -389,6 +438,10 @@ class BinRadarExecutor:
     patch_loc: str
     # Data
     config: Dict[str, str]
+    progress_file: TextIO
+    previous_progress: Optional[BinRadarProgress]
+    run_id: int
+    run_dir: str
     probe_hit_count: int
     probe_file: str
     def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, target_function_entry: str, patch_loc: str):
@@ -407,9 +460,14 @@ class BinRadarExecutor:
 
         os.makedirs(self.outdir, exist_ok=True)
         logger.set_file(os.path.join(self.outdir, "binradar.log"))
+        
+        progress_filename = os.path.join(self.outdir, "progress.sbsv")
+        self.previous_progress = BinRadarProgress.from_progress_file(progress_filename)
+        self.progress_file = open(progress_filename, "a", encoding="utf-8")
 
         self.config = dict()
         self.set_base_config()
+        self.run_id, self.run_dir = self.set_run_dir()
 
     @staticmethod
     def init(workdir: str) -> "BinRadarExecutor":
@@ -418,7 +476,7 @@ class BinRadarExecutor:
 
     @staticmethod
     def init_from_env(workdir: str, env: Dict[str, str]) -> "BinRadarExecutor":
-        return BinRadarExecutor(
+        binradar = BinRadarExecutor(
             workdir=workdir,
             outdir=env["BINRADAR_OUTDIR"],
             timeout=int(env["BINRADAR_TIMEOUT"]),
@@ -428,8 +486,23 @@ class BinRadarExecutor:
             target_function_entry=env["TARGET_FUNCTION_ENTRY"],
             patch_loc=env["PATCH_LOC"],
         )
+        # Backup config.env to run_dir
+        config_file = os.path.join(binradar.run_dir, "config.env")
+        if not os.path.exists(config_file):
+            binradar_verifier.save_env(env, config_file)
+        return binradar
+    
+    def save_progress(self, data: str):
+        if self.progress_file.closed:
+            logger.warning("Progress file is already closed. Cannot save progress.")
+            return
+        self.progress_file.write(data + "\n")
+        self.progress_file.flush()
     
     def set_plt_info(self, plt_info: str) -> str:
+        if os.path.exists(plt_info):
+            logger.info(f"PLT info file already exists: {plt_info}")
+            return plt_info
         plt_result = binradar_verifier.execute([FIND_MODELS_BIN, "-o", plt_info, self.original_binary()])
         if not plt_result.success:
             logger.warning("Failed to find PLT info. PLT-based optimizations will be disabled.")
@@ -444,22 +517,16 @@ class BinRadarExecutor:
             return self.poc_input
         return os.path.join(self.workdir, self.poc_input)
 
-    def run_dir(self) -> Tuple[str, int]:
-        status_path = os.path.join(self.outdir, "status")
-        if not os.path.exists(status_path):
-            with open(status_path, "w", encoding="utf-8") as status_fp:
-                status_fp.write("0")
-
-        with open(status_path, "r", encoding="utf-8") as status_fp:
-            run_id = int(status_fp.read())
-
+    def set_run_dir(self) -> Tuple[int, str]:
+        run_id = 0
+        # Currently, start a new run if the previous run exists.
+        # Can resume in more fine-grained way if needed.
+        if self.previous_progress is not None:
+            run_id = self.previous_progress.run_id + 1
         run_dir = os.path.join(self.outdir, f"fuzzolic-{run_id:05d}")
-        os.makedirs(run_dir, exist_ok=False)
-
-        with open(status_path, "w", encoding="utf-8") as status_fp:
-            status_fp.write(str(run_id + 1))
-
-        return run_dir, run_id
+        os.makedirs(run_dir, exist_ok=True)
+        self.save_progress(f"[rundir] [set] [id {run_id}] [dir {run_dir}]")
+        return run_id, run_dir
 
     def set_base_config(self):
         # Basic default config
@@ -506,18 +573,18 @@ class BinRadarExecutor:
             sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
 
         exec_mode = "probe"
-        run_dir, run_id = self.run_dir()
-        shutil.copy2(testcase, run_dir)
-        logger.info("\nRunning directory: %s" % run_dir)
+        shutil.copy2(testcase, self.run_dir)
+        logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
+        self.save_progress(f"[probe] [start] [id {self.run_id}]")
 
-        probe_env = self.get_env(exec_mode, run_dir)
+        probe_env = self.get_env(exec_mode, self.run_dir)
         shm = SharedMemoryManager(probe_env)
         shm.assign_random_keys()
         
         try:
-            solver = SolverExecutor(exec_mode, testcase, run_dir, probe_env, self.workdir)
+            solver = SolverExecutor(exec_mode, testcase, self.run_dir, probe_env, self.workdir)
             solver.start()
-            tracer = TracerExecutor(exec_mode, probe_env, self.workdir, run_dir, self.original_binary(), self.test_cmd, testcase)
+            tracer = TracerExecutor(exec_mode, probe_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase)
             tracer.start()
             try:
                 tracer.run()
@@ -547,7 +614,52 @@ class BinRadarExecutor:
                 sys.exit(f"[binradar] [error] no crash found in probe result.")
             self.probe_hit_count = int(crashes[-1]["hit-count"])
             logger.info(f"[binradar] [probe] [hit-count {self.probe_hit_count}]")
+            self.save_progress(f"[probe] [done] [id {self.run_id}] [hit-count {self.probe_hit_count}]")
         return self.probe_hit_count
+    
+    def run_directed(self):
+        testcase = self.resolved_poc_input()
+        if not os.path.exists(self.original_binary()):
+            sys.exit("ERROR: binary does not exist.")
+        if not os.path.exists(testcase):
+            sys.exit("ERROR: input does not exist.")
+        # TODO: support stdin
+        if "@@" not in self.test_cmd:
+            sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
+
+        exec_mode = "directed"
+        shutil.copy2(testcase, self.run_dir)
+        logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
+        self.save_progress(f"[directed] [start] [id {self.run_id}]")
+        
+        directed_env = self.get_env(exec_mode, self.run_dir)
+        shm = SharedMemoryManager(directed_env)
+        shm.assign_random_keys()
+        
+        try:
+            solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir)
+            solver.start()
+            tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase)
+            tracer.start()
+            try:
+                tracer.run()
+                solver.create_inputs()
+                solver.wait()
+            except Exception as e:
+                logger.error(f"Error during directed execution: {str(e)}")
+                tracer.stop()
+                solver.stop()
+                raise e
+        finally:
+            shm.cleanup()
+
+        logger.info(f"[binradar] [directed] [done] [id {self.run_id}]")
+        self.save_progress(f"[directed] [done] [id {self.run_id}]")
+    
+    def done(self):
+        logger.info(f"[binradar] [done] [id {self.run_id}] [dir {self.run_dir}]")
+        self.save_progress(f"[rundir] [done] [id {self.run_id}] [dir {self.run_dir}]")
+        self.progress_file.close()
 
 def main():
     setlimits()
@@ -595,10 +707,11 @@ def main():
     env["BINRADAR_WORKDIR"] = os.path.abspath(args.workdir)
     env["BINRADAR_TIMEOUT"] = str(args.timeout)
     os.makedirs(env["BINRADAR_OUTDIR"], exist_ok=True)
-    binradar_verifier.save_env(env, os.path.join(env["BINRADAR_OUTDIR"], "config.env"))
 
     executor = BinRadarExecutor.init_from_env(args.workdir, env)
     executor.run_probe()
+    executor.run_directed()
+    executor.done()
 
 
 if __name__ == "__main__":
