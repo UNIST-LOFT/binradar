@@ -135,5 +135,27 @@ class BinRadarVerifier:
             logger.error("Failed to execute the command.")
             return None
         return BinRadarProbeResult.load_from_log(result.stderr)
+    
+    def test_with_original_detailed(self, testcase: str) -> Optional[BinRadarDetailedProbeResult]:
+        command = self.get_qemu_stacktrace_command(self.original_binary(), testcase)
+        result = binradar_utils.execute(command, cwd=self.dir, verbose=False)
+        if not result.success:
+            logger.error("Failed to execute the command.")
+            return None
+        probe_result = BinRadarProbeResult.load_from_log(result.stderr)
+        if probe_result is None:
+            logger.error("Failed to parse the probe result.")
+            return None
+        # TODO: implement BinRadarDetailedProbeResult to include more detailed information
+        detailed_result = BinRadarDetailedProbeResult(
+            patch_loc=probe_result.patch_loc,
+            patch_func_entry=probe_result.patch_func_entry,
+            stacktrace=probe_result.stacktrace,
+            exit_info=probe_result.exit_info,
+            patch_hit_cnt=probe_result.patch_hit_cnt,
+            patch_func_hit_cnt=probe_result.patch_func_hit_cnt,
+            fault_addr=probe_result.fault_addr
+        )
+        return detailed_result
 
 

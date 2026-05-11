@@ -36,6 +36,17 @@ class TestcaseInfo:
         self.stacktrace = []
         self.fault_addr = None
     
+    def __hash__(self):
+        return hash(self.hash)
+    
+    def __eq__(self, other):
+        if not isinstance(other, TestcaseInfo):
+            return False
+        return self.hash == other.hash
+
+    def __lt__(self, other):
+        return self.filename < other.filename
+    
     def compute_hash(self, data: bytes) -> str:
         hasher = hashlib.sha256()
         hasher.update(data)
@@ -54,7 +65,7 @@ class BinRadarMinimizer:
     minimized_dir: str
     testcases_dirs: List[str]
     files: Set[str]
-    testcases: Dict[str, TestcaseInfo]
+    testcases: Set[TestcaseInfo]
     config: Dict[str, str]
     logger: logging.Logger
     start_time: float
@@ -65,11 +76,14 @@ class BinRadarMinimizer:
         os.makedirs(self.minimized_dir, exist_ok=True)
         self.testcases_dirs = testcases_dirs
         self.files = set()
-        self.testcases = dict()
+        self.testcases = set()
         self.config = config
         self.start_time = time.time()
+        # Setup logger
         log_file = os.path.join(run_dir, "minimizer.sbsv")
         self.logger = logging.getLogger(__name__)
+        self.logger.propagate = False
+        self.logger.setLevel(logging.DEBUG)
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.DEBUG)
         fmt = logging.Formatter("%(asctime)s - %(message)s")
@@ -82,34 +96,33 @@ class BinRadarMinimizer:
     
     def load_testcases(self):
         for testcases_dir in self.testcases_dirs:
-            for testcase_file in glob.glob(os.path.join(testcases_dir, "*")):
+            for testcase_file in sorted(glob.glob(os.path.join(testcases_dir, "*"))):
                 if testcase_file in self.files:
                     continue
                 self.files.add(testcase_file)
                 with open(testcase_file, "rb") as f:
                     data = f.read()
                     testcase_info = TestcaseInfo(data, testcase_file)
-                    if testcase_info.hash in self.testcases:
+                    if testcase_info in self.testcases:
                         continue
-                    self.testcases[testcase_info.hash] = testcase_info
+                    self.testcases.add(testcase_info)
     
     def run_testcases(self):
         verifier = binradar_verifier.BinRadarVerifier.init_from_env(self.work_dir, self.config)
         id = 0
         with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
             current_testcase = os.path.join(tmpdir, ".cur_input")
-            for hash, testcase in self.testcases.items():
-                id += 1
-                self.log(f"[testcase] [info] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
+            for testcase in sorted(self.testcases):
+                self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
                 if os.path.exists(current_testcase):
                     os.unlink(current_testcase)
                 os.link(testcase.filename, current_testcase)
                 # TODO: better minimization
-                run_result = verifier.test_with_original(current_testcase)
+                run_result = verifier.test_with_original_detailed(current_testcase)
                 if run_result is None:
                     self.log(f"Failed {testcase.filename} with error.")
                     continue
                 save_file = f"{id}_{os.path.basename(testcase.filename)}"
                 os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
                 self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_result.serialize()}")
-                
+                id += 1

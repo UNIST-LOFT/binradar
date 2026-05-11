@@ -19,15 +19,16 @@ class ExecutionResult:
             return -os.WTERMSIG(self.exit_code)
         return 0
 
-def execute_async(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0) -> subprocess.Popen:
+def execute_async(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0, verbose: bool = True) -> subprocess.Popen:
     """
     Executes a command and returns the exit code, stdout, and stderr.
     """
-    logger.info(f"Executing command: {' '.join(command)} at {cwd if cwd else os.getcwd()}")
+    if verbose:
+        logger.info(f"Executing command: {' '.join(command)} at {cwd if cwd else os.getcwd()}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd, start_new_session=True)
     return process
 
-def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> ExecutionResult:
+def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: bool = False) -> ExecutionResult:
     
     def decode_output(data) -> str:
         if data is None:
@@ -36,7 +37,8 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> Execution
             return data.decode(errors="ignore")
         return str(data)
     
-    logger.debug(f"Awaiting process with PID {process.pid} for up to {timeout} seconds")
+    if verbose:
+        logger.debug(f"Awaiting process with PID {process.pid} for up to {timeout} seconds")
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         return ExecutionResult(
@@ -65,9 +67,9 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0) -> Execution
             stdout=decode_output(stdout),
             stderr=decode_output(stderr))
 
-def execute(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0) -> ExecutionResult:
-    process = execute_async(command, env=env, cwd=cwd, timeout=timeout)
-    return execute_await(process, timeout=timeout)
+def execute(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: float = 60.0, verbose: bool = True) -> ExecutionResult:
+    process = execute_async(command, env=env, cwd=cwd, timeout=timeout, verbose=verbose)
+    return execute_await(process, timeout=timeout, verbose=verbose)
 
 def load_env(file: str) -> Dict[str, str]:
     """
