@@ -6,130 +6,110 @@ import glob
 import subprocess
 import tempfile
 import shutil
+import hashlib
+import logging
+import time
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-TRACER_BIN = SCRIPT_DIR + '/../tracer/build/x86_64-linux-user/qemu-x86_64'
+from typing import List, Dict, Set, Tuple, Any, Optional
 
+import binradar_verifier
 
-def file_lines_count(fname):
-    p = subprocess.Popen(['wc', '-l', fname], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
-    result, err = p.communicate()
-    if p.returncode != 0:
-        raise IOError(err)
-    return int(result.strip().split()[0])
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
 
+class TestcaseInfo:
+    hash: str
+    data: bytes
+    filename: str
+    is_crash: bool
+    patch_hit_cnt: int
+    patch_func_hit_cnt: int
+    stacktrace: List[Tuple[int, str]]
+    fault_addr: Optional[Tuple[int, str]]
+    def __init__(self, data: bytes, filename: str):
+        self.data = data
+        self.filename = filename
+        self.hash = self.compute_hash(data)
+        self.is_crash = False
+        self.patch_hit_cnt = 0
+        self.patch_func_hit_cnt = 0
+        self.stacktrace = []
+        self.fault_addr = None
+    
+    def compute_hash(self, data: bytes) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(data)
+        return hasher.hexdigest()
 
-class TestcaseMinimizer(object):
-    def __init__(self, cmd, global_bitmap):
-        self.cmd = cmd
-        self.use_stdin = False if "@@" in cmd else True
-        self.global_bitmap = global_bitmap
-        self.global_bitmap_pre_run = [None, None]
-
-    def run(self, args, env, testcase, arg_input_idx):
-        if self.use_stdin:
-            p = subprocess.Popen(args,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    stdin=subprocess.PIPE,
-                                    env=env,
-                                    # cwd=workdir
-                                    )
-            with open(testcase, "rb") as f:
-                p.stdin.write(f.read())
-            p.stdin.close()
-            p.wait()
-        else:
-            args_new = args[:]
-            args_new[arg_input_idx] = testcase
-            p = subprocess.Popen(args_new,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    stdin=subprocess.PIPE,
-                                    env=env,
-                                    # cwd=workdir
-                                    )
-            p.stdin.close()
-            p.wait()
-
-    def check_testcase(self, testcase, global_bitmap_pre_run, no_msg=False):
-
-        # print("Testcase: %s" % testcase)
-
-        if global_bitmap_pre_run != self.global_bitmap_pre_run[0]:
-            self.cleanup()
-            fp, bitmap = tempfile.mkstemp()
-            os.close(fp)
-            os.system("cp " + global_bitmap_pre_run + " " + bitmap)
-            self.global_bitmap_pre_run = [global_bitmap_pre_run, bitmap]
-
-        args = self.cmd
-        args = [TRACER_BIN] + ['-symbolic'] + args
-        arg_input_idx = -1
-        if "@@" in args:
-            assert not self.use_stdin
-            arg_input_idx = args.index("@@")
-
-        is_interesting = False
-
-        env = os.environ.copy()
-        env['COVERAGE_TRACER_FILTER_LIB'] = "-1"
-
-        # compare against the bitmap before running the trace
-        # this is for decting false positive
-        fp, initial_global_bitmap = tempfile.mkstemp()
-        os.close(fp)
-        os.system("cp " + global_bitmap_pre_run + " " + initial_global_bitmap)
-        env['COVERAGE_TRACER'] = initial_global_bitmap
-
-        fp, coverage_log_path = tempfile.mkstemp()
-        os.close(fp)
-        env['COVERAGE_TRACER_LOG'] = coverage_log_path
-
-        self.run(args, env, testcase, arg_input_idx)
-
-        delta_coverage = file_lines_count(coverage_log_path)
-        if delta_coverage == 0:
-            if not no_msg:
-                print("[-] Discarding %s" % os.path.basename(testcase))
-                # print("WARNING: false positive?")
-            is_interesting = False
-        else:
-            # compare against the bitmap after running the trace
-            # we may have generated testcases that reach
-            # similar basic blocks. We don't use the global
-            # bitmap because the solver has already marked
-            # solved branches as visited.
-            env['COVERAGE_TRACER'] = self.global_bitmap_pre_run[1]
-
-            os.unlink(coverage_log_path)
-            fp, coverage_log_path = tempfile.mkstemp()
-            os.close(fp)
-            env['COVERAGE_TRACER_LOG'] = coverage_log_path
-
-            self.run(args, env, testcase, arg_input_idx)
-
-            initial_delta_coverage = delta_coverage
-            delta_coverage = file_lines_count(coverage_log_path)
-            if delta_coverage == 0:
-                if not no_msg:
-                    print("[=] Discarding %s (+%s, +0)" % (os.path.basename(testcase), initial_delta_coverage))
-                is_interesting = False
-            else:
-                if not no_msg:
-                    print("[+] Keeping %s (+%s, +%s)" %
-                          (os.path.basename(testcase), initial_delta_coverage, delta_coverage))
-                is_interesting = True
-
-                # update global bitmap
-                env['COVERAGE_TRACER'] = self.global_bitmap
-                self.run(args, env, testcase, arg_input_idx)
-
-        os.unlink(initial_global_bitmap)
-        os.unlink(coverage_log_path)
-        return is_interesting
-
-    def cleanup(self):
-        if self.global_bitmap_pre_run[1]:
-            os.unlink(self.global_bitmap_pre_run[1])
+"""
+Minimize testcases
+Filter out same testcases based on hash, 
+and run them to get more info (patch hit count, stacktrace, etc).
+Currently, we just run them one by one, which is not very efficient.
+Plus, we only check if they hit the patch or not, without doing any actual minimization.
+"""
+class BinRadarMinimizer:
+    work_dir: str
+    run_dir: str
+    minimized_dir: str
+    testcases_dirs: List[str]
+    files: Set[str]
+    testcases: Dict[str, TestcaseInfo]
+    config: Dict[str, str]
+    logger: logging.Logger
+    start_time: float
+    def __init__(self, work_dir: str, run_dir: str, testcases_dirs: List[str], config: Dict[str, str]):
+        self.work_dir = work_dir
+        self.run_dir = run_dir
+        self.minimized_dir = os.path.join(run_dir, "minimized")
+        os.makedirs(self.minimized_dir, exist_ok=True)
+        self.testcases_dirs = testcases_dirs
+        self.files = set()
+        self.testcases = dict()
+        self.config = config
+        self.start_time = time.time()
+        log_file = os.path.join(run_dir, "minimizer.sbsv")
+        self.logger = logging.getLogger(__name__)
+        fh = logging.FileHandler(log_file)
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s - %(message)s")
+        fh.setFormatter(fmt)
+        self.logger.addHandler(fh)
+    
+    def log(self, msg: str):
+        elapsed = int((time.time() - self.start_time) * 1000)
+        self.logger.info(f"{msg} [time {elapsed}]")
+    
+    def load_testcases(self):
+        for testcases_dir in self.testcases_dirs:
+            for testcase_file in glob.glob(os.path.join(testcases_dir, "*")):
+                if testcase_file in self.files:
+                    continue
+                self.files.add(testcase_file)
+                with open(testcase_file, "rb") as f:
+                    data = f.read()
+                    testcase_info = TestcaseInfo(data, testcase_file)
+                    if testcase_info.hash in self.testcases:
+                        continue
+                    self.testcases[testcase_info.hash] = testcase_info
+    
+    def run_testcases(self):
+        verifier = binradar_verifier.BinRadarVerifier.init_from_env(self.work_dir, self.config)
+        id = 0
+        with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
+            current_testcase = os.path.join(tmpdir, ".cur_input")
+            for hash, testcase in self.testcases.items():
+                id += 1
+                self.log(f"[testcase] [info] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
+                if os.path.exists(current_testcase):
+                    os.unlink(current_testcase)
+                os.link(testcase.filename, current_testcase)
+                # TODO: better minimization
+                run_result = verifier.test_with_original(current_testcase)
+                if run_result is None:
+                    self.log(f"Failed {testcase.filename} with error.")
+                    continue
+                save_file = f"{id}_{os.path.basename(testcase.filename)}"
+                os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
+                self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_result.serialize()}")
+                

@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
 import binradar_verifier
+import binradar_minimizer
 import binradar_utils
 import logger
 import sbsv
@@ -392,12 +393,14 @@ class BinRadarProgress:
     run_id: int
     run_dir: str
     probe_done: bool
+    fuzzolic_done: bool
     directed_done: bool
     done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, directed_done: bool, done: bool):
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, done: bool):
         self.run_id = run_id
         self.run_dir = run_dir
         self.probe_done = probe_done
+        self.fuzzolic_done = fuzzolic_done
         self.directed_done = directed_done
         self.done = done
     
@@ -408,7 +411,8 @@ class BinRadarProgress:
         parser = sbsv.parser()
         parser.add_schema("[rundir] [set] [id: int] [dir: str]")
         parser.add_schema("[rundir] [done] [id: int] [dir: str]")
-        parser.add_schema("[probe] [done] [id: int] [hit-count: int]")
+        parser.add_schema("[probe] [done] [id: int] [func-entry: hex] [func-hit: int] [patch: hex] [patch-hit: int] [fault-addr: hex]")
+        parser.add_schema("[fuzzolic] [done] [id: int]")
         parser.add_schema("[directed] [done] [id: int]")
         with open(file, "r", encoding="utf-8") as f:
             parser.load(f)
@@ -420,11 +424,16 @@ class BinRadarProgress:
         run_dir = last_rundir["dir"]
         
         probe_done = False
+        fuzzolic_done = False
         directed_done = False
         done = False
         for probe in parser.get_result()["probe"]["done"]:
             if int(probe["id"]) == run_id:
                 probe_done = True
+                break
+        for fuzzolic in parser.get_result()["fuzzolic"]["done"]:
+            if int(fuzzolic["id"]) == run_id:
+                fuzzolic_done = True
                 break
         for directed in parser.get_result()["directed"]["done"]:
             if int(directed["id"]) == run_id:
@@ -434,7 +443,7 @@ class BinRadarProgress:
             if int(done_item["id"]) == run_id:
                 done = True
                 break
-        return BinRadarProgress(run_id, run_dir, probe_done, directed_done, done)
+        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, done)
 
 class BinRadarExecutor:
     # Config from config.env and command line arguments
@@ -444,7 +453,6 @@ class BinRadarExecutor:
     binary: str
     poc_input: str
     test_cmd: str
-    target_function_entry: str
     patch_loc: str
     # Data
     config: Dict[str, str]
@@ -452,22 +460,19 @@ class BinRadarExecutor:
     previous_progress: Optional[BinRadarProgress]
     run_id: int
     run_dir: str
-    probe_hit_count: int
     probe_file: str
+    probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, target_function_entry: str, patch_loc: str):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
         self.binary = binary
         self.poc_input = poc_input
         self.test_cmd = test_cmd
-        self.target_function_entry = target_function_entry
         self.patch_loc = patch_loc
 
         self.libc = ctypes.CDLL("libc.so.6")
-        self.probe_hit_count = 0
-        self.probe_file = ""
 
         os.makedirs(self.outdir, exist_ok=True)
         logger.set_file(os.path.join(self.outdir, "binradar.log"))
@@ -480,6 +485,8 @@ class BinRadarExecutor:
         self.config = dict()
         self.set_base_config()
         self.run_id, self.run_dir = self.set_run_dir()
+        self.probe_file = os.path.join(self.run_dir, "probe-result.sbsv")
+        self.probe_result = None
 
     @staticmethod
     def init(workdir: str) -> "BinRadarExecutor":
@@ -495,7 +502,6 @@ class BinRadarExecutor:
             binary=env["BINARY"],
             poc_input=env["POC_INPUT"],
             test_cmd=env["TEST_CMD"],
-            target_function_entry=env["TARGET_FUNCTION_ENTRY"],
             patch_loc=env["PATCH_LOC"],
         )
         # Backup config.env to run_dir
@@ -503,6 +509,16 @@ class BinRadarExecutor:
         if not os.path.exists(config_file):
             binradar_utils.save_env(env, config_file)
         return binradar
+    
+    def extract_config(self) -> Dict[str, str]:
+        config = self.config.copy()
+        config["BINRADAR_OUTDIR"] = self.outdir
+        config["BINRADAR_TIMEOUT"] = str(self.timeout)
+        config["BINARY"] = self.binary
+        config["POC_INPUT"] = self.poc_input
+        config["TEST_CMD"] = self.test_cmd
+        config["PATCH_LOC"] = self.patch_loc
+        return config
 
     def elapsed_time_ms(self) -> int:
         return int((time.time() - self.start_time) * 1000)
@@ -545,30 +561,35 @@ class BinRadarExecutor:
         self.save_progress(f"[rundir] [set] [id {run_id}] [dir {run_dir}]")
         return run_id, run_dir
 
+    def set_config(self, key: str, value: str):
+        self.config[key] = value
+        logger.debug(f"Config updated: {key}={value}")
+    
     def set_base_config(self):
         # Basic default config
         # TODO: implement stdin
-        self.config["BINRADAR_TIMEOUT"] = str(self.timeout)
-        self.config["SYMBOLIC_INJECT_INPUT_MODE"] = "FROM_FILE"
+        self.set_config("BINRADAR_TIMEOUT", str(self.timeout))
+        self.set_config("SYMBOLIC_INJECT_INPUT_MODE", "FROM_FILE")
         testcase = self.resolved_poc_input()
-        self.config["SYMBOLIC_TESTCASE_NAME"] = testcase
-        self.config["BINRADAR_ENTRYPOINT"] = self.target_function_entry
+        self.set_config("SYMBOLIC_TESTCASE_NAME", testcase)
         if self.timeout > 0:
-            self.config["SOLVER_TIMEOUT"] = str(int(self.timeout * 1000))
-        self.config["PLT_INFO_FILE"] = self.set_plt_info(os.path.join(self.outdir, "plt_info.txt"))
+            self.set_config("SOLVER_TIMEOUT", str(int(self.timeout * 1000)))
+        self.set_config("PLT_INFO_FILE", self.set_plt_info(os.path.join(self.outdir, "plt_info.txt")))
     
     def get_env(self, mode: str, run_dir: str) -> Dict[str, str]:
         env = os.environ.copy()
         env.update(self.config)
+        if self.probe_result is None:
+            raise RuntimeError("Probe result is not available. Cannot set environment for tracer and solver.")
         # Tracer
         if mode == "probe":
-            self.probe_file = os.path.join(run_dir, "probe-result.sbsv")
+            self.probe_file = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_PROBE_FILE"] = self.probe_file
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = "0"
         elif mode in ["directed", "binradar"]:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_hit_count)
+            env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
             if mode == "directed":
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
@@ -578,73 +599,71 @@ class BinRadarExecutor:
         env["BINRADAR_SOLVER_CONCRETE_OUTDIR"] = os.path.join(run_dir, f"solver-out-{mode}")
         os.makedirs(env["BINRADAR_SOLVER_CONCRETE_OUTDIR"], exist_ok=True)
         return env
-
-    def run_probe(self) -> int:
-        testcase = self.resolved_poc_input()
+    
+    def run_probe(self):
+        config = self.extract_config()
+        self.save_progress(f"[probe] [start] [id {self.run_id}]")
+        probe_runner = binradar_verifier.BinRadarVerifier.init_from_env(self.workdir, config)
+        probe_result = probe_runner.test_with_original(self.resolved_poc_input())
+        if probe_result is None or probe_result.patch_hit_cnt == 0:
+            logger.info("[PROBE] No patch hit found in probe result.")
+            sys.exit(1)
+        self.probe_result = probe_result
+        # Set config
+        self.set_config("BINRADAR_ENTRYPOINT", hex(probe_result.patch_func_entry))
+        self.save_progress(f"[probe] [done] [id {self.run_id}] {probe_result.serialize()}")
+        with open(self.probe_file, "w", encoding="utf-8") as f:
+            f.write(f"[probe] [hit-count] {probe_result.serialize()}\n")
+    
+    def check_requirements(self):
         if not os.path.exists(self.original_binary()):
             sys.exit("ERROR: binary does not exist.")
-        if not os.path.exists(testcase):
+        if not os.path.exists(self.resolved_poc_input()):
             sys.exit("ERROR: input does not exist.")
-        # TODO: support stdin
+        # TODO: Implement stdin
         if "@@" not in self.test_cmd:
-            sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
-
-        exec_mode = "probe"
+            sys.exit("ERROR: current implementation requires a file-based testcase (@@).")
+        if self.probe_result is None:
+            sys.exit("ERROR: probe result not found. Please run the probe phase first.")
+    
+    def run_fuzzolic(self):
+        testcase = self.resolved_poc_input()
+        self.check_requirements()
+        
+        exec_mode = "fuzzolic"
         shutil.copy2(testcase, self.run_dir)
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[probe] [start] [id {self.run_id}]")
+        self.save_progress(f"[fuzzolic] [start] [id {self.run_id}]")
 
-        probe_env = self.get_env(exec_mode, self.run_dir)
-        shm = SharedMemoryManager(probe_env)
+        fuzzolic_env = self.get_env(exec_mode, self.run_dir)
+        shm = SharedMemoryManager(fuzzolic_env)
         shm.assign_random_keys()
         
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, probe_env, self.workdir, timeout=self.timeout)
-        tracer = TracerExecutor(exec_mode, probe_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, fuzzolic_env, self.workdir, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, fuzzolic_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
         
         try:
             solver.start()
             tracer.start()
             tracer_time, tracer_success, _ = tracer.run()
-            self.save_progress(f"[probe] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            self.save_progress(f"[fuzzolic] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
-            self.save_progress(f"[probe] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            self.save_progress(f"[fuzzolic] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
         except Exception as e:
-            logger.error(f"Error during probe execution: {str(e)}")
+            logger.error(f"Error during fuzzolic execution: {str(e)}")
             tracer.stop()
             solver.stop()
             raise e
         finally:
             shm.cleanup()
-
-        if not os.path.exists(self.probe_file):
-            sys.exit(f"[binradar] [error] crash call index file not found: {self.probe_file}")
-
-        logger.info(f"[binradar] [probe] [done] [file {self.probe_file}]")
-        with open(self.probe_file, "r", encoding="utf-8", errors="ignore") as probe_fp:
-            parser = sbsv.parser()
-            parser.add_schema(
-                "[snapshot] [crash] [hit-count: int] [reason: str] "
-                "[guest_pc: str] [guest_cs_base: str] [fault_addr: str] "
-                "[host_fault_addr: str]")
-            result = parser.load(probe_fp)
-            crashes = result["snapshot"]["crash"]
-            if not crashes:
-                sys.exit(f"[binradar] [error] no crash found in probe result.")
-            self.probe_hit_count = int(crashes[-1]["hit-count"])
-            self.save_progress(f"[probe] [done] [id {self.run_id}] [hit-count {self.probe_hit_count}]")
-        return self.probe_hit_count
+        
+        self.save_progress(f"[fuzzolic] [done] [id {self.run_id}]")
     
     def run_directed(self):
         testcase = self.resolved_poc_input()
-        if not os.path.exists(self.original_binary()):
-            sys.exit("ERROR: binary does not exist.")
-        if not os.path.exists(testcase):
-            sys.exit("ERROR: input does not exist.")
-        # TODO: support stdin
-        if "@@" not in self.test_cmd:
-            sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
-
+        self.check_requirements()
+        
         exec_mode = "directed"
         shutil.copy2(testcase, self.run_dir)
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
@@ -674,16 +693,20 @@ class BinRadarExecutor:
 
         self.save_progress(f"[directed] [done] [id {self.run_id}]")
     
+    def run_minimizer(self):
+        self.check_requirements()
+        exec_mode = "minimizer"
+        self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
+        config = self.extract_config()
+        testcase_dirs = [os.path.join(self.run_dir, f"solver-out-{mode}") for mode in ["fuzzolic", "directed"]]
+        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
+        minimizer.load_testcases()
+        minimizer.run_testcases()
+
     def run_binradar(self):
         testcase = self.resolved_poc_input()
-        if not os.path.exists(self.original_binary()):
-            sys.exit("ERROR: binary does not exist.")
-        if not os.path.exists(testcase):
-            sys.exit("ERROR: input does not exist.")
-        # TODO: support stdin
-        if "@@" not in self.test_cmd:
-            sys.exit("ERROR: probe phase requires a file-based testcase (@@).")
-
+        self.check_requirements()
+        
         exec_mode = "binradar"
         shutil.copy2(testcase, self.run_dir)
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
@@ -733,9 +756,6 @@ def main():
         "-t", "--timeout", type=int, default=-1,
         help="set timeout for each test case (s)")
     parser.add_argument(
-        "-f", "--target-function-entry", default="",
-        help="set the target function entry point for fuzzolic (hex)")
-    parser.add_argument(
         "-p", "--patch-loc", default="",
         help="set the patch location for fuzzolic (hex)")
     parser.add_argument(
@@ -751,10 +771,10 @@ def main():
 
     if not os.path.exists(args.workdir):
         sys.exit(f"ERROR: workdir {args.workdir} does not exist.")
+    
+    os.chdir(args.workdir)
 
     env = binradar_utils.load_env(os.path.join(args.workdir, "config.env"))
-    if args.target_function_entry:
-        env["TARGET_FUNCTION_ENTRY"] = args.target_function_entry
     if args.patch_loc:
         env["PATCH_LOC"] = args.patch_loc
     if args.input:
@@ -772,7 +792,13 @@ def main():
 
     executor = BinRadarExecutor.init_from_env(args.workdir, env)
     executor.run_probe()
+    # For now, we run fuzzolic and directed sequentially.
+    # But they can be run in parallel if needed.
+    executor.run_fuzzolic()
     executor.run_directed()
+    # Run minimizer to minimize the generated concrete test cases
+    executor.run_minimizer()
+    # If fuzzolic and directed results are not enough, run binradar for deeper verification.
     # executor.run_binradar()
     executor.done()
 
