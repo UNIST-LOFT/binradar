@@ -73,6 +73,8 @@ class BinRadarMinimizer:
         self.work_dir = work_dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
+        if os.path.exists(self.minimized_dir):
+            shutil.rmtree(self.minimized_dir)
         os.makedirs(self.minimized_dir, exist_ok=True)
         self.testcases_dirs = testcases_dirs
         self.files = set()
@@ -84,7 +86,7 @@ class BinRadarMinimizer:
         self.logger = logging.getLogger(__name__)
         self.logger.propagate = False
         self.logger.setLevel(logging.DEBUG)
-        fh = logging.FileHandler(log_file)
+        fh = logging.FileHandler(log_file, mode="w")
         fh.setLevel(logging.DEBUG)
         fmt = logging.Formatter("%(asctime)s - %(message)s")
         fh.setFormatter(fmt)
@@ -118,9 +120,12 @@ class BinRadarMinimizer:
                     os.unlink(current_testcase)
                 os.link(testcase.filename, current_testcase)
                 # TODO: better minimization
-                run_result = verifier.test_with_original_detailed(current_testcase)
+                run_result = verifier.test_with_original(current_testcase, verbose=False)
                 if run_result is None:
                     self.log(f"Failed {testcase.filename} with error.")
+                    continue
+                if not run_result.patch_hit():
+                    self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_result.serialize()}")
                     continue
                 save_file = f"{id}_{os.path.basename(testcase.filename)}"
                 os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
