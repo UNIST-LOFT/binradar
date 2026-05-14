@@ -110,7 +110,7 @@ class BinRadarMinimizer:
                     self.testcases.add(testcase_info)
     
     def run_testcases(self):
-        verifier = binradar_verifier.BinRadarVerifier.init_from_env(self.work_dir, self.config)
+        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.work_dir, self.config)
         id = 0
         with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
             current_testcase = os.path.join(tmpdir, ".cur_input")
@@ -120,7 +120,7 @@ class BinRadarMinimizer:
                     os.unlink(current_testcase)
                 os.link(testcase.filename, current_testcase)
                 # TODO: better minimization
-                run_result = verifier.test_with_original(current_testcase, verbose=False)
+                run_result = runner.test_with_original(current_testcase, verbose=False)
                 if run_result is None:
                     self.log(f"Failed {testcase.filename} with error.")
                     continue

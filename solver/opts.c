@@ -9,13 +9,10 @@ void parse_opts(int argc, char* argv[], Config* config)
     assert(config);
     int error = 0;
     int opt;
-    while ((opt = getopt(argc, argv, ":i:t:o:b:c:m:sap")) != -1) {
+    while ((opt = getopt(argc, argv, ":i:o:b:c:m:sap")) != -1) {
         switch (opt) {
             case 'i':
                 config->testcase_path = optarg;
-                break;
-            case 't':
-                config->testcase_dir = optarg;
                 break;
             case 'o':
                 config->output_dir = optarg;
@@ -49,10 +46,10 @@ void parse_opts(int argc, char* argv[], Config* config)
         }
     }
 
-    if (error || !(config->testcase_path) || !(config->testcase_dir) ||
+    if (error || !(config->testcase_path) ||
         !(config->output_dir) || !(config->branch_bitmap_path) ||
         !(config->context_bitmap_path) || !(config->memory_bitmap_path)) {
-        printf("Usage: %s [-a] [-p] [-s] -i <current_testcase> -t <testcase_dir> -o "
+        printf("Usage: %s [-a] [-p] [-s] -i <current_testcase> -o "
                "-b <branch_bitmap> -c <context_bitmap> -m memory_bitmap -o <output_dir>\n\n"
                "Optional arguments:\n"
                "  -s       - enable memory slice reasoning\n"
@@ -102,13 +99,6 @@ void parse_opts(int argc, char* argv[], Config* config)
     var = getenv("BITMAP_ALT");
     if (var) {
         config->branch_alt_bitmap_path = var;
-    }
-
-    var = getenv("BINRADAR_SOLVER_CONCRETE_OUTDIR");
-    if (var) {
-        config->concrete_outdir = var;
-    } else {
-        config->concrete_outdir = ".";
     }
 
 }

@@ -73,7 +73,6 @@ typedef struct Config {
     const char* testcase_size;
     //
     const char* output_dir;
-    const char* concrete_outdir;
     //
     const char* branch_bitmap_path;
     const char* branch_alt_bitmap_path;

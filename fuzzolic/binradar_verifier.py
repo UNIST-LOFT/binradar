@@ -2,6 +2,8 @@ import subprocess
 import os
 import signal
 import shlex
+import logging
+import time
 from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
 
 import sbsv
@@ -117,7 +119,7 @@ class BinRadarProbeResult:
         return self.exit_info == "ok"
     
 
-class BinRadarVerifier:
+class BinRadarQemuRunner:
     dir: str
     binary: str
     test_cmd: str
@@ -131,13 +133,13 @@ class BinRadarVerifier:
         self.run_results = None
     
     @staticmethod
-    def from_workdir(dir: str) -> "BinRadarVerifier":
+    def from_workdir(dir: str) -> "BinRadarQemuRunner":
         env = binradar_utils.load_env(os.path.join(dir, "config.env"))
-        return BinRadarVerifier.from_env(dir, env)
+        return BinRadarQemuRunner.from_env(dir, env)
     
     @staticmethod
-    def from_env(dir: str, env: Dict[str, str]) -> "BinRadarVerifier":
-        return BinRadarVerifier(
+    def from_env(dir: str, env: Dict[str, str]) -> "BinRadarQemuRunner":
+        return BinRadarQemuRunner(
             dir=dir,
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
@@ -158,4 +160,105 @@ class BinRadarVerifier:
             return None
         return BinRadarProbeResult.from_log(result.stderr)
 
+    def test_with_patched(self, binary: str, testcase: str, verbose: bool = False) -> Optional[BinRadarProbeResult]:
+        command = self.get_qemu_stacktrace_command(binary, testcase)
+        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
+        if not result.success:
+            logger.error("Failed to execute the command")
+            return None
+        return BinRadarProbeResult.from_log(result.stderr)
 
+class Testcase:
+    id: int
+    filename: str
+    exit: str
+    fault_addr: int
+    def __init__(self, id: int, filename: str, exit: str, fault_addr: int):
+        self.id = id
+        self.filename = filename
+        self.exit = exit
+        self.fault_addr = fault_addr
+
+
+class BinRadarConcreteVerifier:
+    dir: str
+    run_dir: str
+    runner: BinRadarQemuRunner
+    patched_binary: str
+    testcases: List[Testcase]
+    start_time: float
+    logger: logging.Logger
+    minimized_dir: str
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, patched_binary: str):
+        self.dir = dir
+        self.run_dir = run_dir
+        self.minimized_dir = os.path.join(run_dir, "minimized")
+        self.runner = runner
+        self.patched_binary = patched_binary
+        self.testcases = list()
+        self.start_time = time.time()
+        # Setup logger
+        log_file = os.path.join(run_dir, "verifier.sbsv")
+        self.logger = logging.getLogger(__name__)
+        self.logger.propagate = False
+        self.logger.setLevel(logging.DEBUG)
+        fh = logging.FileHandler(log_file, mode="w")
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s - %(message)s")
+        fh.setFormatter(fmt)
+        self.logger.addHandler(fh)
+    
+    def load_testcases(self, minimizer_result: str):
+        parser = sbsv.parser()
+        parser.add_custom_type("hex", lambda x: int(x, 16))
+        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex]")
+        with open(minimizer_result, "r", encoding="utf-8") as f:
+            parser.load(f)
+        testcases = parser.get_result()["testcase"]["result"]
+        for testcase in testcases:
+            self.testcases.append(Testcase(
+                id=testcase["id"],
+                filename=testcase["file"],
+                exit=testcase["exit"],
+                fault_addr=testcase["fault-addr"]
+            ))
+    
+    def run_testcase_crash(self, testcase: Testcase) -> Optional[BinRadarProbeResult]:
+        result = self.runner.test_with_patched(self.patched_binary, os.path.join(self.minimized_dir, testcase.filename), verbose=False)
+        if result is None:
+            self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+            return None
+        return result
+    
+    def run_testcase_no_crash(self, testcase: Testcase) -> Optional[BinRadarProbeResult]:
+        result = self.runner.test_with_patched(self.patched_binary, os.path.join(self.minimized_dir, testcase.filename), verbose=False)
+        if result is None:
+            self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+            return None
+        return result
+
+    def run_verification_concrete_testcases(self):
+        for testcase in self.testcases:
+            self.logger.info(f"[testcase] [try] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+            if testcase.exit == "crash":
+                result = self.run_testcase_crash(testcase)
+                if result is None:
+                    self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                    continue
+                if result.is_crash():
+                    self.logger.info(f"[verifier] [crash-fail] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                elif result.is_normal_exit():
+                    self.logger.info(f"[verifier] [crash-pass] [id {testcase.id}] [file {testcase.filename}]")
+                elif result.is_timeout():
+                    self.logger.info(f"[verifier] [crash-timeout] [id {testcase.id}] [file {testcase.filename}]")
+            else:
+                result = self.run_testcase_no_crash(testcase)
+                if result is None:
+                    self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                    continue
+                if result.is_crash():
+                    self.logger.info(f"[verifier] [no-crash-fail] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                elif result.is_normal_exit():
+                    self.logger.info(f"[verifier] [no-crash-pass] [id {testcase.id}] [file {testcase.filename}]")
+                elif result.is_timeout():
+                    self.logger.info(f"[verifier] [no-crash-timeout] [id {testcase.id}] [file {testcase.filename}]")

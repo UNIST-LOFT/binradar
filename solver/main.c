@@ -893,7 +893,7 @@ static void perform_mutations(size_t idx,
     int mutation_count = 0;
     while (mutations[mutation_count].type != NO_MUTATION) {
         int  n = snprintf(testcase_name, sizeof(testcase_name),
-                     "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, ++sub_idx + sub_idx_offset);
+                     "%s/test_case_%s_%lu_%lu.dat", config.output_dir, query_mode_to_str(current_query_mode), idx, ++sub_idx + sub_idx_offset);
         fprintf(stderr, "[dump] [mutation] [name %s]\n", testcase_name);
 #if 0
         printf("Running mutation: %s\n", testcase_name);
@@ -1008,7 +1008,7 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
     } else
 #endif
     snprintf(testcase_name, sizeof(testcase_name),
-        "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
+        "%s/test_case_%s_%lu_%lu.dat", config.output_dir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
 
     fprintf(stderr, "[dump] [solution] [name %s]\n", testcase_name);
 #if 0
@@ -1073,7 +1073,7 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
 {
     char testcase_name[256];
     int  n = snprintf(testcase_name, sizeof(testcase_name),
-                    "%s/test_case_%s_%lu_%lu.dat", config.concrete_outdir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
+                    "%s/test_case_%s_%lu_%lu.dat", config.output_dir, query_mode_to_str(current_query_mode), idx, sub_idx + sub_idx_offset);
     assert(n > 0 && n < sizeof(testcase_name) && "test case name too long");
 
 #if 0
@@ -1263,7 +1263,7 @@ static void inline smt_dump_solver(Z3_solver solver, size_t idx)
     Z3_string s_query = Z3_solver_to_string(smt_solver.ctx, solver);
     char      test_case_name[256];
     int       n = snprintf(test_case_name, sizeof(test_case_name),
-                     "%s/test_case_%lu.query", config.concrete_outdir, idx);
+                     "%s/test_case_%lu.query", config.output_dir, idx);
     assert(n > 0 && n < sizeof(test_case_name) && "test case name too long");
     // SAYF("Dumping solution into %s\n", test_case_name);
     FILE* fp = fopen(test_case_name, "w");

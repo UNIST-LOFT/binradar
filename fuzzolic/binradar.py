@@ -45,7 +45,8 @@ class BinRadarPhase(enum.IntEnum):
     FUZZOLIC = 2
     DIRECTED = 3
     MINIMIZER = 4
-    BINRADAR = 5
+    VERIFIER = 5
+    BINRADAR = 6
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -303,7 +304,7 @@ class TracerExecutor:
 
 class SolverExecutor:
     command: List[str]
-    mode: str
+    out_dir: str
     env: Dict[str, str]
     workdir: str
     rundir: str
@@ -312,18 +313,17 @@ class SolverExecutor:
     timeout: float
     run_result: Optional[binradar_utils.ExecutionResult]
     def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float):
-        testcase_dir = os.path.join(run_dir, f"{mode}-tests")
-        os.makedirs(testcase_dir, exist_ok=True)
         global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
         context_bitmap = os.path.join(run_dir, f"{mode}-context-bitmap")
         memory_bitmap = os.path.join(run_dir, f"{mode}-memory-bitmap")
+        self.out_dir = os.path.join(run_dir, f"{mode}-tests")
+        os.makedirs(self.out_dir, exist_ok=True)
         for bitmap in [global_bitmap, context_bitmap, memory_bitmap]:
             with open(bitmap, "w") as f:
                 pass
         self.command = ["stdbuf", "-o0", SOLVER_SMT_BIN, 
                         "-i", testcase, 
-                        "-t", testcase_dir, 
-                        "-o", run_dir, 
+                        "-o", self.out_dir, 
                         "-b", global_bitmap,
                         "-c", context_bitmap,
                         "-m", memory_bitmap]
@@ -403,13 +403,17 @@ class BinRadarProgress:
     probe_done: bool
     fuzzolic_done: bool
     directed_done: bool
+    minimizer_done: bool
+    verifier_done: bool
     done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, done: bool):
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
         self.run_id = run_id
         self.run_dir = run_dir
         self.probe_done = probe_done
         self.fuzzolic_done = fuzzolic_done
         self.directed_done = directed_done
+        self.minimizer_done = minimizer_done
+        self.verifier_done = verifier_done
         self.done = done
     
     @staticmethod
@@ -422,6 +426,8 @@ class BinRadarProgress:
         parser.add_schema("[probe] [done] [id: int] [func-entry: hex] [func-hit: int] [patch: hex] [patch-hit: int] [fault-addr: hex]")
         parser.add_schema("[fuzzolic] [done] [id: int]")
         parser.add_schema("[directed] [done] [id: int]")
+        parser.add_schema("[minimizer] [done] [id: int]")
+        parser.add_schema("[verifier] [done] [id: int]")
         with open(file, "r", encoding="utf-8") as f:
             parser.load(f)
         rundir = parser.get_result()["rundir"]["set"]
@@ -434,6 +440,8 @@ class BinRadarProgress:
         probe_done = False
         fuzzolic_done = False
         directed_done = False
+        minimizer_done = False
+        verifier_done = False
         done = False
         for probe in parser.get_result()["probe"]["done"]:
             if int(probe["id"]) == run_id:
@@ -451,7 +459,15 @@ class BinRadarProgress:
             if int(done_item["id"]) == run_id:
                 done = True
                 break
-        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, done)
+        for minimizer in parser.get_result()["minimizer"]["done"]:
+            if int(minimizer["id"]) == run_id:
+                minimizer_done = True
+                break
+        for verifier in parser.get_result()["verifier"]["done"]:
+            if int(verifier["id"]) == run_id:
+                verifier_done = True
+                break
+        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
     # Config from config.env and command line arguments
@@ -554,6 +570,9 @@ class BinRadarExecutor:
     def original_binary(self) -> str:
         return os.path.join(self.workdir, f"{self.binary}.orig")
 
+    def patched_binary(self) -> str:
+        return os.path.join(self.workdir, f"{self.binary}.bad")
+
     def resolved_poc_input(self) -> str:
         if os.path.isabs(self.poc_input):
             return self.poc_input
@@ -606,18 +625,12 @@ class BinRadarExecutor:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
             else:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
-        # Solver
-        solver_out_dir = os.path.join(run_dir, f"solver-out-{mode}")
-        env["BINRADAR_SOLVER_CONCRETE_OUTDIR"] = solver_out_dir
-        if os.path.exists(solver_out_dir):
-            shutil.rmtree(solver_out_dir)
-        os.makedirs(solver_out_dir, exist_ok=True)
         return env
     
     def run_probe(self):
         config = self.extract_config()
         self.save_progress(f"[probe] [start] [id {self.run_id}]")
-        probe_runner = binradar_verifier.BinRadarVerifier.from_env(self.workdir, config)
+        probe_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         probe_result = probe_runner.test_with_original(self.resolved_poc_input())
         if probe_result is None:
             logger.info("[PROBE] Failed to get probe result. Check if patch location is set or qemu_stacktrace is available.")
@@ -675,6 +688,8 @@ class BinRadarExecutor:
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
             self.save_progress(f"[fuzzolic] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            tracer.stop()
+            solver.stop()
         except Exception as e:
             logger.error(f"Error during fuzzolic execution: {str(e)}")
             tracer.stop()
@@ -707,6 +722,8 @@ class BinRadarExecutor:
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
             self.save_progress(f"[directed] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            tracer.stop()
+            solver.stop()
         except Exception as e:
             logger.error(f"Error during directed execution: {str(e)}")
             tracer.stop()
@@ -722,10 +739,26 @@ class BinRadarExecutor:
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
         config = self.extract_config()
-        testcase_dirs = [os.path.join(self.run_dir, f"solver-out-{mode}") for mode in ["fuzzolic", "directed"]]
+        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()
         minimizer.run_testcases()
+        self.save_progress(f"[minimizer] [done] [id {self.run_id}]")
+    
+    def run_verifier(self):
+        self.check_requirements()
+        exec_mode = "verifier"
+        if not os.path.join(self.run_dir, "minimizer.sbsv"):
+            logger.info("[VERIFIER] Minimizer results not found. Please run the minimizer phase first.")
+            sys.exit(1)
+        
+        config = self.extract_config()
+        self.save_progress(f"[verifier] [start] [id {self.run_id}]")
+        # Implementation for concrete verifier
+        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.patched_binary())
+        
+        self.save_progress(f"[verifier] [done] [id {self.run_id}]")
 
     def run_binradar(self):
         testcase = self.resolved_poc_input()
@@ -752,6 +785,7 @@ class BinRadarExecutor:
                 tracer_time, tracer_success, remaining = tracer.run()
                 self.save_progress(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
             # TODO: we can generate more inputs - currently, we don't utilize collected constraints
+            tracer.stop()
             solver.stop()
         except Exception as e:
             logger.error(f"Error during binradar execution: {str(e)}")
@@ -779,6 +813,9 @@ class BinRadarExecutor:
         # Run minimizer to minimize the generated concrete test cases
         if resume_phase <= BinRadarPhase.MINIMIZER:
             self.run_minimizer()
+        # Run verifier to verify the generated test cases with concrete execution
+        if resume_phase <= BinRadarPhase.VERIFIER:
+            self.run_verifier()
         # If fuzzolic and directed results are not enough, run binradar for deeper verification.
         # self.run_binradar()
         self.done()
@@ -807,6 +844,7 @@ def main():
     parser.add_argument(
         "--cmd", default="",
         help="set the test command for fuzzolic (overrides TEST_CMD in config.env)")
+    # The following argument is for experiments and debugging
     parser.add_argument("--resume-phase", default="", 
         choices=["probe", "fuzzolic", "directed", "minimizer", "binradar"],
         help="resume from a specific phase")
