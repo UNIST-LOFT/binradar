@@ -571,7 +571,7 @@ class BinRadarExecutor:
         return os.path.join(self.workdir, f"{self.binary}.orig")
 
     def patched_binary(self) -> str:
-        return os.path.join(self.workdir, f"{self.binary}.bad")
+        return os.path.join(self.workdir, f"{self.binary}.patched")
 
     def resolved_poc_input(self) -> str:
         if os.path.isabs(self.poc_input):
@@ -648,11 +648,17 @@ class BinRadarExecutor:
             logger.info("[PROBE] Multiple patch function hits found. Current implementation does not support this case.")
             sys.exit(1)
         self.probe_result = probe_result
+        file_trace_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
+        file_trace_result = file_trace_runner.test_with_patched_and_file_trace(self.patched_binary(), self.resolved_poc_input(), patch_func_entry=probe_result.patch_func_entry, verbose=True)
+        if file_trace_result is None:
+            logger.info("[PROBE] Failed to get file trace result. Check if patch location is set or qemu_stacktrace is available.")
+            sys.exit(1)
         # Set config
         self.set_config("BINRADAR_ENTRYPOINT", hex(probe_result.patch_func_entry))
-        self.save_progress(f"[probe] [done] [id {self.run_id}] {probe_result.serialize()}")
+        self.save_progress(f"[probe] [done] [id {self.run_id}] {probe_result.serialize()} {file_trace_result.serialize_file_trace_result()}")
         with open(os.path.join(self.run_dir, "probe-results.sbsv"), "w", encoding="utf-8") as f:
             f.write(f"[probe] [hit-count] {probe_result.serialize()}\n")
+            f.write(f"[file-trace] [hit-count] {file_trace_result.serialize_file_trace_result()}\n")
     
     def check_requirements(self):
         if not os.path.exists(self.original_binary()):

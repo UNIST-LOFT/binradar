@@ -10,11 +10,14 @@ int magic_check(int p){
 
 int get_input(char* fname) {
     FILE* fp = fopen(fname, "r");
+    FILE *fp2 = fopen("example.c", "r");
+    int j = fread(&j, 1, sizeof(j), fp2);
     if (fp == NULL) exit(EXIT_FAILURE);
     int data;
     int r = fread(&data, 1, sizeof(data), fp);
     if (r != sizeof(data)) exit(EXIT_FAILURE);
     fclose(fp);
+    fclose(fp2);
     return data;
 }
 

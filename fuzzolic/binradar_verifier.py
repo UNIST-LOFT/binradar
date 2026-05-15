@@ -25,6 +25,7 @@ class BinRadarProbeResult:
         self.patch_func_hit_cnt = patch_func_hit_cnt
         self.fault_addr = fault_addr
         self.patch_func_candidates = patch_func_candidates
+        self.need_file_hook = False
     
     @staticmethod
     def get_parser() -> sbsv.parser:
@@ -37,6 +38,21 @@ class BinRadarProbeResult:
         parser.add_schema("[patch-cov] [location: hex] [covered: bool] [hits: int]")
         parser.add_schema("[patch-func] [location: hex] [entry: hex] [hits: int]")
         parser.add_schema("[fault-addr] [idx: int] [addr: hex] [symbol: str]")
+        return parser
+    
+    @staticmethod
+    def get_parser_for_file_trace() -> sbsv.parser:
+        parser = sbsv.parser()
+        parser.add_custom_type("hex", lambda x: int(x, 16))
+        parser.add_schema("[patch-func-entry] [set] [set: bool]")
+        parser.add_schema("[file-trace] [open] [path: str] [fd: int] [gid: int] [offset: int] [seekable: bool] [after_patch: bool]")
+        parser.add_schema("[file-trace] [read] [syscall: int] [fd: int] [gid: int] [offset: int] [seekable: bool] [bytes: int] [after_patch: bool]")
+        # parser.add_schema("[file-trace] [pread64] [syscall: int] [fd: int] [gid: int] [offset: int] [requested_offset: int] [bytes: int] [after_patch: bool]")
+        parser.add_schema("[file-trace] [lseek] [fd: int] [gid: int] [offset: int] [whence: int] [new_offset: int] [seekable: bool] [succ: bool] [after_patch: bool]")
+        parser.add_schema("[file-trace] [dup] [old_fd: int] [new_fd: int] [gid: int] [offset: int] [seekable: bool] [after_patch: bool]")
+        parser.add_schema("[file-trace] [fcntl-dup] [fd: int] [cmd: str] [new_fd: int] [gid: int] [offset: int] [seekable: bool] [after_patch: bool]")
+        parser.add_schema("[file-trace] [close] [fd: int] [gid: int] [offset: int] [result: int] [after_patch: bool]")
+        parser.add_schema("[file-trace] [group-close] [gid: int] [after_patch: bool]")
         return parser
     
     @staticmethod
@@ -96,9 +112,67 @@ class BinRadarProbeResult:
             fault_addr=fault_addr,
             patch_func_candidates=patch_func_candidates
         )
-    
+        
+    def update_with_file_trace(self, log: str):
+        parser = BinRadarProbeResult.get_parser_for_file_trace()
+        result = parser.loads(log)
+        if len(result["patch-func-entry"]["set"]) == 0:
+            raise ValueError("Patch func entry info not found in the log.")
+        if not result["patch-func-entry"]["set"][-1]["set"]:
+            raise ValueError("Patch func entry was not set during execution.")
+        # Check file trace
+        open_file_desc_read_after_patch_func = dict()  # gid -> bool
+        for trace in parser.get_result_in_order():
+            if self.need_file_hook:
+                break
+            if trace.get_name() == "file-trace$open":
+                path = trace["path"]
+                after_patch = trace["after_patch"]
+                gid = trace["gid"]
+                seekable = trace["seekable"]
+                # We only care about files opened before hitting the patch func entry
+                if not seekable or after_patch:
+                    continue
+                open_file_desc_read_after_patch_func[gid] = False
+            elif trace.get_name() == "file-trace$read":
+                gid = trace["gid"]
+                seekable = trace["seekable"]
+                if not seekable:
+                    continue
+                after_patch = trace["after_patch"]
+                if gid in open_file_desc_read_after_patch_func:
+                    if after_patch:
+                        open_file_desc_read_after_patch_func[gid] = True
+                        self.need_file_hook = True
+                        break
+            elif trace.get_name() == "file-trace$lseek":
+                gid = trace["gid"]
+                offset = trace["offset"]
+                whence = trace["whence"]
+                seekable = trace["seekable"]
+                if not seekable:
+                    continue
+                after_patch = trace["after_patch"]
+                if gid in open_file_desc_read_after_patch_func:
+                    if after_patch:
+                        if open_file_desc_read_after_patch_func[gid]:
+                            # Already read: need reset
+                            self.need_file_hook = True
+                            break
+                        else:
+                            if whence != 1:
+                                # No need to reset
+                                del open_file_desc_read_after_patch_func[gid]
+                            else:
+                                # Need to reset
+                                self.need_file_hook = True
+                                break
+
     def serialize(self) -> str:
         return f"[exit {self.exit_info}] [func-entry {self.patch_func_entry:x}] [func-hit {self.patch_func_hit_cnt}] [patch {self.patch_loc:x}] [patch-hit {self.patch_hit_cnt}] [fault-addr {self.fault_addr:x}]"
+
+    def serialize_file_trace_result(self) -> str:
+        return f"[need-file-hook {self.need_file_hook}]"
 
     def patch_hit(self) -> bool:
         return self.patch_hit_cnt > 0
@@ -149,8 +223,12 @@ class BinRadarQemuRunner:
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
 
-    def get_qemu_stacktrace_command(self, binary: str, input_file: str) -> List[str]:
-        return [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc, binary, "--"] + shlex.split(self.test_cmd)
+    def get_qemu_stacktrace_command(self, binary: str, input_file: str, patch_func_entry: int = 0) -> List[str]:
+        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc]
+        if patch_func_entry != 0:
+            cmd += [ "--patch-func-entry", f"{patch_func_entry:x}"] 
+        cmd += [binary, "--"] + shlex.split(self.test_cmd)
+        return cmd
 
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(self.original_binary(), testcase)
@@ -167,6 +245,20 @@ class BinRadarQemuRunner:
             logger.error("Failed to execute the command")
             return None
         return BinRadarProbeResult.from_log(result.stderr)
+    
+    def test_with_patched_and_file_trace(self, binary: str, testcase: str, patch_func_entry: int, verbose: bool = False) -> Optional[BinRadarProbeResult]:
+        command = self.get_qemu_stacktrace_command(binary, testcase, patch_func_entry=patch_func_entry)
+        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
+        if not result.success:
+            logger.error("Failed to execute the command")
+            return None
+        probe_result = BinRadarProbeResult.from_log(result.stderr)
+        if probe_result is None:
+            logger.error("Failed to parse the probe result from log.")
+            return None
+        probe_result.update_with_file_trace(result.stderr)
+        return probe_result
+
 
 class Testcase:
     id: int
