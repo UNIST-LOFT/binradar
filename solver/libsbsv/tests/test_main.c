@@ -78,9 +78,9 @@ static int test_escape_examples(void) {
     sbsv_free_string(escaped);
     escaped = NULL;
 
-    failed |= assert_true(sbsv_unescape_str("\\,|\\]\\]\\[\\[\\]", &unescaped) == SBSV_OK, "unescape literal should succeed");
+    failed |= assert_true(sbsv_unescape_str(",|\\]\\][[]]", &unescaped) == SBSV_OK, "unescape literal should succeed");
     if (!failed) {
-        failed |= assert_str_eq(unescaped, ",|]][[]", "unescape sequence should match python behavior");
+        failed |= assert_str_eq(unescaped, ",|]][[]]", "unescape sequence should match python behavior");
     }
     sbsv_free_string(unescaped);
 
@@ -104,8 +104,8 @@ static int test_tokenize_escape(void) {
         failed |= assert_str_eq(tokens.items[0], "mem", "token 0");
         failed |= assert_str_eq(tokens.items[1], "pos", "token 1");
         failed |= assert_str_eq(tokens.items[2], "seed 123", "token 2");
-        failed |= assert_str_eq(tokens.items[3], "id should escape ]]\\ this", "token 3");
-        failed |= assert_str_eq(tokens.items[4], "file /path/to/file\"", "token 4");
+        failed |= assert_str_eq(tokens.items[3], "id should escape \\]\\]\\ this", "token 3");
+        failed |= assert_str_eq(tokens.items[4], "file /path/to/file\\\"", "token 4");
     }
 
     sbsv_free_token_list(&tokens);
@@ -260,15 +260,15 @@ static int test_parser_nullable_and_list(void) {
     return failed;
 }
 
-static int test_parser_custom_type_and_late_registration(void) {
+static int test_parser_custom_type_and_registration_order(void) {
     sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     int failed = 0;
     const sbsv_row* row;
     const sbsv_value* value;
 
     failed |= assert_true(parser != NULL, "parser should be created");
-    failed |= assert_true(sbsv_parser_add_schema(parser, "[d] [v: hex2]") == SBSV_OK, "add custom schema first");
-    failed |= assert_true(sbsv_parser_add_custom_type(parser, "hex2", custom_hex, NULL) == SBSV_OK, "register custom type after schema");
+    failed |= assert_true(sbsv_parser_add_custom_type(parser, "hex2", custom_hex, NULL) == SBSV_OK, "register custom type before schema");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[d] [v: hex2]") == SBSV_OK, "add custom schema");
     failed |= assert_true(sbsv_parser_loads(parser, "[d] [v 1a]\n") == SBSV_OK, "parse custom type data");
 
     if (!failed) {
@@ -278,6 +278,24 @@ static int test_parser_custom_type_and_late_registration(void) {
     }
 
     sbsv_parser_free(parser);
+    return failed;
+}
+
+static int test_parser_rejects_late_or_unknown_custom_types(void) {
+    sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    int failed = 0;
+
+    failed |= assert_true(parser != NULL, "parser should be created");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[d] [v: str]") == SBSV_OK, "add string schema");
+    failed |= assert_true(sbsv_parser_add_custom_type(parser, "hex3", custom_hex, NULL) == SBSV_ERR_INVALID_ARG, "late custom type should fail");
+    sbsv_parser_free(parser);
+
+    parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    failed |= assert_true(parser != NULL, "parser should be recreated");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[d] [v: hex4]") == SBSV_ERR_INVALID_ARG, "unknown custom type should fail during schema registration");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[d] [v: list[hex4]]") == SBSV_ERR_INVALID_ARG, "unknown list subtype should fail during schema registration");
+    sbsv_parser_free(parser);
+
     return failed;
 }
 
@@ -473,10 +491,10 @@ static int test_parser_ordered_query(void) {
     if (!failed) {
         failed |= assert_true(row_count == 4, "ordered query row count");
         if (row_count == 4) {
-            failed |= assert_true(strcmp(rows[0]->schema_name, "node") == 0, "row0 schema");
-            failed |= assert_true(strcmp(rows[1]->schema_name, "node") == 0, "row1 schema");
-            failed |= assert_true(strcmp(rows[2]->schema_name, "edge") == 0, "row2 schema");
-            failed |= assert_true(strcmp(rows[3]->schema_name, "edge") == 0, "row3 schema");
+            failed |= assert_true(strcmp(sbsv_row_schema_name(rows[0]), "node") == 0, "row0 schema");
+            failed |= assert_true(strcmp(sbsv_row_schema_name(rows[1]), "node") == 0, "row1 schema");
+            failed |= assert_true(strcmp(sbsv_row_schema_name(rows[2]), "edge") == 0, "row2 schema");
+            failed |= assert_true(strcmp(sbsv_row_schema_name(rows[3]), "edge") == 0, "row3 schema");
         }
     }
 
@@ -632,8 +650,8 @@ static int test_parser_custom_void_pointer_type(void) {
     g_custom_boxed_int_freed = 0;
 
     failed |= assert_true(parser != NULL, "parser should be created");
-    failed |= assert_true(sbsv_parser_add_schema(parser, "[obj] [v: boxed_int]") == SBSV_OK, "add boxed custom schema");
     failed |= assert_true(sbsv_parser_add_custom_type(parser, "boxed_int", custom_boxed_int_parse, NULL) == SBSV_OK, "register boxed custom type");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[obj] [v: boxed_int]") == SBSV_OK, "add boxed custom schema");
     failed |= assert_true(sbsv_parser_loads(parser, "[obj] [v 123]\n") == SBSV_OK, "parse boxed custom type");
 
     if (!failed) {
@@ -738,6 +756,128 @@ static int test_row_typed_getters(void) {
     return failed;
 }
 
+static int test_parser_v020_string_rules(void) {
+    sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    int failed = 0;
+    const sbsv_row* row;
+    const char* value;
+
+    failed |= assert_true(parser != NULL, "parser should be created");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[data] [value: str]") == SBSV_OK, "add string schema");
+    failed |= assert_true(
+        sbsv_parser_loads(
+            parser,
+            "[data] [value \"[internal] \\\"quote\\\"\"]\n"
+            "[data] [value [balanced] value]\n"
+            "[data] [value internal \"quote]\n"
+        ) == SBSV_OK,
+        "parse v0.2 string forms"
+    );
+
+    if (!failed) {
+        row = sbsv_parser_row_at(parser, 0);
+        value = sbsv_row_get_string(row, "value");
+        failed |= assert_str_eq(value, "[internal] \"quote\"", "quoted brackets and quote");
+        row = sbsv_parser_row_at(parser, 1);
+        value = sbsv_row_get_string(row, "value");
+        failed |= assert_str_eq(value, "[balanced] value", "balanced unquoted brackets");
+        row = sbsv_parser_row_at(parser, 2);
+        value = sbsv_row_get_string(row, "value");
+        failed |= assert_str_eq(value, "internal \"quote", "literal quote in unquoted value");
+    }
+
+    sbsv_parser_free(parser);
+    return failed;
+}
+
+static int test_parser_ignore_prefix_and_detached_line(void) {
+    sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    int failed = 0;
+    sbsv_row* row = NULL;
+    const sbsv_value* value;
+
+    failed |= assert_true(parser != NULL, "parser should be created");
+    failed |= assert_true(sbsv_parser_ignore_prefix(parser, "[$timestamp] [$level]", 1) == SBSV_OK, "add ignored prefix");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[necessary] [from] [this: str]") == SBSV_OK, "add prefixed schema");
+    failed |= assert_true(
+        sbsv_parser_parse_line_detached(
+            parser,
+            "[2024-03-04 13:22:56] [DEBUG] [necessary] [from] [this part]",
+            1,
+            &row
+        ) == SBSV_OK,
+        "detached line parse should succeed"
+    );
+
+    if (!failed) {
+        failed |= assert_true(row != NULL, "detached row should be returned");
+        failed |= assert_str_eq(sbsv_row_schema_name(row), "necessary$from", "detached row schema");
+        failed |= assert_true(row->id == (size_t)-1, "detached row id should be sentinel");
+        value = sbsv_row_get(row, "$timestamp");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_STRING, "timestamp should be captured");
+        if (value != NULL && value->type == SBSV_VALUE_STRING) {
+            failed |= assert_str_eq(value->data.string_value, "2024-03-04 13:22:56", "timestamp capture");
+        }
+        value = sbsv_row_get(row, "$level");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_STRING, "level should be captured");
+        if (value != NULL && value->type == SBSV_VALUE_STRING) {
+            failed |= assert_str_eq(value->data.string_value, "DEBUG", "level capture");
+        }
+        value = sbsv_row_get(row, "this");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_STRING, "body should be parsed");
+        if (value != NULL && value->type == SBSV_VALUE_STRING) {
+            failed |= assert_str_eq(value->data.string_value, "part", "body value");
+        }
+        failed |= assert_true(sbsv_parser_row_count(parser) == 0, "detached parse should not append");
+    }
+
+    sbsv_row_free(row);
+    sbsv_parser_free(parser);
+    return failed;
+}
+
+static int test_body_parser(void) {
+    sbsv_body_parser* parser = sbsv_body_parser_new();
+    int failed = 0;
+    sbsv_row* row = NULL;
+    const sbsv_value* value;
+
+    failed |= assert_true(parser != NULL, "body parser should be created");
+    failed |= assert_true(sbsv_body_parser_set_schema(parser, "[id?: int] [value: int]") == SBSV_OK, "set body schema");
+    failed |= assert_true(sbsv_body_parser_parse(parser, "[id] [value 2]", &row) == SBSV_OK, "parse body");
+
+    if (!failed) {
+        value = sbsv_row_get(row, "id");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_NULL, "nullable first body field should be allowed");
+        value = sbsv_row_get(row, "value");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_INT && value->data.int_value == 2, "body int value");
+    }
+
+    sbsv_row_free(row);
+    sbsv_body_parser_free(parser);
+    return failed;
+}
+
+static int test_schema_validation_v020(void) {
+    sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    int failed = 0;
+
+    failed |= assert_true(parser != NULL, "parser should be created");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[bad.name] [id: int]") == SBSV_ERR_INVALID_ARG, "invalid schema name should fail");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[node] [bad.name: int]") == SBSV_ERR_INVALID_ARG, "invalid field name should fail");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[node] [bad.sub] [id: int]") == SBSV_ERR_INVALID_ARG, "invalid sub-schema name should fail");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[node] [id?: int]") == SBSV_ERR_INVALID_ARG, "nullable first full-line field should fail");
+    sbsv_parser_free(parser);
+
+    parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    failed |= assert_true(parser != NULL, "parser should be recreated");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[graph] [node] [id: int]") == SBSV_OK, "add graph node");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[graph] [id: int]") == SBSV_ERR_INVALID_ARG, "root/sub-schema conflict should fail");
+    sbsv_parser_free(parser);
+
+    return failed;
+}
+
 int main(void) {
 
     assert_no_error(test_escape_roundtrip(), "test_escape_roundtrip");
@@ -746,7 +886,8 @@ int main(void) {
     assert_no_error(test_tokenize_remove_noise(), "test_tokenize_remove_noise");
     assert_no_error(test_parser_basic(), "test_parser_basic");
     assert_no_error(test_parser_nullable_and_list(), "test_parser_nullable_and_list");
-    assert_no_error(test_parser_custom_type_and_late_registration(), "test_parser_custom_type_and_late_registration");
+    assert_no_error(test_parser_custom_type_and_registration_order(), "test_parser_custom_type_and_registration_order");
+    assert_no_error(test_parser_rejects_late_or_unknown_custom_types(), "test_parser_rejects_late_or_unknown_custom_types");
     assert_no_error(test_parser_duplicating_names_with_tags(), "test_parser_duplicating_names_with_tags");
     assert_no_error(test_parser_name_matching_ignores_unknown_in_order(), "test_parser_name_matching_ignores_unknown_in_order");
     assert_no_error(test_parser_group_and_index(), "test_parser_group_and_index");
@@ -758,6 +899,10 @@ int main(void) {
     assert_no_error(test_parser_load_file_from_fp(), "test_parser_load_file_from_fp");
     assert_no_error(test_parser_custom_void_pointer_type(), "test_parser_custom_void_pointer_type");
     assert_no_error(test_row_typed_getters(), "test_row_typed_getters");
+    assert_no_error(test_parser_v020_string_rules(), "test_parser_v020_string_rules");
+    assert_no_error(test_parser_ignore_prefix_and_detached_line(), "test_parser_ignore_prefix_and_detached_line");
+    assert_no_error(test_body_parser(), "test_body_parser");
+    assert_no_error(test_schema_validation_v020(), "test_schema_validation_v020");
 
     printf("sbsv C tests passed\n");
     return 0;
