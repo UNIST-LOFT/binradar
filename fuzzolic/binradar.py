@@ -18,6 +18,7 @@ from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
 import binradar_verifier
+import binradar_fuzzer
 import binradar_minimizer
 import binradar_utils
 import logger
@@ -44,9 +45,10 @@ class BinRadarPhase(enum.IntEnum):
     PROBE = 1
     FUZZOLIC = 2
     DIRECTED = 3
-    MINIMIZER = 4
-    VERIFIER = 5
-    BINRADAR = 6
+    FUZZER = 4
+    MINIMIZER = 5
+    VERIFIER = 6
+    BINRADAR = 7
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -403,15 +405,17 @@ class BinRadarProgress:
     probe_done: bool
     fuzzolic_done: bool
     directed_done: bool
+    fuzzer_done: bool
     minimizer_done: bool
     verifier_done: bool
     done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
         self.run_id = run_id
         self.run_dir = run_dir
         self.probe_done = probe_done
         self.fuzzolic_done = fuzzolic_done
         self.directed_done = directed_done
+        self.fuzzer_done = fuzzer_done
         self.minimizer_done = minimizer_done
         self.verifier_done = verifier_done
         self.done = done
@@ -426,6 +430,7 @@ class BinRadarProgress:
         parser.add_schema("[probe] [done] [id: int] [func-entry: hex] [func-hit: int] [patch: hex] [patch-hit: int] [fault-addr: hex]")
         parser.add_schema("[fuzzolic] [done] [id: int]")
         parser.add_schema("[directed] [done] [id: int]")
+        parser.add_schema("[fuzzer] [done] [id: int]")
         parser.add_schema("[minimizer] [done] [id: int]")
         parser.add_schema("[verifier] [done] [id: int]")
         with open(file, "r", encoding="utf-8") as f:
@@ -440,6 +445,7 @@ class BinRadarProgress:
         probe_done = False
         fuzzolic_done = False
         directed_done = False
+        fuzzer_done = False
         minimizer_done = False
         verifier_done = False
         done = False
@@ -455,6 +461,10 @@ class BinRadarProgress:
             if int(directed["id"]) == run_id:
                 directed_done = True
                 break
+        for fuzzer in parser.get_result()["fuzzer"]["done"]:
+            if int(fuzzer["id"]) == run_id:
+                fuzzer_done = True
+                break
         for done_item in parser.get_result()["rundir"]["done"]:
             if int(done_item["id"]) == run_id:
                 done = True
@@ -467,7 +477,7 @@ class BinRadarProgress:
             if int(verifier["id"]) == run_id:
                 verifier_done = True
                 break
-        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, minimizer_done, verifier_done, done)
+        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
     # Config from config.env and command line arguments
@@ -740,12 +750,26 @@ class BinRadarExecutor:
 
         self.save_progress(f"[directed] [done] [id {self.run_id}]")
     
+    def run_fuzzer(self):
+        self.check_requirements()
+        exec_mode = "fuzzer"
+        self.save_progress(f"[fuzzer] [start] [id {self.run_id}]")
+        config = self.extract_config()
+        fuzzer_outdir = os.path.join(self.run_dir, "fuzzer-out")
+        if os.path.exists(fuzzer_outdir):
+            logger.info(f"Fuzzer output directory already exists: {fuzzer_outdir}. It will be overwritten.")
+            shutil.rmtree(fuzzer_outdir)
+        fuzzer = binradar_fuzzer.BinRadarFuzzer.from_env(self.workdir, fuzzer_outdir, config)
+        fuzzer.run()
+        self.save_progress(f"[fuzzer] [done] [id {self.run_id}]")
+    
     def run_minimizer(self):
         self.check_requirements()
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
+        testcase_dirs.append(os.path.join(self.run_dir, "fuzzer-out", "reached"))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()
         minimizer.run_testcases()
@@ -763,7 +787,7 @@ class BinRadarExecutor:
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.patched_binary())
-        
+        verifier.run_verification_concrete_testcases()
         self.save_progress(f"[verifier] [done] [id {self.run_id}]")
 
     def run_binradar(self):
@@ -816,6 +840,8 @@ class BinRadarExecutor:
             self.run_fuzzolic()
         if resume_phase <= BinRadarPhase.DIRECTED:
             self.run_directed()
+        # if resume_phase <= BinRadarPhase.FUZZER:
+        #     self.run_fuzzer()
         # Run minimizer to minimize the generated concrete test cases
         if resume_phase <= BinRadarPhase.MINIMIZER:
             self.run_minimizer()
