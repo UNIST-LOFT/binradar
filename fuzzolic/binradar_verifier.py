@@ -16,6 +16,10 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
 
 class BinRadarProbeResult:
+    line_parser: sbsv.line_parser = sbsv.line_parser()
+    line_parser.add_custom_type("hex", lambda x: int(x, 16))
+    line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
+    line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     def __init__(self, patch_loc: int, patch_func_entry: int, stacktrace: List[Tuple[int, str]], exit_info: str, patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int, patch_func_candidates: List[Tuple[int, int]]):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
@@ -112,6 +116,50 @@ class BinRadarProbeResult:
             fault_addr=fault_addr,
             patch_func_candidates=patch_func_candidates
         )
+    
+    @staticmethod
+    def from_sbsv(sbsv_file: str) -> Optional["BinRadarProbeResult"]:
+        parser = sbsv.parser()
+        parser.add_custom_type("hex", lambda x: int(x, 16))
+        parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
+        parser.add_schema("[file-trace] [need-file-hook: bool]")
+        with open(sbsv_file, "r", encoding="utf-8") as f:
+            result = parser.load(f)
+        if len(result["probe-info"]) == 0:
+            logger.error("Probe info not found in the log.")
+            return None
+        if len(result["file-trace"]) == 0:
+            logger.error("File trace info not found in the log.")
+            return None
+        probe_info = result["probe-info"][-1]
+        patch_loc = probe_info["patch-loc"]
+        patch_func_entry = probe_info["func-entry"]
+        stacktrace = list()
+        for entry in probe_info["stacktrace"]:
+            addr, symbol = entry.split(":", 1)
+            stacktrace.append((int(addr, 16), symbol))
+        
+        exit_info = probe_info["exit"]
+        patch_hit_cnt = probe_info["patch-hit"]
+        patch_func_hit_cnt = probe_info["func-hit"]
+        fault_addr = probe_info["fault-addr"]
+        patch_func_candidates = list()
+        for func in probe_info["patch-func-candidates"]:
+            entry, hits = func.split(":", 1)
+            patch_func_candidates.append((int(entry, 16), int(hits)))
+        need_file_hook = result["file-trace"][-1]["need-file-hook"]
+        probe_result = BinRadarProbeResult(
+            patch_loc=patch_loc,
+            patch_func_entry=patch_func_entry,
+            stacktrace=stacktrace,
+            exit_info=exit_info,
+            patch_hit_cnt=patch_hit_cnt,
+            patch_func_hit_cnt=patch_func_hit_cnt,
+            fault_addr=fault_addr,
+            patch_func_candidates=patch_func_candidates
+        )
+        probe_result.need_file_hook = need_file_hook
+        return probe_result
         
     def update_with_file_trace(self, log: str):
         parser = BinRadarProbeResult.get_parser_for_file_trace()
@@ -169,11 +217,42 @@ class BinRadarProbeResult:
                                 break
 
     def serialize(self) -> str:
-        return f"[exit {self.exit_info}] [func-entry {self.patch_func_entry:x}] [func-hit {self.patch_func_hit_cnt}] [patch {self.patch_loc:x}] [patch-hit {self.patch_hit_cnt}] [fault-addr {self.fault_addr:x}]"
+        return f"[exit {self.exit_info}] [patch-loc {self.patch_loc:x}] [func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] [func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] [patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] [stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]"
 
     def serialize_file_trace_result(self) -> str:
         return f"[need-file-hook {self.need_file_hook}]"
-
+    
+    @classmethod
+    def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
+        for line in data.splitlines():
+            res = cls.line_parser.loads(line)
+            if res is not None:
+                if res.get_name() == "probe-info":
+                    return cls(
+                        patch_loc=res["patch-loc"],
+                        patch_func_entry=res["func-entry"],
+                        stacktrace=[(entry["addr"], entry["symbol"]) for entry in res["stacktrace"]],
+                        exit_info=res["exit"],
+                        patch_hit_cnt=res["patch-hit"],
+                        patch_func_hit_cnt=res["func-hit"],
+                        fault_addr=res["fault-addr"],
+                        patch_func_candidates=[(int(func.split(":")[0], 16), int(func.split(":")[1])) for func in res["patch-func-candidates"]]
+                    )
+                elif res.get_name() == "file-trace":
+                    tmp = cls(
+                        patch_loc=0,
+                        patch_func_entry=0,
+                        stacktrace=[],
+                        exit_info="",
+                        patch_hit_cnt=0,
+                        patch_func_hit_cnt=0,
+                        fault_addr=0,
+                        patch_func_candidates=[],
+                    )
+                    tmp.need_file_hook = res["need-file-hook"]
+                    return tmp
+        return None
+    
     def patch_hit(self) -> bool:
         return self.patch_hit_cnt > 0
 
@@ -191,7 +270,57 @@ class BinRadarProbeResult:
     
     def is_normal_exit(self) -> bool:
         return self.exit_info == "ok"
+
+
+class BinRadarPatchResult:
+    line_parser: sbsv.line_parser = sbsv.line_parser()
+    line_parser.add_schema("[patch] [id: int] [br: bool]")
+    line_parser.add_schema("[patch-res] [id: int] [br: list[bool]]")
     
+    def __init__(self, patch_id: int, br_selection: List[int]):
+        self.patch_id = patch_id
+        self.br_selection = br_selection
+    
+    @classmethod
+    def from_log(cls, log: str) -> Optional["BinRadarPatchResult"]:
+        result: List[sbsv.SbsvData] = list()
+        for line in log.splitlines():
+            res = cls.line_parser.loads(line)
+            if res is not None:
+                result.append(res)
+
+        if len(result) == 0:
+            logger.error("No patch result found in the log.")
+            return None
+        
+        patch_id = -1
+        for entry in result:
+            if entry.get_name() == "patch":
+                patch_id = entry["id"]
+                br_selection = entry["br"]
+                break
+        if patch_id == -1:
+            logger.error("No patch result found in the log.")
+            return None
+        br_selection: List[int] = list()
+        for entry in result:
+            if entry.get_name() == "patch" and entry["id"] == patch_id:
+                br = entry["br"]
+                br_selection.append(br)
+            elif entry.get_name() == "patch" and entry["id"] != patch_id:
+                logger.warning(f"Multiple patch results found in the log. Using the first one with id {patch_id}.")
+        return BinRadarPatchResult(patch_id=patch_id, br_selection=br_selection)
+
+    def serialize(self) -> str:
+        return f"[id {self.patch_id}] [br [{'] ['.join([str(br) for br in self.br_selection])}]]"
+    
+    @classmethod
+    def deserialize(cls, data: str) -> Optional["BinRadarPatchResult"]:
+        for line in data.splitlines():
+            res = cls.line_parser.loads(line)
+            if res is not None and res.get_name() == "patch-res":
+                return cls(patch_id=res["id"], br_selection=res["br"])
+        return None
 
 class BinRadarQemuRunner:
     dir: str
@@ -223,6 +352,9 @@ class BinRadarQemuRunner:
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
 
+    def patched_binary(self) -> str:
+        return os.path.join(self.dir, f"{self.binary}.patched")
+
     def get_qemu_stacktrace_command(self, binary: str, input_file: str, patch_func_entry: int = 0) -> List[str]:
         cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc]
         if patch_func_entry != 0:
@@ -237,27 +369,43 @@ class BinRadarQemuRunner:
             logger.error("Failed to execute the command.")
             return None
         return BinRadarProbeResult.from_log(result.stderr)
-
-    def test_with_patched(self, binary: str, testcase: str, verbose: bool = False) -> Optional[BinRadarProbeResult]:
-        command = self.get_qemu_stacktrace_command(binary, testcase)
-        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
-        if not result.success:
-            logger.error("Failed to execute the command")
-            return None
-        return BinRadarProbeResult.from_log(result.stderr)
     
-    def test_with_patched_and_file_trace(self, binary: str, testcase: str, patch_func_entry: int, verbose: bool = False) -> Optional[BinRadarProbeResult]:
-        command = self.get_qemu_stacktrace_command(binary, testcase, patch_func_entry=patch_func_entry)
+    def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
+        command = self.get_qemu_stacktrace_command(self.original_binary(), testcase, patch_func_entry=patch_func_entry)
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
         if not result.success:
-            logger.error("Failed to execute the command")
+            logger.error("Failed to execute the command.")
             return None
         probe_result = BinRadarProbeResult.from_log(result.stderr)
         if probe_result is None:
-            logger.error("Failed to parse the probe result from log.")
+            logger.error("Failed to parse probe result from the log.")
             return None
-        probe_result.update_with_file_trace(result.stderr)
         return probe_result
+
+    def test_with_patched(self, patch_id: str, testcase: str, env: Dict[str, str], verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        command = self.get_qemu_stacktrace_command(self.patched_binary(), testcase)
+        rfd, wfd = os.pipe()
+        env["PATCH_ID"] = patch_id
+        env["PATCH_FD"] = str(wfd)
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
+        os.close(wfd)
+        result = binradar_utils.execute_await(proc, timeout=60.0, verbose=verbose)
+        patch_result_chunks = list()
+        while True:
+            chunk = os.read(rfd, 4096)
+            if not chunk:
+                break
+            patch_result_chunks.append(chunk)
+        patch_result_data = b"".join(patch_result_chunks).decode(errors="ignore")
+        os.close(rfd)
+        if not result.success:
+            logger.error("Failed to execute the command")
+            return None, None
+        patch_result = BinRadarPatchResult.from_log(patch_result_data)
+        if patch_result is None:
+            logger.error("Failed to parse patch result from the log.")
+            return None, None
+        return BinRadarProbeResult.from_log(result.stderr), patch_result
 
 
 class Testcase:
@@ -278,17 +426,21 @@ class BinRadarConcreteVerifier:
     runner: BinRadarQemuRunner
     patched_binary: str
     testcases: List[Testcase]
+    patches: List[int]
     start_time: float
     logger: logging.Logger
     minimized_dir: str
-    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, patched_binary: str):
+    env: Dict[str, str]
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
         self.runner = runner
         self.patched_binary = patched_binary
+        self.patches = patches
         self.testcases = list()
         self.start_time = time.time()
+        self.env = os.environ.copy()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
         self.logger = logging.getLogger(__name__)
@@ -315,42 +467,53 @@ class BinRadarConcreteVerifier:
                 fault_addr=testcase["fault-addr"]
             ))
     
-    def run_testcase_crash(self, testcase: Testcase) -> Optional[BinRadarProbeResult]:
-        result = self.runner.test_with_patched(self.patched_binary, os.path.join(self.minimized_dir, testcase.filename), verbose=False)
+    def run_testcase_crash(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename), self.env)
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-            return None
-        return result
+            return None, None
+        return result, patch_result
     
-    def run_testcase_no_crash(self, testcase: Testcase) -> Optional[BinRadarProbeResult]:
-        result = self.runner.test_with_patched(self.patched_binary, os.path.join(self.minimized_dir, testcase.filename), verbose=False)
+    def run_testcase_no_crash(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename), self.env)
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-            return None
-        return result
+            return None, None
+        if patch_result is None:
+            self.logger.error(f"Failed to get patch result for test case {testcase.filename}.")
+            return None, None
+        return result, patch_result
 
     def run_verification_concrete_testcases(self):
-        for testcase in self.testcases:
-            self.logger.info(f"[testcase] [try] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
-            if testcase.exit == "crash":
-                result = self.run_testcase_crash(testcase)
-                if result is None:
-                    self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                    continue
-                if result.is_crash():
-                    self.logger.info(f"[verifier] [crash-fail] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                elif result.is_normal_exit():
-                    self.logger.info(f"[verifier] [crash-pass] [id {testcase.id}] [file {testcase.filename}]")
-                elif result.is_timeout():
-                    self.logger.info(f"[verifier] [crash-timeout] [id {testcase.id}] [file {testcase.filename}]")
-            else:
-                result = self.run_testcase_no_crash(testcase)
-                if result is None:
-                    self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                    continue
-                if result.is_crash():
-                    self.logger.info(f"[verifier] [no-crash-fail] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                elif result.is_normal_exit():
-                    self.logger.info(f"[verifier] [no-crash-pass] [id {testcase.id}] [file {testcase.filename}]")
-                elif result.is_timeout():
-                    self.logger.info(f"[verifier] [no-crash-timeout] [id {testcase.id}] [file {testcase.filename}]")
+        for patch in self.patches:
+            for testcase in self.testcases:
+                self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+                if testcase.exit == "crash":
+                    result, patch_result = self.run_testcase_crash(patch, testcase)
+                    if result is None:
+                        self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                        continue
+                    if result.is_crash():
+                        self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                        # TODO: check if the crash is same with original crash
+                        break # Patch is incorrect: no need to check further
+                    elif result.is_normal_exit():
+                        self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                    elif result.is_timeout():
+                        self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                        # TODO: retry
+                else:
+                    result, patch_result = self.run_testcase_no_crash(patch, testcase)
+                    if result is None:
+                        self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                        continue
+                    if result.is_crash():
+                        self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                        # TODO: check if the crash is same with original crash
+                        break # Patch is incorrect: no need to check further
+                    elif result.is_normal_exit():
+                        self.logger.info(f"[verifier] [no-crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                        # TODO: check regression
+                    elif result.is_timeout():
+                        self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                        # TODO: retry
