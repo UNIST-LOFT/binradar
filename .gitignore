@@ -11,3 +11,4 @@ utils/AFLplusplus/
 solver/solver-fuzzy
 solver/solver-smt
 *-bak
+*-out
