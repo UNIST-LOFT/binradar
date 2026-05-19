@@ -385,19 +385,16 @@ class BinRadarQemuRunner:
     def test_with_patched(self, patch_id: str, testcase: str, env: Dict[str, str], verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         command = self.get_qemu_stacktrace_command(self.patched_binary(), testcase)
         rfd, wfd = os.pipe()
+        env = env.copy()
         env["PATCH_ID"] = patch_id
         env["PATCH_FD"] = str(wfd)
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
         os.close(wfd)
+        thread, patch_result_chunks = binradar_utils.create_pipe_reader_thread(rfd, verbose=verbose)
         result = binradar_utils.execute_await(proc, timeout=60.0, verbose=verbose)
-        patch_result_chunks = list()
-        while True:
-            chunk = os.read(rfd, 4096)
-            if not chunk:
-                break
-            patch_result_chunks.append(chunk)
+        thread.join() # Read all patch results and close the pipe(rfd)
+        
         patch_result_data = b"".join(patch_result_chunks).decode(errors="ignore")
-        os.close(rfd)
         if not result.success:
             logger.error("Failed to execute the command")
             return None, None

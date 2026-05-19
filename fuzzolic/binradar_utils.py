@@ -1,6 +1,7 @@
 import subprocess
 import os
 import signal
+import threading
 from typing import List, Set, Tuple, Dict, Optional, Any
 
 import logger
@@ -28,17 +29,37 @@ def execute_async(command: List[str], env: Optional[Dict[str, str]] = None, cwd:
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd, start_new_session=True)
     return process
 
+def decode_output(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode(errors="ignore")
+    return str(data)
+
+def pipe_reader(rfd: int, chunks: List[bytes], verbose: bool = False):
+    try:
+        while True:
+            chunk = os.read(rfd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except Exception as e:
+        if verbose:
+            logger.debug(f"Pipe reader thread encountered an error: {str(e)}")
+    finally:
+        os.close(rfd)
+
+def create_pipe_reader_thread(rfd: int, verbose: bool = False) -> Tuple[threading.Thread, List[bytes]]:
+    patch_chunks = list()
+    thread = threading.Thread(target=pipe_reader, args=(rfd, patch_chunks, verbose), daemon=False)
+    thread.start()
+    return thread, patch_chunks
+
 def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: bool = False) -> ExecutionResult:
-    
-    def decode_output(data) -> str:
-        if data is None:
-            return ""
-        if isinstance(data, bytes):
-            return data.decode(errors="ignore")
-        return str(data)
-    
+
     if verbose:
         logger.debug(f"Awaiting process with PID {process.pid} for up to {timeout} seconds")
+    
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         return ExecutionResult(
@@ -46,7 +67,10 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
             exit_code=process.returncode,
             stdout=decode_output(stdout),
             stderr=decode_output(stderr))
-    except Exception as e:
+    
+    except subprocess.TimeoutExpired as e:
+        if verbose:
+            logger.debug(f"Process with PID {process.pid} timed out after {timeout} seconds")
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         except ProcessLookupError:
@@ -59,6 +83,17 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()
+        return ExecutionResult(
+            success=False,
+            exit_code=process.returncode,
+            stdout=decode_output(stdout),
+            stderr=decode_output(stderr))
+    
+    except Exception as e:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         stdout, stderr = process.communicate()
         logger.debug(f"Command failed: Error: {str(e)}")
         return ExecutionResult(
