@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import select
+import struct
 import io
 import time
 import enum
@@ -91,27 +92,29 @@ class SharedMemoryManager:
     def __init__(self, env: Dict[str, str]):
         self.env = env
         self.libc = ctypes.CDLL("libc.so.6")
+        self.shm_keys = list()
     
     def assign_random_keys(self):
         for key in SHM_KEYS:
-            self.env[key] = hex(random.getrandbits(32))
+            shm_key = random.getrandbits(32)
+            self.env[key] = hex(shm_key)
+            self.shm_keys.append(shm_key)
+    
+    def assign_random_key_for_binradar(self):
+        shm_key = random.getrandbits(32)
+        self.env["BINRADAR_PATCH_SHM_KEY"] = hex(shm_key)
+        self.shm_keys.append(shm_key)
     
     def cleanup(self):
-        shm_keys = list()
-        for key in SHM_KEYS:
-            if key not in self.env:
-                continue
-            shm_keys.append(int(self.env[key], 16))
-
         ipc_rmid = 0
-        for shm_key in shm_keys:
+        for shm_key in self.shm_keys:
             shm_id = self.libc.shmget(
                 ctypes.c_int(shm_key), ctypes.c_int(1), ctypes.c_int(0))
-            if shm_id > 0:
+            if shm_id != -1:
                 result = self.libc.shmctl(
                     ctypes.c_int(shm_id),
                     ctypes.c_int(ipc_rmid),
-                    ctypes.c_int(0))
+                    ctypes.c_void_p(0))
                 logger.info(
                     "Shared memory detach on (%s, %s): %s"
                     % (shm_key, shm_id, result))
@@ -177,6 +180,10 @@ class TracerExecutor:
         os.close(st_w)
         os.set_inheritable(ctrl_fd, True)
         os.set_inheritable(status_fd, True)
+        pass_fds = [ctrl_fd, status_fd]
+        if self.mode == "binradar":
+            pass_fds.append(int(self.env["PATCH_FD"]))
+            pass_fds.append(int(self.env["BINRADAR_PATCH_FD_R"]))
         
         self.process = subprocess.Popen(
             self.command,
@@ -184,13 +191,13 @@ class TracerExecutor:
             stderr=self.log_fp,
             cwd=self.workdir,
             env=self.env,
-            pass_fds=(ctrl_fd, status_fd),
+            pass_fds=pass_fds,
             preexec_fn=setlimits, 
             start_new_session=True)
         
         RUNNING_PROCESSES.append(self.process)
-        os.close(ctrl_fd)
-        os.close(status_fd)
+        for fd in pass_fds:
+            os.close(fd)
         self.ctrl_w = ctl_w
         self.stat_r = st_r
         
@@ -209,18 +216,17 @@ class TracerExecutor:
         if self.process is None:
             raise RuntimeError("Tracer process not started")
         start_time = time.time()
-        self.iter += 1
         if not self.forkserver_mode:
             self.run_result = binradar_utils.execute_await(self.process, timeout=self.timeout)
             logger.info(f"[TRACER] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
-        self._write_u32(0)  # Send run command to forkserver
+        self._write_u32(0)  # was_killed - send run command to forkserver
         is_timeout = False
-        child_pid = self._read_u32(self.timeout)
         try:
-            status = self._read_u32(self.timeout)
+            exit_status, patch_id, iter = self._read_status(self.timeout)
+            self.iter = iter
             analyze_result = b""
-            if self._need_type_analysis():
+            if self._need_type_analysis(patch_id, iter):
                 out_buf = io.StringIO()
                 start_time = time.time()
                 self.log_fp.flush()
@@ -233,7 +239,7 @@ class TracerExecutor:
                 with open(analyze_result_file, "wb") as f:
                     f.write(analyze_result)
                 logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - start_time, 3)}] [saved {analyze_result_file}]")
-            logger.info(f"[TRACER] Target process finished with status {status:#x}")
+            logger.info(f"[TRACER] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
         except Exception as e:
             is_timeout = True
             logger.error(f"Error while waiting for tracer forkserver: {str(e)}")
@@ -263,15 +269,18 @@ class TracerExecutor:
         if not self.log_fp.closed:
             self.log_fp.close()
         
-    def _need_type_analysis(self) -> bool:
+    def _need_type_analysis(self, patch_id: int, iter: int) -> bool:
         """
         Determine if type analysis is needed:
         - It has large overhead, so we only want to run it when necessary.
         """
-        return self.mode == "binradar" and self.iter == 1
+        if self.mode == "binradar":
+            if patch_id == 0 and iter == 1:
+                return True
+        return False
     
     def _write_u32(self, value: int):
-        self._write(value.to_bytes(4, byteorder="little"))
+        self._write(struct.pack("<I", value))
     
     def _write(self, data: bytes):
         total_written = 0
@@ -291,7 +300,16 @@ class TracerExecutor:
         data = self._read(4)
         if len(data) < 4:
             raise EOFError("Failed to read 4 bytes from forkserver")
-        return int.from_bytes(data, byteorder="little")
+        return struct.unpack("<I", data)[0]
+    
+    def _read_status(self, timeout: float) -> Tuple[int, int, int]:
+        rlist, _, _ = select.select([self.stat_r], [], [], timeout)
+        if not rlist:
+            raise TimeoutError("Timeout while waiting for forkserver response")
+        data = self._read(12)
+        if len(data) < 12:
+            raise EOFError("Failed to read 12 bytes from forkserver")
+        return struct.unpack("<III", data)
     
     def _read(self, size: int) -> bytes:
         data = b''
@@ -640,6 +658,8 @@ class BinRadarExecutor:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
             else:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
+                env["PATCH_ID"] = "123456"
+                env["BINRADAR_PATCH_CNT"] = str(self.total_patches)
         return env
     
     def run_probe(self):
@@ -818,9 +838,14 @@ class BinRadarExecutor:
         binradar_env = self.get_env(exec_mode, self.run_dir)
         shm = SharedMemoryManager(binradar_env)
         shm.assign_random_keys()
+        shm.assign_random_key_for_binradar()
+        # Create pipe
+        patch_r, patch_w = os.pipe()
+        binradar_env["PATCH_FD"] = str(patch_w)
+        binradar_env["BINRADAR_PATCH_FD_R"] = str(patch_r)
         
         solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout)
-        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.patched_binary(), self.test_cmd, testcase, timeout=self.timeout)
         
         try:
             solver.start()

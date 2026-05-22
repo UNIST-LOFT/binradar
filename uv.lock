@@ -48,7 +48,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "pytest", specifier = ">=8.3.5" },
-    { name = "sbsv", specifier = ">=0.2.0,<0.3.0" },
+    { name = "sbsv", specifier = ">=0.2.1,<0.3.0" },
     { name = "sortedcontainers", specifier = ">=2.4.0" },
 ]
 
@@ -108,11 +108,11 @@ wheels = [
 
 [[package]]
 name = "sbsv"
-version = "0.2.0"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/12/87/6585a65ab58b792f5de88f6f5776b9204321713df203d335d7fa6d5cb3d4/sbsv-0.2.0.tar.gz", hash = "sha256:c41e375fa9cffb020c9dffdeb903b7ea38609bc0497866ca452fd75a1671b873", size = 69879, upload-time = "2026-05-16T13:24:25.794Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d7/6a/c92e8719e979f73718408c246fcb7a578ec39e2a0c8604fa0a4ecdc2cbd8/sbsv-0.2.1.tar.gz", hash = "sha256:89b072e49249f3dfdc74497e523a786d3cd7e22af608d7f9d77907c82469d724", size = 54290, upload-time = "2026-05-21T07:33:11.264Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/2d/5260fe1a3214e80c698f20dbb02b61706d3d5fc8d43d98aa937b063d449a/sbsv-0.2.0-py3-none-any.whl", hash = "sha256:079ad2adb1926da7679dc69be91acfdb93dc4cf7627100dec0062b38f4f1157c", size = 12395, upload-time = "2026-05-16T13:24:26.8Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/f1/4f80fd868d3e160a1d273f946cf3d53c1cc2e2d1bd0aac0b158b56cf27a7/sbsv-0.2.1-py3-none-any.whl", hash = "sha256:6c452b37ba2b88b6459e4d7e2dbf97440112429adc0cf1f62cdbeae35742f850", size = 12375, upload-time = "2026-05-21T07:33:09.93Z" },
 ]
 
 [[package]]

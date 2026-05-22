@@ -16,7 +16,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
 
 class BinRadarProbeResult:
-    line_parser: sbsv.line_parser = sbsv.line_parser()
+    line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_custom_type("hex", lambda x: int(x, 16))
     line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
@@ -225,7 +225,7 @@ class BinRadarProbeResult:
     @classmethod
     def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
         for line in data.splitlines():
-            res = cls.line_parser.loads(line)
+            res = cls.line_parser.parse_line_detached(line)
             if res is not None:
                 if res.get_name() == "probe-info":
                     return cls(
@@ -273,7 +273,7 @@ class BinRadarProbeResult:
 
 
 class BinRadarPatchResult:
-    line_parser: sbsv.line_parser = sbsv.line_parser()
+    line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_schema("[patch] [id: int] [br: bool]")
     line_parser.add_schema("[patch-res] [id: int] [br: list[bool]]")
     
@@ -285,7 +285,7 @@ class BinRadarPatchResult:
     def from_log(cls, log: str) -> Optional["BinRadarPatchResult"]:
         result: List[sbsv.SbsvData] = list()
         for line in log.splitlines():
-            res = cls.line_parser.loads(line)
+            res = cls.line_parser.parse_line_detached(line)
             if res is not None:
                 result.append(res)
 
@@ -317,7 +317,7 @@ class BinRadarPatchResult:
     @classmethod
     def deserialize(cls, data: str) -> Optional["BinRadarPatchResult"]:
         for line in data.splitlines():
-            res = cls.line_parser.loads(line)
+            res = cls.line_parser.parse_line_detached(line)
             if res is not None and res.get_name() == "patch-res":
                 return cls(patch_id=res["id"], br_selection=res["br"])
         return None
