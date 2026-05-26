@@ -227,6 +227,7 @@ class TracerExecutor:
             self.iter = iter
             analyze_result = b""
             if self._need_type_analysis(patch_id, iter):
+                logger.info(f"[TRACER] Start type analysis for patch {patch_id}, iter {iter} in {self.mode} mode")
                 out_buf = io.StringIO()
                 start_time = time.time()
                 self.log_fp.flush()
@@ -457,12 +458,15 @@ class BinRadarProgress:
             fcntl.flock(f, fcntl.LOCK_EX)
             parser.load(f)
             fcntl.flock(f, fcntl.LOCK_UN)
-        rundir = parser.get_result()["rundir"]["set"]
-        if len(rundir) == 0:
+        rundir_log = parser.get_result()["rundir"]["set"]
+        if len(rundir_log) == 0:
             return None
-        last_rundir = rundir[-1]
-        run_id = int(last_rundir["id"])
-        run_dir = last_rundir["dir"]
+        run_id = 0
+        run_dir = ""
+        for item in rundir_log:
+            if item["id"] > run_id:
+                run_id = int(item["id"])
+                run_dir = item["dir"]
         
         probe_done = False
         fuzzolic_done = False
@@ -670,6 +674,7 @@ class BinRadarExecutor:
         if os.path.exists(os.path.join(self.run_dir, "probe-results.sbsv")):
             self.probe_result = binradar_verifier.BinRadarProbeResult.from_sbsv(os.path.join(self.run_dir, "probe-results.sbsv"))
             if self.probe_result is not None:
+                self.set_config("BINRADAR_ENTRYPOINT", hex(self.probe_result.patch_func_entry))
                 logger.info(f"[PROBE] Loaded existing probe result: {self.probe_result.serialize()}")
                 return
         config = self.extract_config()
