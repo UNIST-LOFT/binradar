@@ -125,7 +125,7 @@ class TracerExecutor:
     env: Dict[str, str]
     workdir: str
     rundir: str
-    log_fp: BinaryIO
+    log_file: str
     process: Optional[subprocess.Popen]
     timeout: float
     # Forkserver
@@ -140,9 +140,10 @@ class TracerExecutor:
         self.env = env
         self.workdir = workdir
         self.rundir = rundir
+        self.log_file = ""
+        if "BINRADAR_TRACE_FILE" in env:
+            self.log_file = env["BINRADAR_TRACE_FILE"]
         self.timeout = timeout
-        log_file = os.path.join(rundir, f"{mode}-tracer.log")
-        self.log_fp = open(log_file, "wb")
         self.process = None
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
         self.ctrl_w = 0
@@ -160,7 +161,7 @@ class TracerExecutor:
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.DEVNULL,
-                stderr=self.log_fp,
+                stderr=subprocess.DEVNULL,
                 cwd=self.workdir,
                 env=self.env,
                 preexec_fn=setlimits,
@@ -188,7 +189,7 @@ class TracerExecutor:
         self.process = subprocess.Popen(
             self.command,
             stdout=subprocess.DEVNULL,
-            stderr=self.log_fp,
+            stderr=subprocess.DEVNULL,
             cwd=self.workdir,
             env=self.env,
             pass_fds=pass_fds,
@@ -230,8 +231,9 @@ class TracerExecutor:
                 logger.info(f"[TRACER] Start type analysis for patch {patch_id}, iter {iter} in {self.mode} mode")
                 out_buf = io.StringIO()
                 start_time = time.time()
-                self.log_fp.flush()
-                with open(self.log_fp.name, "r", encoding="utf-8", errors="ignore") as log_file:
+                if not os.path.exists(self.log_file):
+                    raise RuntimeError(f"Log file for type analysis not found: {self.log_file}")
+                with open(self.log_file, "r", encoding="utf-8", errors="ignore") as log_file:
                     osprey = analyze_type.OspreyAnalyzer(log_file, out_buf)
                     osprey.analyze()
                     osprey.dump_results(dump_mode="best")
@@ -267,8 +269,6 @@ class TracerExecutor:
             self.run_result = binradar_utils.execute_await(self.process, timeout=5)
             RUNNING_PROCESSES.remove(self.process)
             self.process = None
-        if not self.log_fp.closed:
-            self.log_fp.close()
         
     def _need_type_analysis(self, patch_id: int, iter: int) -> bool:
         """
@@ -654,13 +654,18 @@ class BinRadarExecutor:
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = "0"
+            env["BINRADAR_TRACE_FILE"] = "none"
         elif mode in ["directed", "binradar"]:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
             if mode == "directed":
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
+                env["BINRADAR_TRACE_FILE"] = "none"
             else:
+                trace_file = os.path.join(run_dir, f"{mode}-tracer.log")
+                open(trace_file, "w").close()
+                env["BINRADAR_TRACE_FILE"] = trace_file
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
                 env["PATCH_ID"] = "123456"
                 env["BINRADAR_PATCH_CNT"] = str(self.total_patches)

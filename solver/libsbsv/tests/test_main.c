@@ -569,6 +569,47 @@ static int test_parser_unknown_schema_error_context(void) {
     return failed;
 }
 
+static int test_parser_malformed_unknown_schema_lines(void) {
+    sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    int failed = 0;
+    sbsv_status status;
+    const sbsv_row* row;
+    const sbsv_value* value;
+
+    failed |= assert_true(parser != NULL, "parser should be created");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[known] [id: int]") == SBSV_OK, "add known schema");
+    status = sbsv_parser_loads(
+        parser,
+        "[unknown] [broken\n"
+        "[unknown] [value \"broken]\n"
+        "[known] [id 1]\n"
+    );
+    failed |= assert_true(status == SBSV_OK, "malformed unknown schemas should be ignored");
+    failed |= assert_true(sbsv_parser_row_count(parser) == 1, "only known row should be parsed");
+    if (!failed) {
+        row = sbsv_parser_row_at(parser, 0);
+        value = sbsv_row_get(row, "id");
+        failed |= assert_true(value != NULL && value->type == SBSV_VALUE_INT && value->data.int_value == 1, "known id should parse");
+    }
+    sbsv_parser_free(parser);
+
+    parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    failed |= assert_true(parser != NULL, "parser should be recreated");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[known] [id: int]") == SBSV_OK, "add known schema again");
+    status = sbsv_parser_loads(parser, "[known] [id 1\n");
+    failed |= assert_true(status == SBSV_ERR_INVALID_ARG, "malformed known schema should fail");
+    sbsv_parser_free(parser);
+
+    parser = sbsv_parser_new(SBSV_PARSER_NO_IGNORE_UNKNOWN);
+    failed |= assert_true(parser != NULL, "strict parser should be created");
+    failed |= assert_true(sbsv_parser_add_schema(parser, "[known] [id: int]") == SBSV_OK, "add strict known schema");
+    status = sbsv_parser_loads(parser, "[unknown] [broken\n");
+    failed |= assert_true(status == SBSV_ERR_INVALID_ARG, "malformed unknown schema should fail when not ignoring unknown");
+    sbsv_parser_free(parser);
+
+    return failed;
+}
+
 static int test_parser_error_detail_not_corrupted(void) {
     sbsv_parser* parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     int failed = 0;
@@ -895,6 +936,7 @@ int main(void) {
     assert_no_error(test_parser_ordered_query(), "test_parser_ordered_query");
     assert_no_error(test_parser_get_rows_by_schema(), "test_parser_get_rows_by_schema");
     assert_no_error(test_parser_unknown_schema_error_context(), "test_parser_unknown_schema_error_context");
+    assert_no_error(test_parser_malformed_unknown_schema_lines(), "test_parser_malformed_unknown_schema_lines");
     assert_no_error(test_parser_error_detail_not_corrupted(), "test_parser_error_detail_not_corrupted");
     assert_no_error(test_parser_load_file_from_fp(), "test_parser_load_file_from_fp");
     assert_no_error(test_parser_custom_void_pointer_type(), "test_parser_custom_void_pointer_type");

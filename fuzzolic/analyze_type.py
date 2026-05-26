@@ -3,6 +3,7 @@ import os
 import sys
 import math
 import logging
+import time
 from typing import Dict, List, Tuple, Set, Optional, TextIO
 from enum import Enum
 from dataclasses import dataclass
@@ -1043,12 +1044,14 @@ class ProbabilisticInference:
                 output_logger.info(f"[pointer-var] {node.chunk.get_str()} [type {ptr_tid}] -> [target {target_addr_int:x}] [t-role {t_role}] [t-val {t_val}] [P {prob:.4f}]")
 
 class OspreyAnalyzer:
+    start_time: float
     output_logger: logging.Logger
     parser: LogParser
     primitive_analyzer: PrimitiveFactAnalyzer
     deterministic_inference: DeterministicInference
     probabilistic_inference: ProbabilisticInference
     def __init__(self, log_fp: TextIO, out_fp: Optional[TextIO] = None):
+        self.start_time = time.time()
         self.parser = LogParser(log_fp)
         self.output_logger = logging.getLogger("osprey-analyzer")
         if out_fp is None:
@@ -1058,14 +1061,22 @@ class OspreyAnalyzer:
         ch.setFormatter(logging.Formatter("%(message)s"))
         self.output_logger.addHandler(ch)
         self.output_logger.setLevel(logging.DEBUG)
+        self.output_logger.debug(f"[pr] [parse-time] [time {self.elapsed_time()}] {len(self.parser.parser.data)}")
 
+    def elapsed_time(self) -> float:
+        return int((time.time() - self.start_time) * 1000)
+    
     def analyze(self):
+        self.output_logger.debug(f"[pr] [start-analysis] [time {self.elapsed_time()}]")
         self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser.parser)
         self.primitive_analyzer.run_trace_replay()
+        self.output_logger.debug(f"[pr] [primitive-analysis] [time {self.elapsed_time()}]")
         self.deterministic_inference = DeterministicInference(self.primitive_analyzer)
         self.deterministic_inference.infer()
+        self.output_logger.debug(f"[pr] [deterministic-inference] [time {self.elapsed_time()}]")
         self.probabilistic_inference = ProbabilisticInference(self.deterministic_inference)
         self.probabilistic_inference.type_infer()
+        self.output_logger.debug(f"[pr] [probabilistic-inference] [time {self.elapsed_time()}]")
     
     def dump_results(self, threshold: float = 0.6, dump_mode: str = "all"):
         self.probabilistic_inference.dump_results(self.output_logger, threshold, dump_mode)
