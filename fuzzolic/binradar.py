@@ -40,7 +40,6 @@ SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
 # Tracer forkserver
 HANDSHAKE_EXPECTED = 0x41464C00
-CTRL_FD = 198
 
 class BinRadarPhase(enum.IntEnum):
     ALL = 0
@@ -119,6 +118,60 @@ class SharedMemoryManager:
                     "Shared memory detach on (%s, %s): %s"
                     % (shm_key, shm_id, result))
 
+
+class PipeManager:
+    def __init__(self, env: Dict[str, str], mode: str):
+        self.env = env
+        self.mode = mode
+        self.closed = False
+        self.cleanup_done = False
+        self.ctrl_r = 0
+        self.ctrl_w = 0
+        self.stat_r = 0
+        self.stat_w = 0
+        self.patch_fd_r = 0
+        self.patch_fd_w = 0
+    
+    def setup_pipe(self):
+        result = list()
+        self.ctrl_r, self.ctrl_w = os.pipe()
+        self.stat_r, self.stat_w = os.pipe()
+        self.env["BINRADAR_FORKSERVER_CTRL_R"] = str(self.ctrl_r)
+        self.env["BINRADAR_FORKSERVER_STAT_W"] = str(self.stat_w)
+        if self.mode == "binradar":
+            self.patch_fd_r, self.patch_fd_w = os.pipe()
+            self.env["PATCH_FD"] = str(self.patch_fd_w)
+            self.env["BINRADAR_PATCH_FD_R"] = str(self.patch_fd_r)
+        return result
+    
+    def get_pass_fds(self) -> List[int]:
+        pass_fds = [self.ctrl_r, self.stat_w]
+        if self.mode == "binradar":
+            pass_fds += [self.patch_fd_r, self.patch_fd_w]
+        return pass_fds
+    
+    def close_passed_fds(self):
+        if self.closed:
+            return
+        for fd in self.get_pass_fds():
+            os.close(fd)
+        self.closed = True
+
+    def cleanup(self):
+        if self.cleanup_done:
+            return
+        if not self.closed:
+            self.close_passed_fds()
+        os.close(self.ctrl_w)
+        os.close(self.stat_r)
+        self.cleanup_done = True
+    
+    def get_ctrl_w(self) -> int:
+        return self.ctrl_w
+
+    def get_stat_r(self) -> int:
+        return self.stat_r
+
 class TracerExecutor:
     command: List[str]
     mode: str
@@ -130,8 +183,7 @@ class TracerExecutor:
     timeout: float
     # Forkserver
     forkserver_mode: bool
-    ctrl_w: int
-    stat_r: int
+    pipe_manager: Optional[PipeManager]
     iter: int
     run_result: Optional[binradar_utils.ExecutionResult]
     def __init__(self, mode: str, env: Dict[str, str], workdir: str, rundir: str, binary: str, test_cmd: str, testcase: str, timeout: float):
@@ -146,10 +198,9 @@ class TracerExecutor:
         self.timeout = timeout
         self.process = None
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
-        self.ctrl_w = 0
-        self.stat_r = 0
         self.iter = 0
         self.run_result = None
+        self.pipe_manager = None
     
     def start(self):
         """ 
@@ -161,7 +212,7 @@ class TracerExecutor:
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=None,
                 cwd=self.workdir,
                 env=self.env,
                 preexec_fn=setlimits,
@@ -171,20 +222,9 @@ class TracerExecutor:
             return
 
         # Set up pipes for forkserver communication
-        ctl_r, ctl_w = os.pipe()
-        st_r, st_w = os.pipe()
-        ctrl_fd = CTRL_FD
-        status_fd = CTRL_FD + 1
-        os.dup2(ctl_r, ctrl_fd)
-        os.dup2(st_w, status_fd)
-        os.close(ctl_r)
-        os.close(st_w)
-        os.set_inheritable(ctrl_fd, True)
-        os.set_inheritable(status_fd, True)
-        pass_fds = [ctrl_fd, status_fd]
-        if self.mode == "binradar":
-            pass_fds.append(int(self.env["PATCH_FD"]))
-            pass_fds.append(int(self.env["BINRADAR_PATCH_FD_R"]))
+        self.pipe_manager = PipeManager(self.env, self.mode)
+        self.pipe_manager.setup_pipe()
+        pass_fds = self.pipe_manager.get_pass_fds()
         
         self.process = subprocess.Popen(
             self.command,
@@ -197,10 +237,7 @@ class TracerExecutor:
             start_new_session=True)
         
         RUNNING_PROCESSES.append(self.process)
-        for fd in pass_fds:
-            os.close(fd)
-        self.ctrl_w = ctl_w
-        self.stat_r = st_r
+        self.pipe_manager.close_passed_fds()
         
         # Handshake with forkserver
         logger.info("[TRACER] Waiting for forkserver handshake...")
@@ -246,6 +283,11 @@ class TracerExecutor:
         except Exception as e:
             is_timeout = True
             logger.error(f"Error while waiting for tracer forkserver: {str(e)}")
+            # Check if process died - print exit status
+            if self.process.poll() is not None:
+                logger.error(f"Tracer process exited with code {self.process.returncode}")
+            else:
+                logger.error("Tracer process is still running - sending SIGINT to stop it")
             self.process.send_signal(signal.SIGINT)
             self.process.wait()
             raise e
@@ -258,12 +300,8 @@ class TracerExecutor:
         return int((time.time() - start_time) * 1000), is_timeout, remaining
     
     def stop(self):
-        if self.ctrl_w != 0:
-            os.close(self.ctrl_w)
-            self.ctrl_w = 0
-        if self.stat_r != 0:
-            os.close(self.stat_r)
-            self.stat_r = 0
+        if self.pipe_manager is not None:
+            self.pipe_manager.cleanup()
         if self.process is not None:
             logger.info("[TRACER] Stopping tracer process...")
             self.run_result = binradar_utils.execute_await(self.process, timeout=5)
@@ -284,10 +322,12 @@ class TracerExecutor:
         self._write(struct.pack("<I", value))
     
     def _write(self, data: bytes):
+        if self.pipe_manager is None:
+            raise RuntimeError("Pipe manager not initialized")
         total_written = 0
         while total_written < len(data):
             try:
-                written = os.write(self.ctrl_w, data[total_written:])
+                written = os.write(self.pipe_manager.get_ctrl_w(), data[total_written:])
                 total_written += written
             except BrokenPipeError:
                 raise RuntimeError("Tracer forkserver pipe is broken")
@@ -295,7 +335,9 @@ class TracerExecutor:
                 continue
     
     def _read_u32(self, timeout: float) -> int:
-        rlist, _, _ = select.select([self.stat_r], [], [], timeout)
+        if self.pipe_manager is None:
+            raise RuntimeError("Pipe manager not initialized")
+        rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
         if not rlist:
             raise TimeoutError("Timeout while waiting for forkserver response")
         data = self._read(4)
@@ -304,7 +346,9 @@ class TracerExecutor:
         return struct.unpack("<I", data)[0]
     
     def _read_status(self, timeout: float) -> Tuple[int, int, int]:
-        rlist, _, _ = select.select([self.stat_r], [], [], timeout)
+        if self.pipe_manager is None:
+            raise RuntimeError("Pipe manager not initialized")
+        rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
         if not rlist:
             raise TimeoutError("Timeout while waiting for forkserver response")
         data = self._read(12)
@@ -313,10 +357,12 @@ class TracerExecutor:
         return struct.unpack("<III", data)
     
     def _read(self, size: int) -> bytes:
+        if self.pipe_manager is None:
+            raise RuntimeError("Pipe manager not initialized")
         data = b''
         while len(data) < size:
             try:
-                chunk = os.read(self.stat_r, size - len(data))
+                chunk = os.read(self.pipe_manager.get_stat_r(), size - len(data))
                 if not chunk:
                     raise EOFError("EOF while reading from forkserver")
                 data += chunk
@@ -841,7 +887,6 @@ class BinRadarExecutor:
         self.check_requirements()
         
         exec_mode = "binradar"
-        shutil.copy2(testcase, self.run_dir)
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
         self.save_progress(f"[binradar] [start] [id {self.run_id}]")
         
@@ -849,10 +894,6 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(binradar_env)
         shm.assign_random_keys()
         shm.assign_random_key_for_binradar()
-        # Create pipe
-        patch_r, patch_w = os.pipe()
-        binradar_env["PATCH_FD"] = str(patch_w)
-        binradar_env["BINRADAR_PATCH_FD_R"] = str(patch_r)
         
         solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout)
         tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.patched_binary(), self.test_cmd, testcase, timeout=self.timeout)
