@@ -212,7 +212,7 @@ class TracerExecutor:
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.DEVNULL,
-                stderr=None,
+                stderr=subprocess.DEVNULL,
                 cwd=self.workdir,
                 env=self.env,
                 preexec_fn=setlimits,
