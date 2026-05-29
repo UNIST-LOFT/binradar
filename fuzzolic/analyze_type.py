@@ -1,10 +1,11 @@
-import sbsv
 import os
+import io
 import sys
 import math
+import sbsv
 import logging
 import time
-from typing import Dict, List, Tuple, Set, Optional, TextIO
+from typing import Dict, Iterator, List, Tuple, Set, Optional, TextIO
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
@@ -60,10 +61,15 @@ class MemoryRegion():
         return f"Region({self.type.name}, id={self.id:x}, base={self.region_base:x})"
     
     def __lt__(self, other):
-        return self.region_base < other.region_base
+        return (self.type.value, self.id, self.region_base) < (other.type.value, other.id, other.region_base)
     
     def get_str(self) -> str:
         return f"[RT {self.type.name[0]}] [RB {self.region_base:x}] [RI {self.id:x}]"
+
+@dataclass(frozen=True)
+class ActiveStackFrame():
+    region: MemoryRegion
+    base: int
 
 @dataclass(frozen=True)
 class MemoryAddress():
@@ -123,8 +129,10 @@ class FieldOfRelation():
     def __repr__(self):
         return f"FieldOf(field={self.field}, base={self.base})"
 
-class LogParser():
+
+class LogSbsvParser():
     parser: sbsv.parser
+    fp: TextIO
     def __init__(self, fp: TextIO):
         # https://github.com/hsh814/sbsv
         self.parser = sbsv.parser()
@@ -147,29 +155,211 @@ class LogParser():
         # memmoveh: this include register copy, memcpy, memmove, strcpy
         self.parser.add_schema("[memmoveh] [src: hex] [dst: hex] [size: hex] [val: hex] [is-ptr: bool] [src-r: str] [src-rb: hex] [dst-r: str] [dst-rb: hex] ")
         # cov: edge coverage
-        self.parser.add_schema("[cov] [base] [from: hex] [to: hex] [cnt: int]")
-        self.parser.add_schema("[cov] [update] [from: hex] [to: hex] [cnt: int]")
+        # self.parser.add_schema("[cov] [base] [from: hex] [to: hex] [cnt: int]")
+        # self.parser.add_schema("[cov] [update] [from: hex] [to: hex] [cnt: int]")
         # Read access for pointer
         # self.parser.add_schema("[rpo] [addr: hex] [target: hex] [pc: hex] [index: int] [id: int]")
-        self.parser.load(fp)
+        self.fp = fp
+    
+    def get_result_in_order(self) -> Iterator[sbsv.SbsvData]:
+        line_num = 0
+        for line in self.fp:
+            line_num += 1
+            if not line.startswith(("[alloc]", "[calloc]", "[free]", "[stack]",
+                                "[global]", "[loadh]", "[storeh]",
+                                "[memmoveh]")):
+                continue
+            data = self.parser.parse_line_detached(line, line_num)
+            if data is not None:
+                yield data
+    
+class TraceRow:
+    __slots__ = ("schema_name", "data")
+
+    def __init__(self, schema_name: str, data: Dict[str, object]):
+        self.schema_name = schema_name
+        self.data = data
+
+    def __getitem__(self, key: str):
+        return self.data[key]
+
+class LogParser:
+    def __init__(self, fp: TextIO):
+        # The sbsv package materializes the whole trace in memory.  BinRadar
+        # traces can be many GB, so the type analyzer consumes only the schemas
+        # it needs and yields rows as it scans the file.
+        self.fp = fp
+        self.rows_seen = 0
+        self.rows_parsed = 0
+
+    def get_result_in_order(self) -> Iterator[TraceRow]:
+        for line in self.fp:
+            self.rows_seen += 1
+            row = self._parse_line(line)
+            if row is None:
+                continue
+            self.rows_parsed += 1
+            yield row
+
+    @staticmethod
+    def _tokens(line: str) -> List[str]:
+        tokens: List[str] = []
+        pos = 0
+        while True:
+            start = line.find("[", pos)
+            if start < 0:
+                break
+            end = line.find("]", start + 1)
+            if end < 0:
+                break
+            tokens.append(line[start + 1:end])
+            pos = end + 1
+        return tokens
+
+    @staticmethod
+    def _hex(value: str) -> int:
+        return int(value, 16)
+
+    @staticmethod
+    def _int(value: str) -> int:
+        return int(value, 10)
+
+    @staticmethod
+    def _bool(value: str) -> bool:
+        value = value.strip().lower()
+        if value in ("true", "t"):
+            return True
+        if value in ("false", "f"):
+            return False
+        return int(value, 0) != 0
+
+    @staticmethod
+    def _field_map(tokens: List[str], start: int) -> Dict[str, str]:
+        fields: Dict[str, str] = {}
+        for token in tokens[start:]:
+            parts = token.split(None, 1)
+            if len(parts) == 2:
+                fields[parts[0]] = parts[1]
+        return fields
+
+    def _parse_line(self, line: str) -> Optional[TraceRow]:
+        if not line or line[0] != "[":
+            return None
+        if not line.startswith(("[alloc]", "[calloc]", "[free]", "[stack]",
+                                "[global]", "[loadh]", "[storeh]",
+                                "[memmoveh]")):
+            return None
+
+        tokens = self._tokens(line)
+        if not tokens:
+            return None
+        head = tokens[0]
+
+        try:
+            if head == "alloc" and len(tokens) > 1 and tokens[1] == "start":
+                f = self._field_map(tokens, 2)
+                return TraceRow("alloc$start", {
+                    "base": self._hex(f["base"]),
+                    "size": self._hex(f["size"]),
+                    "pc": self._hex(f["pc"]),
+                })
+            if head == "calloc":
+                f = self._field_map(tokens, 1)
+                return TraceRow("calloc", {
+                    "size": self._hex(f["size"]),
+                    "pc": self._hex(f["pc"]),
+                })
+            if head == "free" and len(tokens) > 1 and tokens[1] == "done":
+                f = self._field_map(tokens, 2)
+                return TraceRow("free$done", {
+                    "base": self._hex(f["base"]),
+                    "pc": self._hex(f["pc"]),
+                })
+            if head == "stack" and len(tokens) > 1 and tokens[1] == "push":
+                f = self._field_map(tokens, 2)
+                return TraceRow("stack$push", {
+                    "sp": self._hex(f["sp"]),
+                    "size": self._hex(f["size"]),
+                    "pc": self._hex(f["pc"]),
+                    "depth": self._int(f["depth"]),
+                    "sr-base": self._hex(f["sr-base"]),
+                    "sr-size": self._hex(f["sr-size"]),
+                })
+            if head == "stack" and len(tokens) > 1 and tokens[1] == "pop":
+                f = self._field_map(tokens, 2)
+                return TraceRow("stack$pop", {
+                    "sp": self._hex(f["sp"]),
+                    "base": self._hex(f["base"]),
+                    "pc": self._hex(f["pc"]),
+                    "depth": self._int(f["depth"]),
+                })
+            if head == "global" and len(tokens) > 1 and tokens[1] == "add":
+                f = self._field_map(tokens, 2)
+                return TraceRow("global$add", {
+                    "base": self._hex(f["base"]),
+                    "size": self._hex(f["size"]),
+                    "name": f.get("name", "unknown"),
+                })
+            if head in ("loadh", "storeh") and len(tokens) > 1:
+                sub = tokens[1]
+                if sub in ("val", "val-fallback"):
+                    f = self._field_map(tokens, 2)
+                    return TraceRow(f"{head}${sub}", {
+                        "reg": f["reg"],
+                        "pc": self._hex(f["pc"]),
+                        "addr": self._hex(f["addr"]),
+                        "base": self._hex(f["base"]),
+                        "disp": self._int(f["disp"]),
+                        "reg-base": self._hex(f["reg-base"]),
+                        "size": self._hex(f["size"]),
+                        "val": self._hex(f["val"]),
+                        "is-ptr": self._bool(f["is-ptr"]),
+                    })
+                if sub == "inval":
+                    f = self._field_map(tokens, 2)
+                    return TraceRow(f"{head}$inval", {
+                        "reg": f["reg"],
+                        "pc": self._hex(f["pc"]),
+                        "addr": self._hex(f["addr"]),
+                        "reg-base": self._hex(f["reg-base"]),
+                        "size": self._hex(f["size"]),
+                        "val": self._hex(f["val"]),
+                        "is-ptr": self._bool(f["is-ptr"]),
+                    })
+            if head == "memmoveh":
+                f = self._field_map(tokens, 1)
+                return TraceRow("memmoveh", {
+                    "src": self._hex(f["src"]),
+                    "dst": self._hex(f["dst"]),
+                    "size": self._hex(f["size"]),
+                    "val": self._hex(f["val"]),
+                    "is-ptr": self._bool(f["is-ptr"]),
+                    "src-r": f["src-r"],
+                    "src-rb": self._hex(f["src-rb"]),
+                    "dst-r": f["dst-r"],
+                    "dst-rb": self._hex(f["dst-rb"]),
+                })
+        except (KeyError, ValueError):
+            return None
+        return None
 
 class PrimitiveFactAnalyzer:
-    parser: sbsv.parser
+    parser: LogParser
     fact_access: Dict[Tuple[int, MemoryChunk], int]
-    base_addr: Dict[MemoryChunk, int]
+    base_addr: Dict[MemoryChunk, Set[MemoryAddress]]
     access_cnt: Dict[MemoryChunk, int]
     fact_pointers: Dict[MemoryChunk, Set[int]]
     fact_malloc_size: Dict[int, List[int]]
     fact_mem_copy: Set[Tuple[MemoryChunk, MemoryChunk, int]]  # (src_chunk, dst_chunk, size)
     active_allocs: Dict[int, MemoryRegion]
-    stack_frames: List[MemoryRegion]
+    stack_frames: List[ActiveStackFrame]
     global_vars: Dict[int, MemoryRegion]
     addr_to_chunk: SortedDict[int, MemoryChunk]
     all_chunks: Set[MemoryChunk]
     pointer_size: int
     pointer_pcs: Set[int]
     null_ptr_candiates: Set[MemoryChunk] # (chunk) where val is 0 and possibly a pointer
-    def __init__(self, parser: sbsv.parser):
+    def __init__(self, parser: LogParser):
         self.parser = parser
         
         # OSPREY Primitive Facts Store
@@ -177,7 +367,7 @@ class PrimitiveFactAnalyzer:
         self.fact_access: Dict[Tuple[int, MemoryChunk], int] = defaultdict(int)
         self.access_cnt: Dict[MemoryChunk, int] = defaultdict(int)
         # F02: BaseAddr(v, a) -> chunk : base_addr
-        self.base_addr: Dict[MemoryChunk, int] = {}
+        self.base_addr: Dict[MemoryChunk, Set[MemoryAddress]] = defaultdict(set)
         
         # F04: Pointers: set of chunks that contains valid addresses (from load/store with is-ptr=true)
         self.fact_pointers: Dict[MemoryChunk, Set[int]] = defaultdict(set)
@@ -190,7 +380,7 @@ class PrimitiveFactAnalyzer:
         
         # Memory Region Tracking
         self.active_allocs: Dict[int, MemoryRegion] = {} # addr -> Region
-        self.stack_frames: List[MemoryRegion] = [] 
+        self.stack_frames: List[ActiveStackFrame] = [] 
         self.global_vars: Dict[int, MemoryRegion] = {}
         self.addr_to_chunk: SortedDict[int, MemoryChunk] = SortedDict() # addr -> chunk (for quick lookup during memmove)
         self.all_chunks: Set[MemoryChunk] = set()
@@ -198,18 +388,39 @@ class PrimitiveFactAnalyzer:
         self.pointer_pcs = set() # PCs that have pointer accesses
         self.null_ptr_candiates = set() # (chunk) where val is 0 and possibly a pointer
 
-    def _resolve_memory_region(self, region_type: str, region_base: int) -> Optional[MemoryRegion]:
+    def _resolve_memory_reference(self, region_type: str, region_base: int) -> Optional[Tuple[MemoryRegion, int]]:
         if region_type == "stack":
-            for region in reversed(self.stack_frames):
-                if region.region_base == region_base:
-                    return region
+            for frame in reversed(self.stack_frames):
+                if frame.base == region_base:
+                    return frame.region, frame.base
         elif region_type == "heap":
             if region_base in self.active_allocs:
-                return self.active_allocs[region_base]
+                return self.active_allocs[region_base], region_base
         elif region_type == "global":
             if region_base in self.global_vars:
-                return self.global_vars[region_base]
+                return self.global_vars[region_base], region_base
         return None
+
+    def _record_base_addr_hint(self, chunk: MemoryChunk, base_addr: int, canonical_base: int):
+        if chunk.region.type == RegionType.STACK:
+            # For stack accesses, an instruction's addressing base is usually
+            # the current RSP/RBP-like value, not an object base.  RSP is not
+            # stable across prologues, pushes, or alloca, so using it creates
+            # fake structs at many adjacent offsets.  The dynamic frame itself
+            # is the canonical stack object.
+            if chunk.offset != 0:
+                self.base_addr[chunk].add(MemoryAddress(chunk.region, 0))
+            return
+
+        base_chunk = self.addr_to_chunk.get(base_addr)
+        if base_chunk is not None and base_chunk.region == chunk.region:
+            if base_chunk != chunk:
+                self.base_addr[chunk].add(base_chunk.get_address())
+            return
+
+        base_off = base_addr - canonical_base
+        if base_off != chunk.offset:
+            self.base_addr[chunk].add(MemoryAddress(chunk.region, base_off))
     
     def run_trace_replay(self):
         iterator = self.parser.get_result_in_order()
@@ -239,8 +450,11 @@ class PrimitiveFactAnalyzer:
             elif schema == "stack$push":
                 sp = row["sp"]
                 pc = row["pc"]
-                region = MemoryRegion(RegionType.STACK, pc, sp)
-                self.stack_frames.append(region)
+                # Stack offsets are dynamic-frame-relative, but the abstract
+                # type region must be stable across invocations.  Use the
+                # legacy callsite/return-site id as RI and a canonical RB=0.
+                region = MemoryRegion(RegionType.STACK, pc, 0)
+                self.stack_frames.append(ActiveStackFrame(region, sp))
             elif schema == "stack$pop":
                 if self.stack_frames:
                     self.stack_frames.pop()
@@ -265,12 +479,13 @@ class PrimitiveFactAnalyzer:
                 region_base = row["reg-base"]
                 is_ptr = row["is-ptr"]
                 val = row["val"] # If is_ptr is true, val is the dereferenced value, which is a potential pointer target
-                memory_region = self._resolve_memory_region(region, region_base)
-                if memory_region is None:
+                resolved = self._resolve_memory_reference(region, region_base)
+                if resolved is None:
                     logger.debug(f"Warning: Could not resolve memory region for addr {addr:x} at PC {pc:x}")
                     continue
-                chunk = MemoryChunk(memory_region, addr - region_base, size)
-                self.base_addr[chunk] = base_addr
+                memory_region, canonical_base = resolved
+                chunk = MemoryChunk(memory_region, addr - canonical_base, size)
+                self._record_base_addr_hint(chunk, base_addr, canonical_base)
                 self.addr_to_chunk[addr] = chunk
                 self.all_chunks.add(chunk)
                 
@@ -295,13 +510,15 @@ class PrimitiveFactAnalyzer:
                 src_region_base = row["src-rb"]
                 dst_region = row["dst-r"]
                 dst_region_base = row["dst-rb"]
-                src_memory_region = self._resolve_memory_region(src_region, src_region_base)
-                dst_memory_region = self._resolve_memory_region(dst_region, dst_region_base)
-                if src_memory_region is None or dst_memory_region is None:
+                src_resolved = self._resolve_memory_reference(src_region, src_region_base)
+                dst_resolved = self._resolve_memory_reference(dst_region, dst_region_base)
+                if src_resolved is None or dst_resolved is None:
                     # logger.debug(f"Warning: Could not resolve memory region for memmove")
                     continue
-                src_chunk = MemoryChunk(src_memory_region, src - src_region_base, size)
-                dst_chunk = MemoryChunk(dst_memory_region, dst - dst_region_base, size)
+                src_memory_region, src_base = src_resolved
+                dst_memory_region, dst_base = dst_resolved
+                src_chunk = MemoryChunk(src_memory_region, src - src_base, size)
+                dst_chunk = MemoryChunk(dst_memory_region, dst - dst_base, size)
                 self.fact_mem_copy.add((src_chunk, dst_chunk, size))
                 self.all_chunks.add(src_chunk)
                 self.all_chunks.add(dst_chunk)
@@ -345,18 +562,15 @@ class DeterministicInference:
         return gcd
     
     def infer_fieldof(self):
-        # F02: BaseAddr(v, a) -> chunk : base_addr
-        for chunk, base_addr in self.analyzer.base_addr.items():
-            if base_addr in self.analyzer.addr_to_chunk:
-                base_chunk: MemoryChunk = self.analyzer.addr_to_chunk[base_addr]
-                if self._same_region(chunk, base_chunk):
-                    if chunk != base_chunk:
-                        self.rel_base_addr_access.add((chunk, base_chunk))
-                        self.rel_fieldof.add(FieldOfRelation(chunk, base_chunk.get_address()))
-            elif base_addr != chunk.region.region_base + chunk.offset:
-                off = base_addr - chunk.region.region_base
-                base = MemoryAddress(chunk.region, off)
-                self.rel_fieldof.add(FieldOfRelation(chunk, base))
+        # F02: BaseAddr(v, a) -> chunk : base_addr.  Base addresses are
+        # normalized to MemoryAddress during replay, so stack field inference
+        # does not depend on absolute RSP values from a particular invocation.
+        for chunk, base_addrs in self.analyzer.base_addr.items():
+            for base in base_addrs:
+                if base.region == chunk.region and base.offset != chunk.offset:
+                    base_chunk = MemoryChunk(base.region, base.offset, chunk.size)
+                    self.rel_base_addr_access.add((chunk, base_chunk))
+                    self.rel_fieldof.add(FieldOfRelation(chunk, base))
     
     def infer_access_patterns(self):
         # R03, R04: Access Pattern Analysis
@@ -454,34 +668,55 @@ class DeterministicInference:
                 c2_chunks.add(c2)
     
     def infer_arrays_from_access(self):
-        # multi-chunk -> array
+        # R03/R04: array candidates need a regular dynamic stride.  Group by
+        # access size and split into exact constant-stride runs; otherwise a
+        # single instruction touching many unrelated stack fields gets promoted
+        # to a fake frame-sized array.
         access_by_pc_region: Dict[Tuple[int, MemoryRegion], List[MemoryChunk]] = defaultdict(list)
         for (pc, chunk), _ in self.analyzer.fact_access.items():
             access_by_pc_region[(pc, chunk.region)].append(chunk)
 
         for (pc, region), chunks in access_by_pc_region.items():
-            offsets = sorted(set(c.offset for c in chunks))
-            if len(offsets) < 2:
-                continue
+            chunks_by_size: Dict[int, Set[int]] = defaultdict(set)
+            for chunk in chunks:
+                chunks_by_size[chunk.size].add(chunk.offset)
 
-            diffs = [offsets[i+1] - offsets[i] for i in range(len(offsets)-1)]
-            g = diffs[0]
-            for d in diffs[1:]:
-                g = math.gcd(g, d)
+            for chunk_size, offset_set in chunks_by_size.items():
+                offsets = sorted(offset_set)
+                if len(offsets) < 3:
+                    continue
 
-            any_chunk = chunks[0]
-            elem = g if g in (1,2,4,8,16) else any_chunk.size
+                run_start = 0
+                run_stride = 0
+                for i in range(1, len(offsets)):
+                    diff = offsets[i] - offsets[i - 1]
+                    if diff <= 0:
+                        continue
+                    if run_stride == 0:
+                        run_stride = diff
+                    elif diff != run_stride:
+                        self._emit_array_run(region, offsets, run_start, i - 1,
+                                             run_stride, chunk_size)
+                        run_start = i - 1
+                        run_stride = diff
+                self._emit_array_run(region, offsets, run_start, len(offsets) - 1,
+                                     run_stride, chunk_size)
 
-            lo = offsets[0]
-            max_off = offsets[-1]
-            max_chunks = [c for c in chunks if c.offset == max_off]
-            last_sz = max(c.size for c in max_chunks) if max_chunks else any_chunk.size
-            hi = max_off + last_sz
+    def _emit_array_run(self, region: MemoryRegion, offsets: List[int],
+                        start_idx: int, end_idx: int, stride: int,
+                        chunk_size: int):
+        if stride <= 0 or end_idx - start_idx + 1 < 3:
+            return
+        if stride < chunk_size:
+            return
+        if stride > 0x1000:
+            return
+        lo = offsets[start_idx]
+        hi = offsets[end_idx] + chunk_size
+        arr = ArrayRelation(region, lo, hi, stride)
+        if arr.valid():
+            self.rel_may_array.add(arr)
 
-            arr = ArrayRelation(region, lo, hi, elem)
-            if arr.valid():
-                self.rel_may_array.add(arr)
-    
     def infer_points_to_hint(self):
         for ptr_chunk, target_addrs in self.analyzer.fact_pointers.items():
             valid_targets: List[MemoryChunk] = list()
@@ -1061,16 +1296,19 @@ class OspreyAnalyzer:
         ch.setFormatter(logging.Formatter("%(message)s"))
         self.output_logger.addHandler(ch)
         self.output_logger.setLevel(logging.DEBUG)
-        self.output_logger.debug(f"[pr] [parse-time] [time {self.elapsed_time()}] {len(self.parser.parser.data)}")
+        self.output_logger.debug(f"[pr] [parser-init-time] [time {self.elapsed_time()}] [mode streaming]")
 
     def elapsed_time(self) -> float:
         return int((time.time() - self.start_time) * 1000)
     
     def analyze(self):
         self.output_logger.debug(f"[pr] [start-analysis] [time {self.elapsed_time()}]")
-        self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser.parser)
+        self.primitive_analyzer = PrimitiveFactAnalyzer(self.parser)
         self.primitive_analyzer.run_trace_replay()
-        self.output_logger.debug(f"[pr] [primitive-analysis] [time {self.elapsed_time()}]")
+        self.output_logger.debug(
+            f"[pr] [primitive-analysis] [time {self.elapsed_time()}] "
+            f"[rows-seen {self.parser.rows_seen}] [rows-parsed {self.parser.rows_parsed}]"
+        )
         self.deterministic_inference = DeterministicInference(self.primitive_analyzer)
         self.deterministic_inference.infer()
         self.output_logger.debug(f"[pr] [deterministic-inference] [time {self.elapsed_time()}]")
@@ -1081,6 +1319,13 @@ class OspreyAnalyzer:
     def dump_results(self, threshold: float = 0.6, dump_mode: str = "all"):
         self.probabilistic_inference.dump_results(self.output_logger, threshold, dump_mode)
 
+def osprey_analyze(log_file: str, analyzed_file: str):
+    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+        with open(analyzed_file, "w", encoding="utf-8") as out_f:
+            osprey = OspreyAnalyzer(f, out_fp=out_f)
+            osprey.analyze()
+            osprey.dump_results(dump_mode="best")
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         log_file = sys.argv[1]
@@ -1090,7 +1335,28 @@ if __name__ == "__main__":
     if not os.path.exists(log_file):
         logger.info(f"Log file {log_file} does not exist")
         sys.exit(1)
-    with open(log_file, "r") as f:
+    
+    # start_time = time.time()
+    # logger.info(f"Load using custom parser: {log_file}")
+    # with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+    #     parser = LogParser(f)
+    #     num = 1
+    #     for _ in parser.get_result_in_order():
+    #         num += 1
+    # elapsed = int((time.time() - start_time) * 1000)
+    # logger.info(f"Custom parser loaded {num} rows in {elapsed} ms")
+    
+    # start_time = time.time()
+    # logger.info(f"Load using SBSV parser: {log_file}")
+    # with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+    #     parser = LogSbsvParser(f)
+    #     num = 1
+    #     for _ in parser.get_result_in_order():
+    #         num += 1
+    # elapsed = int((time.time() - start_time) * 1000)
+    # logger.info(f"SBSV parser loaded {num} rows in {elapsed} ms")
+    
+    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
         osprey = OspreyAnalyzer(f)
-    osprey.analyze()
-    osprey.dump_results() # dump_mode="best"
+        osprey.analyze()
+        osprey.dump_results(dump_mode="best") # dump_mode="best"

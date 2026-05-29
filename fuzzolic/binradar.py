@@ -9,6 +9,9 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
+import multiprocessing
+import queue
 import sys
 import select
 import struct
@@ -34,8 +37,9 @@ FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
 SOLVER_TIMEOUT = 10 # s
 
-RUNNING_PROCESSES = []
-MAX_VIRTUAL_MEMORY = 16 * 1024 * 1024 * 1024  # 16 GB
+RUNNING_PROCESSES: List[subprocess.Popen] = []
+RUNNING_PROCESSES_LOCK = threading.Lock()
+MAX_VIRTUAL_MEMORY = 32 * 1024 * 1024 * 1024  # 32 GB
 SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
 # Tracer forkserver
@@ -57,34 +61,21 @@ def setlimits():
         resource.RLIMIT_AS, (MAX_VIRTUAL_MEMORY, MAX_VIRTUAL_MEMORY))
 
 
+def stop_running_processes():
+    with RUNNING_PROCESSES_LOCK:
+        processes = list(RUNNING_PROCESSES)
+    for proc in processes:
+        binradar_utils.execute_await(proc, timeout=3)
+        with RUNNING_PROCESSES_LOCK:
+            if proc in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(proc)
+
 def handler(signo, stackframe):
     del signo
     del stackframe
 
     print("[BINRADAR] Aborting....")
-    global SHUTDOWN
-    SHUTDOWN = True
-
-    for proc in list(RUNNING_PROCESSES):
-        print("[BINRADAR] Sending SIGINT")
-        try:
-            proc.send_signal(signal.SIGINT)
-            proc.send_signal(signal.SIGUSR2)
-            proc.wait(2)
-        except Exception:
-            print("[BINRADAR] Sending SIGKILL")
-            try:
-                proc.send_signal(signal.SIGKILL)
-            except Exception:
-                pass
-            try:
-                proc.wait()
-            except Exception:
-                pass
-        finally:
-            if proc in RUNNING_PROCESSES:
-                RUNNING_PROCESSES.remove(proc)
-
+    stop_running_processes()
     sys.exit(f"Aborted binradar with cleanup.")
 
 class SharedMemoryManager:
@@ -178,7 +169,7 @@ class TracerExecutor:
     env: Dict[str, str]
     workdir: str
     rundir: str
-    log_file: str
+    trace_file: str
     process: Optional[subprocess.Popen]
     timeout: float
     # Forkserver
@@ -192,9 +183,9 @@ class TracerExecutor:
         self.env = env
         self.workdir = workdir
         self.rundir = rundir
-        self.log_file = ""
+        self.trace_file = ""
         if "BINRADAR_TRACE_FILE" in env:
-            self.log_file = env["BINRADAR_TRACE_FILE"]
+            self.trace_file = env["BINRADAR_TRACE_FILE"]
         self.timeout = timeout
         self.process = None
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
@@ -217,7 +208,8 @@ class TracerExecutor:
                 env=self.env,
                 preexec_fn=setlimits,
                 start_new_session=True)
-            RUNNING_PROCESSES.append(self.process)
+            with RUNNING_PROCESSES_LOCK:
+                RUNNING_PROCESSES.append(self.process)
             logger.info(f"[TRACER] Started tracer without forkserver mode. {' '.join(self.command)}")
             return
 
@@ -236,7 +228,8 @@ class TracerExecutor:
             preexec_fn=setlimits, 
             start_new_session=True)
         
-        RUNNING_PROCESSES.append(self.process)
+        with RUNNING_PROCESSES_LOCK:
+            RUNNING_PROCESSES.append(self.process)
         self.pipe_manager.close_passed_fds()
         
         # Handshake with forkserver
@@ -266,19 +259,29 @@ class TracerExecutor:
             analyze_result = b""
             if self._need_type_analysis(patch_id, iter):
                 logger.info(f"[TRACER] Start type analysis for patch {patch_id}, iter {iter} in {self.mode} mode")
-                out_buf = io.StringIO()
-                start_time = time.time()
-                if not os.path.exists(self.log_file):
-                    raise RuntimeError(f"Log file for type analysis not found: {self.log_file}")
-                with open(self.log_file, "r", encoding="utf-8", errors="ignore") as log_file:
-                    osprey = analyze_type.OspreyAnalyzer(log_file, out_buf)
-                    osprey.analyze()
-                    osprey.dump_results(dump_mode="best")
-                analyze_result = out_buf.getvalue().encode("utf-8")
+                if not os.path.exists(self.trace_file):
+                    raise RuntimeError(f"Log file for type analysis not found: {self.trace_file}")
                 analyze_result_file = os.path.join(self.rundir, f"analyzed-type.{self.iter}.sbsv")
-                with open(analyze_result_file, "wb") as f:
-                    f.write(analyze_result)
-                logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - start_time, 3)}] [saved {analyze_result_file}]")
+                analyze_start_time = time.time()
+                analyze_process = multiprocessing.get_context("spawn").Process(target=analyze_type.osprey_analyze, args=(self.trace_file, analyze_result_file), daemon=False)
+                analyze_process.start()
+                analyze_process.join(timeout=self.timeout)
+                if analyze_process.is_alive():
+                    is_timeout = True
+                    logger.error(f"Osprey analysis is taking too long. Let us stop it.")
+                    analyze_process.terminate()
+                    analyze_process.join(timeout=5)
+                    if analyze_process.is_alive():
+                        logger.error(f"Osprey analysis will be killed.")
+                        analyze_process.kill()
+                    raise TimeoutError(f"Osprey analysis timed out")
+                if analyze_process.exitcode != 0:
+                    raise RuntimeError(f"Osprey analysis failed with exit code {analyze_process.exitcode}")
+                if not os.path.exists(analyze_result_file):
+                    raise RuntimeError(f"Osprey analysis result file not found: {analyze_result_file}")
+                with open(analyze_result_file, "rb") as f:
+                    analyze_result = f.read()
+                logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start_time, 3)}] [saved {analyze_result_file}]")
             logger.info(f"[TRACER] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
         except Exception as e:
             is_timeout = True
@@ -297,7 +300,7 @@ class TracerExecutor:
         self._write_u32(len(analyze_result))
         self._write(analyze_result)
         remaining = self._read_u32(self.timeout)
-        return int((time.time() - start_time) * 1000), is_timeout, remaining
+        return int((time.time() - start_time) * 1000), (not is_timeout), remaining
     
     def stop(self):
         if self.pipe_manager is not None:
@@ -305,7 +308,9 @@ class TracerExecutor:
         if self.process is not None:
             logger.info("[TRACER] Stopping tracer process...")
             self.run_result = binradar_utils.execute_await(self.process, timeout=5)
-            RUNNING_PROCESSES.remove(self.process)
+            with RUNNING_PROCESSES_LOCK:
+                if self.process in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(self.process)
             self.process = None
         
     def _need_type_analysis(self, patch_id: int, iter: int) -> bool:
@@ -415,7 +420,8 @@ class SolverExecutor:
             env=self.env,
             preexec_fn=setlimits, 
             start_new_session=True)
-        RUNNING_PROCESSES.append(self.process)
+        with RUNNING_PROCESSES_LOCK:
+            RUNNING_PROCESSES.append(self.process)
         # Give the solver some time to start up and create shared memories
         time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
     
@@ -449,7 +455,7 @@ class SolverExecutor:
             except subprocess.TimeoutExpired:
                 logger.info("[SOLVER] Solver will be killed.")
                 binradar_utils.execute_await(self.process, timeout=1)
-        return int((time.time() - start_time) * 1000), is_timeout
+        return int((time.time() - start_time) * 1000), (not is_timeout)
 
     def stop(self):
         if self.process:
@@ -460,7 +466,9 @@ class SolverExecutor:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-            RUNNING_PROCESSES.remove(self.process)
+            with RUNNING_PROCESSES_LOCK:
+                if self.process in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(self.process)
             self.process = None
         if not self.log_fp.closed:
             self.log_fp.close()
@@ -611,10 +619,6 @@ class BinRadarExecutor:
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
             total_patches=int(env["TOTAL_PATCHES"]))
-        # Backup config.env to run_dir
-        config_file = os.path.join(binradar.run_dir, "config.env")
-        if not os.path.exists(config_file):
-            binradar_utils.save_env(env, config_file)
         return binradar
     
     def extract_config(self) -> Dict[str, str]:
@@ -669,7 +673,7 @@ class BinRadarExecutor:
             run_id = self.previous_progress.run_id
             if resume_phase == BinRadarPhase.ALL:
                 run_id += 1
-        run_dir = os.path.join(self.outdir, f"fuzzolic-{run_id:05d}")
+        run_dir = os.path.join(self.outdir, f"run-{run_id:05d}")
         os.makedirs(run_dir, exist_ok=True)
         self.save_progress(f"[rundir] [set] [id {run_id}] [dir {run_dir}]")
         self.run_id = run_id
@@ -695,8 +699,13 @@ class BinRadarExecutor:
         env.update(self.config)
         if self.probe_result is None:
             raise RuntimeError("Probe result is not available. Cannot set environment for tracer and solver.")
+        trace_file = os.path.join(run_dir, f"{mode}-tracer-trace.log")
+        log_file = os.path.join(run_dir, f"{mode}-tracer-msg.log")
+        if os.path.exists(log_file):
+            open(log_file, "w").close()
+        env["BINRADAR_TRACER_LOG_FILE"] = log_file
         # Tracer
-        if mode == "probe":
+        if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = "0"
@@ -704,12 +713,11 @@ class BinRadarExecutor:
         elif mode in ["directed", "binradar"]:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
-            env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
             if mode == "directed":
+                env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
                 env["BINRADAR_TRACE_FILE"] = "none"
             else:
-                trace_file = os.path.join(run_dir, f"{mode}-tracer.log")
                 open(trace_file, "w").close()
                 env["BINRADAR_TRACE_FILE"] = trace_file
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
@@ -858,7 +866,7 @@ class BinRadarExecutor:
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
         config = self.extract_config()
-        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
+        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed", "fuzzer"]]
         testcase_dirs.append(os.path.join(self.run_dir, "fuzzer-out", "reached"))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()
@@ -922,31 +930,24 @@ class BinRadarExecutor:
     def done(self):
         self.save_progress(f"[rundir] [done] [id {self.run_id}] [dir {self.run_dir}]")
     
-    def run(self, resume_phase: BinRadarPhase = BinRadarPhase.ALL):
-        self.set_run_dir(resume_phase)
+    def run_sequential(self):
+        self.set_run_dir(resume_phase=BinRadarPhase.ALL)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
-        # For now, we run fuzzolic and directed sequentially.
-        # But they can be run in parallel if needed.
-        if resume_phase <= BinRadarPhase.FUZZOLIC:
-            self.run_fuzzolic()
-        if resume_phase <= BinRadarPhase.DIRECTED:
-            self.run_directed()
-        # if resume_phase <= BinRadarPhase.FUZZER:
-        #     self.run_fuzzer()
-        # Run minimizer to minimize the generated concrete test cases
-        if resume_phase <= BinRadarPhase.MINIMIZER:
-            self.run_minimizer()
-        # Run verifier to verify the generated test cases with concrete execution
-        if resume_phase <= BinRadarPhase.VERIFIER:
-            self.run_verifier()
-        # If fuzzolic and directed results are not enough, run binradar for deeper verification.
-        # self.run_binradar()
+        self.run_fuzzolic()
+        self.run_directed()
+        self.run_fuzzer()
+        self.run_minimizer()
+        self.run_verifier()
+        self.run_binradar()
         self.done()
     
     def run_single_phase(self, run_id: int, phase: BinRadarPhase):
-        self.run_id = run_id
-        self.run_dir = os.path.join(self.outdir, f"fuzzolic-{run_id:05d}")
+        if run_id < 0:
+            self.set_run_dir()
+        else:
+            self.run_id = run_id
+            self.run_dir = os.path.join(self.outdir, f"run-{run_id:05d}")
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
         if phase == BinRadarPhase.FUZZOLIC:
@@ -964,7 +965,57 @@ class BinRadarExecutor:
         else:
             raise ValueError(f"Unknown phase: {phase}")
         self.done()
+    
+    def run_multithreaded(self):
+        self.set_run_dir()
+        logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.run_probe()
 
+        thread_errors: "queue.Queue[Tuple[str, BaseException, object]]" = queue.Queue()
+        
+        def run_captured(name: str, target):
+            try:
+                target()
+            except BaseException as exc:
+                thread_errors.put((name, exc, exc.__traceback__))
+                logger.error(f"[{name}] failed: {exc}")
+
+        def raise_thread_error_if_any(wait_for_binradar: bool = False):
+            if thread_errors.empty():
+                return
+            _, exc, tb = thread_errors.get()
+            stop_running_processes()
+            if wait_for_binradar:
+                binradar_thread.join()
+            if tb is not None:
+                raise exc.with_traceback(tb)
+            raise exc
+
+        binradar_thread = threading.Thread(target=run_captured, args=("binradar", self.run_binradar))
+        binradar_thread.start()
+
+        fuzzolic_thread = threading.Thread(target=run_captured, args=("fuzzolic", self.run_fuzzolic))
+        directed_thread = threading.Thread(target=run_captured, args=("directed", self.run_directed))
+        fuzzer_thread = threading.Thread(target=run_captured, args=("fuzzer", self.run_fuzzer))
+        threads_concrete = [fuzzolic_thread, directed_thread, fuzzer_thread]
+        for thread in threads_concrete:
+            thread.start()
+        for thread in threads_concrete:
+            thread.join()
+
+        raise_thread_error_if_any()
+
+        # TODO: we can modify minimizer and verifier to be run in parallel as well
+        self.run_minimizer()
+        raise_thread_error_if_any(wait_for_binradar=True)
+        self.run_verifier()
+        raise_thread_error_if_any(wait_for_binradar=True)
+
+        binradar_thread.join()
+        raise_thread_error_if_any()
+        self.done()
+
+    
 def main():
     setlimits()
     signal.signal(signal.SIGINT, handler)
@@ -991,11 +1042,10 @@ def main():
         help="set the test command for fuzzolic (overrides TEST_CMD in config.env)")
     # The following argument is for experiments and debugging
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar"]
-    parser.add_argument("--resume-phase", default="", 
-        choices=phases, help="resume from a specific phase")
     parser.add_argument("--run-single-phase", default="", 
         choices=phases, help="run a specific phase")
-    parser.add_argument("--run-id", type=int, default=-1, help="run id for running single phase")
+    parser.add_argument("--run-id", type=int, default=-1, help="Rerun a specific phase with a given run id (only valid when --run-single-phase is set)")
+    parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
     args = parser.parse_args()
 
     if not os.path.exists(args.workdir):
@@ -1018,18 +1068,14 @@ def main():
     env["BINRADAR_OUTDIR"] = os.path.abspath(args.output)
     env["BINRADAR_WORKDIR"] = os.path.abspath(args.workdir)
     os.makedirs(env["BINRADAR_OUTDIR"], exist_ok=True)
-    
-    resume_phase = BinRadarPhase.ALL
-    if args.resume_phase:
-        resume_phase = BinRadarPhase[args.resume_phase.upper()]
 
     executor = BinRadarExecutor.from_env(args.workdir, env)
     if args.run_single_phase:
-        if args.run_id == -1:
-            sys.exit("ERROR: --run-id is required when --run-single-phase is specified.")
         executor.run_single_phase(args.run_id, BinRadarPhase[args.run_single_phase.upper()])
+    elif args.seq:
+        executor.run_sequential()
     else:
-        executor.run(resume_phase=resume_phase)
+        executor.run_multithreaded()
 
 
 if __name__ == "__main__":
