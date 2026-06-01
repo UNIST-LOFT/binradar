@@ -866,7 +866,7 @@ class BinRadarExecutor:
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
         config = self.extract_config()
-        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed", "fuzzer"]]
+        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         testcase_dirs.append(os.path.join(self.run_dir, "fuzzer-out", "reached"))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()

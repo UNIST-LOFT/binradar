@@ -52,11 +52,16 @@ class BinRadarFuzzer:
             "--",
         ] + shlex.split(self.test_cmd)
         return cmd
+    
+    def get_patched_binary_path(self) -> str:
+        return os.path.join(self.workdir, f"{self.binary}.patched")
 
     def run(self, timeout: float = 1800.0):
-        command = self.get_qemu_targeted_simple_command(self.binary, self.poc_input)
+        command = self.get_qemu_targeted_simple_command(self.get_patched_binary_path(), self.poc_input)
         logger.info(f"Running command: {' '.join(command)}")
-        result = binradar_utils.execute(command, cwd=self.workdir, timeout=timeout)
+        with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
+            process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True)
+        result = binradar_utils.execute_await(process, timeout=timeout, verbose=True)
         if result is None:
             logger.info("QEMU execution timed out.")
             return
