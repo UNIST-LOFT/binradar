@@ -29,7 +29,7 @@ You need to provide:
 ```shell
 uv run /root/fuzzolic/fuzzolic/binradar.py -w /root/fuzzolic/tests/example7/CVE-2017-15025
 ```
-Entrypoint is `fuzzolic/binradar.py`. It will automatically read the config.env file in the specified working directory and run the verification process. You can also specify other options as needed.
+Entrypoint is `fuzzolic/binradar.py`. It will automatically read the `config.env` file in the specified working directory and run the verification process. You can also specify other options as needed.
 Timeout can be given as `-t` or `--timeout` option (default: 3600 seconds).
 
 Output will be saved in the `out` directory in the working directory. You can check the logs and results in the output directory.
@@ -50,8 +50,9 @@ These are main phases:
 5. MINIMIZER: remove redundant or non-reachable concrete test cases.
 6. VERIFIER: run patched binary with the collected test cases to check if the patch is correct. If any test case fails, the patch is rejected. If all test cases pass, the patch is verified.
 7. BINRADAR: binradar - directly mutate the memory state and check if the patch is correct.
-8. DONE: finalize the verification process and save the results.
+8. FINAL: finalize the verification process and save the results.
 
+Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run concurrently by default. You can run them sequentially by specifying `--seq` option. Also, you can specify which phases to run by using `--run-single-phase` option.
 
 ### tracer
 Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QEMU `4.1.1` with modifications for symbolic execution and type inference.
@@ -82,6 +83,6 @@ Used for solving path constraints and producing concrete test cases in `fuzzolic
 ### LibAFL
 `LibAFL/fuzzers/binary_only/qemu_stacktrace`: Used for `probe`, `minimizer`, and `verifier` phases. Run original or patched binary with the concrete test cases and get the results.
 
-`LibAFL/fuzzers/binary_only/qemu_targeted_simple`: Used for fuzzing in `fuzzer` phase. Collect test cases that can reach the patch location, using simple coverage-based fuzzing strategies.
+`LibAFL/fuzzers/binary_only/qemu_targeted_simple`: Used for fuzzing in `fuzzer` phase. Collect test cases that can reach the patch location. Fuzzing is done using simple coverage-based fuzzing strategies.
 
 

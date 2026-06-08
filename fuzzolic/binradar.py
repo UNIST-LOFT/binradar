@@ -929,9 +929,11 @@ class BinRadarExecutor:
     
     def run_final(self):
         # Read verifier.sbsv and binradar-trace-msg.log to get final results and save them to progress file
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run final analysis.")
+            raise RuntimeError("Probe result not found.")
         verifier_result_file = os.path.join(self.run_dir, "verifier.sbsv")
         trace_msg_log_file = os.path.join(self.run_dir, "binradar-tracer-msg.log")
-        verifier_result = None
         self.save_progress(f"[final] [start] [id {self.run_id}]")
         if not os.path.exists(trace_msg_log_file):
             logger.error("Trace message log file not found. BinRadar results might be incomplete.")
@@ -974,6 +976,8 @@ class BinRadarExecutor:
                     current["result"] = "normal"
                 elif result.schema_name == "binradar$commit":
                     current["br"] = result["br"]
+            
+            poc_fault_loc = self.probe_result.fault_addr
 
             for iter in iter_map:
                 original = iter_map[iter][0]
@@ -990,11 +994,19 @@ class BinRadarExecutor:
                     if "result" not in patch_result or "br" not in patch_result:
                         continue
                     if original["result"] == "crash" and patch_result["result"] == "crash":
-                        binradar_remaining_patches.discard(patch)
+                        if original["fault_addr"] == poc_fault_loc and patch_result["fault_addr"] == poc_fault_loc:
+                            if patch in binradar_remaining_patches:
+                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] still causes the same crash - likely not fixed.")
+                            binradar_remaining_patches.discard(patch)
                     elif original["result"] == "normal" and patch_result["result"] == "crash":
-                        binradar_remaining_patches.discard(patch)
+                        if patch_result["fault_addr"] == poc_fault_loc:
+                            if patch in binradar_remaining_patches:
+                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] introduces a crash - likely not fixed.")
+                            binradar_remaining_patches.discard(patch)
                     elif original["result"] == "normal" and patch_result["result"] == "normal":
                         if original["br"] != patch_result["br"]:
+                            if patch in binradar_remaining_patches:
+                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}) - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
         self.save_progress(f"[final] [done] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
 
