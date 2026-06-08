@@ -496,19 +496,20 @@ class BinRadarProgress:
         self.done = done
     
     @staticmethod
-    def from_progress_file(file: str) -> Optional["BinRadarProgress"]:
+    def from_progress_file(run_prefix: str, file: str) -> Optional["BinRadarProgress"]:
         if not os.path.exists(file):
             return None
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
-        parser.add_schema("[rundir] [set] [id: int] [dir: str]")
-        parser.add_schema("[rundir] [done] [id: int] [dir: str]")
-        parser.add_schema("[probe] [done] [id: int]")
-        parser.add_schema("[fuzzolic] [done] [id: int]")
-        parser.add_schema("[directed] [done] [id: int]")
-        parser.add_schema("[fuzzer] [done] [id: int]")
-        parser.add_schema("[minimizer] [done] [id: int]")
-        parser.add_schema("[verifier] [done] [id: int]")
+        parser.add_schema("[rundir] [set] [prefix: str] [id: int] [dir: str]")
+        parser.add_schema("[rundir] [done] [prefix: str] [id: int] [dir: str]")
+        parser.add_schema("[probe] [done] [prefix: str] [id: int]")
+        parser.add_schema("[fuzzolic] [done] [prefix: str] [id: int]")
+        parser.add_schema("[directed] [done] [prefix: str] [id: int]")
+        parser.add_schema("[fuzzer] [done] [prefix: str] [id: int]")
+        parser.add_schema("[minimizer] [done] [prefix: str] [id: int]")
+        parser.add_schema("[verifier] [done] [prefix: str] [id: int]")
+        parser.add_schema("[final] [done] [prefix: str] [id: int] [remaining_patches: str] [binradar_remaining_patches: str]")
         with open(file, "r", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             parser.load(f)
@@ -519,6 +520,8 @@ class BinRadarProgress:
         run_id = 0
         run_dir = ""
         for item in rundir_log:
+            if item["prefix"] != run_prefix:
+                continue
             if item["id"] > run_id:
                 run_id = int(item["id"])
                 run_dir = item["dir"]
@@ -531,31 +534,31 @@ class BinRadarProgress:
         verifier_done = False
         done = False
         for probe in parser.get_result()["probe"]["done"]:
-            if int(probe["id"]) == run_id:
+            if int(probe["id"]) == run_id and probe["prefix"] == run_prefix:
                 probe_done = True
                 break
         for fuzzolic in parser.get_result()["fuzzolic"]["done"]:
-            if int(fuzzolic["id"]) == run_id:
+            if int(fuzzolic["id"]) == run_id and fuzzolic["prefix"] == run_prefix:
                 fuzzolic_done = True
                 break
         for directed in parser.get_result()["directed"]["done"]:
-            if int(directed["id"]) == run_id:
+            if int(directed["id"]) == run_id and directed["prefix"] == run_prefix:
                 directed_done = True
                 break
         for fuzzer in parser.get_result()["fuzzer"]["done"]:
-            if int(fuzzer["id"]) == run_id:
+            if int(fuzzer["id"]) == run_id and fuzzer["prefix"] == run_prefix:
                 fuzzer_done = True
                 break
         for done_item in parser.get_result()["rundir"]["done"]:
-            if int(done_item["id"]) == run_id:
+            if int(done_item["id"]) == run_id and done_item["prefix"] == run_prefix:
                 done = True
                 break
         for minimizer in parser.get_result()["minimizer"]["done"]:
-            if int(minimizer["id"]) == run_id:
+            if int(minimizer["id"]) == run_id and minimizer["prefix"] == run_prefix:
                 minimizer_done = True
                 break
         for verifier in parser.get_result()["verifier"]["done"]:
-            if int(verifier["id"]) == run_id:
+            if int(verifier["id"]) == run_id and verifier["prefix"] == run_prefix:
                 verifier_done = True
                 break
         return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
@@ -574,6 +577,7 @@ class BinRadarExecutor:
     config: Dict[str, str]
     progress_filename: str
     previous_progress: Optional[BinRadarProgress]
+    run_prefix: str
     run_id: int
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
@@ -593,7 +597,7 @@ class BinRadarExecutor:
         os.makedirs(self.outdir, exist_ok=True)
         
         self.progress_filename = os.path.join(self.outdir, "progress.sbsv")
-        self.previous_progress = BinRadarProgress.from_progress_file(self.progress_filename)
+        self.previous_progress = None
         
         self.start_time = time.time()
         self.config = dict()
@@ -602,6 +606,7 @@ class BinRadarExecutor:
         self.probe_result = None
         
         self.run_dir = ""
+        self.run_prefix = ""
         self.run_id = -1
 
     @staticmethod
@@ -666,19 +671,21 @@ class BinRadarExecutor:
             return self.poc_input
         return os.path.join(self.workdir, self.poc_input)
 
-    def set_run_dir(self, resume_phase: BinRadarPhase = BinRadarPhase.ALL):
+    def set_run_dir(self, run_prefix: str = "run", resume_phase: BinRadarPhase = BinRadarPhase.ALL):
         run_id = 0
         # Currently, start a new run if the previous run exists.
         # Can resume in more fine-grained way if needed.
+        self.previous_progress = BinRadarProgress.from_progress_file(self.run_prefix, self.progress_filename)
         if self.previous_progress is not None:
             run_id = self.previous_progress.run_id
             if resume_phase == BinRadarPhase.ALL:
                 run_id += 1
-        run_dir = os.path.join(self.outdir, f"run-{run_id:05d}")
+        run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         os.makedirs(run_dir, exist_ok=True)
-        self.save_progress(f"[rundir] [set] [id {run_id}] [dir {run_dir}]")
+        self.save_progress(f"[rundir] [set] [prefix {run_prefix}] [id {run_id}] [dir {run_dir}]")
         self.run_id = run_id
         self.run_dir = run_dir
+        self.run_prefix = run_prefix
 
     def set_config(self, key: str, value: str):
         self.config[key] = value
@@ -738,7 +745,7 @@ class BinRadarExecutor:
                 logger.info(f"[PROBE] Loaded existing probe result: {self.probe_result.serialize()}")
                 return
         config = self.extract_config()
-        self.save_progress(f"[probe] [start] [id {self.run_id}]")
+        self.save_progress(f"[probe] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         probe_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         probe_result = probe_runner.test_with_original(self.resolved_poc_input())
         if probe_result is None:
@@ -764,7 +771,7 @@ class BinRadarExecutor:
             sys.exit(1)
         # Set config
         self.set_config("BINRADAR_ENTRYPOINT", hex(probe_result.patch_func_entry))
-        self.save_progress(f"[probe] [done] [id {self.run_id}] {probe_result.serialize()} {file_trace_result.serialize_file_trace_result()}")
+        self.save_progress(f"[probe] [done] [prefix {self.run_prefix}] [id {self.run_id}] {probe_result.serialize()} {file_trace_result.serialize_file_trace_result()}")
         with open(os.path.join(self.run_dir, "probe-results.sbsv"), "w", encoding="utf-8") as f:
             f.write(f"[probe-info] {probe_result.serialize()}\n")
             f.write(f"[file-trace] {file_trace_result.serialize_file_trace_result()}\n")
@@ -786,7 +793,7 @@ class BinRadarExecutor:
         
         exec_mode = "fuzzolic"
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[fuzzolic] [start] [id {self.run_id}]")
+        self.save_progress(f"[fuzzolic] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
 
         fuzzolic_env = self.get_env(exec_mode, self.run_dir)
         shm = SharedMemoryManager(fuzzolic_env)
@@ -799,10 +806,10 @@ class BinRadarExecutor:
             solver.start()
             tracer.start()
             tracer_time, tracer_success, _ = tracer.run()
-            self.save_progress(f"[fuzzolic] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            self.save_progress(f"[fuzzolic] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
-            self.save_progress(f"[fuzzolic] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            self.save_progress(f"[fuzzolic] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
             tracer.stop()
             solver.stop()
         except Exception as e:
@@ -813,7 +820,7 @@ class BinRadarExecutor:
         finally:
             shm.cleanup()
         
-        self.save_progress(f"[fuzzolic] [done] [id {self.run_id}]")
+        self.save_progress(f"[fuzzolic] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_directed(self):
         testcase = self.resolved_poc_input()
@@ -821,7 +828,7 @@ class BinRadarExecutor:
         
         exec_mode = "directed"
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[directed] [start] [id {self.run_id}]")
+        self.save_progress(f"[directed] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         
         directed_env = self.get_env(exec_mode, self.run_dir)
         shm = SharedMemoryManager(directed_env)
@@ -833,10 +840,10 @@ class BinRadarExecutor:
             solver.start()
             tracer.start()
             tracer_time, tracer_success, _ = tracer.run()
-            self.save_progress(f"[directed] [tracer] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            self.save_progress(f"[directed] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
-            self.save_progress(f"[directed] [solver] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            self.save_progress(f"[directed] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
             tracer.stop()
             solver.stop()
         except Exception as e:
@@ -847,12 +854,12 @@ class BinRadarExecutor:
         finally:
             shm.cleanup()
 
-        self.save_progress(f"[directed] [done] [id {self.run_id}]")
+        self.save_progress(f"[directed] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_fuzzer(self):
         self.check_requirements()
         exec_mode = "fuzzer"
-        self.save_progress(f"[fuzzer] [start] [id {self.run_id}]")
+        self.save_progress(f"[fuzzer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         fuzzer_outdir = os.path.join(self.run_dir, "fuzzer-out")
         if os.path.exists(fuzzer_outdir):
@@ -860,19 +867,19 @@ class BinRadarExecutor:
             shutil.rmtree(fuzzer_outdir)
         fuzzer = binradar_fuzzer.BinRadarFuzzer.from_env(self.workdir, fuzzer_outdir, config)
         fuzzer.run(self.timeout)
-        self.save_progress(f"[fuzzer] [done] [id {self.run_id}]")
+        self.save_progress(f"[fuzzer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_minimizer(self):
         self.check_requirements()
         exec_mode = "minimizer"
-        self.save_progress(f"[minimizer] [start] [id {self.run_id}]")
+        self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         testcase_dirs.append(os.path.join(self.run_dir, "fuzzer-out", "reached"))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()
         minimizer.run_testcases()
-        self.save_progress(f"[minimizer] [done] [id {self.run_id}]")
+        self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_verifier(self):
         self.check_requirements()
@@ -883,13 +890,13 @@ class BinRadarExecutor:
             sys.exit(1)
         
         config = self.extract_config()
-        self.save_progress(f"[verifier] [start] [id {self.run_id}]")
+        self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.patched_binary(), list(range(1, self.total_patches + 1)))
         verifier.load_testcases(minimizer_result_file)
         verifier.run_verification_concrete_testcases()
-        self.save_progress(f"[verifier] [done] [id {self.run_id}]")
+        self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_binradar(self):
         testcase = self.resolved_poc_input()
@@ -897,7 +904,7 @@ class BinRadarExecutor:
         
         exec_mode = "binradar"
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[binradar] [start] [id {self.run_id}]")
+        self.save_progress(f"[binradar] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         
         binradar_env = self.get_env(exec_mode, self.run_dir)
         shm = SharedMemoryManager(binradar_env)
@@ -925,7 +932,7 @@ class BinRadarExecutor:
         finally:
             shm.cleanup()
 
-        self.save_progress(f"[binradar] [done] [id {self.run_id}]")
+        self.save_progress(f"[binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_final(self):
         # Read verifier.sbsv and binradar-trace-msg.log to get final results and save them to progress file
@@ -934,7 +941,7 @@ class BinRadarExecutor:
             raise RuntimeError("Probe result not found.")
         verifier_result_file = os.path.join(self.run_dir, "verifier.sbsv")
         trace_msg_log_file = os.path.join(self.run_dir, "binradar-tracer-msg.log")
-        self.save_progress(f"[final] [start] [id {self.run_id}]")
+        self.save_progress(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         if not os.path.exists(trace_msg_log_file):
             logger.error("Trace message log file not found. BinRadar results might be incomplete.")
             raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
@@ -1008,13 +1015,13 @@ class BinRadarExecutor:
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}) - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
-        self.save_progress(f"[final] [done] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
+        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
 
     def done(self):
-        self.save_progress(f"[rundir] [done] [id {self.run_id}] [dir {self.run_dir}]")
+        self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")
     
-    def run_sequential(self):
-        self.set_run_dir(resume_phase=BinRadarPhase.ALL)
+    def run_sequential(self, run_prefix: str = "run"):
+        self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
         self.run_fuzzolic()
@@ -1026,12 +1033,13 @@ class BinRadarExecutor:
         self.run_final()
         self.done()
     
-    def run_single_phase(self, run_id: int, phase: BinRadarPhase):
+    def run_single_phase(self, run_prefix: str, run_id: int, phase: BinRadarPhase):
         if run_id < 0:
-            self.set_run_dir()
+            self.set_run_dir(run_prefix=run_prefix)
         else:
             self.run_id = run_id
-            self.run_dir = os.path.join(self.outdir, f"run-{run_id:05d}")
+            self.run_prefix = run_prefix
+            self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
         if phase == BinRadarPhase.FUZZOLIC:
@@ -1052,8 +1060,8 @@ class BinRadarExecutor:
             raise ValueError(f"Unknown phase: {phase}")
         self.done()
     
-    def run_multithreaded(self):
-        self.set_run_dir()
+    def run_multithreaded(self, run_prefix: str = "run"):
+        self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
 
@@ -1131,6 +1139,7 @@ def main():
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
         choices=phases, help="run a specific phase")
+    parser.add_argument("--run-prefix", default="run", help="set the prefix for run directories (default: run)")
     parser.add_argument("--run-id", type=int, default=-1, help="Rerun a specific phase with a given run id (only valid when --run-single-phase is set)")
     parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
     args = parser.parse_args()
@@ -1158,11 +1167,11 @@ def main():
 
     executor = BinRadarExecutor.from_env(args.workdir, env)
     if args.run_single_phase:
-        executor.run_single_phase(args.run_id, BinRadarPhase[args.run_single_phase.upper()])
+        executor.run_single_phase(args.run_prefix, args.run_id, BinRadarPhase[args.run_single_phase.upper()])
     elif args.seq:
-        executor.run_sequential()
+        executor.run_sequential(args.run_prefix)
     else:
-        executor.run_multithreaded()
+        executor.run_multithreaded(args.run_prefix)
 
 
 if __name__ == "__main__":

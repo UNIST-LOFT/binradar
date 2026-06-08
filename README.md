@@ -52,7 +52,7 @@ These are main phases:
 7. BINRADAR: binradar - directly mutate the memory state and check if the patch is correct.
 8. FINAL: finalize the verification process and save the results.
 
-Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run concurrently by default. You can run them sequentially by specifying `--seq` option. Also, you can specify which phases to run by using `--run-single-phase` option.
+Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run in parallel by default. You can run them sequentially by specifying `--seq` option. Also, you can specify which phases to run by using `--run-single-phase` option.
 
 ### tracer
 Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QEMU `4.1.1` with modifications for symbolic execution and type inference.
