@@ -398,7 +398,8 @@ class BinRadarQemuRunner:
             return None, None
         patch_result = BinRadarPatchResult.from_log(patch_result_data)
         if patch_result is None:
-            logger.error("Failed to parse patch result from the log.")
+            # logger.error("Failed to parse patch result from the log.")
+            logger.debug(f"Failed to parse patch result with id {patch_id}, {testcase}")
             return None, None
         return BinRadarProbeResult.from_log(result.stderr), patch_result
 
@@ -415,6 +416,27 @@ class Testcase:
         self.exit = exit
         self.fault_addr = fault_addr
         self.br = br
+
+
+class BinRadarConcreteVerifierResult:
+    patch_verified: Dict[int, bool]
+    def __init__(self, results: dict):
+        self.patch_verified = dict()
+        for res in results["verifier-result"]:
+            patch_id = res["patch"]
+            verified = res["res"] == "verified"
+            self.patch_verified[patch_id] = verified
+    
+    @classmethod
+    def from_sbsv(cls, sbsv_file: str) -> Optional["BinRadarConcreteVerifierResult"]:
+        parser = sbsv.parser()
+        parser.add_schema("[verifier-result] [res: str] [patch: int] [testcase?: str]")
+        with open(sbsv_file, "r", encoding="utf-8") as f:
+            result = parser.load(f)
+        if "verifier-result" not in result:
+            logger.error("Verifier result not found in the sbsv file.")
+            return None
+        return cls(result)
 
 
 class BinRadarConcreteVerifier:
@@ -516,6 +538,6 @@ class BinRadarConcreteVerifier:
                         # TODO: retry
             
             if patch_reject is None:
-                self.logger.info(f"[verifier] [patch-verified] [patch {patch}]")
+                self.logger.info(f"[verifier-result] [res verified] [patch {patch}] [testcase ]")
             else:
-                self.logger.info(f"[verifier] [patch-rejected] [patch {patch}] [testcase {patch_reject.filename}]")
+                self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {patch_reject.filename}]")

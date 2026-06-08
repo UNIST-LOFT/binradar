@@ -54,6 +54,7 @@ class BinRadarPhase(enum.IntEnum):
     MINIMIZER = 5
     VERIFIER = 6
     BINRADAR = 7
+    FINAL = 8
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -65,7 +66,7 @@ def stop_running_processes():
     with RUNNING_PROCESSES_LOCK:
         processes = list(RUNNING_PROCESSES)
     for proc in processes:
-        binradar_utils.execute_await(proc, timeout=3)
+        binradar_utils.execute_await(proc, timeout=1)
         with RUNNING_PROCESSES_LOCK:
             if proc in RUNNING_PROCESSES:
                 RUNNING_PROCESSES.remove(proc)
@@ -282,7 +283,7 @@ class TracerExecutor:
                 with open(analyze_result_file, "rb") as f:
                     analyze_result = f.read()
                 logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start_time, 3)}] [saved {analyze_result_file}]")
-            logger.info(f"[TRACER] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
+            logger.debug(f"[TRACER] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
         except Exception as e:
             is_timeout = True
             logger.error(f"Error while waiting for tracer forkserver: {str(e)}")
@@ -858,7 +859,7 @@ class BinRadarExecutor:
             logger.info(f"Fuzzer output directory already exists: {fuzzer_outdir}. It will be overwritten.")
             shutil.rmtree(fuzzer_outdir)
         fuzzer = binradar_fuzzer.BinRadarFuzzer.from_env(self.workdir, fuzzer_outdir, config)
-        fuzzer.run()
+        fuzzer.run(self.timeout)
         self.save_progress(f"[fuzzer] [done] [id {self.run_id}]")
     
     def run_minimizer(self):
@@ -911,10 +912,9 @@ class BinRadarExecutor:
             tracer.start()
             remaining = 1
             while remaining > 0:
-                # TODO: implement behavior comparison
                 tracer_time, tracer_success, remaining = tracer.run()
-                self.save_progress(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
-            # TODO: we can generate more inputs - currently, we don't utilize collected constraints
+                logger.debug(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            # TODO: currently, we don't utilize collected constraints
             tracer.stop()
             solver.stop()
         except Exception as e:
@@ -927,6 +927,77 @@ class BinRadarExecutor:
 
         self.save_progress(f"[binradar] [done] [id {self.run_id}]")
     
+    def run_final(self):
+        # Read verifier.sbsv and binradar-trace-msg.log to get final results and save them to progress file
+        verifier_result_file = os.path.join(self.run_dir, "verifier.sbsv")
+        trace_msg_log_file = os.path.join(self.run_dir, "binradar-tracer-msg.log")
+        verifier_result = None
+        self.save_progress(f"[final] [start] [id {self.run_id}]")
+        if not os.path.exists(trace_msg_log_file):
+            logger.error("Trace message log file not found. BinRadar results might be incomplete.")
+            raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
+        if not os.path.exists(verifier_result_file):
+            logger.error("Verifier result file not found. BinRadar results might be incomplete.")
+            raise FileNotFoundError(f"Verifier result file not found: {verifier_result_file}")
+        remaining_patches = set(range(1, self.total_patches + 1))
+        concrete_verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verifier_result_file)
+        if concrete_verifier_result is None:
+            logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
+            raise ValueError("Failed to parse verifier result.")
+        for result in concrete_verifier_result.patch_verified:
+            verified = concrete_verifier_result.patch_verified[result]
+            if not verified:
+                remaining_patches.discard(result)
+        binradar_remaining_patches = remaining_patches.copy()
+        with open(trace_msg_log_file, "r", encoding="utf-8") as f:
+            parser = sbsv.parser()
+            parser.add_custom_type("hex", lambda x: int(x, 16))
+            parser.add_schema("[binradar] [crash] [iter: int] [patch: int] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
+            parser.add_schema("[binradar] [normal] [iter: int] [patch: int]")
+            parser.add_schema("[binradar] [commit] [iter: int] [patch: int] [br: str]")
+            iter_map: Dict[int, Dict[int, dict]] = dict()
+            for line in f:
+                result = parser.parse_line_detached(line)
+                if result is None:
+                    continue
+                iter = result["iter"]
+                patch = result["patch"]
+                if iter not in iter_map:
+                    iter_map[iter] = dict()
+                if patch not in iter_map[iter]:
+                    iter_map[iter][patch] = dict()
+                current = iter_map[iter][patch]
+                if result.schema_name == "binradar$crash":
+                    current["result"] = "crash"
+                    current["fault_addr"] = result["fault_addr"]
+                elif result.schema_name == "binradar$normal":
+                    current["result"] = "normal"
+                elif result.schema_name == "binradar$commit":
+                    current["br"] = result["br"]
+
+            for iter in iter_map:
+                original = iter_map[iter][0]
+                if original is None:
+                    continue
+                if "result" not in original or "br" not in original:
+                    continue
+                if original["br"] == "null":
+                    continue
+                for patch in remaining_patches:
+                    patch_result = iter_map[iter].get(patch, None)
+                    if patch_result is None:
+                        continue
+                    if "result" not in patch_result or "br" not in patch_result:
+                        continue
+                    if original["result"] == "crash" and patch_result["result"] == "crash":
+                        binradar_remaining_patches.discard(patch)
+                    elif original["result"] == "normal" and patch_result["result"] == "crash":
+                        binradar_remaining_patches.discard(patch)
+                    elif original["result"] == "normal" and patch_result["result"] == "normal":
+                        if original["br"] != patch_result["br"]:
+                            binradar_remaining_patches.discard(patch)
+        self.save_progress(f"[final] [done] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
+
     def done(self):
         self.save_progress(f"[rundir] [done] [id {self.run_id}] [dir {self.run_dir}]")
     
@@ -940,6 +1011,7 @@ class BinRadarExecutor:
         self.run_minimizer()
         self.run_verifier()
         self.run_binradar()
+        self.run_final()
         self.done()
     
     def run_single_phase(self, run_id: int, phase: BinRadarPhase):
@@ -962,6 +1034,8 @@ class BinRadarExecutor:
             self.run_verifier()
         elif phase == BinRadarPhase.BINRADAR:
             self.run_binradar()
+        elif phase == BinRadarPhase.FINAL:
+            self.run_final()
         else:
             raise ValueError(f"Unknown phase: {phase}")
         self.done()
@@ -1013,6 +1087,7 @@ class BinRadarExecutor:
 
         binradar_thread.join()
         raise_thread_error_if_any()
+        self.run_final()
         self.done()
 
     
@@ -1041,7 +1116,7 @@ def main():
         "--cmd", default="",
         help="set the test command for fuzzolic (overrides TEST_CMD in config.env)")
     # The following argument is for experiments and debugging
-    phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar"]
+    phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
         choices=phases, help="run a specific phase")
     parser.add_argument("--run-id", type=int, default=-1, help="Rerun a specific phase with a given run id (only valid when --run-single-phase is set)")
@@ -1063,7 +1138,7 @@ def main():
     if args.timeout >= 0:
         env["BINRADAR_TIMEOUT"] = str(args.timeout)
     else:
-        env["BINRADAR_TIMEOUT"] = "600" # 10 minutes
+        env["BINRADAR_TIMEOUT"] = "3600" # 1 hours
 
     env["BINRADAR_OUTDIR"] = os.path.abspath(args.output)
     env["BINRADAR_WORKDIR"] = os.path.abspath(args.workdir)
