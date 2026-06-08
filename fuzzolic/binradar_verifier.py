@@ -474,6 +474,7 @@ class BinRadarConcreteVerifier:
 
     def run_verification_concrete_testcases(self):
         for patch in self.patches:
+            patch_reject: Optional[Testcase] = None
             for testcase in self.testcases:
                 self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
                 if testcase.exit == "crash":
@@ -482,6 +483,7 @@ class BinRadarConcreteVerifier:
                         self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
                         continue
                     if result.is_crash():
+                        patch_reject = testcase
                         self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                         # TODO: check if the crash is same with original crash
                         break # Patch is incorrect: no need to check further
@@ -497,6 +499,7 @@ class BinRadarConcreteVerifier:
                         continue
                     if result.is_crash():
                         self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                        patch_reject = testcase
                         # TODO: check if the crash is same with original crash
                         break # Patch is incorrect: no need to check further
                     elif result.is_normal_exit():
@@ -506,7 +509,13 @@ class BinRadarConcreteVerifier:
                         if testcase.br == patch_result.br_selection:
                             self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                         else:
+                            patch_reject = testcase
                             self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     elif result.is_timeout():
                         self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                         # TODO: retry
+            
+            if patch_reject is None:
+                self.logger.info(f"[verifier] [patch-verified] [patch {patch}]")
+            else:
+                self.logger.info(f"[verifier] [patch-rejected] [patch {patch}] [testcase {patch_reject.filename}]")

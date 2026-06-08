@@ -1,6 +1,6 @@
 [submodule "tracer"]
 	path = tracer
-	url = https://github.com/hsh814/qemu.git
+	url = https://github.com/UNIST-LOFT/qemu.git
 	branch = symbolic
 [submodule "solver/xxHash"]
 	path = solver/xxHash
