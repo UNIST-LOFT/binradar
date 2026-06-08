@@ -112,6 +112,7 @@ class BinRadarMinimizer:
     def run_testcases(self):
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.work_dir, self.config)
         id = 0
+        env = os.environ.copy()
         with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
             current_testcase = os.path.join(tmpdir, ".cur_input")
             for testcase in sorted(self.testcases):
@@ -120,14 +121,18 @@ class BinRadarMinimizer:
                     os.unlink(current_testcase)
                 os.link(testcase.filename, current_testcase)
                 # TODO: better minimization
-                run_result = runner.test_with_original(current_testcase, verbose=False)
-                if run_result is None:
+                run_res, patch_res = runner.test_with_patched("0", current_testcase, env=env, verbose=False)
+                # run_result = runner.test_with_original(current_testcase, verbose=False)
+                if run_res is None:
                     self.log(f"Failed {testcase.filename} with error.")
                     continue
-                if not run_result.patch_hit():
-                    self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_result.serialize()}")
+                if not run_res.patch_hit():
+                    self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_res.serialize()}")
+                    continue
+                if patch_res is None:
+                    self.log(f"Failed to run patched binary for {testcase.filename}.")
                     continue
                 save_file = f"{id}_{os.path.basename(testcase.filename)}"
                 os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
-                self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_result.serialize()}")
+                self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_res.serialize()} {patch_res.serialize()}")
                 id += 1
