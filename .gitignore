@@ -12,3 +12,6 @@ solver/solver-fuzzy
 solver/solver-smt
 *-bak
 *-out
+out/
+workdir/
+loftix-tmp

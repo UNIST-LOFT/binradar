@@ -1,0 +1,22 @@
+import "../../Justfile"
+BENCHMARK := "loftix"
+
+poc_input := env("POC_INPUT")
+poc_dir := env("POC_DIR", "poc")
+binary := env("BINARY")
+guix_spec := env("GUIX_SPEC")
+test_cmd := env("TEST_CMD")
+
+default:
+    just --list
+
+build:
+    guix build {{guix_spec}}
+
+fix output_dir="workdir":
+    mkdir -p {{output_dir}}
+    guix shell taosc -- taosc-fix 1 {{output_dir}} {{poc_dir}} "$(guix build {{guix_spec}})/bin/{{binary}}" {{test_cmd}}
+
+setup workdir="workdir":
+    # cp "$(guix build {{guix_spec}})/bin/{{binary}}" {{workdir}}/{{binary}}.orig
+    python3 {{BENCHMARK_PATH}}/scripts/binradar_setup.py -w {{workdir}}

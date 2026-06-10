@@ -564,7 +564,7 @@ class BinRadarProgress:
         return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
-    # Config from config.env and command line arguments
+    # Config from binradar.env and command line arguments
     workdir: str
     outdir: str
     timeout: int
@@ -611,7 +611,7 @@ class BinRadarExecutor:
 
     @staticmethod
     def from_workdir(workdir: str) -> "BinRadarExecutor":
-        env = binradar_utils.load_env(os.path.join(workdir, "config.env"))
+        env = binradar_utils.load_env(os.path.join(workdir, "binradar.env"))
         return BinRadarExecutor.from_env(workdir, env)
 
     @staticmethod
@@ -1134,7 +1134,7 @@ def main():
         help="set the output directory for fuzzolic")
     parser.add_argument(
         "--cmd", default="",
-        help="set the test command for fuzzolic (overrides TEST_CMD in config.env)")
+        help="set the test command for fuzzolic (overrides TEST_CMD in binradar.env)")
     # The following argument is for experiments and debugging
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1149,7 +1149,7 @@ def main():
     
     os.chdir(args.workdir)
 
-    env = binradar_utils.load_env(os.path.join(args.workdir, "config.env"))
+    env = binradar_utils.load_env(os.path.join(args.workdir, "binradar.env"))
     if args.patch_loc:
         env["PATCH_LOC"] = args.patch_loc
     if args.input:

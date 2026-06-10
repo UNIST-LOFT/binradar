@@ -7,3 +7,4 @@ QEMU_TARGETED_SIMPLE := LIBAFL_PATH + "/fuzzers/binary_only/qemu_targeted_simple
 FUZZOLIC_SCRIPT := FUZZOLIC_ROOT + "/fuzzolic/fuzzolic.py"
 FUZZOLIC_BASE_ARGS := "--symbolic-models --keep-run-dirs --address-reasoning --optimistic-solving --timeout 60000"
 BINRADAR_SCRIPT := FUZZOLIC_ROOT + "/fuzzolic/binradar.py"
+BENCHMARK_PATH := FUZZOLIC_ROOT + "/benchmarks"
