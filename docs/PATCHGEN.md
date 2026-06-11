@@ -13,7 +13,7 @@ guix build taosc
 guix build binutils@2.29
 cd benchmarks/loftix/binutils/CVE-2017-14940
 # Use just (https://github.com/casey/just)
-just fix
+just taosc
 # Or run directly
 guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
 ```

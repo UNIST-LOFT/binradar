@@ -211,7 +211,7 @@ class TracerExecutor:
                 start_new_session=True)
             with RUNNING_PROCESSES_LOCK:
                 RUNNING_PROCESSES.append(self.process)
-            logger.info(f"[TRACER] Started tracer without forkserver mode. {' '.join(self.command)}")
+            logger.info(f"[TRACER] [{self.mode}] Started tracer without forkserver mode. {' '.join(self.command)}")
             return
 
         # Set up pipes for forkserver communication
@@ -234,23 +234,23 @@ class TracerExecutor:
         self.pipe_manager.close_passed_fds()
         
         # Handshake with forkserver
-        logger.info("[TRACER] Waiting for forkserver handshake...")
+        logger.info(f"[TRACER] [{self.mode}] Waiting for forkserver handshake...")
         banner = self._read_u32(self.timeout)
         if banner != HANDSHAKE_EXPECTED:
-            raise RuntimeError(f"Unexpected forkserver handshake: {banner:#x}")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
         self._write_u32(HANDSHAKE_EXPECTED ^ 0xFFFFFFFF)
         ack = self._read_u32(self.timeout)
         if ack != HANDSHAKE_EXPECTED:
-            raise RuntimeError(f"Unexpected forkserver ack: {ack:#x}")
-        logger.info("[TRACER] Tracer forkserver started successfully.")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
+        logger.info(f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
         
     def run(self) -> Tuple[int, bool, int]: # synchronous run, wait for target binary to finish
         if self.process is None:
-            raise RuntimeError("Tracer process not started")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Tracer process not started")
         start_time = time.time()
         if not self.forkserver_mode:
             self.run_result = binradar_utils.execute_await(self.process, timeout=self.timeout)
-            logger.info(f"[TRACER] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
+            logger.info(f"[TRACER] [{self.mode}] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
         self._write_u32(0)  # was_killed - send run command to forkserver
         is_timeout = False
@@ -283,21 +283,21 @@ class TracerExecutor:
                 with open(analyze_result_file, "rb") as f:
                     analyze_result = f.read()
                 logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start_time, 3)}] [saved {analyze_result_file}]")
-            logger.debug(f"[TRACER] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
+            logger.debug(f"[TRACER] [{self.mode}] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
         except Exception as e:
             is_timeout = True
-            logger.error(f"Error while waiting for tracer forkserver: {str(e)}")
+            logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
             # Check if process died - print exit status
             if self.process.poll() is not None:
-                logger.error(f"Tracer process exited with code {self.process.returncode}")
+                logger.error(f"[TRACER] [{self.mode}] Tracer process exited with code {self.process.returncode}")
             else:
-                logger.error("Tracer process is still running - sending SIGINT to stop it")
+                logger.error(f"[TRACER] [{self.mode}] Tracer process is still running - sending SIGINT to stop it")
             self.process.send_signal(signal.SIGINT)
             self.process.wait()
             raise e
         analyze_result_size = len(analyze_result)
         if analyze_result_size > 0xFFFFFFFF:
-            raise ValueError("Analyze result too large")
+            raise ValueError(f"[TRACER] [{self.mode}] Analyze result too large")
         self._write_u32(len(analyze_result))
         self._write(analyze_result)
         remaining = self._read_u32(self.timeout)
@@ -307,7 +307,7 @@ class TracerExecutor:
         if self.pipe_manager is not None:
             self.pipe_manager.cleanup()
         if self.process is not None:
-            logger.info("[TRACER] Stopping tracer process...")
+            logger.info(f"[TRACER] [{self.mode}] Stopping tracer process...")
             self.run_result = binradar_utils.execute_await(self.process, timeout=5)
             with RUNNING_PROCESSES_LOCK:
                 if self.process in RUNNING_PROCESSES:
@@ -329,54 +329,55 @@ class TracerExecutor:
     
     def _write(self, data: bytes):
         if self.pipe_manager is None:
-            raise RuntimeError("Pipe manager not initialized")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
         total_written = 0
         while total_written < len(data):
             try:
                 written = os.write(self.pipe_manager.get_ctrl_w(), data[total_written:])
                 total_written += written
             except BrokenPipeError:
-                raise RuntimeError("Tracer forkserver pipe is broken")
+                raise RuntimeError(f"[TRACER] [{self.mode}] Tracer forkserver pipe is broken")
             except BlockingIOError:
                 continue
     
     def _read_u32(self, timeout: float) -> int:
         if self.pipe_manager is None:
-            raise RuntimeError("Pipe manager not initialized")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
         rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
         if not rlist:
-            raise TimeoutError("Timeout while waiting for forkserver response")
+            raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
         data = self._read(4)
         if len(data) < 4:
-            raise EOFError("Failed to read 4 bytes from forkserver")
+            raise EOFError(f"[TRACER] [{self.mode}] Failed to read 4 bytes from forkserver")
         return struct.unpack("<I", data)[0]
     
     def _read_status(self, timeout: float) -> Tuple[int, int, int]:
         if self.pipe_manager is None:
-            raise RuntimeError("Pipe manager not initialized")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
         rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
         if not rlist:
-            raise TimeoutError("Timeout while waiting for forkserver response")
+            raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
         data = self._read(12)
         if len(data) < 12:
-            raise EOFError("Failed to read 12 bytes from forkserver")
+            raise EOFError(f"[TRACER] [{self.mode}] Failed to read 12 bytes from forkserver")
         return struct.unpack("<III", data)
     
     def _read(self, size: int) -> bytes:
         if self.pipe_manager is None:
-            raise RuntimeError("Pipe manager not initialized")
+            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
         data = b''
         while len(data) < size:
             try:
                 chunk = os.read(self.pipe_manager.get_stat_r(), size - len(data))
                 if not chunk:
-                    raise EOFError("EOF while reading from forkserver")
+                    raise EOFError(f"[TRACER] [{self.mode}] EOF while reading from forkserver")
                 data += chunk
             except BlockingIOError:
                 continue
         return data
 
 class SolverExecutor:
+    mode: str
     command: List[str]
     out_dir: str
     env: Dict[str, str]
@@ -387,6 +388,7 @@ class SolverExecutor:
     timeout: float
     run_result: Optional[binradar_utils.ExecutionResult]
     def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float):
+        self.mode = mode
         global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
         context_bitmap = os.path.join(run_dir, f"{mode}-context-bitmap")
         memory_bitmap = os.path.join(run_dir, f"{mode}-memory-bitmap")
@@ -411,8 +413,8 @@ class SolverExecutor:
         self.run_result = None
     
     def start(self):
-        logger.info(f"[SOLVER] Starting solver with command: {' '.join(self.command)}")
-        logger.debug(f"[SOLVER] timeout set to {self.timeout} seconds")
+        logger.info(f"[SOLVER] [{self.mode}] Starting solver with command: {' '.join(self.command)}")
+        logger.debug(f"[SOLVER] [{self.mode}] timeout set to {self.timeout} seconds")
         self.process = subprocess.Popen(
             self.command,
             stdout=self.log_fp,
@@ -428,13 +430,13 @@ class SolverExecutor:
     
     def create_inputs(self):
         if self.process is None:
-            raise RuntimeError("Solver process not started")
-        logger.info("[SOLVER] Sending signal to create inputs...")
+            raise RuntimeError(f"[SOLVER] [{self.mode}] Solver process not started")
+        logger.info(f"[SOLVER] [{self.mode}] Sending signal to create inputs...")
         self.process.send_signal(signal.SIGUSR1)
     
     def wait(self) -> Tuple[int, bool]:
         if self.process is None:
-            raise RuntimeError("Solver process not started - cannot wait")
+            raise RuntimeError(f"[SOLVER] [{self.mode}] Solver process not started - cannot wait")
         start_time = time.time()
         elapsed = 0
         is_timeout = False
@@ -449,18 +451,18 @@ class SolverExecutor:
                 is_timeout = True
                 break
         if is_timeout:
-            logger.info("[SOLVER] Solver is taking too long. Let us stop it.")
+            logger.info(f"[SOLVER] [{self.mode}] Solver is taking too long. Let us stop it.")
             self.process.send_signal(signal.SIGUSR2)
             try:
                 self.process.wait(SOLVER_TIMEOUT)
             except subprocess.TimeoutExpired:
-                logger.info("[SOLVER] Solver will be killed.")
+                logger.info(f"[SOLVER] [{self.mode}] Solver will be killed.")
                 binradar_utils.execute_await(self.process, timeout=1)
         return int((time.time() - start_time) * 1000), (not is_timeout)
 
     def stop(self):
         if self.process:
-            logger.info("[SOLVER] Stopping solver process...")
+            logger.info(f"[SOLVER] [{self.mode}] Stopping solver process...")
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)

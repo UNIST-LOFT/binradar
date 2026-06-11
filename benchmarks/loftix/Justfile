@@ -6,6 +6,7 @@ poc_dir := env("POC_DIR", "poc")
 binary := env("BINARY")
 guix_spec := env("GUIX_SPEC")
 test_cmd := env("TEST_CMD")
+patch_source := source_directory() + "/brpatch.c"
 
 default:
     just --list
@@ -13,13 +14,28 @@ default:
 build:
     guix build {{guix_spec}}
 
-fix output_dir="workdir":
-    mkdir -p {{output_dir}}
-    guix shell taosc -- taosc-fix 1 {{output_dir}} {{poc_dir}} "$(guix build {{guix_spec}})/bin/{{binary}}" {{test_cmd}}
+taosc workdir="workdir":
+    mkdir -p {{workdir}}
+    BINARY_PATH=$(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) && \
+    guix shell taosc -- taosc-fix 1 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
 
 setup workdir="workdir":
     python3 {{BENCHMARK_PATH}}/scripts/binradar_setup.py -w {{workdir}}
 
-binradar workdir="workdir" binradar_image="fuzzolic:2204":
+patch workdir="workdir":
+    cp {{patch_source}} {{workdir}}/brpatch.c
+    guix shell e9patch -- e9compile {{workdir}}/brpatch.c
+    PATCH_ADDR=$(cat {{workdir}}/patch-location); \
+    BINARY_PATH=$(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) && \
+    guix shell e9patch -- e9tool -100 -M addr=0x$PATCH_ADDR -P "if dest(state)@brpatch goto" \
+        -o {{workdir}}/{{binary}}.brpatched "$BINARY_PATH"
+
+
+@_ensure_binradar_is_ready workdir="workdir":
+    [ -d "{{workdir}}" ] || just taosc {{workdir}}
+    [ -f "{{workdir}}/binradar.env" ] || just setup {{workdir}}
+    [ -f "{{workdir}}/{{binary}}.brpatched" ] || just patch {{workdir}}
+
+binradar workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
     docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir

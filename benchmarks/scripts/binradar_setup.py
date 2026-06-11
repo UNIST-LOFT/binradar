@@ -56,6 +56,18 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
         patch_location = f.read().strip()
         env["PATCH_LOC"] = f"0x{patch_location}"
     
+    destinations_file = workdir / "destinations"
+    if not destinations_file.exists():
+        print(f"Error: {destinations_file.name} file not found in {workdir}")
+        exit(1)
+    with destinations_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            env["TAOSC_DEST"] = f"0x{line}" # Use first line
+            break
+    
     predicates_file = workdir / "predicates"
     if not predicates_file.exists():
         print(f"Error: {predicates_file.name} file not found in {workdir}")
