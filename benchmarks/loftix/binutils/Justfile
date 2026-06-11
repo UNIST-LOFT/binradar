@@ -1,2 +1,0 @@
-import "../Justfile"
-PROJECT := "binutils"

@@ -18,5 +18,8 @@ fix output_dir="workdir":
     guix shell taosc -- taosc-fix 1 {{output_dir}} {{poc_dir}} "$(guix build {{guix_spec}})/bin/{{binary}}" {{test_cmd}}
 
 setup workdir="workdir":
-    # cp "$(guix build {{guix_spec}})/bin/{{binary}}" {{workdir}}/{{binary}}.orig
     python3 {{BENCHMARK_PATH}}/scripts/binradar_setup.py -w {{workdir}}
+
+binradar workdir="workdir" binradar_image="fuzzolic:2204":
+    ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
+    docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir

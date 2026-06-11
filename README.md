@@ -1,17 +1,32 @@
 # BinRadar: Patch Verification for Binary Patching Tools
-
-## Patch generation with taosc
-[taosc](./docs/PATCHGEN.md)
-
-## Build
-```
-git clone https://github.com/hsh814/fuzzolic.git
-cd fuzzolic
+```shell
+git clone https://github.com/UNIST-LOFT/binradar.git
+cd binradar
 git submodule update --init --recursive
 docker build -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204 .
 ```
 
+## Patch generation with taosc
+[taosc](./docs/PATCHGEN.md)
+```shell
+# Install guix, add channel
+cd benchmarks/loftix/binutils/CVE-2017-14940
+just fix
+```
+
 ## Usage
+```shell
+cd benchmarks/loftix/binutils/CVE-2017-14940
+just build
+# guix build binutils@2.29
+just fix
+# guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
+just setup
+# python3 /path/to/binradar/benchmarks/scripts/binradar_setup.py -w workdir
+just binradar
+# ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir
+```
+
 ### Test configuration
 Binradar requires `binradar.env` file in work directory.
 ```
@@ -30,13 +45,7 @@ BINARY="nm"
 GUIX_SPEC="binutils@2.29"
 TEST_CMD="-l @@"
 ```
-You can run `binradar_setup.py` script with 
-```shell
-cd benchmarks/loftix/binutils/CVE-2017-14940
-just build
-just fix
-just setup
-```
+
 `binradar_setup.py` will generate `./workdir/binradar.env` file with the necessary configuration for binradar.
 
 The configuration you should provide includes:
@@ -114,5 +123,3 @@ Used for solving path constraints and producing concrete test cases in `fuzzolic
 `LibAFL/fuzzers/binary_only/qemu_stacktrace`: Used for `probe`, `minimizer`, and `verifier` phases. Run original or patched binary with the concrete test cases and get the results.
 
 `LibAFL/fuzzers/binary_only/qemu_targeted_simple`: Used for fuzzing in `fuzzer` phase. Collect test cases that can reach the patch location. Fuzzing is done using simple coverage-based fuzzing strategies.
-
-

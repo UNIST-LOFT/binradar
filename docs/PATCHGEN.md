@@ -11,8 +11,9 @@ guix pull
 guix build taosc
 # Build buggy binary
 guix build binutils@2.29
-mkdir -p out/binutils/cve-2017-14940
-guix shell taosc
-taosc-fix 1 out ./benchmarks/loftix/bugs/cve/2017/14940  /gnu/store/s2ga20pj4jiiya53nr2rbiqsdh778k3b-binutils-2.29/bin/nm -l @@
-
+cd benchmarks/loftix/binutils/CVE-2017-14940
+# Use just (https://github.com/casey/just)
+just fix
+# Or run directly
+guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
 ```
