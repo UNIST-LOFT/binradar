@@ -1144,10 +1144,11 @@ def main():
     parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
     args = parser.parse_args()
 
-    if not os.path.exists(args.workdir):
-        sys.exit(f"ERROR: workdir {args.workdir} does not exist.")
+    workdir = os.path.abspath(args.workdir)
+    if not os.path.exists(workdir):
+        sys.exit(f"ERROR: workdir {workdir} does not exist.")
 
-    env = binradar_utils.load_env(os.path.join(args.workdir, "binradar.env"))
+    env = binradar_utils.load_env(os.path.join(workdir, "binradar.env"))
     if args.patch_loc:
         env["PATCH_LOC"] = args.patch_loc
     if args.input:
@@ -1159,14 +1160,15 @@ def main():
     else:
         env["BINRADAR_TIMEOUT"] = "3600" # 1 hours
 
-    env["BINRADAR_WORKDIR"] = os.path.abspath(args.workdir)
-    outdir = os.path.abspath(os.path.join(args.workdir, "out")) 
+    env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
+    outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)
     env["BINRADAR_OUTDIR"] = outdir
     os.makedirs(outdir, exist_ok=True)
+    os.chdir(workdir)
 
-    executor = BinRadarExecutor.from_env(args.workdir, env)
+    executor = BinRadarExecutor.from_env(workdir, env)
     if args.run_single_phase:
         executor.run_single_phase(args.run_prefix, args.run_id, BinRadarPhase[args.run_single_phase.upper()])
     elif args.seq:
