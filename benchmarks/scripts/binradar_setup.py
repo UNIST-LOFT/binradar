@@ -54,7 +54,7 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
         exit(1)
     with patch_location_file.open("r") as f:
         patch_location = f.read().strip()
-        env["PATCH_LOCATION"] = f"0x{patch_location}"
+        env["PATCH_LOC"] = f"0x{patch_location}"
     
     predicates_file = workdir / "predicates"
     if not predicates_file.exists():

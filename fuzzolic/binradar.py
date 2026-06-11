@@ -1130,8 +1130,8 @@ def main():
         "-i", "--input", default="",
         help="set the input file for fuzzolic")
     parser.add_argument(
-        "-o", "--output", default="out",
-        help="set the output directory for fuzzolic")
+        "-o", "--output", default="",
+        help="set the output directory for fuzzolic (default: workdir/out)")
     parser.add_argument(
         "--cmd", default="",
         help="set the test command for fuzzolic (overrides TEST_CMD in binradar.env)")
@@ -1146,8 +1146,6 @@ def main():
 
     if not os.path.exists(args.workdir):
         sys.exit(f"ERROR: workdir {args.workdir} does not exist.")
-    
-    os.chdir(args.workdir)
 
     env = binradar_utils.load_env(os.path.join(args.workdir, "binradar.env"))
     if args.patch_loc:
@@ -1161,9 +1159,12 @@ def main():
     else:
         env["BINRADAR_TIMEOUT"] = "3600" # 1 hours
 
-    env["BINRADAR_OUTDIR"] = os.path.abspath(args.output)
     env["BINRADAR_WORKDIR"] = os.path.abspath(args.workdir)
-    os.makedirs(env["BINRADAR_OUTDIR"], exist_ok=True)
+    outdir = os.path.abspath(os.path.join(args.workdir, "out")) 
+    if args.output != "":
+        outdir = os.path.abspath(args.output)
+    env["BINRADAR_OUTDIR"] = outdir
+    os.makedirs(outdir, exist_ok=True)
 
     executor = BinRadarExecutor.from_env(args.workdir, env)
     if args.run_single_phase:

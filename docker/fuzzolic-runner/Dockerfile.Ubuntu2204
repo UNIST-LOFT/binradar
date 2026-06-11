@@ -53,7 +53,6 @@ RUN /root/.local/bin/uv venv && /root/.local/bin/uv sync
 
 ENV VIRTUAL_ENV=/root/fuzzolic/.venv
 ENV PATH="$VIRTUAL_ENV/bin:/root/.local/bin:/root/.cargo/bin:$PATH"
-RUN echo export PATH="$VIRTUAL_ENV/bin:/root/.local/bin:/root/.cargo/bin:\$PATH" >> $BASH_ENV
 
 # fuzzolic
 COPY . .
@@ -66,16 +65,15 @@ RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 
 # Build LibAFL
 RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace && /root/.cargo/bin/cargo build --release
-
+RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple && /root/.cargo/bin/cargo build --release
 # Build AFL++
-RUN cd utils && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
+RUN cd utils && rm -rf AFLplusplus && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
 	cd AFLplusplus && git checkout 2dac4e7 && \
 	git apply ../afl-showmap.c.patch && \
 	make -j `nproc` all 
-RUN cd utils/AFLplusplus/qemu_mode && /root/.local/bin/uvx virtualenv venv && source venv/bin/activate && \
+RUN cd utils/AFLplusplus/qemu_mode && /root/.local/bin/uvx virtualenv venv && . venv/bin/activate && \
     pip install "meson==0.56.2" && ./build_qemu_support.sh
 ENV AFL_PATH=/root/fuzzolic/utils/AFLplusplus
-RUN echo "export AFL_PATH=/root/fuzzolic/utils/AFLplusplus" >> $BASH_ENV
 
 # Build fuzzolic tests
 RUN cd tests && make

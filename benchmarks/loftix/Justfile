@@ -1,5 +1,5 @@
 import "../../Justfile"
-BENCHMARK := "loftix"
+import? 'dev.justfile'
 
 poc_input := env("POC_INPUT")
 poc_dir := env("POC_DIR", "poc")

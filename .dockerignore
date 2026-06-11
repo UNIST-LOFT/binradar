@@ -1,0 +1,33 @@
+.git
+
+# python
+__pycache__
+*.pyc
+.venv
+
+# docker
+docker/
+
+# build results
+build/
+target/
+dist/
+
+# outputs
+out/
+workdir/
+**/out
+**/workdir
+
+# development
+.vscode
+dev.justfile
+*-bak
+*-out
+**/*-bak
+**/*-out
+
+# tracer, solver, etc
+tracer/build
+solver/build
+LibAFL/fuzzers/binary_only/*/target

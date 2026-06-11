@@ -15,3 +15,4 @@ solver/solver-smt
 out/
 workdir/
 loftix-tmp
+dev.justfile
