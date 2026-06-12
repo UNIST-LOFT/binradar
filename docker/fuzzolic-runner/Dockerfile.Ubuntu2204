@@ -64,8 +64,8 @@ RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-li
 RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 
 # Build LibAFL
-RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace && /root/.cargo/bin/cargo build --release
-RUN cd /root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple && /root/.cargo/bin/cargo build --release
+RUN /root/.cargo/bin/cargo build --release --manifest-path=/root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/Cargo.toml
+RUN /root/.cargo/bin/cargo build --release --manifest-path=/root/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/Cargo.toml
 # Build AFL++
 RUN cd utils && rm -rf AFLplusplus && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
 	cd AFLplusplus && git checkout 2dac4e7 && \
