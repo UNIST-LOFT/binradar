@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Union, Tuple
 import shutil
 import re
+import json
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BRPATCH_SOURCE = SCRIPT_DIR.parent / "loftix" / "brpatch.c"
@@ -278,6 +279,22 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                 continue
             predicates.append(line)
     
+    # Get patch destination
+    destinations_file = workdir / "destinations"
+    if not destinations_file.exists():
+        print(f"Error: {destinations_file.name} file not found in {workdir}")
+        exit(1)
+    dest = None
+    with destinations_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            dest = f"0x{line}" # Use first line
+            break
+    if dest is None:
+        print(f"Error: no destination found in {destinations_file}")
+        exit(1)
     # Generate brpatches.inc
     # Currently, we only select top 10 patches.
     patch_cnt = min(10, len(predicates))
@@ -291,7 +308,6 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             patch_str = predicate_to_patch_str(predicates[i - 1])
             f.write(f"case {i}:\n\treturn \"{patch_str}\";\n")
         f.write("default:\n\treturn \"p0\";\n")
-    dest = binradar_env["TAOSC_DEST"]
     cmd = ["guix", "shell", "e9patch", "--", 
             "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
     print(" ".join(cmd))
@@ -308,6 +324,33 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     brpatch_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
     patch_addr = binradar_env["PATCH_LOC"]
+    # dump metadata
+    cmd = ["guix", "shell", "e9patch", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
+            "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=workdir)
+    if result.returncode != 0:
+        print(f"Error dumping patch metadata: {result.stderr}")
+        exit(1)
+    else:
+        print(f"Patch metadata dumped successfully")
+    json_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+    if not json_path.exists():
+        print(f"Error: patch metadata {json_path.name} not found in {workdir}")
+        exit(1)
+    with json_path.open("r") as f:
+        for line in f:
+            data = json.loads(line)
+            if data.get("method", "") == "reserve":
+                params = data.get("params", {})
+                if params.get("protection", "") == "r-x":
+                    addr = params.get("address", None)
+                    if addr is None:
+                        print(f"Error: reserve patch metadata does not contain address")
+                        exit(1)
+                    binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
+                    print(f"Patch reserve metadata: addr=0x{addr:x}")
+                    break
     cmd = ["guix", "shell", "e9patch", "--", "e9tool", "-100", "-M", f"addr={patch_addr}", 
             "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
     print(" ".join(cmd))
@@ -336,18 +379,6 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
     with patch_location_file.open("r") as f:
         patch_location = f.read().strip()
         env["PATCH_LOC"] = f"0x{patch_location}"
-    
-    destinations_file = workdir / "destinations"
-    if not destinations_file.exists():
-        print(f"Error: {destinations_file.name} file not found in {workdir}")
-        exit(1)
-    with destinations_file.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            env["TAOSC_DEST"] = f"0x{line}" # Use first line
-            break
     return env
 
 def main():

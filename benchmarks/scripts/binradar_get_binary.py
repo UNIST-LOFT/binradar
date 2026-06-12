@@ -39,15 +39,18 @@ def main():
 
     env = load_env(config_path)
     binary = env.get("BINARY")
-    if not binary:
+    if binary is None:
         print_error("BINARY not found in config.env")
+        return
     guix_spec = env.get("GUIX_SPEC")
-    if guix_spec is None or guix_spec == "":
-        print_stdout(configdir / binary)
-    else:
+    final_binary_path = configdir / binary
+    if guix_spec is not None and guix_spec != "":
         proc = subprocess.run(["guix", "build", guix_spec], check=True, stdout=subprocess.PIPE, text=True)
         guix_path = proc.stdout.strip()
-        print_stdout(f"{guix_path}/bin/{binary}")
+        final_binary_path = Path(guix_path) / "bin" / binary
+    if not final_binary_path.exists():
+        print_error(f"Binary not found at {final_binary_path}")
+    print_stdout(str(final_binary_path))
 
 
 if __name__ == "__main__":

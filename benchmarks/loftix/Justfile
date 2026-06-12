@@ -23,15 +23,6 @@ setup workdir="workdir":
     [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
     python3 {{BENCHMARK_PATH}}/scripts/binradar_setup.py -w {{workdir}}
 
-_patch workdir="workdir":
-    cp {{patch_source}} {{workdir}}/brpatch.c
-    guix shell e9patch -- e9compile {{workdir}}/brpatch.c
-    PATCH_ADDR=$(cat {{workdir}}/patch-location); \
-    BINARY_PATH=$(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) && \
-    guix shell e9patch -- e9tool -100 -M addr=0x$PATCH_ADDR -P "if dest(state)@brpatch goto" \
-        -o {{workdir}}/{{binary}}.brpatched "$BINARY_PATH"
-
-
 @_ensure_binradar_is_ready workdir="workdir":
     [ -d "{{workdir}}" ] || just taosc {{workdir}}
     [ -f "{{workdir}}/binradar.env" ] || just setup {{workdir}}
