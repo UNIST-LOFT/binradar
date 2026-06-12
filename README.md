@@ -23,9 +23,6 @@ just taosc
 # guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
 just setup
 # python3 /path/to/binradar/benchmarks/scripts/binradar_setup.py -w workdir
-just patch
-# guix shell e9patch -- e9compile patch.c
-# guix shell e9patch -- e9tool -100 -M addr=0x
 just binradar
 # ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir
 ```
@@ -45,8 +42,8 @@ You still need to provide `config.env` file in `benchmarks/loftix/binutils/CVE-2
 POC_INPUT="poc/nullderef"
 POC_DIR="poc"
 BINARY="nm"
-GUIX_SPEC="binutils@2.29"
 TEST_CMD="-l @@"
+GUIX_SPEC="binutils@2.29"
 ```
 
 `binradar_setup.py` will generate `./workdir/binradar.env` file with the necessary configuration for binradar.
@@ -54,7 +51,7 @@ TEST_CMD="-l @@"
 The configuration you should provide includes:
 - POC_INPUT: a test case that triggers the vulnerability (e.g., a crashing input)
 - POC_DIR: a directory containing poc inputs.
-- BINARY: the target binary to be patched and verified. Patched binary should be named as `nm.patched` in the same directory.
+- BINARY: the target binary to be patched and verified. Patched binary should be named as `nm.brpatched` in the same directory.
 - TEST_CMD: the command to run the test case with the binary. Use `@@` as a placeholder for the test case file path.
 - GUIX_SPEC: the guix package spec for the target binary (e.g., `binutils@2.29`). This is used for binradar to find the buggy binary in guix store. 
 If `GUIX_SPEC` is not given, then it uses `BINARY`. In that case, you should provide buggy program at `benchmarks/loftix/binutils/CVE-2017-14940/nm`.

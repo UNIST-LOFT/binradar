@@ -54,7 +54,7 @@ class BinRadarFuzzer:
         return cmd
     
     def get_patched_binary_path(self) -> str:
-        return os.path.join(self.workdir, f"{self.binary}.patched")
+        return os.path.join(self.workdir, f"{self.binary}.brpatched")
 
     def run(self, timeout: float = 1800.0):
         command = self.get_qemu_targeted_simple_command(self.get_patched_binary_path(), self.poc_input)

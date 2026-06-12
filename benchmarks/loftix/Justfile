@@ -20,9 +20,10 @@ taosc workdir="workdir":
     guix shell taosc -- taosc-fix 1 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
 
 setup workdir="workdir":
+    [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
     python3 {{BENCHMARK_PATH}}/scripts/binradar_setup.py -w {{workdir}}
 
-patch workdir="workdir":
+_patch workdir="workdir":
     cp {{patch_source}} {{workdir}}/brpatch.c
     guix shell e9patch -- e9compile {{workdir}}/brpatch.c
     PATCH_ADDR=$(cat {{workdir}}/patch-location); \
@@ -34,7 +35,6 @@ patch workdir="workdir":
 @_ensure_binradar_is_ready workdir="workdir":
     [ -d "{{workdir}}" ] || just taosc {{workdir}}
     [ -f "{{workdir}}/binradar.env" ] || just setup {{workdir}}
-    [ -f "{{workdir}}/{{binary}}.brpatched" ] || just patch {{workdir}}
 
 binradar workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \

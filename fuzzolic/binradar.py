@@ -234,7 +234,7 @@ class TracerExecutor:
         self.pipe_manager.close_passed_fds()
         
         # Handshake with forkserver
-        logger.info(f"[TRACER] [{self.mode}] Waiting for forkserver handshake...")
+        logger.info(f"[TRACER] [{self.mode}] Started tracer {' '.join(self.command)}")
         banner = self._read_u32(self.timeout)
         if banner != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
@@ -666,7 +666,7 @@ class BinRadarExecutor:
         return os.path.join(self.workdir, f"{self.binary}.orig")
 
     def patched_binary(self) -> str:
-        return os.path.join(self.workdir, f"{self.binary}.patched")
+        return os.path.join(self.workdir, f"{self.binary}.brpatched")
 
     def resolved_poc_input(self) -> str:
         if os.path.isabs(self.poc_input):

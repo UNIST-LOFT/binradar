@@ -20,8 +20,12 @@
 
 #include "stdlib.c"
 
-static const void *destination;
 static const char *predicate;
+#define MAGIC_VALUE_PATCH 123456
+// patch_shm size is 8 bytes: patch_shm[0] is patch_id, patch_shm[1] is for index
+static const uint32_t *patch_shm = NULL;
+static uint32_t env_patch_id = 0;
+static int patch_fd = 2;
 
 /*
  * Get an environment variable and parse as a number.
@@ -39,13 +43,39 @@ static uint64_t getenvull(const char *name)
 	return ull;
 }
 
+static uint32_t getenvul(const char *name)
+{
+	const char *const str = getenv(name);
+	if (str == NULL)
+		return 0UL;
+	errno = 0;
+	const uint32_t ull = strtoul(str, NULL, 0);
+	if (errno)
+		return 0UL;
+	return ull;
+}
+
 void init(int argc, const char *const *argv, char **envp)
 {
 	environ = envp;
-	destination = (void *) getenvull("TAOSC_DEST");
 	predicate = getenv("TAOSC_PRED");
 	if (predicate == NULL)
 		predicate = "p0"; /* false */
+	
+	env_patch_id = getenvul("PATCH_ID");
+	uint32_t s = getenvul("PATCH_FD");
+	if (s > 2) {
+		patch_fd = (int)s;
+	}
+	if (env_patch_id != MAGIC_VALUE_PATCH) {
+		return;
+	}
+	const key_t patch_shm_key = getenvul("BINRADAR_PATCH_SHM_KEY");
+	if (patch_shm_key) {
+		const int patch_shm_id = shmget(patch_shm_key, 8, 0666);
+		if (patch_shm_id >= 0)
+			patch_shm = shmat(patch_shm_id, NULL, 0);
+	}
 }
 
 /* Parse *p as an integer. */
@@ -68,11 +98,16 @@ int64_t eval(const char **ptr, const int64_t *env)
 		return scani(ptr);
 	case 'v': /* variable look up */
 		return env[scani(ptr)];
+	case '~': /* bitwise not */
+		return ~eval(ptr, env);
 	}
-	const bool eq = **ptr == '=';
+
+	const bool eq = (**ptr == '=' && (op == '>' || op == '<'));
 	*ptr += eq;
+
 	const int64_t a = eval(ptr, env);
 	const int64_t b = eval(ptr, env);
+
 	switch (op) {
 	case '=':
 		return a == b;
@@ -90,13 +125,41 @@ int64_t eval(const char **ptr, const int64_t *env)
 		return a * b;
 	case '/':
 		return a / b;
+	case '%':
+		return a % b;
+	case '&':
+		return a & b;
+	case '|':
+		return a | b;
+	case '^':
+		return a ^ b;
+	case 'l': /* << */
+		return a << b;
+	case 'r': /* >> */
+		return a >> b;
 	default:
 		__builtin_unreachable();
 	}
 }
 
+const char *get_patch_str(int id) {
+	switch (id) {
+#include "brpatches.inc"
+	}
+}
+
 const void *dest(const struct STATE *state)
 {
-	const char *tmp = predicate;
-	return eval(&tmp, (const int64_t *) state) ? NULL : destination;
+	uint32_t patch_id = env_patch_id;
+	uint32_t v = 0;
+	if (patch_id == MAGIC_VALUE_PATCH) {
+		patch_id = patch_shm ? *patch_shm : 0;
+		v = patch_shm ? *(patch_shm + 1) : 0;
+	}
+	const char *tmp = get_patch_str(patch_id);
+	int branch_taken = eval(&tmp, (const int64_t *) state) != 0;
+	char buf[64];
+	int n = snprintf(buf, sizeof(buf), "[patch] [id %u] [br %d] [v %u]\n", patch_id, branch_taken, v);
+	write(patch_fd, buf, n);
+	return branch_taken ? NULL : (const void *)TAOSC_DEST;
 }

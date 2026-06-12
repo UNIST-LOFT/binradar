@@ -351,7 +351,7 @@ class BinRadarQemuRunner:
         return os.path.join(self.dir, f"{self.binary}.orig")
 
     def patched_binary(self) -> str:
-        return os.path.join(self.dir, f"{self.binary}.patched")
+        return os.path.join(self.dir, f"{self.binary}.brpatched")
 
     def get_qemu_stacktrace_command(self, binary: str, input_file: str, patch_func_entry: int = 0) -> List[str]:
         cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc]
