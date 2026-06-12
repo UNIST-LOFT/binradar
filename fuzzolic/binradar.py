@@ -19,6 +19,7 @@ import io
 import time
 import enum
 import fcntl
+from types import TracebackType
 from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
@@ -75,7 +76,7 @@ def handler(signo, stackframe):
     del signo
     del stackframe
 
-    print("[BINRADAR] Aborting....")
+    print("[BINRADAR] Aborting... Wait for safe cleanup.")
     stop_running_processes()
     sys.exit(f"Aborted binradar with cleanup.")
 
@@ -207,7 +208,6 @@ class TracerExecutor:
                 stderr=subprocess.DEVNULL,
                 cwd=self.workdir,
                 env=self.env,
-                preexec_fn=setlimits,
                 start_new_session=True)
             with RUNNING_PROCESSES_LOCK:
                 RUNNING_PROCESSES.append(self.process)
@@ -226,7 +226,6 @@ class TracerExecutor:
             cwd=self.workdir,
             env=self.env,
             pass_fds=pass_fds,
-            preexec_fn=setlimits, 
             start_new_session=True)
         
         with RUNNING_PROCESSES_LOCK:
@@ -421,7 +420,6 @@ class SolverExecutor:
             stderr=subprocess.STDOUT,
             cwd=self.rundir,
             env=self.env,
-            preexec_fn=setlimits, 
             start_new_session=True)
         with RUNNING_PROCESSES_LOCK:
             RUNNING_PROCESSES.append(self.process)
@@ -574,6 +572,7 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
+    patch_reserve_addr: str
     total_patches: int
     # Data
     config: Dict[str, str]
@@ -584,7 +583,7 @@ class BinRadarExecutor:
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, total_patches: int):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_reserve_addr: str, total_patches: int):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -593,6 +592,7 @@ class BinRadarExecutor:
         self.total_patches = total_patches
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
+        self.patch_reserve_addr = patch_reserve_addr
 
         self.libc = ctypes.CDLL("libc.so.6")
 
@@ -612,8 +612,13 @@ class BinRadarExecutor:
         self.run_id = -1
 
     @staticmethod
-    def from_workdir(workdir: str) -> "BinRadarExecutor":
+    def from_workdir(workdir: str, outdir: Optional[str] = None, timeout: int = 3600) -> "BinRadarExecutor":
         env = binradar_utils.load_env(os.path.join(workdir, "binradar.env"))
+        if outdir is not None:
+            env["BINRADAR_OUTDIR"] = outdir
+        else:
+            env["BINRADAR_OUTDIR"] = os.path.join(workdir, "out")
+        env["BINRADAR_TIMEOUT"] = str(timeout)
         return BinRadarExecutor.from_env(workdir, env)
 
     @staticmethod
@@ -626,6 +631,7 @@ class BinRadarExecutor:
             poc_input=env["POC_INPUT"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
+            patch_reserve_addr=env["PATCH_RESERVE_ADDR"],
             total_patches=int(env["TOTAL_PATCHES"]))
         return binradar
     
@@ -637,6 +643,7 @@ class BinRadarExecutor:
         config["POC_INPUT"] = self.poc_input
         config["TEST_CMD"] = self.test_cmd
         config["PATCH_LOC"] = self.patch_loc
+        config["PATCH_RESERVE_ADDR"] = self.patch_reserve_addr
         config["TOTAL_PATCHES"] = str(self.total_patches)
         return config
 
@@ -677,7 +684,7 @@ class BinRadarExecutor:
         run_id = 0
         # Currently, start a new run if the previous run exists.
         # Can resume in more fine-grained way if needed.
-        self.previous_progress = BinRadarProgress.from_progress_file(self.run_prefix, self.progress_filename)
+        self.previous_progress = BinRadarProgress.from_progress_file(run_prefix, self.progress_filename)
         if self.previous_progress is not None:
             run_id = self.previous_progress.run_id
             if resume_phase == BinRadarPhase.ALL:
@@ -1067,7 +1074,7 @@ class BinRadarExecutor:
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
 
-        thread_errors: "queue.Queue[Tuple[str, BaseException, object]]" = queue.Queue()
+        thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
         
         def run_captured(name: str, target):
             try:
@@ -1126,17 +1133,8 @@ def main():
         "-t", "--timeout", type=int, default=-1,
         help="set timeout for each test case (s)")
     parser.add_argument(
-        "-p", "--patch-loc", default="",
-        help="set the patch location for fuzzolic (hex)")
-    parser.add_argument(
-        "-i", "--input", default="",
-        help="set the input file for fuzzolic")
-    parser.add_argument(
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
-    parser.add_argument(
-        "--cmd", default="",
-        help="set the test command for fuzzolic (overrides TEST_CMD in binradar.env)")
     # The following argument is for experiments and debugging
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1151,12 +1149,6 @@ def main():
         sys.exit(f"ERROR: workdir {workdir} does not exist.")
 
     env = binradar_utils.load_env(os.path.join(workdir, "binradar.env"))
-    if args.patch_loc:
-        env["PATCH_LOC"] = args.patch_loc
-    if args.input:
-        env["POC_INPUT"] = args.input
-    if args.cmd:
-        env["TEST_CMD"] = args.cmd
     if args.timeout >= 0:
         env["BINRADAR_TIMEOUT"] = str(args.timeout)
     else:
