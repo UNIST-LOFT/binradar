@@ -722,6 +722,7 @@ class BinRadarExecutor:
             open(log_file, "w").close()
         env["BINRADAR_TRACER_LOG_FILE"] = log_file
         # Tracer
+        env["PATCH_RESERVE_ADDR"] = self.patch_reserve_addr
         if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -875,7 +876,16 @@ class BinRadarExecutor:
             logger.info(f"Fuzzer output directory already exists: {fuzzer_outdir}. It will be overwritten.")
             shutil.rmtree(fuzzer_outdir)
         fuzzer = binradar_fuzzer.BinRadarFuzzer.from_env(self.workdir, fuzzer_outdir, config)
-        fuzzer.run(self.timeout)
+        fuzzer.start()
+        if fuzzer.process is None:
+            logger.error("Failed to start fuzzer process.")
+            sys.exit(1)
+        with RUNNING_PROCESSES_LOCK:
+            RUNNING_PROCESSES.append(fuzzer.process)
+        fuzzer.wait(timeout=self.timeout)
+        with RUNNING_PROCESSES_LOCK:
+            if fuzzer.process in RUNNING_PROCESSES:
+                RUNNING_PROCESSES.remove(fuzzer.process)
         self.save_progress(f"[fuzzer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_minimizer(self):
