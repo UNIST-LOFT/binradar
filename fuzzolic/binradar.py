@@ -166,6 +166,9 @@ class PipeManager:
         return self.stat_r
 
 class TracerExecutor:
+    forkserver_init_timeout: float = 600.0
+    forkserver_timeout: float = 60.0
+    analyzer_timeout: float = 600.0
     command: List[str]
     mode: str
     env: Dict[str, str]
@@ -234,11 +237,11 @@ class TracerExecutor:
         
         # Handshake with forkserver
         logger.info(f"[TRACER] [{self.mode}] Started tracer {' '.join(self.command)}")
-        banner = self._read_u32(self.timeout)
+        banner = self._read_u32(self.forkserver_init_timeout)
         if banner != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
         self._write_u32(HANDSHAKE_EXPECTED ^ 0xFFFFFFFF)
-        ack = self._read_u32(self.timeout)
+        ack = self._read_u32(self.forkserver_timeout)
         if ack != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
         logger.info(f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
@@ -254,7 +257,7 @@ class TracerExecutor:
         self._write_u32(0)  # was_killed - send run command to forkserver
         is_timeout = False
         try:
-            exit_status, patch_id, iter = self._read_status(self.timeout)
+            exit_status, patch_id, iter = self._read_status(self.forkserver_timeout)
             self.iter = iter
             analyze_result = b""
             if self._need_type_analysis(patch_id, iter):
@@ -265,7 +268,7 @@ class TracerExecutor:
                 analyze_start_time = time.time()
                 analyze_process = multiprocessing.get_context("spawn").Process(target=analyze_type.osprey_analyze, args=(self.trace_file, analyze_result_file), daemon=False)
                 analyze_process.start()
-                analyze_process.join(timeout=self.timeout)
+                analyze_process.join(timeout=self.analyzer_timeout)
                 if analyze_process.is_alive():
                     is_timeout = True
                     logger.error(f"Osprey analysis is taking too long. Let us stop it.")
@@ -299,7 +302,7 @@ class TracerExecutor:
             raise ValueError(f"[TRACER] [{self.mode}] Analyze result too large")
         self._write_u32(len(analyze_result))
         self._write(analyze_result)
-        remaining = self._read_u32(self.timeout)
+        remaining = self._read_u32(self.forkserver_timeout)
         return int((time.time() - start_time) * 1000), (not is_timeout), remaining
     
     def stop(self):
@@ -938,8 +941,11 @@ class BinRadarExecutor:
             tracer.start()
             remaining = 1
             while remaining > 0:
+                if time.time() - self.start_time > self.timeout:
+                    logger.info(f"[BINRADAR] [id {self.run_id}] Timeout reached. Stopping binradar execution.")
+                    break
                 tracer_time, tracer_success, remaining = tracer.run()
-                logger.debug(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+                logger.debug(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}] [remaining {remaining}]")
             # TODO: currently, we don't utilize collected constraints
             tracer.stop()
             solver.stop()
