@@ -1,4 +1,4 @@
-import "../../Justfile"
+import "../../loftix.justfile"
 
 set dotenv-filename := "config.env"
 set dotenv-load
