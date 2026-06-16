@@ -17,7 +17,7 @@ build-all:
 # Internal helper
 @_run-all command jobs prefix:
     #!/bin/bash
-    find . -name config.env -exec dirname {} \; \
+    find . -maxdepth 3 -name config.env -exec dirname {} \; \
     | parallel -j {{jobs}} '
       echo "### {{prefix}} {}"
       cd "{}" && just {{command}} || echo "{{prefix}} FAILED FOR {}"
