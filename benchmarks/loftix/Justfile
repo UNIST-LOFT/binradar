@@ -8,7 +8,7 @@ build-all:
             for bug in "$project"/*; do \
                 # If directory, run just build
                 if [ -d "$bug" ]; then \
-                    (cd "$bug" && just build); \
+                    (cd "$bug" && echo "Building $bug" && just build); \
                 fi; \
             done; \
         fi; \
@@ -17,10 +17,20 @@ build-all:
 # Internal helper
 @_run-all command jobs prefix:
     #!/bin/bash
+    mkdir -p logs
     find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel -j {{jobs}} '
+    | parallel --joblog logs/{{command}}.txt -j {{jobs}} '
       echo "### {{prefix}} {}"
-      cd "{}" && just {{command}} || echo "{{prefix}} FAILED FOR {}"
+      cd "{}" && just {{command}}
+    '
+
+@_rerun-all command jobs prefix:
+    #!/bin/bash
+    mkdir -p logs
+    find . -maxdepth 3 -name config.env -exec dirname {} \; \
+    | parallel --joblog logs/{{command}}.txt -j {{jobs}} '
+      echo "### {{prefix}} {}"
+      cd "{}" && just {{command}} || (echo "{{prefix}} FAILED FOR {}" && just {{command}})
     '
 
 taosc-all jobs="20":

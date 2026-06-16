@@ -47,6 +47,14 @@ def main():
     if guix_spec is not None and guix_spec != "":
         proc = subprocess.run(["guix", "build", guix_spec], check=True, stdout=subprocess.PIPE, text=True)
         guix_path = proc.stdout.strip()
+        guix_path_candidates = guix_path.splitlines()
+        min_len = len(guix_path_candidates[0])
+        guix_path = guix_path_candidates[0]
+        for path in guix_path_candidates:
+            if len(path) < min_len:
+                # If there are multiple candidates, we choose the one with the shortest path
+                min_len = len(path)
+                guix_path = path
         final_binary_path = Path(guix_path) / "bin" / binary
     if not final_binary_path.exists():
         print_error(f"Binary not found at {final_binary_path}")

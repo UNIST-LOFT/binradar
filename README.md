@@ -31,6 +31,16 @@ just binradar
 # ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir
 ```
 
+For batch execution, you can run in `benchmarks/loftix` directory:
+```shell
+# sudo apt install -y parallel
+cd benchmarks/loftix
+just build-all
+just taosc-all 20
+just setup-all 20
+just binradar-all 20
+```
+
 ### Configuration
 Binradar requires `binradar.env` file in work directory.
 ```
