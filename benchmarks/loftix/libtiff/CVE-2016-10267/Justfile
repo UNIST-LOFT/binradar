@@ -1,0 +1,4 @@
+import "../../Justfile"
+
+set dotenv-filename := "config.env"
+set dotenv-load
