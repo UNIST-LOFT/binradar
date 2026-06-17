@@ -1,1 +1,6 @@
-brpatch
+workdir
+test
+out
+logs
+
+*.list

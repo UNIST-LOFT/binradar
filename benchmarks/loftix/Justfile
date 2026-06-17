@@ -2,42 +2,66 @@
 # Run in benchmarks/loftix: cd benchmarks/loftix && just build-all
 
 build-all:
-    #!/bin/bash
+    #!/usr/bin/env bash
     for project in *; do \
         if [ -d "$project" ]; then \
             for bug in "$project"/*; do \
                 # If directory, run just build
                 if [ -d "$bug" ]; then \
-                    (cd "$bug" && echo "Building $bug" && just build); \
+                    if [ -f "$bug/config.env" ]; then \
+                        echo "Building $bug"; \
+                        (cd "$bug" && just build); \
+                    else \
+                        echo "Skipping $bug, no config.env found"; \
+                    fi; \
                 fi; \
             done; \
         fi; \
     done;
 
 # Internal helper
-@_run-all command jobs prefix:
-    #!/bin/bash
+@_run-all command jobs prefix workdir:
+    #!/usr/bin/env bash
     mkdir -p logs
     find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel --joblog logs/{{command}}.txt -j {{jobs}} '
+    | parallel --tag --joblog logs/{{command}}.joblog -j {{jobs}} '
       echo "### {{prefix}} {}"
-      cd "{}" && just {{command}}
+      cd "{}" && just {{command}} {{workdir}}
     '
 
-@_rerun-all command jobs prefix:
-    #!/bin/bash
+@_run-from-file command argfile jobs prefix workdir:
+    #!/usr/bin/env bash
     mkdir -p logs
-    find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel --joblog logs/{{command}}.txt -j {{jobs}} '
-      echo "### {{prefix}} {}"
-      cd "{}" && just {{command}} || (echo "{{prefix}} FAILED FOR {}" && just {{command}})
-    '
+    parallel --tag --joblog "logs/{{command}}.joblog" -j {{jobs}} \
+      'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
+      :::: "{{argfile}}"
 
-taosc-all jobs="20":
-    just _run-all taosc {{jobs}} "TAOSC RUN"
+@_resume-from-file command argfile jobs prefix workdir:
+    #!/usr/bin/env bash
+    mkdir -p logs
+    parallel --resume --tag --joblog "logs/{{command}}.joblog" -j {{jobs}} \
+      'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
+      :::: "{{argfile}}"
 
-setup-all jobs="20":
-    just _run-all setup {{jobs}} "SETUP RUN"
+list out="exp.list":
+    mkdir -p "$(dirname {{out}})"
+    find . -maxdepth 3 -name config.env -exec dirname {} \; | sort -u > {{out}}
+    wc -l {{out}}
 
-binradar-all jobs="20":
-    just _run-all binradar {{jobs}} "BINRADAR RUN"
+failed command out="failed.list":
+    #!/usr/bin/env bash
+    mkdir -p "$(dirname {{out}})"
+    awk 'NR>1 && $7 != 0 {print $9}' "logs/{{command}}.joblog" | sort -u > {{out}}
+    wc -l {{out}}
+
+run cmd argfile="exp.list" jobs="20" workdir="workdir":
+    just _run-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RUN" {{workdir}}
+
+resume cmd argfile="exp.list" jobs="20" workdir="workdir":
+    just _resume-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RESUME" {{workdir}}
+
+run-all cmd jobs="20" workdir="workdir":
+    just _run-all {{cmd}} {{jobs}} "{{cmd}} RUN" {{workdir}}
+
+clean-all workdir="workdir":
+    rm -rf */*/{{workdir}}
