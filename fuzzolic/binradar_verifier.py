@@ -14,6 +14,7 @@ import binradar_utils
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
+CUSTOM_ASAN_PATH = os.path.join(ROOT_DIR, "LibAFL", "crates/libafl_qemu/libafl_qemu_asan/target/x86_64-unknown-linux-gnu/release/libafl_qemu_asan_guest.so")
 
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
@@ -347,6 +348,15 @@ class BinRadarQemuRunner:
             patch_loc=env["PATCH_LOC"]
         )
     
+    def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
+        env = os.environ.copy()
+        env["CUSTOM_LIBAFL_QEMU_ASAN_PATH"] = CUSTOM_ASAN_PATH
+        env["LC_ALL"] = "C"
+        env["PATCH_ID"] = patch_id
+        if patch_fd is not None:
+            env["PATCH_FD"] = str(patch_fd)
+        return env
+    
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
 
@@ -362,7 +372,8 @@ class BinRadarQemuRunner:
 
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(self.original_binary(), testcase)
-        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
+        env = self.get_env_for_exec(patch_id="0")
+        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
             logger.error("Failed to execute the command.")
             return None
@@ -370,7 +381,8 @@ class BinRadarQemuRunner:
     
     def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
         command = self.get_qemu_stacktrace_command(self.original_binary(), testcase, patch_func_entry=patch_func_entry)
-        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose)
+        env = self.get_env_for_exec(patch_id="0")
+        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
             logger.error("Failed to execute the command.")
             return None
@@ -380,12 +392,10 @@ class BinRadarQemuRunner:
             return None
         return probe_result
 
-    def test_with_patched(self, patch_id: str, testcase: str, env: Dict[str, str], verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+    def test_with_patched(self, patch_id: str, testcase: str, verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         command = self.get_qemu_stacktrace_command(self.patched_binary(), testcase)
         rfd, wfd = os.pipe()
-        env = env.copy()
-        env["PATCH_ID"] = patch_id
-        env["PATCH_FD"] = str(wfd)
+        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd)
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
         os.close(wfd)
         thread, patch_result_chunks = binradar_utils.create_pipe_reader_thread(rfd, verbose=verbose)
@@ -449,7 +459,6 @@ class BinRadarConcreteVerifier:
     start_time: float
     logger: logging.Logger
     minimized_dir: str
-    env: Dict[str, str]
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
@@ -459,7 +468,6 @@ class BinRadarConcreteVerifier:
         self.patches = patches
         self.testcases = list()
         self.start_time = time.time()
-        self.env = os.environ.copy()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
         self.logger = logging.getLogger(__name__)
@@ -488,7 +496,7 @@ class BinRadarConcreteVerifier:
             ))
     
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
-        result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename), self.env)
+        result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename))
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
             return None, None

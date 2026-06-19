@@ -40,7 +40,7 @@ SOLVER_TIMEOUT = 10 # s
 
 RUNNING_PROCESSES: List[subprocess.Popen] = []
 RUNNING_PROCESSES_LOCK = threading.Lock()
-MAX_VIRTUAL_MEMORY = 32 * 1024 * 1024 * 1024  # 32 GB
+MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
 # Tracer forkserver
@@ -1067,7 +1067,9 @@ class BinRadarExecutor:
             self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
-        if phase == BinRadarPhase.FUZZOLIC:
+        if phase == BinRadarPhase.PROBE:
+            return
+        elif phase == BinRadarPhase.FUZZOLIC:
             self.run_fuzzolic()
         elif phase == BinRadarPhase.DIRECTED:
             self.run_directed()

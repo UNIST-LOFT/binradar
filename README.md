@@ -3,7 +3,7 @@
 git clone https://github.com/UNIST-LOFT/binradar.git
 cd binradar
 git submodule update --init --recursive
-docker build -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204 .
+docker build -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204v2 .
 ```
 
 ## Prerequisites
@@ -28,7 +28,7 @@ just taosc
 just setup
 # python3 /path/to/binradar/benchmarks/scripts/binradar_setup.py -w workdir
 just binradar
-# ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir
+# ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir
 ```
 
 For batch execution, you can run these commands in `benchmarks/loftix` directory:
@@ -36,10 +36,12 @@ For batch execution, you can run these commands in `benchmarks/loftix` directory
 # sudo apt install -y parallel
 cd benchmarks/loftix
 just build-all
-just list exp.list
+just list exp.list # You can edit exp.list to select benchmarks to run.
 just run taosc exp.list 20
 just run setup exp.list 20
 just run binradar exp.list 20
+# Run `just failed taosc taosc_failed.list` to check failed runs.
+# You can rerun failed runs with `just resume taosc exp.list 20` based on the joblog or `just run taosc taosc_failed.list 20`.
 ```
 
 ### Configuration
@@ -85,7 +87,7 @@ All paths in the configuration should be relative to the working directory.
 ```shell
 cd benchmarks/loftix/binutils/CVE-2017-14940
 just binradar
-# docker run -v /path/to/benchmarks/loftix/binutils/CVE-2017-14940/workdir:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /root/fuzzolic/fuzzolic/binradar.py -w /workdir
+# docker run -v /path/to/benchmarks/loftix/binutils/CVE-2017-14940/workdir:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir
 ```
 Entrypoint is `fuzzolic/binradar.py`. It will read the `binradar.env` file in the specified working directory and run the verification process. You can also specify other options as needed.
 Timeout can be given as `-t` or `--timeout` option (default: 3600 seconds).

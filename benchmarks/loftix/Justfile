@@ -31,15 +31,15 @@ build-all:
 
 @_run-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
-    mkdir -p logs
-    parallel --tag --joblog "logs/{{command}}.joblog" -j {{jobs}} \
+    mkdir -p logs/{{command}}-results
+    parallel --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
       'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
-    mkdir -p logs
-    parallel --resume --tag --joblog "logs/{{command}}.joblog" -j {{jobs}} \
+    mkdir -p logs/{{command}}-results
+    parallel --resume --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
       'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
@@ -50,9 +50,9 @@ list out="exp.list":
 
 failed command out="failed.list":
     #!/usr/bin/env bash
-    mkdir -p "$(dirname {{out}})"
-    awk 'NR>1 && $7 != 0 {print $9}' "logs/{{command}}.joblog" | sort -u > {{out}}
-    wc -l {{out}}
+    awk 'NR>1 && $7!=0' logs/{{command}}.joblog \
+      | sed -E 's/^.*cd "([^"]+)".*$/\1/' \
+      > {{out}}
 
 run cmd argfile="exp.list" jobs="20" workdir="workdir":
     just _run-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RUN" {{workdir}}
