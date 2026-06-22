@@ -366,7 +366,7 @@ class BinRadarQemuRunner:
     def get_qemu_stacktrace_command(self, binary: str, input_file: str, patch_func_entry: int = 0) -> List[str]:
         cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc]
         if patch_func_entry != 0:
-            cmd += [ "--patch-func-entry", f"{patch_func_entry:x}"] 
+            cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"] 
         cmd += [binary, "--"] + shlex.split(self.test_cmd)
         return cmd
 

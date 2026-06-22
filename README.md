@@ -3,7 +3,7 @@
 git clone https://github.com/UNIST-LOFT/binradar.git
 cd binradar
 git submodule update --init --recursive
-docker build -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204v2 .
+docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204v2 .
 ```
 
 ## Prerequisites

@@ -41,7 +41,9 @@ RUN git clone https://github.com/git/git.git && cd git && git checkout v2.54.0 &
 RUN git clone https://github.com/Kitware/CMake.git && cd CMake && git checkout v3.31.12 && ./bootstrap && make -j 32 && make install
 
 # Install uv and rustup
-RUN useradd -m -s /bin/bash binradar
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} binradar && useradd -m -u ${UID} -g binradar -s /bin/bash binradar
 RUN chown -R binradar:binradar /root/prog
 RUN mkdir -p /workspace && chown -R binradar:binradar /workspace
 USER binradar
