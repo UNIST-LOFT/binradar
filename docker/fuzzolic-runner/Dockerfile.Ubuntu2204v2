@@ -68,12 +68,13 @@ RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-li
 RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 
 # Build LibAFL
-RUN cargo install just
-RUN cd /workspace/fuzzolic/LibAFL/crates/libafl_qemu/libafl_qemu_asan && ARCH=x86_64 PROFILE=release just build
-ENV CUSTOM_LIBAFL_QEMU_ASAN_PATH=/workspace/fuzzolic/LibAFL/crates/libafl_qemu/libafl_qemu_asan/target/x86_64-unknown-linux-gnu/release/libafl_qemu_asan_guest.so
 ENV LC_ALL=C
 
+# qemu_stacktrace: build.rs auto-builds libafl_qemu_asan_guest.so into its target dir
 RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/Cargo.toml
+# qemu_targeted_simple: reuse the same DSO
+RUN mkdir -p /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release && \
+    cp /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/target/release/libafl_qemu_asan_guest.so /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release/
 RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/Cargo.toml
 
 # Build AFL++

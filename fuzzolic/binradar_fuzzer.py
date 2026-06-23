@@ -14,7 +14,7 @@ import binradar_utils
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_targeted_simple", "target", "release", "qemu_targeted_simple")
-CUSTOM_ASAN_PATH = os.path.join(ROOT_DIR, "LibAFL", "crates/libafl_qemu/libafl_qemu_asan/target/x86_64-unknown-linux-gnu/release/libafl_qemu_asan_guest.so")
+
 
 class BinRadarFuzzer:
     def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str):
@@ -59,7 +59,6 @@ class BinRadarFuzzer:
 
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
-        env["CUSTOM_LIBAFL_QEMU_ASAN_PATH"] = CUSTOM_ASAN_PATH
         env["LC_ALL"] = "C"
         command = self.get_qemu_targeted_simple_command(self.get_patched_binary_path(), self.poc_input)
         logger.info(f"Running command: {' '.join(command)}")

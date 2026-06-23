@@ -14,7 +14,7 @@ import binradar_utils
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
-CUSTOM_ASAN_PATH = os.path.join(ROOT_DIR, "LibAFL", "crates/libafl_qemu/libafl_qemu_asan/target/x86_64-unknown-linux-gnu/release/libafl_qemu_asan_guest.so")
+
 
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
@@ -350,7 +350,6 @@ class BinRadarQemuRunner:
     
     def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
         env = os.environ.copy()
-        env["CUSTOM_LIBAFL_QEMU_ASAN_PATH"] = CUSTOM_ASAN_PATH
         env["LC_ALL"] = "C"
         env["PATCH_ID"] = patch_id
         if patch_fd is not None:

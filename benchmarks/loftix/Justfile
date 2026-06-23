@@ -24,8 +24,7 @@ build-all:
     #!/usr/bin/env bash
     mkdir -p logs
     find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel --tag --joblog logs/{{command}}.joblog -j {{jobs}} '
-      echo "### {{prefix}} {}"
+    | parallel --tag --joblog logs/{{command}}.joblog --results logs/{{command}}-results -j {{jobs}} '
       cd "{}" && just {{command}} {{workdir}}
     '
 
@@ -33,14 +32,14 @@ build-all:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
     parallel --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
-      'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
+      'echo "cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
     parallel --resume --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
-      'echo "### {{prefix}} {}"; cd "{}" && just {{command}} {{workdir}}' \
+      'echo "cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 list out="exp.list":

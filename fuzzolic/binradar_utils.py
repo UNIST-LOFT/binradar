@@ -25,7 +25,7 @@ def execute_async(command: List[str], env: Optional[Dict[str, str]] = None, cwd:
     Executes a command and returns the exit code, stdout, and stderr.
     """
     if verbose:
-        logger.info(f"Executing command: {' '.join(command)} at {cwd if cwd else os.getcwd()}")
+        logger.info(f"Executing command: cd {cwd if cwd else os.getcwd()} && {' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd, start_new_session=True)
     return process
 
