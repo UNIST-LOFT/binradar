@@ -1,0 +1,801 @@
+diff --git a/accel/tcg/tcg-runtime.h b/accel/tcg/tcg-runtime.h
+index 754d54a9a7..05f5d310a4 100644
+--- a/accel/tcg/tcg-runtime.h
++++ b/accel/tcg/tcg-runtime.h
+@@ -335,6 +335,11 @@ DEF_HELPER_FLAGS_5(gvec_bitsel, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, ptr, i32)
+ DEF_HELPER_FLAGS_1(afl_entry_routine, TCG_CALL_NO_RWG, void, env)
+ DEF_HELPER_FLAGS_1(afl_persistent_routine, TCG_CALL_NO_RWG, void, env)
+ DEF_HELPER_FLAGS_1(afl_maybe_log, TCG_CALL_NO_RWG, void, tl)
++DEF_HELPER_FLAGS_1(binradar_trace_start, 0, void, tl)
++DEF_HELPER_FLAGS_1(binradar_trace_bb, 0, void, tl)
++DEF_HELPER_FLAGS_1(binradar_trace_insn, 0, void, tl)
++DEF_HELPER_FLAGS_3(binradar_trace_call, 0, void, tl, tl, tl)
++DEF_HELPER_FLAGS_2(binradar_trace_ret, 0, void, tl, tl)
+ DEF_HELPER_FLAGS_3(afl_compcov_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
+ DEF_HELPER_FLAGS_3(afl_compcov_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+ DEF_HELPER_FLAGS_3(afl_compcov_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 92c0228627..fdc05f67f2 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -64,6 +64,7 @@
+ #include "internal.h"
+ 
+ #include "qemuafl/common.h"
++#include "qemuafl/binradar-trace.h"
+ #include "tcg/tcg-op.h"
+ 
+ __thread int cur_block_is_good;
+@@ -2055,6 +2056,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+ 
+     tcg_ctx->cpu = env_cpu(env);
+     afl_gen_trace(pc);
++    if (binradar_trace_trace_basic_blocks()) {
++        TCGv pc_v = tcg_const_tl(pc);
++        gen_helper_binradar_trace_bb(pc_v);
++        tcg_temp_free(pc_v);
++    }
+     gen_intermediate_code(cpu, tb, max_insns);
+     tcg_ctx->cpu = NULL;
+     max_insns = tb->icount;
+diff --git a/accel/tcg/translator.c b/accel/tcg/translator.c
+index 1ec267d5e1..577964a044 100644
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -20,6 +20,7 @@
+ #include "sysemu/replay.h"
+ 
+ #include "qemuafl/common.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ /* Pairs with tcg_clear_temp_count.
+    To be called by #TranslatorOps.{translate_insn,tb_stop} if
+@@ -95,9 +96,20 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
+ 
+         if (db->pc_next == afl_entry_point) {
+             afl_setup();
++            if (binradar_trace_is_enabled()) {
++                TCGv pc_v = tcg_const_tl(db->pc_next);
++                gen_helper_binradar_trace_start(pc_v);
++                tcg_temp_free(pc_v);
++            }
+             gen_helper_afl_entry_routine(cpu_env);
+         }
+ 
++        if (binradar_trace_should_hook_pc(db->pc_next)) {
++            TCGv pc_v = tcg_const_tl(db->pc_next);
++            gen_helper_binradar_trace_insn(pc_v);
++            tcg_temp_free(pc_v);
++        }
++
+         /* Disassemble one instruction.  The translate_insn hook should
+            update db->pc_next and db->is_jmp to indicate what should be
+            done next -- either exiting this loop or locate the start of
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index f1e8b8dc2a..8da62e392d 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -16,6 +16,7 @@
+ #include "qapi/error.h"
+ 
+ #include "qemuafl/common.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ #ifdef _ARCH_PPC64
+ #undef ARCH_DLINFO
+@@ -2924,7 +2925,7 @@ static void load_elf_image(const char *image_name, int image_fd,
+         info->end_data = info->end_code;
+     }
+ 
+-    if (qemu_log_enabled()) {
++    if (qemu_log_enabled() || binradar_trace_symbols_enabled()) {
+         load_symbols(ehdr, image_fd, load_bias);
+     }
+ 
+diff --git a/linux-user/main.c b/linux-user/main.c
+index c8c5963b72..d7d7051129 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -50,6 +50,7 @@
+ #include "crypto/init.h"
+ 
+ #include "qemuafl/qasan-qemu.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ char *exec_path;
+ 
+@@ -524,6 +525,20 @@ static const struct qemu_argument arg_table[] = {
+      "",           "run in singlestep mode"},
+     {"strace",     "QEMU_STRACE",      false, handle_arg_strace,
+      "",           "log system calls"},
++    {"input",      "BINRADAR_INPUT",   true,  binradar_trace_set_input,
++     "path",       "qemu_stacktrace-compatible input path for @@ replacement"},
++    {"patch-loc",  "BINRADAR_PATCH_LOC", true, binradar_trace_set_patch_loc,
++     "address",    "qemu_stacktrace-compatible patch location"},
++    {"patch-func-entry", "BINRADAR_PATCH_FUNC_ENTRY", true, binradar_trace_set_patch_func_entry,
++     "address",    "qemu_stacktrace-compatible patch function entry"},
++    {"asan",       "BINRADAR_ASAN",    true,  binradar_trace_set_asan,
++     "mode",       "accept host, guest, or none without enabling QASAN"},
++    {"asan-include", "",               true,  binradar_trace_ignore_arg,
++     "range",      "accepted for qemu_stacktrace CLI compatibility"},
++    {"asan-exclude", "",               true,  binradar_trace_ignore_arg,
++     "range",      "accepted for qemu_stacktrace CLI compatibility"},
++    {"trace-basic-blocks", "BINRADAR_TRACE_BASIC_BLOCKS", false, binradar_trace_enable_basic_blocks,
++     "",           "print qemu_stacktrace-compatible basic block hits"},
+     {"seed",       "QEMU_RAND_SEED",   true,  handle_arg_seed,
+      "",           "Seed for pseudo-random number generator"},
+     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
+@@ -701,6 +716,8 @@ int main(int argc, char **argv, char **envp)
+     int log_mask;
+     unsigned long max_reserved_va;
+ 
++    binradar_trace_init_time();
++
+     use_qasan = !!getenv("AFL_USE_QASAN");
+ 
+     if (getenv("QASAN_MAX_CALL_STACK"))
+@@ -782,6 +799,11 @@ int main(int argc, char **argv, char **envp)
+ 
+     optind = parse_args(argc, argv);
+ 
++    if (binradar_trace_is_enabled()) {
++        struct rlimit lim = { 0, 0 };
++        setrlimit(RLIMIT_CORE, &lim);
++    }
++
+     log_mask = last_log_mask | (enable_strace ? LOG_STRACE : 0);
+     if (log_mask) {
+         qemu_log_needs_buffers();
+@@ -917,10 +939,14 @@ int main(int argc, char **argv, char **envp)
+     if (argv0 != NULL) {
+         target_argv[i++] = strdup(argv0);
+     }
+-    for (; i < target_argc; i++) {
+-        target_argv[i] = strdup(argv[optind + i]);
++    for (int src_i = argv0 != NULL ? 1 : 0; src_i < target_argc; src_i++) {
++        const char *arg = argv[optind + src_i];
++        if (binradar_trace_should_drop_separator(src_i, arg)) {
++            continue;
++        }
++        target_argv[i++] = binradar_trace_rewrite_arg(arg);
+     }
+-    target_argv[target_argc] = NULL;
++    target_argv[i] = NULL;
+ 
+     ts = g_new0(TaskState, 1);
+     init_task_state(ts);
+@@ -937,6 +963,9 @@ int main(int argc, char **argv, char **envp)
+         _exit(EXIT_FAILURE);
+     }
+ 
++    binradar_trace_after_load(info->entry, info->start_code, info->end_code,
++                              exec_path);
++
+     for (wrk = target_environ; *wrk; wrk++) {
+         g_free(*wrk);
+     }
+diff --git a/linux-user/meson.build b/linux-user/meson.build
+index 7fe28d659e..8ef13c11eb 100644
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -1,4 +1,5 @@
+ linux_user_ss.add(files(
++  'binradar-trace.c',
+   'elfload.c',
+   'exit.c',
+   'fd-trans.c',
+diff --git a/linux-user/signal.c b/linux-user/signal.c
+index 9c23ca83e2..c0f0de9571 100644
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -26,6 +26,7 @@
+ #include "signal-common.h"
+ 
+ #include "qemuafl/qasan-qemu.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ static struct target_sigaction sigact_table[TARGET_NSIG];
+ 
+@@ -949,6 +950,11 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+                    sig != TARGET_SIGWINCH &&
+                    sig != TARGET_SIGCONT) {
+ 
++            binradar_trace_report_signal(cpu_env, sig);
++            if (binradar_trace_is_enabled()) {
++                _exit(128 + target_to_host_signal(sig));
++            }
++
+ #ifdef ASAN_GIOVESE
+             if (use_qasan) {
+               if (sig == TARGET_SIGILL ||
+@@ -973,6 +979,11 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+         /* ignore sig */
+     } else if (handler == TARGET_SIG_ERR) {
+ 
++        binradar_trace_report_signal(cpu_env, sig);
++        if (binradar_trace_is_enabled()) {
++            _exit(128 + target_to_host_signal(sig));
++        }
++
+ #ifdef ASAN_GIOVESE
+       if (use_qasan) {
+         if (sig == TARGET_SIGILL ||
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index a716c713c2..b65362f5c1 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -136,6 +136,7 @@
+ 
+ #include "qemuafl/common.h"
+ #include "qemuafl/qasan-qemu.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ #ifndef CLONE_IO
+ #define CLONE_IO                0x80000000      /* Clone io context */
+@@ -8312,6 +8313,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+         }
+ 
+         pthread_mutex_unlock(&clone_lock);
++        binradar_trace_report_exit(cpu_env, arg1);
+         preexit_cleanup(cpu_env, arg1);
+         _exit(arg1);
+         return 0; /* avoid warning */
+@@ -8330,6 +8332,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+         }
+         return ret;
+     case TARGET_NR_write:
++        if (binradar_trace_suppress_write_fd(arg1)) {
++            return arg3;
++        }
+         if (arg2 == 0 && arg3 == 0) {
+             return get_errno(safe_write(arg1, 0, 0));
+         }
+@@ -10308,6 +10313,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+ #ifdef __NR_exit_group
+         /* new thread calls */
+     case TARGET_NR_exit_group:
++        binradar_trace_report_exit(cpu_env, arg1);
+         preexit_cleanup(cpu_env, arg1);
+         return get_errno(exit_group(arg1));
+ #endif
+@@ -13362,5 +13368,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
+     }
+ 
+     record_syscall_return(cpu, num, ret);
++    binradar_trace_post_syscall(cpu_env, num, ret, arg1, arg2, arg3, arg4,
++                                arg5, arg6);
+     return ret;
+ }
+diff --git a/qemuafl/imported/cmplog.h b/qemuafl/imported/cmplog.h
+index a6259a75be..878ed60c32 100644
+--- a/qemuafl/imported/cmplog.h
++++ b/qemuafl/imported/cmplog.h
+@@ -29,26 +29,26 @@
+ #define _AFL_CMPLOG_H
+ 
+ #include "config.h"
+-//#include "forkserver.h"
++
++#define CMPLOG_LVL_MAX 3
+ 
+ #define CMP_MAP_W 65536
+-#define CMP_MAP_H 256
++#define CMP_MAP_H 32
+ #define CMP_MAP_RTN_H (CMP_MAP_H / 4)
+ 
+ #define SHAPE_BYTES(x) (x + 1)
+ 
+-#define CMP_TYPE_INS 0
+-#define CMP_TYPE_RTN 1
++#define CMP_TYPE_INS 1
++#define CMP_TYPE_RTN 2
+ 
+ struct cmp_header {
+ 
+-  unsigned hits : 20;
+-
+-  unsigned cnt : 20;
+-  unsigned id : 16;
+-
+-  unsigned shape : 5;  // from 0 to 31
+-  unsigned type : 1;
++  unsigned hits : 24;
++  unsigned id : 24;
++  unsigned shape : 5;
++  unsigned type : 2;
++  unsigned attribute : 4;
++  unsigned reserved : 5;
+ 
+ } __attribute__((packed));
+ 
+@@ -56,6 +56,8 @@ struct cmp_operands {
+ 
+   u64 v0;
+   u64 v1;
++  u64 v0_128;
++  u64 v1_128;
+ 
+ };
+ 
+@@ -77,7 +79,8 @@ struct cmp_map {
+ 
+ /* Execs the child */
+ 
+-//void cmplog_exec_child(afl_forkserver_t *fsrv, char **argv);
++struct afl_forkserver;
++void cmplog_exec_child(struct afl_forkserver *fsrv, char **argv);
+ 
+ #endif
+ 
+diff --git a/qemuafl/imported/config.h b/qemuafl/imported/config.h
+index 344a368f5d..c93a6d51fe 100644
+--- a/qemuafl/imported/config.h
++++ b/qemuafl/imported/config.h
+@@ -10,7 +10,7 @@
+                      Dominik Maier <mail@dmnk.co>
+ 
+    Copyright 2016, 2017 Google Inc. All rights reserved.
+-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
++   Copyright 2019-2021 AFLplusplus Project. All rights reserved.
+ 
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+@@ -23,12 +23,10 @@
+ #ifndef _HAVE_CONFIG_H
+ #define _HAVE_CONFIG_H
+ 
+-#include "types.h"
+-
+ /* Version string: */
+ 
+-// c = release, d = volatile github dev, e = experimental branch
+-#define VERSION "++2.66d"
++// c = release, a = volatile github dev, e = experimental branch
++#define VERSION "++3.12c"
+ 
+ /******************************************************
+  *                                                    *
+@@ -36,15 +34,79 @@
+  *                                                    *
+  ******************************************************/
+ 
++/* Default shared memory map size. Most targets just need a coverage map
++   between 20-250kb. Plus there is an auto-detection feature in afl-fuzz.
++   However if a target has problematic constructors and init arrays then
++   this can fail. Hence afl-fuzz deploys a larger default map. The largest
++   map seen so far is the xlsx fuzzer for libreoffice which is 5MB.
++   At runtime this value can be overriden via AFL_MAP_SIZE.
++   Default: 8MB (defined in bytes) */
++#define DEFAULT_SHMEM_SIZE (8 * 1024 * 1024)
++
++/* Default file permission umode when creating files (default: 0600) */
++#define DEFAULT_PERMISSION 0600
++
++/* CMPLOG/REDQUEEN TUNING
++ *
++ * Here you can modify tuning and solving options for CMPLOG.
++ * Note that these are run-time options for afl-fuzz, no target
++ * recompilation required.
++ *
++ */
++
++/* if TRANSFORM is enabled with '-l T', this additionally enables base64
++   encoding/decoding */
++// #define CMPLOG_SOLVE_TRANSFORM_BASE64
++
++/* If a redqueen pass finds more than one solution, try to combine them? */
++#define CMPLOG_COMBINE
++
++/* Minimum % of the corpus to perform cmplog on. Default: 10% */
++#define CMPLOG_CORPUS_PERCENT 5U
++
++/* Number of potential positions from which we decide if cmplog becomes
++   useless, default 8096 */
++#define CMPLOG_POSITIONS_MAX (12 * 1024)
++
++/* Maximum allowed fails per CMP value. Default: 128 */
++#define CMPLOG_FAIL_MAX 96
++
++/* Now non-cmplog configuration options */
++
++/* console output colors: There are three ways to configure its behavior
++ * 1. default: colored outputs fixed on: defined USE_COLOR && defined
++ * ALWAYS_COLORED The env var. AFL_NO_COLOR will have no effect
++ * 2. defined USE_COLOR && !defined ALWAYS_COLORED
++ *    -> depending on env var AFL_NO_COLOR=1 colors can be switched off
++ *    at run-time. Default is to use colors.
++ * 3. colored outputs fixed off: !defined USE_COLOR
++ *    The env var. AFL_NO_COLOR will have no effect
++ */
++
+ /* Comment out to disable terminal colors (note that this makes afl-analyze
+    a lot less nice): */
+ 
+ #define USE_COLOR
+ 
++#ifdef USE_COLOR
++  /* Comment in to always enable terminal colors */
++  /* Comment out to enable runtime controlled terminal colors via AFL_NO_COLOR
++   */
++  #define ALWAYS_COLORED 1
++#endif
++
++/* StatsD config
++   Config can be adjusted via AFL_STATSD_HOST and AFL_STATSD_PORT environment
++   variable.
++*/
++#define STATSD_UPDATE_SEC 1
++#define STATSD_DEFAULT_PORT 8125
++#define STATSD_DEFAULT_HOST "127.0.0.1"
++
+ /* If you want to have the original afl internal memory corruption checks.
+    Disabled by default for speed. it is better to use "make ASAN_BUILD=1". */
+ 
+-//#define _WANT_ORIGINAL_AFL_ALLOC
++// #define _WANT_ORIGINAL_AFL_ALLOC
+ 
+ /* Comment out to disable fancy ANSI boxes and use poor man's 7-bit UI: */
+ 
+@@ -55,69 +117,61 @@
+ /* Default timeout for fuzzed code (milliseconds). This is the upper bound,
+    also used for detecting hangs; the actual value is auto-scaled: */
+ 
+-#define EXEC_TIMEOUT 1000
++#define EXEC_TIMEOUT 1000U
+ 
+ /* Timeout rounding factor when auto-scaling (milliseconds): */
+ 
+-#define EXEC_TM_ROUND 20
++#define EXEC_TM_ROUND 20U
+ 
+ /* 64bit arch MACRO */
+ #if (defined(__x86_64__) || defined(__arm64__) || defined(__aarch64__))
+   #define WORD_SIZE_64 1
+ #endif
+ 
+-/* Default memory limit for child process (MB): */
+-
+-#ifndef __NetBSD__
+-  #ifndef WORD_SIZE_64
+-    #define MEM_LIMIT 25
+-  #else
+-    #define MEM_LIMIT 50
+-  #endif                                                  /* ^!WORD_SIZE_64 */
+-#else /* NetBSD's kernel needs more space for stack, see discussion for issue \
+-         #165 */
+-  #define MEM_LIMIT 200
+-#endif
+-/* Default memory limit when running in QEMU mode (MB): */
++/* Default memory limit for child process (MB) 0 = disabled : */
++
++#define MEM_LIMIT 0U
+ 
+-#define MEM_LIMIT_QEMU 200
++/* Default memory limit when running in QEMU mode (MB) 0 = disabled : */
+ 
+-/* Default memory limit when running in Unicorn mode (MB): */
++#define MEM_LIMIT_QEMU 0U
+ 
+-#define MEM_LIMIT_UNICORN 200
++/* Default memory limit when running in Unicorn mode (MB) 0 = disabled : */
++
++#define MEM_LIMIT_UNICORN 0U
+ 
+ /* Number of calibration cycles per every new test case (and for test
+    cases that show variable behavior): */
+ 
+-#define CAL_CYCLES 8
+-#define CAL_CYCLES_LONG 40
++#define CAL_CYCLES 8U
++#define CAL_CYCLES_LONG 40U
+ 
+ /* Number of subsequent timeouts before abandoning an input file: */
+ 
+-#define TMOUT_LIMIT 250
++#define TMOUT_LIMIT 250U
+ 
+ /* Maximum number of unique hangs or crashes to record: */
+ 
+-#define KEEP_UNIQUE_HANG 500
+-#define KEEP_UNIQUE_CRASH 5000
++#define KEEP_UNIQUE_HANG 500U
++#define KEEP_UNIQUE_CRASH 5000U
+ 
+ /* Baseline number of random tweaks during a single 'havoc' stage: */
+ 
+-#define HAVOC_CYCLES 256
+-#define HAVOC_CYCLES_INIT 1024
++#define HAVOC_CYCLES 256U
++#define HAVOC_CYCLES_INIT 1024U
+ 
+ /* Maximum multiplier for the above (should be a power of two, beware
+    of 32-bit int overflows): */
+ 
+-#define HAVOC_MAX_MULT 16
+-#define HAVOC_MAX_MULT_MOPT 32
++#define HAVOC_MAX_MULT 64U
++#define HAVOC_MAX_MULT_MOPT 64U
+ 
+ /* Absolute minimum number of havoc cycles (after all adjustments): */
+ 
+-#define HAVOC_MIN 16
++#define HAVOC_MIN 12U
+ 
+ /* Power Schedule Divisor */
+-#define POWER_BETA 1
++#define POWER_BETA 1U
+ #define MAX_FACTOR (POWER_BETA * 32)
+ 
+ /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
+@@ -126,22 +180,22 @@
+    n = random between 1 and HAVOC_STACK_POW2
+    stacking = 2^n
+ 
+-   In other words, the default (n = 7) produces 2, 4, 8, 16, 32, 64, or
+-   128 stacked tweaks: */
++   In other words, the default (n = 4) produces 2, 4, 8, 16
++   stacked tweaks: */
+ 
+-#define HAVOC_STACK_POW2 7
++#define HAVOC_STACK_POW2 4U
+ 
+ /* Caps on block sizes for cloning and deletion operations. Each of these
+    ranges has a 33% probability of getting picked, except for the first
+    two cycles where smaller blocks are favored: */
+ 
+-#define HAVOC_BLK_SMALL 32
+-#define HAVOC_BLK_MEDIUM 128
+-#define HAVOC_BLK_LARGE 1500
++#define HAVOC_BLK_SMALL 32U
++#define HAVOC_BLK_MEDIUM 128U
++#define HAVOC_BLK_LARGE 1500U
+ 
+ /* Extra-large blocks, selected very rarely (<5% of the time): */
+ 
+-#define HAVOC_BLK_XL 32768
++#define HAVOC_BLK_XL 32768U
+ 
+ /* Probabilities of skipping non-favored entries in the queue, expressed as
+    percentages: */
+@@ -169,9 +223,11 @@
+ #define TRIM_START_STEPS 16
+ #define TRIM_END_STEPS 1024
+ 
+-/* Maximum size of input file, in bytes (keep under 100MB): */
++/* Maximum size of input file, in bytes (keep under 100MB, default 1MB):
++   (note that if this value is changed, several areas in afl-cc.c, afl-fuzz.c
++   and afl-fuzz-state.c have to be changed as well! */
+ 
+-#define MAX_FILE (1 * 1024 * 1024)
++#define MAX_FILE (1 * 1024 * 1024U)
+ 
+ /* The same, for the test case minimizer: */
+ 
+@@ -195,7 +251,7 @@
+    steps; past this point, the "extras/user" step will be still carried out,
+    but with proportionally lower odds: */
+ 
+-#define MAX_DET_EXTRAS 200
++#define MAX_DET_EXTRAS 256
+ 
+ /* Maximum number of auto-extracted dictionary tokens to actually use in fuzzing
+    (first value), and to keep in memory as candidates. The latter should be much
+@@ -236,6 +292,11 @@
+ 
+ #define SYNC_INTERVAL 8
+ 
++/* Sync time (minimum time between syncing in ms, time is halfed for -M main
++   nodes) - default is 30 minutes: */
++
++#define SYNC_TIME (30 * 60 * 1000)
++
+ /* Output directory reuse grace period (minutes): */
+ 
+ #define OUTPUT_GRACE 25
+@@ -295,6 +356,13 @@
+ 
+ #define RESEED_RNG 100000
+ 
++/* The default maximum testcase cache size in MB, 0 = disable.
++   A value between 50 and 250 is a good default value. Note that the
++   number of entries will be auto assigned if not specified via the
++   AFL_TESTCACHE_ENTRIES env variable */
++
++#define TESTCASE_CACHE_SIZE 50
++
+ /* Maximum line length passed from GCC to 'as' and used for parsing
+    configuration files: */
+ 
+@@ -356,7 +424,7 @@
+    after changing this - otherwise, SEGVs may ensue. */
+ 
+ #define MAP_SIZE_POW2 16
+-#define MAP_SIZE (1 << MAP_SIZE_POW2)
++#define MAP_SIZE (1U << MAP_SIZE_POW2)
+ 
+ /* Maximum allocator request size (keep well under INT_MAX): */
+ 
+diff --git a/qemuafl/imported/types.h b/qemuafl/imported/types.h
+index 39f599a0f4..7b94fb83b1 100644
+--- a/qemuafl/imported/types.h
++++ b/qemuafl/imported/types.h
+@@ -25,10 +25,15 @@
+ 
+ #include <stdint.h>
+ #include <stdlib.h>
++#include "config.h"
+ 
+ typedef uint8_t  u8;
+ typedef uint16_t u16;
+ typedef uint32_t u32;
++#ifdef WORD_SIZE_64
++typedef unsigned __int128 uint128_t;
++typedef uint128_t         u128;
++#endif
+ 
+ /* Extended forkserver option values */
+ 
+@@ -50,7 +55,7 @@ typedef uint32_t u32;
+ #define FS_OPT_SHDMEM_FUZZ 0x01000000
+ #define FS_OPT_OLD_AFLPP_WORKAROUND 0x0f000000
+ // FS_OPT_MAX_MAPSIZE is 8388608 = 0x800000 = 2^23 = 1 << 22
+-#define FS_OPT_MAX_MAPSIZE ((0x00fffffe >> 1) + 1)
++#define FS_OPT_MAX_MAPSIZE ((0x00fffffeU >> 1) + 1)
+ #define FS_OPT_GET_MAPSIZE(x) (((x & 0x00fffffe) >> 1) + 1)
+ #define FS_OPT_SET_MAPSIZE(x) \
+   (x <= 1 || x > FS_OPT_MAX_MAPSIZE ? 0 : ((x - 1) << 1))
+@@ -61,6 +66,10 @@ typedef int8_t  s8;
+ typedef int16_t s16;
+ typedef int32_t s32;
+ typedef int64_t s64;
++#ifdef WORD_SIZE_64
++typedef __int128 int128_t;
++typedef int128_t s128;
++#endif
+ 
+ #ifndef MIN
+   #define MIN(a, b)           \
+@@ -114,6 +123,33 @@ typedef int64_t s64;
+                                                                                \
+   })
+ 
++// It is impossible to define 128 bit constants, so ...
++#ifdef WORD_SIZE_64
++  #define SWAPN(_x, _l)                            \
++    ({                                             \
++                                                   \
++      u128  _res = (_x), _ret;                     \
++      char *d = (char *)&_ret, *s = (char *)&_res; \
++      int   i;                                     \
++      for (i = 0; i < 16; i++)                     \
++        d[15 - i] = s[i];                          \
++      u32 sr = 128U - ((_l) << 3U);                \
++      (_ret >>= sr);                               \
++      (u128) _ret;                                 \
++                                                   \
++    })
++#endif
++
++#define SWAPNN(_x, _y, _l)                     \
++  ({                                           \
++                                               \
++    char *d = (char *)(_x), *s = (char *)(_y); \
++    u32   i, l = (_l)-1;                       \
++    for (i = 0; i <= l; i++)                   \
++      d[l - i] = s[i];                         \
++                                               \
++  })
++
+ #ifdef AFL_LLVM_PASS
+   #if defined(__linux__) || !defined(__ANDROID__)
+     #define AFL_SR(s) (srandom(s))
+diff --git a/target/hexagon/meson.build b/target/hexagon/meson.build
+index 15318a6fa7..322d910ba5 100644
+--- a/target/hexagon/meson.build
++++ b/target/hexagon/meson.build
+@@ -34,7 +34,7 @@ semantics_generated = custom_target(
+     'semantics_generated.pyinc',
+     output: 'semantics_generated.pyinc',
+     input: gen_semantics,
+-    command: ['@INPUT@', '@OUTPUT@'],
++    command: [gen_semantics, '@OUTPUT@'],
+ )
+ hexagon_ss.add(semantics_generated)
+ 
+@@ -155,7 +155,7 @@ iset_py = custom_target(
+     'iset.py',
+     output: 'iset.py',
+     input: gen_dectree_import,
+-    command: ['@INPUT@', '@OUTPUT@'],
++    command: [gen_dectree_import, '@OUTPUT@'],
+ )
+ hexagon_ss.add(iset_py)
+ 
+@@ -168,7 +168,8 @@ dectree_generated = custom_target(
+     output: 'dectree_generated.h.inc',
+     input: 'dectree.py',
+     depends: [iset_py],
+-    command: ['PYTHONPATH=' + meson.current_build_dir(), '@INPUT@', '@OUTPUT@'],
++    command: [python, '@INPUT@', '@OUTPUT@'],
++    env: {'PYTHONPATH': meson.current_build_dir()},
+ )
+ hexagon_ss.add(dectree_generated)
+ 
+diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
+index 271cbf6455..9a79879f85 100644
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -36,6 +36,7 @@
+ #include "qemuafl/qasan-qemu.h"
+ #include "qemuafl/cpu-translate.h"
+ #include "qemuafl/api.h"
++#include "qemuafl/binradar-trace.h"
+ 
+ #define AFL_QEMU_TARGET_I386_SNIPPET                                          \
+   if (is_persistent) {                                                        \
+@@ -5186,6 +5187,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
+               gen_helper_afl_cmplog_rtn(cpu_env);
+             if (use_qasan && qasan_max_call_stack)
+               gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc));
++            if (binradar_trace_is_enabled()) {
++                TCGv pc_v = tcg_const_tl(pc_start);
++                TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
++                gen_helper_binradar_trace_call(pc_v, ret_v, s->T0);
++                tcg_temp_free(pc_v);
++                tcg_temp_free(ret_v);
++            }
+             tcg_gen_movi_tl(s->T1, next_eip);
+             gen_push_v(s, s->T1);
+             gen_op_jmp_v(s->T0);
+@@ -6645,6 +6653,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
+         gen_stack_update(s, val + (1 << ot));
+         if (use_qasan && qasan_max_call_stack)
+           gen_helper_qasan_shadow_stack_pop(s->T0);
++        if (binradar_trace_is_enabled()) {
++            TCGv pc_v = tcg_const_tl(pc_start);
++            gen_helper_binradar_trace_ret(pc_v, s->T0);
++            tcg_temp_free(pc_v);
++        }
+         /* Note that gen_pop_T0 uses a zero-extending load.  */
+         gen_op_jmp_v(s->T0);
+         gen_bnd_jmp(s);
+@@ -6655,6 +6668,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
+         gen_pop_update(s, ot);
+         if (use_qasan && qasan_max_call_stack)
+           gen_helper_qasan_shadow_stack_pop(s->T0);
++        if (binradar_trace_is_enabled()) {
++            TCGv pc_v = tcg_const_tl(pc_start);
++            gen_helper_binradar_trace_ret(pc_v, s->T0);
++            tcg_temp_free(pc_v);
++        }
+         /* Note that gen_pop_T0 uses a zero-extending load.  */
+         gen_op_jmp_v(s->T0);
+         gen_bnd_jmp(s);
+@@ -6675,6 +6693,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
+             gen_op_ld_v(s, dflag, s->T0, s->A0);
+             if (use_qasan && qasan_max_call_stack)
+               gen_helper_qasan_shadow_stack_pop(s->T0);
++            if (binradar_trace_is_enabled()) {
++                TCGv pc_v = tcg_const_tl(pc_start);
++                gen_helper_binradar_trace_ret(pc_v, s->T0);
++                tcg_temp_free(pc_v);
++            }
+             /* NOTE: keeping EIP updated is not a problem in case of
+                exception */
+             gen_op_jmp_v(s->T0);
+@@ -6728,6 +6751,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
+             } else if (!CODE64(s)) {
+                 tval &= 0xffffffff;
+             }
++            if (binradar_trace_is_enabled()) {
++                TCGv pc_v = tcg_const_tl(pc_start);
++                TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
++                TCGv entry_v = tcg_const_tl(s->cs_base + tval);
++                gen_helper_binradar_trace_call(pc_v, ret_v, entry_v);
++                tcg_temp_free(pc_v);
++                tcg_temp_free(ret_v);
++                tcg_temp_free(entry_v);
++            }
+             tcg_gen_movi_tl(s->T0, next_eip);
+             gen_push_v(s, s->T0);
+             gen_bnd_jmp(s);
