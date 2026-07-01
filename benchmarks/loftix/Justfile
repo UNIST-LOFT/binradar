@@ -32,14 +32,14 @@ build-all:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
     parallel --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
-      'echo "cd "{}" && just {{command}} {{workdir}}' \
+      'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
     parallel --resume --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
-      'echo "cd "{}" && just {{command}} {{workdir}}' \
+      'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 list out="exp.list":

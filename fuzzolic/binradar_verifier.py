@@ -326,26 +326,30 @@ class BinRadarQemuRunner:
     binary: str
     test_cmd: str
     patch_loc: str
+    exclude_addrs: List[str]
     run_results: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str):
+    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, exclude_addrs: List[str] = []):
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
+        self.exclude_addrs = exclude_addrs
         self.run_results = None
     
     @staticmethod
     def from_workdir(dir: str) -> "BinRadarQemuRunner":
-        env = binradar_utils.load_env(os.path.join(dir, "config.env"))
+        env = binradar_utils.load_env(os.path.join(dir, "binradar.env"))
         return BinRadarQemuRunner.from_env(dir, env)
     
     @staticmethod
     def from_env(dir: str, env: Dict[str, str]) -> "BinRadarQemuRunner":
+        exclude_addrs: List[str] = [env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
         return BinRadarQemuRunner(
             dir=dir,
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
-            patch_loc=env["PATCH_LOC"]
+            patch_loc=env["PATCH_LOC"],
+            exclude_addrs=exclude_addrs
         )
     
     def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
@@ -362,15 +366,21 @@ class BinRadarQemuRunner:
     def patched_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.brpatched")
 
-    def get_qemu_stacktrace_command(self, binary: str, input_file: str, patch_func_entry: int = 0) -> List[str]:
-        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc]
+    def get_qemu_stacktrace_command(self, use_patched_bin: bool, input_file: str, patch_func_entry: int = 0) -> List[str]:
+        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc, "--asan", "host"]
         if patch_func_entry != 0:
-            cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"] 
+            cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"]
+        if use_patched_bin:
+            binary = self.patched_binary()
+            for addr_range in self.exclude_addrs:
+                cmd += ["--asan-exclude", addr_range]
+        else:
+            binary = self.original_binary()
         cmd += [binary, "--"] + shlex.split(self.test_cmd)
         return cmd
 
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
-        command = self.get_qemu_stacktrace_command(self.original_binary(), testcase)
+        command = self.get_qemu_stacktrace_command(False, testcase)
         env = self.get_env_for_exec(patch_id="0")
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
@@ -379,7 +389,7 @@ class BinRadarQemuRunner:
         return BinRadarProbeResult.from_log(result.stderr)
     
     def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
-        command = self.get_qemu_stacktrace_command(self.original_binary(), testcase, patch_func_entry=patch_func_entry)
+        command = self.get_qemu_stacktrace_command(False, testcase, patch_func_entry=patch_func_entry)
         env = self.get_env_for_exec(patch_id="0")
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
@@ -392,7 +402,7 @@ class BinRadarQemuRunner:
         return probe_result
 
     def test_with_patched(self, patch_id: str, testcase: str, verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
-        command = self.get_qemu_stacktrace_command(self.patched_binary(), testcase)
+        command = self.get_qemu_stacktrace_command(True, testcase)
         rfd, wfd = os.pipe()
         env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd)
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)

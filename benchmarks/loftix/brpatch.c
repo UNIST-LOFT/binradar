@@ -161,5 +161,5 @@ const void *dest(const struct STATE *state)
 	char buf[64];
 	int n = snprintf(buf, sizeof(buf), "[patch] [id %u] [br %d] [v %u]\n", patch_id, branch_taken, v);
 	write(patch_fd, buf, n);
-	return branch_taken ? NULL : (const void *)TAOSC_DEST;
+	return branch_taken ? (const void *)TAOSC_DEST : NULL;
 }

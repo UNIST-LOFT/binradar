@@ -575,7 +575,8 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
-    patch_reserve_addr: str
+    # PATCH_RESERVE_RANGE, E9_TRAMPOLINE_RANGE, E9_LOADER_RANGE
+    patch_addr_ranges: Tuple[str, str, str]
     total_patches: int
     # Data
     config: Dict[str, str]
@@ -586,7 +587,7 @@ class BinRadarExecutor:
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_reserve_addr: str, total_patches: int):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -595,7 +596,7 @@ class BinRadarExecutor:
         self.total_patches = total_patches
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
-        self.patch_reserve_addr = patch_reserve_addr
+        self.patch_addr_ranges = patch_addr_ranges
 
         self.libc = ctypes.CDLL("libc.so.6")
 
@@ -634,7 +635,11 @@ class BinRadarExecutor:
             poc_input=env["POC_INPUT"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            patch_reserve_addr=env["PATCH_RESERVE_ADDR"],
+            patch_addr_ranges=(
+                env["PATCH_RESERVE_RANGE"],
+                env["E9_TRAMPOLINE_RANGE"],
+                env["E9_LOADER_RANGE"]
+            ),
             total_patches=int(env["TOTAL_PATCHES"]))
         return binradar
     
@@ -646,7 +651,9 @@ class BinRadarExecutor:
         config["POC_INPUT"] = self.poc_input
         config["TEST_CMD"] = self.test_cmd
         config["PATCH_LOC"] = self.patch_loc
-        config["PATCH_RESERVE_ADDR"] = self.patch_reserve_addr
+        config["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
+        config["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
+        config["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
         config["TOTAL_PATCHES"] = str(self.total_patches)
         return config
 
@@ -725,7 +732,9 @@ class BinRadarExecutor:
             open(log_file, "w").close()
         env["BINRADAR_TRACER_LOG_FILE"] = log_file
         # Tracer
-        env["PATCH_RESERVE_ADDR"] = self.patch_reserve_addr
+        env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
+        env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
+        env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
         if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"

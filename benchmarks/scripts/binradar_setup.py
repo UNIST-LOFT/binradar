@@ -2,11 +2,12 @@
 import os
 import argparse
 import subprocess
+import struct
 from pathlib import Path
 from typing import List, Dict, Optional, Union, Tuple
 import shutil
 import re
-import json
+import enum
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BRPATCH_SOURCE = SCRIPT_DIR.parent / "loftix" / "brpatch.c"
@@ -256,6 +257,81 @@ def save_env(env: Dict[str, str], file: Path):
         for key, value in env.items():
             f.write(f"{key}=\"{value}\"\n")
 
+PAGE_SIZE = 0x1000
+
+class E9MapType(enum.IntEnum):
+    TRAMPOLINE = 0
+    RESERVE = 1
+    REFACTOR = 2
+
+E9_CONFIG_MAGIC = b"E9PATCH\0"
+E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
+E9_MAP_STRUCT = struct.Struct("<iII")
+
+def parse_e9patch_config(path: Path) -> Dict:
+    """Parse e9patch's embedded e9_config_s from a patched binary.
+    
+    Returns a dict with:
+      - loader_base: virtual address of the loader LOAD segment
+      - loader_size: size of the loader LOAD segment (page-aligned)
+      - entry: original entry point
+      - reserves: list of (vaddr, size, prot) for RESERVE type mappings
+      - trampolines: list of (vaddr, size, prot) for TRAMPOLINE type mappings
+      - refactors: list of (vaddr, size, prot) for REFACTOR type mappings
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+
+    pos = data.find(E9_CONFIG_MAGIC)
+    if pos < 0:
+        raise ValueError(f"e9patch config magic not found in {path}")
+
+    fields = E9_CONFIG_STRUCT.unpack_from(data, pos)
+    magic, version, flags, loader_size, base, entry, fini, mmap, \
+        num_maps0, num_maps1, maps0_off, maps1_off, \
+        num_preinits, preinits_off, num_postinits, postinits_off, \
+        num_inits, inits_off, num_finis, finis_off, \
+        num_traps, traps_off, handler = fields
+
+    result = {
+        "loader_base": base,
+        "loader_size": loader_size,
+        "entry": entry,
+        "reserves": [],
+        "trampolines": [],
+        "refactors": [],
+    }
+
+    for level, num_maps, maps_off in [
+        (0, num_maps0, maps0_off),
+        (1, num_maps1, maps1_off),
+    ]:
+        map_start = pos + maps_off
+        if map_start + num_maps * 12 > len(data):
+            raise ValueError(f"e9patch config maps overflow in {path}")
+        for i in range(num_maps):
+            addr_s32, file_off, bitfield = E9_MAP_STRUCT.unpack_from(data, map_start + i * 12)
+            size_pages = bitfield & 0xFFFFF
+            map_type = (bitfield >> 20) & 0x3
+            r = (bitfield >> 28) & 1
+            w = (bitfield >> 29) & 1
+            x = (bitfield >> 30) & 1
+
+            vaddr = addr_s32 * PAGE_SIZE
+            vsize = size_pages * PAGE_SIZE
+            prot = f"{'r' if r else '-'}{'w' if w else '-'}{'x' if x else '-'}"
+
+            # type_name = ["TRAMPOLINE", "RESERVE", "REFACTOR"][map_type]
+            if map_type == E9MapType.RESERVE:
+                result["reserves"].append((vaddr, vsize, prot))
+            elif map_type == E9MapType.TRAMPOLINE:
+                result["trampolines"].append((vaddr, vsize, prot))
+            elif map_type == E9MapType.REFACTOR:
+                result["refactors"].append((vaddr, vsize, prot))
+
+    return result
+
+
 def run_fix(configdir: Path, config_path: Path, workdir: Path):
     print(f"Running fix command in {workdir} with config {config_path}")
     result = subprocess.run(["just", "fix", str(workdir)], cwd=configdir, env=os.environ.copy(), capture_output=True, text=True)
@@ -308,7 +384,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             patch_str = predicate_to_patch_str(predicates[i - 1])
             f.write(f"case {i}:\n\treturn \"{patch_str}\";\n")
         f.write("default:\n\treturn \"p0\";\n")
-    cmd = ["guix", "shell", "e9patch", "--", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--", 
             "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -325,7 +401,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     brpatch_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
     patch_addr = binradar_env["PATCH_LOC"]
     # dump metadata
-    cmd = ["guix", "shell", "e9patch", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
             "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -334,24 +410,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch metadata dumped successfully")
-    json_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
-    if not json_path.exists():
-        print(f"Error: patch metadata {json_path.name} not found in {workdir}")
-        exit(1)
-    with json_path.open("r") as f:
-        for line in f:
-            data = json.loads(line)
-            if data.get("method", "") == "reserve":
-                params = data.get("params", {})
-                if params.get("protection", "") == "r-x":
-                    addr = params.get("address", None)
-                    if addr is None:
-                        print(f"Error: reserve patch metadata does not contain address")
-                        exit(1)
-                    binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
-                    print(f"Patch reserve metadata: addr=0x{addr:x}")
-                    break
-    cmd = ["guix", "shell", "e9patch", "--", "e9tool", "-100", "-M", f"addr={patch_addr}", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}", 
             "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -360,6 +419,35 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Prepare patch succeeded, patched binary at {brpatch_binary}")
+
+    # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
+    try:
+        cfg = parse_e9patch_config(brpatch_binary)
+        loader_base = cfg["loader_base"]
+        loader_size = cfg["loader_size"]
+        binradar_env["E9_LOADER_RANGE"] = f"0x{loader_base:x}-0x{loader_base + loader_size:x}"
+        print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
+
+        reserves = cfg["reserves"]
+        if reserves:
+            reserve_start = min(r[0] for r in reserves)
+            reserve_end = max(r[0] + r[1] for r in reserves)
+            binradar_env["PATCH_RESERVE_RANGE"] = f"0x{reserve_start:x}-0x{reserve_end:x}"
+            print(f"Full reserve range: 0x{reserve_start:x}-0x{reserve_end:x}")
+            # for addr, size, prot in sorted(reserves, key=lambda x: x[0]):
+            #     if 'x' in prot and "PATCH_RESERVE_ADDR" not in binradar_env:
+            #         binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
+            #         print(f"Patch reserve addr: 0x{addr:x} prot={prot}")
+            #         break
+
+        trampolines = cfg["trampolines"]
+        if trampolines:
+            tramp_start = min(t[0] for t in trampolines)
+            tramp_end = max(t[0] + t[1] for t in trampolines)
+            binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
+            print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
+    except Exception as e:
+        print(f"Warning: could not parse e9patch config: {e}")
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:    
     env = load_env(config_path)

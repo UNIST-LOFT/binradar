@@ -17,7 +17,7 @@ QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "bina
 
 
 class BinRadarFuzzer:
-    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str):
+    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, exclude_addrs: List[str] = []):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -25,11 +25,12 @@ class BinRadarFuzzer:
         self.poc_input = poc_input
         self.patch_loc = patch_loc
         self.test_cmd = test_cmd
+        self.exclude_addrs = exclude_addrs
         self.process: Optional[subprocess.Popen] = None
     
     @staticmethod
     def from_workdir(dir: str, outdir: str) -> "BinRadarFuzzer":
-        env = binradar_utils.load_env(os.path.join(dir, "config.env"))
+        env = binradar_utils.load_env(os.path.join(dir, "binradar.env"))
         return BinRadarFuzzer.from_env(dir, outdir, env)
 
     @staticmethod
@@ -41,6 +42,7 @@ class BinRadarFuzzer:
             poc_input=env["POC_INPUT"],
             patch_loc=env["PATCH_LOC"],
             test_cmd=env["TEST_CMD"],
+            exclude_addrs=[env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
         )
     
     def get_qemu_targeted_simple_command(self, binary: str, input_path: str) -> List[str]:
@@ -49,9 +51,11 @@ class BinRadarFuzzer:
             "-t", self.patch_loc,
             "-i", input_path,
             "-o", self.outdir,
-            binary,
-            "--",
-        ] + shlex.split(self.test_cmd)
+            "--asan", "host",
+        ]
+        for addr_range in self.exclude_addrs:
+            cmd += ["--asan-exclude", addr_range]
+        cmd = cmd + [binary, "--",] + shlex.split(self.test_cmd)
         return cmd
     
     def get_patched_binary_path(self) -> str:
