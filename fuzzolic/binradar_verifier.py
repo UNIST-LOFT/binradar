@@ -355,7 +355,8 @@ class BinRadarQemuRunner:
     
     def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
         env = os.environ.copy()
-        env["LC_ALL"] = "C"
+        # env["LC_ALL"] = "C"
+        env["AFL_USE_QASAN"] = "1"
         env["PATCH_ID"] = patch_id
         if patch_fd is not None:
             env["PATCH_FD"] = str(patch_fd)

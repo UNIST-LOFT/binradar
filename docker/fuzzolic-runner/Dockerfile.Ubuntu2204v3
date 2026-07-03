@@ -69,7 +69,6 @@ RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-li
 RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
 
 # Build LibAFL
-ENV LC_ALL=C
 
 # qemu_stacktrace: build.rs auto-builds libafl_qemu_asan_guest.so into its target dir
 # RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/Cargo.toml
@@ -80,11 +79,11 @@ ENV LC_ALL=C
 
 # Build AFL++
 # AFLplusplus: just old version for now, apply afl-showmap.c.patch
-RUN cd utils && rm -rf AFLplusplus && git clone -b targeted https://github.com/hsh814/AFLplusplus.git AFLplusplus
+# RUN cd utils && rm -rf AFLplusplus && git clone -b targeted https://github.com/hsh814/AFLplusplus.git AFLplusplus
 RUN cd utils/AFLplusplus && git switch targeted && make -j `nproc` all && \ 
     cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
     pip install "meson==0.56.2" && ./build_qemu_support.sh
-RUN cd utils && rm -rf binradar-aflplusplus && git clone -b binradar https://github.com/hsh814/AFLplusplus.git binradar-aflplusplus
+# RUN cd utils && rm -rf binradar-aflplusplus && git clone -b binradar https://github.com/hsh814/AFLplusplus.git binradar-aflplusplus
 # cp ../../binradar-trace.c qemuafl/linux-user/binradar-trace.c && cp ../../binradar-trace.h qemuafl/qemuafl/binradar-trace.h && git apply ../../qemuafl.patch
 RUN cd utils/binradar-aflplusplus && git switch binradar && make -j `nproc` all && \
     cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \

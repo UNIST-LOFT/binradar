@@ -103,9 +103,10 @@ class AFLppFuzzer(BinRadarFuzzer):
 
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
-        env["LC_ALL"] = "C"
+        # env["LC_ALL"] = "C"
         env["AFL_PATH"] = AFL_PATH
         env["AFL_NO_UI"] = "1"
+        env["AFL_USE_QASAN"] = "1"
         # Currently, all benchmarks are using poc/testcases
         # But if it's not, it can be problematic
         input_dir = os.path.dirname(self.poc_input)

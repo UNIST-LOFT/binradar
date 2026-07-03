@@ -12,3 +12,9 @@
 [submodule "LibAFL"]
 	path = LibAFL
 	url = https://github.com/hsh814/LibAFL.git
+[submodule "utils/AFLplusplus"]
+	path = utils/AFLplusplus
+	url = https://github.com/hsh814/AFLplusplus.git
+[submodule "utils/binradar-aflplusplus"]
+	path = utils/binradar-aflplusplus
+	url = https://github.com/hsh814/AFLplusplus.git
