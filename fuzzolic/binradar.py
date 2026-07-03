@@ -690,14 +690,14 @@ class BinRadarExecutor:
             return self.poc_input
         return os.path.join(self.workdir, self.poc_input)
 
-    def set_run_dir(self, run_prefix: str = "run", resume_phase: BinRadarPhase = BinRadarPhase.ALL):
+    def set_run_dir(self, run_prefix: str = "run", use_last_run_id: bool = False, resume_phase: BinRadarPhase = BinRadarPhase.ALL):
         run_id = 0
         # Currently, start a new run if the previous run exists.
         # Can resume in more fine-grained way if needed.
         self.previous_progress = BinRadarProgress.from_progress_file(run_prefix, self.progress_filename)
         if self.previous_progress is not None:
             run_id = self.previous_progress.run_id
-            if resume_phase == BinRadarPhase.ALL:
+            if not use_last_run_id and resume_phase == BinRadarPhase.ALL:
                 run_id += 1
         run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -887,7 +887,7 @@ class BinRadarExecutor:
         if os.path.exists(fuzzer_outdir):
             logger.info(f"Fuzzer output directory already exists: {fuzzer_outdir}. It will be overwritten.")
             shutil.rmtree(fuzzer_outdir)
-        fuzzer = binradar_fuzzer.BinRadarFuzzer.from_env(self.workdir, fuzzer_outdir, config)
+        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, fuzzer_outdir, config)
         fuzzer.start()
         if fuzzer.process is None:
             logger.error("Failed to start fuzzer process.")
@@ -906,7 +906,9 @@ class BinRadarExecutor:
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
-        testcase_dirs.append(os.path.join(self.run_dir, "fuzzer-out", "reached"))
+        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
+        testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
         minimizer.load_testcases()
         minimizer.run_testcases()
@@ -1067,11 +1069,13 @@ class BinRadarExecutor:
         self.run_final()
         self.done()
     
-    def run_single_phase(self, run_prefix: str, run_id: int, phase: BinRadarPhase):
-        if run_id < 0:
+    def run_single_phase(self, run_prefix: str, run_id: str, phase: BinRadarPhase):
+        if run_id in ("n", "new"):
             self.set_run_dir(run_prefix=run_prefix)
+        elif run_id in ("l", "last"):
+            self.set_run_dir(run_prefix=run_prefix, use_last_run_id=True)
         else:
-            self.run_id = run_id
+            self.run_id = int(run_id)
             self.run_prefix = run_prefix
             self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
@@ -1167,7 +1171,7 @@ def main():
     parser.add_argument("--run-single-phase", default="", 
         choices=phases, help="run a specific phase")
     parser.add_argument("--run-prefix", default="run", help="set the prefix for run directories (default: run)")
-    parser.add_argument("--run-id", type=int, default=-1, help="Rerun a specific phase with a given run id (only valid when --run-single-phase is set)")
+    parser.add_argument("--run-id", default="n", help="n=new run (default), l=last run, or a numeric run id (only valid when --run-single-phase is set)")
     parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
     args = parser.parse_args()
 
