@@ -80,8 +80,8 @@ ENV LC_ALL=C
 
 # Build AFL++
 # AFLplusplus: just old version for now, apply afl-showmap.c.patch
-RUN cd utils && rm -rf AFLplusplus && git clone -b old https://github.com/hsh814/AFLplusplus.git AFLplusplus
-RUN cd utils/AFLplusplus && git switch old && make -j `nproc` all && \ 
+RUN cd utils && rm -rf AFLplusplus && git clone -b targeted https://github.com/hsh814/AFLplusplus.git AFLplusplus
+RUN cd utils/AFLplusplus && git switch targeted && make -j `nproc` all && \ 
     cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
     pip install "meson==0.56.2" && ./build_qemu_support.sh
 RUN cd utils && rm -rf binradar-aflplusplus && git clone -b binradar https://github.com/hsh814/AFLplusplus.git binradar-aflplusplus
