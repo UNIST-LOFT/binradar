@@ -801,8 +801,12 @@ class BinRadarExecutor:
     def check_requirements(self):
         if not os.path.exists(self.original_binary()):
             sys.exit("ERROR: binary does not exist.")
+        if not os.path.exists(self.patched_binary()):
+            sys.exit("ERROR: patched binary does not exist.")
         if not os.path.exists(self.resolved_poc_input()):
             sys.exit("ERROR: input does not exist.")
+        if self.probe_result is None:
+            sys.exit("ERROR: probe result not found. Please run the probe phase first.")
         # TODO: Implement stdin
         if "@@" not in self.test_cmd:
             sys.exit("ERROR: current implementation requires a file-based testcase (@@).")
@@ -902,6 +906,9 @@ class BinRadarExecutor:
     
     def run_minimizer(self):
         self.check_requirements()
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run minimizer.")
+            raise RuntimeError("Probe result not found.")
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
@@ -909,13 +916,16 @@ class BinRadarExecutor:
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
         testcase_dirs.extend(fuzzer.get_testcase_dirs())
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
-        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, testcase_dirs, config)
+        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()
         minimizer.run_testcases()
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_verifier(self):
         self.check_requirements()
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run verifier.")
+            raise RuntimeError("Probe result not found.")
         exec_mode = "verifier"
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
         if not os.path.exists(minimizer_result_file):
@@ -926,7 +936,7 @@ class BinRadarExecutor:
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.patched_binary(), list(range(1, self.total_patches + 1)))
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), list(range(1, self.total_patches + 1)))
         verifier.load_testcases(minimizer_result_file)
         verifier.run_verification_concrete_testcases()
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")

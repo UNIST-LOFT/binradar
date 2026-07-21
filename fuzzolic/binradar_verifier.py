@@ -463,6 +463,7 @@ class BinRadarConcreteVerifierResult:
 class BinRadarConcreteVerifier:
     dir: str
     run_dir: str
+    probe_result: BinRadarProbeResult
     runner: BinRadarQemuRunner
     patched_binary: str
     testcases: List[Testcase]
@@ -470,11 +471,12 @@ class BinRadarConcreteVerifier:
     start_time: float
     logger: logging.Logger
     minimized_dir: str
-    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, patched_binary: str, patches: List[int]):
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
         self.runner = runner
+        self.probe_result = probe_result
         self.patched_binary = patched_binary
         self.patches = patches
         self.testcases = list()
@@ -498,11 +500,18 @@ class BinRadarConcreteVerifier:
             parser.load(f)
         testcases = parser.get_result()["testcase"]["result"]
         for testcase in testcases:
+            id=testcase["id"]
+            filename=testcase["file"]
+            exit = testcase["exit"]
+            fault_addr = testcase["fault-addr"]
+            if exit == "crash" and fault_addr != self.probe_result.fault_addr:
+                self.logger.debug(f"[testcase] [skip-fault-diff] [id {id}] [file {filename}] [fault-addr {fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                continue
             self.testcases.append(Testcase(
-                id=testcase["id"],
-                filename=testcase["file"],
-                exit=testcase["exit"],
-                fault_addr=testcase["fault-addr"],
+                id=id,
+                filename=filename,
+                exit=exit,
+                fault_addr=fault_addr,
                 br=testcase["br"]
             ))
     
@@ -524,6 +533,9 @@ class BinRadarConcreteVerifier:
                         self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
                         continue
                     if result.is_crash():
+                        if result.fault_addr != self.probe_result.fault_addr:
+                            self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                            continue
                         patch_reject = testcase
                         self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                         # TODO: check if the crash is same with original crash

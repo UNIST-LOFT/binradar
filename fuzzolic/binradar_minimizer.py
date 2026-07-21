@@ -62,6 +62,7 @@ Plus, we only check if they hit the patch or not, without doing any actual minim
 class BinRadarMinimizer:
     work_dir: str
     run_dir: str
+    probe_result: binradar_verifier.BinRadarProbeResult
     minimized_dir: str
     testcases_dirs: List[str]
     files: Set[str]
@@ -69,7 +70,7 @@ class BinRadarMinimizer:
     config: Dict[str, str]
     logger: logging.Logger
     start_time: float
-    def __init__(self, work_dir: str, run_dir: str, testcases_dirs: List[str], config: Dict[str, str]):
+    def __init__(self, work_dir: str, run_dir: str, probe_result: binradar_verifier.BinRadarProbeResult, testcases_dirs: List[str], config: Dict[str, str]):
         self.work_dir = work_dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -80,6 +81,7 @@ class BinRadarMinimizer:
         self.files = set()
         self.testcases = set()
         self.config = config
+        self.probe_result = probe_result
         self.start_time = time.time()
         # Setup logger
         log_file = os.path.join(run_dir, "minimizer.sbsv")

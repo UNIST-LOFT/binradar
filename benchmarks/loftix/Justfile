@@ -1,7 +1,8 @@
 # Recipe to build all projects and bugs in the loftix benchmark
 # Run in benchmarks/loftix: cd benchmarks/loftix && just build-all
 
-build-all:
+# sequential
+run-all cmd:
     #!/usr/bin/env bash
     for project in *; do \
         if [ -d "$project" ]; then \
@@ -10,7 +11,7 @@ build-all:
                 if [ -d "$bug" ]; then \
                     if [ -f "$bug/config.env" ]; then \
                         echo "Building $bug"; \
-                        (cd "$bug" && just build); \
+                        (cd "$bug" && {{cmd}}); \
                     else \
                         echo "Skipping $bug, no config.env found"; \
                     fi; \
@@ -19,13 +20,13 @@ build-all:
         fi; \
     done;
 
-# Internal helper
-@_run-all command jobs prefix workdir:
+# parallel
+@_run-all name command jobs:
     #!/usr/bin/env bash
     mkdir -p logs
     find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel --tag --joblog logs/{{command}}.joblog --results logs/{{command}}-results -j {{jobs}} '
-      cd "{}" && just {{command}} {{workdir}}
+    | parallel --tag --joblog logs/{{name}}.joblog --results logs/{{name}}-results -j {{jobs}} '
+      cd "{}" && {{command}}
     '
 
 @_run-from-file command argfile jobs prefix workdir:
@@ -67,8 +68,12 @@ run cmd argfile="exp.list" jobs="20" workdir="workdir":
 resume cmd argfile="exp.list" jobs="20" workdir="workdir":
     just _resume-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RESUME" {{workdir}}
 
-run-all cmd jobs="20" workdir="workdir":
-    just _run-all {{cmd}} {{jobs}} "{{cmd}} RUN" {{workdir}}
+
+build-all:
+    just run-all "just build"
+
+backup-all workdir_old="workdir" workdir_bak="workdir-bak":
+    just _run-all backup "mv {{workdir_old}} {{workdir_bak}}" 20
 
 clean-all workdir="workdir":
-    rm -rf */*/{{workdir}}
+    just _run-all clean "rm -rf {{workdir}}" 20
