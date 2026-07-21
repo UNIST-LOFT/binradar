@@ -528,7 +528,9 @@ class BinRadarProgress:
             if item["id"] > run_id:
                 run_id = int(item["id"])
                 run_dir = item["dir"]
-        
+        if run_dir == "":
+            return None
+
         probe_done = False
         fuzzolic_done = False
         directed_done = False

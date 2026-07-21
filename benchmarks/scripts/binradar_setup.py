@@ -340,14 +340,61 @@ def run_fix(configdir: Path, config_path: Path, workdir: Path):
     else:
         print(f"Fix output: {result.stdout}")
 
+
+def extract_trampoline_info(brpatched_binary: Path) -> Dict[str, str]:
+    # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
+    binradar_env: Dict[str, str] = dict()
+    try:
+        cfg = parse_e9patch_config(brpatched_binary)
+        loader_base = cfg["loader_base"]
+        loader_size = cfg["loader_size"]
+        binradar_env["E9_LOADER_RANGE"] = f"0x{loader_base:x}-0x{loader_base + loader_size:x}"
+        print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
+
+        reserves = cfg["reserves"]
+        if reserves:
+            reserve_start = min(r[0] for r in reserves)
+            reserve_end = max(r[0] + r[1] for r in reserves)
+            binradar_env["PATCH_RESERVE_RANGE"] = f"0x{reserve_start:x}-0x{reserve_end:x}"
+            print(f"Full reserve range: 0x{reserve_start:x}-0x{reserve_end:x}")
+            # for addr, size, prot in sorted(reserves, key=lambda x: x[0]):
+            #     if 'x' in prot and "PATCH_RESERVE_ADDR" not in binradar_env:
+            #         binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
+            #         print(f"Patch reserve addr: 0x{addr:x} prot={prot}")
+            #         break
+        trampolines = cfg["trampolines"]
+        if trampolines:
+            tramp_start = min(t[0] for t in trampolines)
+            tramp_end = max(t[0] + t[1] for t in trampolines)
+            binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
+            print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
+    except Exception as e:
+        print(f"Warning: could not parse e9patch config: {e}")
+    return binradar_env
+
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
     # Read predicates
     predicates = list()
     predicates_file = workdir / "predicates"
+    original_binary = workdir / f"{binradar_env['BINARY']}.orig"
+    brpatched_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
+    
+    if not original_binary.exists():
+        print(f"Error: original binary {original_binary.name} not found in {workdir}")
+        exit(1)
+    
     if not predicates_file.exists():
+        # In certain bug types, taosc may not generate predicates
+        if brpatched_binary.exists():
+            extracted_env = extract_trampoline_info(brpatched_binary)
+            binradar_env.update(extracted_env)
+            binradar_env["TOTAL_PATCHES"] = "1"
+            print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
+            return
         print(f"Error: {predicates_file.name} file not found in {workdir}")
         exit(1)
+    
     with predicates_file.open("r") as f:
         for line in f:
             line = line.strip()
@@ -393,16 +440,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch compiled successfully")
+    
     # Patch the original binary
-    original_binary = workdir / f"{binradar_env['BINARY']}.orig"
-    if not original_binary.exists():
-        print(f"Error: original binary {original_binary.name} not found in {workdir}")
-        exit(1)
-    brpatch_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
     patch_addr = binradar_env["PATCH_LOC"]
     # dump metadata
     cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
-            "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
+            "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -411,43 +454,18 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Patch metadata dumped successfully")
     cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}", 
-            "-P", "if dest(state)@brpatch goto", "-o", str(brpatch_binary), str(original_binary)]
+            "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
         print(f"Error preparing patch: {result.stderr}")
         exit(1)
     else:
-        print(f"Prepare patch succeeded, patched binary at {brpatch_binary}")
+        print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
 
-    # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
-    try:
-        cfg = parse_e9patch_config(brpatch_binary)
-        loader_base = cfg["loader_base"]
-        loader_size = cfg["loader_size"]
-        binradar_env["E9_LOADER_RANGE"] = f"0x{loader_base:x}-0x{loader_base + loader_size:x}"
-        print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
+    extracted_env = extract_trampoline_info(brpatched_binary)
+    binradar_env.update(extracted_env)
 
-        reserves = cfg["reserves"]
-        if reserves:
-            reserve_start = min(r[0] for r in reserves)
-            reserve_end = max(r[0] + r[1] for r in reserves)
-            binradar_env["PATCH_RESERVE_RANGE"] = f"0x{reserve_start:x}-0x{reserve_end:x}"
-            print(f"Full reserve range: 0x{reserve_start:x}-0x{reserve_end:x}")
-            # for addr, size, prot in sorted(reserves, key=lambda x: x[0]):
-            #     if 'x' in prot and "PATCH_RESERVE_ADDR" not in binradar_env:
-            #         binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
-            #         print(f"Patch reserve addr: 0x{addr:x} prot={prot}")
-            #         break
-
-        trampolines = cfg["trampolines"]
-        if trampolines:
-            tramp_start = min(t[0] for t in trampolines)
-            tramp_end = max(t[0] + t[1] for t in trampolines)
-            binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
-            print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
-    except Exception as e:
-        print(f"Warning: could not parse e9patch config: {e}")
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:    
     env = load_env(config_path)
