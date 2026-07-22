@@ -64,6 +64,18 @@ static Query* query_queue;
 uint8_t printed[MAX_PRINT_CHECK];
 static ssize_t query_start_idx = -1;
 static ssize_t query_end_idx = -1;
+static int reverse_directed_mode = 0;
+static int reverse_directed_lowering = 0;
+static int reverse_directed_solving = 0;
+
+typedef struct ReverseCandidate {
+    Query*       query;
+    Z3_ast       alternate;
+    GHashTable*  inputs;
+} ReverseCandidate;
+
+static GArray* reverse_candidates = NULL;
+
 enum query_range_mode {
     QUERY_DEFAULT = 0,
     QUERY_ADD_DEP = 1,
@@ -824,6 +836,57 @@ static inline Z3_ast get_deps(GHashTable* inputs)
 #endif
     f_hash_table_destroy(added_exprs);
     return r;
+}
+
+static inline Z3_ast get_deps_upto(GHashTable* inputs, ssize_t max_query_idx,
+                                   int skip_expr)
+{
+    assert(inputs);
+    Z3_ast result = Z3_mk_true(smt_solver.ctx);
+    GHashTableIter iter, expr_iter;
+    gpointer key, value;
+    GHashTable* added = f_hash_table_new(NULL, NULL);
+
+    g_hash_table_iter_init(&iter, inputs);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        Dependency* dep = dependency_graph[(size_t)key];
+        if (!dep) continue;
+        g_hash_table_iter_init(&expr_iter, dep->exprs);
+        while (g_hash_table_iter_next(&expr_iter, &key, &value)) {
+            ssize_t idx = (ssize_t)(size_t)key;
+            if (idx > max_query_idx || idx == skip_expr ||
+                g_hash_table_contains(added, key)) {
+                continue;
+            }
+            if (idx < 0 || idx >= EXPR_QUERY_CAPACITY ||
+                !z3_ast_exprs[idx]) {
+                continue;
+            }
+            g_hash_table_add(added, key);
+            Z3_ast args[2] = {result, z3_ast_exprs[idx]};
+            result = Z3_mk_and(smt_solver.ctx, 2, args);
+        }
+    }
+
+    f_hash_table_destroy(added);
+    return result;
+}
+
+static inline Z3_ast get_forward_prefix_upto(ssize_t max_query_idx)
+{
+    Z3_ast result = Z3_mk_true(smt_solver.ctx);
+    if (max_query_idx < 0) {
+        return result;
+    }
+
+    for (ssize_t idx = 0; idx <= max_query_idx; idx++) {
+        if (!z3_ast_exprs[idx]) {
+            continue;
+        }
+        Z3_ast args[2] = {result, z3_ast_exprs[idx]};
+        result = Z3_mk_and(smt_solver.ctx, 2, args);
+    }
+    return result;
 }
 
 static Z3_ast z3_new_symbol(const char* name, size_t n_bits)
@@ -5450,7 +5513,10 @@ static inline void smt_notify_fuzzy_constraint(Z3_ast constraint)
 static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs, int mode)
 {
     Z3_solver solver = smt_new_solver();
-    if (mode == 2) {
+    if (reverse_directed_solving) {
+        Z3_ast prefix = get_forward_prefix_upto((ssize_t)GET_QUERY_IDX(q) - 1);
+        Z3_solver_assert(smt_solver.ctx, solver, prefix);
+    } else if (mode == 2) {
         add_deps_to_solver(inputs, solver, GET_QUERY_IDX(q));
     } else {
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), solver,  NULL);
@@ -5597,6 +5663,22 @@ static void smt_branch_query(Query* q)
             has_real_inputs = 1;
             break;
         }
+    }
+
+    if (reverse_directed_lowering) {
+        if (has_real_inputs) {
+            ReverseCandidate candidate = {
+                .query = q,
+                .alternate = z3_neg_query,
+                .inputs = inputs,
+            };
+            g_array_append_val(reverse_candidates, candidate);
+        }
+        if (inputs) {
+            update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
+        }
+        smt_notify_fuzzy_constraint(z3_query);
+        return;
     }
 
     uintptr_t query_idx = GET_QUERY_IDX(q);
@@ -6700,14 +6782,25 @@ static void smt_expr_query(Query* q, OPKIND opkind)
         return;
     }
 
+    uintptr_t solution = (uintptr_t)q->query->op2;
+
+    if (reverse_directed_lowering) {
+        if (opkind == SYMBOLIC_LOAD || opkind == SYMBOLIC_STORE) {
+            Z3_ast c = Z3_mk_eq(smt_solver.ctx, z3_query,
+                                smt_new_const(solution,
+                                              sizeof(uintptr_t) * 8));
+            z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+            update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
+        }
+        return;
+    }
+
 #if 1
     if (inputs_are_concretized) {
         // printf("Address is likely to be already concretized. Skipping it.\n");
         return;
     }
 #endif
-    uintptr_t solution = (uintptr_t)q->query->op2;
-
     if (current_query_mode == QUERY_MODE_BINRADAR) {
         switch (get_query_range_mode(GET_QUERY_IDX(q))) {
         case QUERY_DEFAULT:
@@ -6830,6 +6923,10 @@ static void smt_mem_concr_query(Query* q, OPKIND opkind)
     update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
     smt_notify_fuzzy_constraint(c);
 
+    if (reverse_directed_lowering) {
+        return;
+    }
+
 #if CHECK_SAT_PI
     check_pi(inputs, GET_QUERY_IDX(q));
 #endif
@@ -6879,6 +6976,13 @@ static void smt_binradar_concr_query(Query* q)
     Z3_ast c = Z3_mk_eq(smt_solver.ctx, memory_expr,
                         smt_new_const(concrete_val, expr_n_bits));
 
+    if (reverse_directed_lowering) {
+        z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+        update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
+        smt_notify_fuzzy_constraint(c);
+        return;
+    }
+
     if (current_query_mode == QUERY_MODE_BINRADAR) {
         // Negate the check for BINRADAR mode to find out-of-bounds accesses.
         switch (get_query_range_mode(GET_QUERY_IDX(q))) {
@@ -6907,6 +7011,14 @@ static void smt_binradar_heap_bound_check(Query* q)
     smt_bv_resize(&offset_expr, &size_expr, 0);
     Z3_ast check = Z3_mk_bvult(smt_solver.ctx, offset_expr, size_expr);
     inputs = merge_inputs(inputs, size_inputs);
+    if (reverse_directed_lowering) {
+        z3_ast_exprs[GET_QUERY_IDX(q)] = check;
+        if (inputs) {
+            update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
+        }
+        smt_notify_fuzzy_constraint(check);
+        return;
+    }
     if (current_query_mode == QUERY_MODE_BINRADAR) {
         // Negate the check for BINRADAR mode to find out-of-bounds accesses.
         switch (get_query_range_mode(GET_QUERY_IDX(q))) {
@@ -7226,6 +7338,16 @@ static void smt_model_expr(Query* q)
 {
     uintptr_t pc = q->address;
     printf("\n%s query (id=%lu) at %lx\n", model_to_str(q->model), GET_QUERY_IDX(q), pc);
+
+    if (reverse_directed_lowering) {
+        /* Model queries currently contain mutation-oriented semantics rather
+         * than a single path predicate.  Do not emit mutations during the
+         * lowering pass; the ordinary expression and memory queries around
+         * the model remain chronological. */
+        printf("[reverse-directed] deferring model query %lu\n",
+               GET_QUERY_IDX(q));
+        return;
+    }
 
     if (q->model == MODEL_STRCMP) {
 
@@ -7651,6 +7773,54 @@ static void smt_query(Query* q)
     }
 }
 
+static void reverse_directed_solve(void)
+{
+    if (!reverse_candidates || reverse_candidates->len == 0) {
+        printf("[reverse-directed] no symbolic candidates\n");
+        return;
+    }
+
+    reverse_directed_solving = 1;
+    printf("[reverse-directed] solving %u candidates from termination to entry\n",
+           reverse_candidates->len);
+    for (ssize_t i = (ssize_t)reverse_candidates->len - 1; i >= 0; i--) {
+        ReverseCandidate* candidate =
+            &g_array_index(reverse_candidates, ReverseCandidate, i);
+        if (!candidate->inputs || !candidate->alternate) {
+            continue;
+        }
+        printf("[reverse-directed] candidate index=%lu address=%lx\n",
+               GET_QUERY_IDX(candidate->query), candidate->query->address);
+        smt_check_z3(candidate->query, candidate->alternate,
+                     candidate->inputs, 2);
+    }
+    reverse_directed_solving = 0;
+}
+
+static int is_reverse_directed_mode(void)
+{
+    const char* env = getenv("BINRADAR_REVERSE_DIRECTED");
+    return env && atoi(env) != 0;
+}
+
+static void handle_query_reverse_directed(void)
+{
+    current_query_mode = QUERY_MODE_ORIGINAL;
+    reverse_candidates = g_array_new(FALSE, FALSE, sizeof(ReverseCandidate));
+    reverse_directed_lowering = 1;
+    for (Query* q = query_queue + 1; q->query != FINAL_QUERY; q++) {
+        if (!q->query) {
+            break;
+        }
+        smt_query(q);
+    }
+    reverse_directed_lowering = 0;
+    reverse_directed_solving = 0;
+    reverse_directed_solve();
+    g_array_free(reverse_candidates, TRUE);
+    reverse_candidates = NULL;
+}
+
 static int  need_to_clean = 1;
 static void cleanup(void)
 {
@@ -7725,6 +7895,14 @@ static inline int is_forkserver_mode(void)
 {
     const char* env = getenv("BINRADAR_FORKSERVER_ENABLE");
     return env && atoi(env) != 0;
+}
+
+static inline void load_reverse_directed_mode(void)
+{
+    reverse_directed_mode = is_reverse_directed_mode();
+    if (reverse_directed_mode) {
+        fprintf(stderr, "[solver] reverse-directed mode enabled (Z3 backend)\n");
+    }
 }
 
 static inline void load_initial_testcase()
@@ -8078,6 +8256,7 @@ int main(int argc, char* argv[])
     printf("[SOLVER] Waiting for the tracer...\n");
 
     int forkserver_mode = is_forkserver_mode();
+    load_reverse_directed_mode();
     while (1) {
         // wait tracer to finish one run and executor to trigger solving
         while (1) {
@@ -8100,8 +8279,12 @@ int main(int argc, char* argv[])
         Query *original_next_query = next_query;
         // 2. generate inputs using binradar method
         if (forkserver_mode) {
-            // reset_solver_session();
-            handle_query_binradar();
+            if (reverse_directed_mode) {
+                handle_query_reverse_directed();
+            } else {
+                // reset_solver_session();
+                handle_query_binradar();
+            }
         } else {
             handle_query_original();
             break;
