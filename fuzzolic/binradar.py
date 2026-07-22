@@ -390,7 +390,7 @@ class SolverExecutor:
     process: Optional[subprocess.Popen]
     timeout: float
     run_result: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float, fuzzy: bool = False):
+    def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float, fuzzy: bool = False, reverse_directed: bool = False):
         self.mode = mode
         global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
         context_bitmap = os.path.join(run_dir, f"{mode}-context-bitmap")
@@ -400,7 +400,9 @@ class SolverExecutor:
         for bitmap in [global_bitmap, context_bitmap, memory_bitmap]:
             with open(bitmap, "w") as f:
                 pass
-        solver_bin = SOLVER_FUZZY_BIN if fuzzy else SOLVER_SMT_BIN
+        # Reverse-directed solving currently uses the Z3 bounded-prefix path.
+        # Keep --fuzzy available for the other phases until fuzzy parity exists.
+        solver_bin = SOLVER_SMT_BIN if reverse_directed else (SOLVER_FUZZY_BIN if fuzzy else SOLVER_SMT_BIN)
         self.command = ["stdbuf", "-o0", solver_bin,
                         "-i", testcase, 
                         "-o", self.out_dir, 
@@ -522,7 +524,7 @@ class BinRadarProgress:
         rundir_log = parser.get_result()["rundir"]["set"]
         if len(rundir_log) == 0:
             return None
-        run_id = 0
+        run_id = -1
         run_dir = ""
         for item in rundir_log:
             if item["prefix"] != run_prefix:
@@ -583,6 +585,7 @@ class BinRadarExecutor:
     patch_addr_ranges: Tuple[str, str, str]
     total_patches: int
     fuzzy: bool
+    reverse_directed: bool
     # Data
     config: Dict[str, str]
     progress_filename: str
@@ -592,7 +595,7 @@ class BinRadarExecutor:
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, fuzzy: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, fuzzy: bool = False, reverse_directed: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -600,6 +603,7 @@ class BinRadarExecutor:
         self.poc_input = poc_input
         self.total_patches = total_patches
         self.fuzzy = fuzzy
+        self.reverse_directed = reverse_directed
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.patch_addr_ranges = patch_addr_ranges
@@ -647,7 +651,8 @@ class BinRadarExecutor:
                 env["E9_LOADER_RANGE"]
             ),
             total_patches=int(env["TOTAL_PATCHES"]),
-            fuzzy=env.get("BINRADAR_FUZZY", "0") == "1")
+            fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
+            reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1")
         return binradar
     
     def extract_config(self) -> Dict[str, str]:
@@ -751,6 +756,7 @@ class BinRadarExecutor:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             if mode == "directed":
+                env["BINRADAR_REVERSE_DIRECTED"] = "1" if self.reverse_directed else "0"
                 env["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(run_dir, 'binradar-query-window.sbsv')
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
                 env["BINRADAR_TRACE_FILE"] = "none"
@@ -867,7 +873,7 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(directed_env)
         shm.assign_random_keys()
         
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy, reverse_directed=self.reverse_directed)
         tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
         try:
             solver.start()
@@ -1186,6 +1192,9 @@ def main():
     parser.add_argument(
         "-f", "--fuzzy", action="store_true",
         help="use the Fuzzy-SAT solver")
+    parser.add_argument(
+        "--reverse-directed", action="store_true",
+        help="prioritize directed candidates from the end of the forward trace (Z3 only)")
     # The following argument is for experiments and debugging
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1207,6 +1216,7 @@ def main():
 
     env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
     env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
+    env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)
