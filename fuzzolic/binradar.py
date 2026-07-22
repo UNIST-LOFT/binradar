@@ -32,6 +32,7 @@ import sbsv
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SOLVER_SMT_BIN = SCRIPT_DIR + "/../solver/build/solver-smt"
+SOLVER_FUZZY_BIN = SCRIPT_DIR + "/../solver/build/solver-fuzzy"
 TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
@@ -166,9 +167,9 @@ class PipeManager:
         return self.stat_r
 
 class TracerExecutor:
-    forkserver_init_timeout: float = 600.0
-    forkserver_timeout: float = 60.0
-    analyzer_timeout: float = 600.0
+    forkserver_init_timeout: float = 1800.0
+    forkserver_timeout: float = 1800.0
+    analyzer_timeout: float = 1200.0
     command: List[str]
     mode: str
     env: Dict[str, str]
@@ -389,7 +390,7 @@ class SolverExecutor:
     process: Optional[subprocess.Popen]
     timeout: float
     run_result: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float):
+    def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float, fuzzy: bool = False):
         self.mode = mode
         global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
         context_bitmap = os.path.join(run_dir, f"{mode}-context-bitmap")
@@ -399,7 +400,8 @@ class SolverExecutor:
         for bitmap in [global_bitmap, context_bitmap, memory_bitmap]:
             with open(bitmap, "w") as f:
                 pass
-        self.command = ["stdbuf", "-o0", SOLVER_SMT_BIN, 
+        solver_bin = SOLVER_FUZZY_BIN if fuzzy else SOLVER_SMT_BIN
+        self.command = ["stdbuf", "-o0", solver_bin,
                         "-i", testcase, 
                         "-o", self.out_dir, 
                         "-b", global_bitmap,
@@ -580,6 +582,7 @@ class BinRadarExecutor:
     # PATCH_RESERVE_RANGE, E9_TRAMPOLINE_RANGE, E9_LOADER_RANGE
     patch_addr_ranges: Tuple[str, str, str]
     total_patches: int
+    fuzzy: bool
     # Data
     config: Dict[str, str]
     progress_filename: str
@@ -589,13 +592,14 @@ class BinRadarExecutor:
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, fuzzy: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
         self.binary = binary
         self.poc_input = poc_input
         self.total_patches = total_patches
+        self.fuzzy = fuzzy
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.patch_addr_ranges = patch_addr_ranges
@@ -642,7 +646,8 @@ class BinRadarExecutor:
                 env["E9_TRAMPOLINE_RANGE"],
                 env["E9_LOADER_RANGE"]
             ),
-            total_patches=int(env["TOTAL_PATCHES"]))
+            total_patches=int(env["TOTAL_PATCHES"]),
+            fuzzy=env.get("BINRADAR_FUZZY", "0") == "1")
         return binradar
     
     def extract_config(self) -> Dict[str, str]:
@@ -699,7 +704,7 @@ class BinRadarExecutor:
         self.previous_progress = BinRadarProgress.from_progress_file(run_prefix, self.progress_filename)
         if self.previous_progress is not None:
             run_id = self.previous_progress.run_id
-            if not use_last_run_id and resume_phase == BinRadarPhase.ALL:
+            if not use_last_run_id or resume_phase == BinRadarPhase.ALL:
                 run_id += 1
         run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -827,7 +832,7 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(fuzzolic_env)
         shm.assign_random_keys()
         
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, fuzzolic_env, self.workdir, timeout=self.timeout)
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, fuzzolic_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
         tracer = TracerExecutor(exec_mode, fuzzolic_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
         
         try:
@@ -862,7 +867,7 @@ class BinRadarExecutor:
         shm = SharedMemoryManager(directed_env)
         shm.assign_random_keys()
         
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout)
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
         tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
         try:
             solver.start()
@@ -956,7 +961,7 @@ class BinRadarExecutor:
         shm.assign_random_keys()
         shm.assign_random_key_for_binradar()
         
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout)
+        solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
         tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.patched_binary(), self.test_cmd, testcase, timeout=self.timeout)
         
         try:
@@ -1178,6 +1183,9 @@ def main():
     parser.add_argument(
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
+    parser.add_argument(
+        "-f", "--fuzzy", action="store_true",
+        help="use the Fuzzy-SAT solver")
     # The following argument is for experiments and debugging
     phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1198,6 +1206,7 @@ def main():
         env["BINRADAR_TIMEOUT"] = "3600" # 1 hours
 
     env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
+    env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

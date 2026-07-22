@@ -119,7 +119,7 @@ typedef struct SMTSolver {
     uint64_t   translation_time;
     uint64_t   expr_visit_time;
     uint64_t   slice_reasoning_time;
-#if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+#if USE_FUZZY_SOLVER
     fuzzy_ctx_t fuzzy_ctx;
 #endif
 } SMTSolver;
@@ -428,7 +428,7 @@ static void smt_init(void)
     z3_expr_cache = f_hash_table_new(NULL, NULL);
     z3_opt_cache = f_hash_table_new(NULL, NULL);
 
-#if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+#if USE_FUZZY_SOLVER
     z3fuzz_init(&smt_solver.fuzzy_ctx, smt_solver.ctx,
                 (char*)config.testcase_path, NULL, &conc_query_eval_value,
                 SOLVER_TIMEOUT_FUZZY_MS);
@@ -475,7 +475,7 @@ static inline void smt_del_solver(Z3_solver solver)
 static inline void smt_destroy(void)
 {
 #if USE_FUZZY_SOLVER
-    // z3fuzz_free(&smt_solver.fuzzy_ctx);
+    z3fuzz_free(&smt_solver.fuzzy_ctx);
 #endif
     if (smt_solver.ctx) {
         Z3_del_context(smt_solver.ctx);
@@ -5344,6 +5344,11 @@ int generate_matching_pattern(Z3_ast e)
 static Z3_ast fuzzy_query_dump = NULL;
 
 #if USE_FUZZY_SOLVER
+static inline void smt_notify_fuzzy_constraint(Z3_ast constraint)
+{
+    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, constraint);
+}
+
 static inline int smt_check_fuzzy(Query* q, Z3_ast z3_neg_query, GHashTable* inputs, int mode)
 {
     int is_sat = 0;
@@ -5434,6 +5439,11 @@ static inline int smt_check_fuzzy(Query* q, Z3_ast z3_neg_query, GHashTable* inp
         q->address, (uint16_t)q->args8.arg0, r);
     return is_sat;
 }
+#else
+static inline void smt_notify_fuzzy_constraint(Z3_ast constraint)
+{
+    (void)constraint;
+}
 #endif
 
 // mode: 0 = none, 1 = optimistic, 2 = skip update deps & optimistic
@@ -5498,6 +5508,16 @@ static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs
 #endif
     smt_del_solver(solver);
     return is_sat;
+}
+
+static inline int smt_check(Query* q, Z3_ast query, GHashTable* inputs,
+                            int mode)
+{
+#if USE_FUZZY_SOLVER
+    return smt_check_fuzzy(q, query, inputs, mode);
+#else
+    return smt_check_z3(q, query, inputs, mode);
+#endif
 }
 
 static void smt_branch_query(Query* q)
@@ -5588,7 +5608,8 @@ static void smt_branch_query(Query* q)
                 // update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
                 break;
             case QUERY_NEGATE: {
-                smt_check_z3(q, z3_neg_query, inputs, 2);
+                smt_check(q, z3_neg_query, inputs, 2);
+                smt_notify_fuzzy_constraint(z3_query);
                 return;
             }
             case QUERY_IGNORE:
@@ -5685,29 +5706,7 @@ static void smt_branch_query(Query* q)
             // print_z3_ast(z3_neg_query);
             // print_z3_original(z3_neg_query);
             // print_expr(q->query);
-#if USE_FUZZY_SOLVER
-            if (is_interesting == 2) {
-#else
-            if (is_interesting) {
-#endif
-                smt_check_z3(q, z3_neg_query, inputs, config.optimistic_solving);
-            }
-#if USE_FUZZY_SOLVER
-            else {
-#if !CHECK_FUZZY_MISPREDICTIONS
-                smt_check_fuzzy(q, z3_neg_query, inputs, config.optimistic_solving);
-#else
-                int is_sat = smt_check_fuzzy(q, z3_neg_query, inputs, 0);
-                if (!is_sat) {
-                    is_sat = smt_check_z3(q, z3_neg_query, inputs, 2);
-                    if (is_sat) {
-                        printf("FUZZY MISPREDICTION\n");
-                        //ABORT();
-                    }
-                }
-#endif
-            }
-#endif
+            smt_check(q, z3_neg_query, inputs, config.optimistic_solving);
         } else {
 #if 0
             printf("Branch (addr=%lx id=%lu) is not interesting. Skipping it.\n", 
@@ -5741,9 +5740,7 @@ static void smt_branch_query(Query* q)
     if (GET_QUERY_IDX(q) == 2218)
         ABORT();
 #endif
-#if USE_FUZZY_SOLVER
-    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, z3_query);
-#endif
+    smt_notify_fuzzy_constraint(z3_query);
 
 #if CHECK_SAT_PI
     check_pi(inputs, GET_QUERY_IDX(q));
@@ -6520,9 +6517,7 @@ static void smt_slice_query(Query* q)
             z3_ast_exprs[GET_QUERY_IDX(q)] = c;
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
 
-#if USE_FUZZY_SOLVER
-            z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, c);
-#endif
+            smt_notify_fuzzy_constraint(c);
         }
 
         f_hash_table_destroy(conc_addrs);
@@ -6633,7 +6628,7 @@ static void smt_slice_query(Query* q)
     s_load_obj->expr  = e;
     sloads_exprs      = g_slist_append(sloads_exprs, (gpointer)s_load_obj);
 
-#if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+#if USE_FUZZY_SOLVER
     // printf("Assignment: %lu\n", scale_sload_index(s_load_id) + 1);
     z3fuzz_add_assignment(&smt_solver.fuzzy_ctx,
                           scale_sload_index(s_load_id) + 1, z3_addr);
@@ -6804,9 +6799,7 @@ static void smt_expr_query(Query* q, OPKIND opkind)
 #endif
         z3_ast_exprs[GET_QUERY_IDX(q)] = c;
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
-#if USE_FUZZY_SOLVER
-        z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, c);
-#endif
+        smt_notify_fuzzy_constraint(c);
     }
 }
 static void smt_mem_concr_query(Query* q, OPKIND opkind)
@@ -6835,9 +6828,7 @@ static void smt_mem_concr_query(Query* q, OPKIND opkind)
 
     z3_ast_exprs[GET_QUERY_IDX(q)] = c;
     update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
-#if USE_FUZZY_SOLVER
-    z3fuzz_notify_constraint(&smt_solver.fuzzy_ctx, c);
-#endif
+    smt_notify_fuzzy_constraint(c);
 
 #if CHECK_SAT_PI
     check_pi(inputs, GET_QUERY_IDX(q));
@@ -6897,7 +6888,7 @@ static void smt_binradar_concr_query(Query* q)
                 break;
             case QUERY_NEGATE: {
                 Z3_ast modify = Z3_mk_not(smt_solver.ctx, c);
-                smt_check_z3(q, modify, inputs, 2);
+                smt_check(q, modify, inputs, 2);
                 return;
             }
             case QUERY_IGNORE:
@@ -6925,7 +6916,7 @@ static void smt_binradar_heap_bound_check(Query* q)
                 break;
             case QUERY_NEGATE: {
                 Z3_ast may_crash = Z3_mk_not(smt_solver.ctx, check);
-                smt_check_z3(q, may_crash, inputs, 2);
+                smt_check(q, may_crash, inputs, 2);
                 return;
             }
             case QUERY_IGNORE:
@@ -7118,11 +7109,7 @@ static void strcmp_s1_symbolic(Query* q,
         }
         mutations[mutation_count].type = NO_MUTATION;
 
-#if !USE_FUZZY_SOLVER
-        int r = smt_check_z3(q, branch_neg, inputs, skip_update_deps ? 2 : config.optimistic_solving);
-#else
-        int r = smt_check_fuzzy(q, branch_neg, inputs, skip_update_deps ? 2 : config.optimistic_solving);
-#endif
+        smt_check(q, branch_neg, inputs, skip_update_deps ? 2 : config.optimistic_solving);
     } else {
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
     }
@@ -7291,11 +7278,7 @@ static void smt_model_expr(Query* q)
 
             if (is_interesting) {
             printf("Running query...\n");
-#if !USE_FUZZY_SOLVER
-                smt_check_z3(q, branch_neg, inputs, config.optimistic_solving);
-#else
-                smt_check_fuzzy(q, branch_neg, inputs, config.optimistic_solving);
-#endif
+                smt_check(q, branch_neg, inputs, config.optimistic_solving);
             } else {
                 update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
             }
@@ -7433,11 +7416,7 @@ static void smt_model_expr(Query* q)
             if (is_interesting) {
                 sub_idx_offset = i;
                 printf("Running query...\n");
-#if !USE_FUZZY_SOLVER
-                smt_check_z3(q, byte, p_inputs, 2);
-#else
-                smt_check_fuzzy(q, byte, p_inputs, 2);
-#endif
+                smt_check(q, byte, p_inputs, 2);
             }
             if (offset == 0 || i < offset - 1) {
                 byte = Z3_mk_not(smt_solver.ctx, byte);
@@ -7470,11 +7449,7 @@ static void smt_model_expr(Query* q)
                     Z3_ast cc3 = Z3_mk_and(smt_solver.ctx, 2, and);
                     if (is_interesting) {
                         sub_idx_offset = i;
-#if !USE_FUZZY_SOLVER
-                        smt_check_z3(q, cc3, p_inputs, 2);
-#else
-                        smt_check_fuzzy(q, cc3, p_inputs, 2);
-#endif
+                        smt_check(q, cc3, p_inputs, 2);
                     }
                     byte = Z3_mk_not(smt_solver.ctx, byte);
                     Z3_ast and2[] = { cc2, byte };
@@ -7532,11 +7507,7 @@ static void smt_model_expr(Query* q)
 
         if (is_interesting) {
             printf("Running query...\n");
-#if !USE_FUZZY_SOLVER
-            smt_check_z3(q, branch_neg, inputs, config.optimistic_solving);
-#else
-            smt_check_fuzzy(q, branch_neg, inputs, config.optimistic_solving);
-#endif
+            smt_check(q, branch_neg, inputs, config.optimistic_solving);
 
             int64_t min_index = -1;
             GHashTableIter iter;
@@ -7904,7 +7875,7 @@ static inline void reset_solver_session(void)
     smt_solver.expr_visit_time     = 0;
     smt_solver.slice_reasoning_time = 0;
 
-#if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+#if USE_FUZZY_SOLVER
     z3fuzz_free(&smt_solver.fuzzy_ctx);
     z3fuzz_init(&smt_solver.fuzzy_ctx, smt_solver.ctx,
                 (char*)config.testcase_path, NULL, &conc_query_eval_value,
