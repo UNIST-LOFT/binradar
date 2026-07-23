@@ -420,7 +420,7 @@ class BinRadarQemuRunner:
         patch_result = BinRadarPatchResult.from_log(patch_result_data)
         if patch_result is None:
             # logger.error("Failed to parse patch result from the log.")
-            logger.debug(f"Failed to parse patch result with id {patch_id}, {testcase}")
+            # logger.debug(f"Failed to parse patch result with id {patch_id}, {testcase}")
             return None, None
         return BinRadarProbeResult.from_log(result.stderr), patch_result
 

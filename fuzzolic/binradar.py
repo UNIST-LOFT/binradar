@@ -709,7 +709,7 @@ class BinRadarExecutor:
         self.previous_progress = BinRadarProgress.from_progress_file(run_prefix, self.progress_filename)
         if self.previous_progress is not None:
             run_id = self.previous_progress.run_id
-            if not use_last_run_id or resume_phase == BinRadarPhase.ALL:
+            if not use_last_run_id:
                 run_id += 1
         run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
         os.makedirs(run_dir, exist_ok=True)
