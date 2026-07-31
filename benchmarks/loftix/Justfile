@@ -25,21 +25,21 @@ run-all cmd:
     #!/usr/bin/env bash
     mkdir -p logs
     find . -maxdepth 3 -name config.env -exec dirname {} \; \
-    | parallel --tag --joblog logs/{{name}}.joblog --results logs/{{name}}-results -j {{jobs}} '
+    | parallel --tag --joblog logs/{{name}}.tsv --results logs/{{name}}-results -j {{jobs}} '
       cd "{}" && {{command}}
     '
 
 @_run-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
-    parallel --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
+    parallel --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
       'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
-    parallel --resume --tag --joblog "logs/{{command}}.joblog" --results logs/{{command}}-results -j {{jobs}} \
+    parallel --resume --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
       'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
@@ -50,14 +50,14 @@ list out="exp.list":
 
 failed command out="failed.list":
     #!/usr/bin/env bash
-    awk 'NR>1 && $7!=0' logs/{{command}}.joblog \
+    awk 'NR>1 && $7!=0' logs/{{command}}.tsv \
       | sed -E 's/^.*cd "([^"]+)".*$/\1/' \
       > {{out}}
     echo "Failures ({{out}}): $(wc -l < {{out}})"
 
 success command out="success.list":
     #!/usr/bin/env bash
-    awk 'NR>1 && $7==0' logs/{{command}}.joblog \
+    awk 'NR>1 && $7==0' logs/{{command}}.tsv \
       | sed -E 's/^.*cd "([^"]+)".*$/\1/' \
       > {{out}}
     echo "Successes ({{out}}): $(wc -l < {{out}})"
