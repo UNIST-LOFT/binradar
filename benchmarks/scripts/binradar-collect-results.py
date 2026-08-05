@@ -13,7 +13,7 @@ For each experiment listed in exp.list, it:
   3. Looks for errors in binradar.log (and binradar-tracer-msg.log) for each run
   4. Shows the [final] result (remaining_patches)
 
-Output is saved to logs/<datetime>.log (or .csv)
+Output is saved to logs/binradar-<datetime>.log (or .csv/.tsv)
 """
 
 import argparse
@@ -29,6 +29,19 @@ from typing import Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
+
+
+def display_path(exp_file_dir: str, path: str) -> str:
+    """Return a path relative to the exp list directory, for output."""
+    if not os.path.isabs(path):
+        return os.path.normpath(path)
+    try:
+        rel = os.path.relpath(path, exp_file_dir)
+    except ValueError:
+        return path
+    if rel.startswith(".."):
+        return path
+    return rel
 
 # Phases that appear in progress.sbsv
 KNOWN_PHASES = {"probe", "binradar", "directed", "fuzzer", "fuzzolic",
@@ -464,8 +477,8 @@ def main():
                         help="Work directory name (default: workdir)")
     parser.add_argument("--run-prefix", default="run",
                         help="Run directory prefix (default: run)")
-    parser.add_argument("--format", choices=["log", "csv"], default="log",
-                        help="Output format: log (default) or csv")
+    parser.add_argument("--format", choices=["log", "csv", "tsv"], default="log",
+                        help="Output format: log (default), csv, or tsv")
     args = parser.parse_args()
 
     exp_file = args.exp
@@ -484,7 +497,9 @@ def main():
     # Resolve relative paths against the exp_file directory
     exp_file_dir = os.path.dirname(os.path.abspath(exp_file))
     resolved_dirs = []
+    display_dirs = []
     for d in exp_dirs:
+        display_dirs.append(display_path(exp_file_dir, d))
         if not os.path.isabs(d):
             d = os.path.normpath(os.path.join(exp_file_dir, d))
         resolved_dirs.append(d)
@@ -495,25 +510,28 @@ def main():
 
     # Collect all results
     all_results: List[ExperimentResult] = []
-    for exp_dir in resolved_dirs:
+    for exp_dir, display in zip(resolved_dirs, display_dirs):
         result = collect_experiment_result(exp_dir, workdir_name, run_prefix)
+        if output_format in ("csv", "tsv"):
+            result.exp_dir = display
         all_results.append(result)
 
     # Output file
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    ext = "csv" if output_format == "csv" else "log"
-    output_path = os.path.join(logs_dir, f"{timestamp}.{ext}")
+    ext = output_format if output_format in ("csv", "tsv") else "log"
+    output_path = os.path.join(logs_dir, f"binradar-{timestamp}.{ext}")
 
     # Count
     ok_count = sum(1 for r in all_results if r.overall_status == "ok")
     issues_count = sum(1 for r in all_results if r.overall_status == "issues")
     no_data_count = sum(1 for r in all_results if r.overall_status == "no_data")
 
-    if output_format == "csv":
-        # Write CSV
+    if output_format in ("csv", "tsv"):
+        # Write CSV/TSV
+        delimiter = "\t" if output_format == "tsv" else ","
         csv_rows = format_results_csv(all_results)
         with open(output_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, delimiter=delimiter)
             writer.writeheader()
             # Also write a summary row at the end
             writer.writerows(csv_rows)

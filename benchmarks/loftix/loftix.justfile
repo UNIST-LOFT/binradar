@@ -38,6 +38,11 @@ binradar-dev workdir="workdir" binradar_image="fuzzolic:2204":
 binradar-guix workdir="workdir":
     guix shell binradar -- binradar -w {{workdir}}
 
+
 # Run inside docker container
 br workdir="workdir":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600
+
+eval workdir="workdir" fuzzer="sdfuzz" fuzz_out="/workspace/binradar/benchmarks/sdfuzz":
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-evaluation.py -w {{workdir}} --fuzzer {{fuzzer}} --fuzz-out {{fuzz_out}}
+

@@ -120,7 +120,11 @@ class BinRadarMinimizer:
                 self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
                 if os.path.exists(current_testcase):
                     os.unlink(current_testcase)
-                os.link(testcase.filename, current_testcase)
+                try:
+                    os.link(testcase.filename, current_testcase)
+                except OSError:
+                    # Cross-device link (e.g. external fuzzer output on another filesystem)
+                    shutil.copyfile(testcase.filename, current_testcase)
                 # TODO: better minimization
                 run_res, patch_res = runner.test_with_patched("0", current_testcase, verbose=False)
                 # run_result = runner.test_with_original(current_testcase, verbose=False)
@@ -134,6 +138,10 @@ class BinRadarMinimizer:
                     self.log(f"Failed to run patched binary for {testcase.filename}.")
                     continue
                 save_file = f"{id}_{os.path.basename(testcase.filename)}"
-                os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
+                try:
+                    os.link(testcase.filename, os.path.join(self.minimized_dir, save_file))
+                except OSError:
+                    # Cross-device link (e.g. external fuzzer output on another filesystem)
+                    shutil.copyfile(testcase.filename, os.path.join(self.minimized_dir, save_file))
                 self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_res.serialize()} {patch_res.serialize()}")
                 id += 1

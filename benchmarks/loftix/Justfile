@@ -77,3 +77,6 @@ backup-all workdir_old="workdir" workdir_bak="workdir-bak":
 
 clean-all workdir="workdir":
     just _run-all clean "rm -rf {{workdir}}" 20
+
+eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/workspace/binradar/benchmarks/sdfuzz":
+    just _run-all eval "just eval {{workdir}} {{fuzzer}} {{fuzz_out_root}}/{}/work-{{fuzzer}}/out" 20
