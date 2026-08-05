@@ -4,6 +4,7 @@ import csv
 import enum
 import os
 import re
+import shlex
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -46,6 +47,9 @@ Subcommands:
 
 Results are summarized in a single file (logs/qasan-<timestamp>.log by
 default, or logs/qasan-<timestamp>.csv / .tsv with --format csv / tsv).
+With --format log, --verbose adds a reproduction command line per probe
+(`cd <workdir> && ENV=...; <command>`) so a failing subject can be
+re-run by hand.
 """
 
 
@@ -80,6 +84,25 @@ class QasanSubjectResult:
     orig_fault_addr: str = ""
     patched_exit: str = ""
     patched_fault_addr: str = ""
+    orig_cmd: str = ""
+    patched_cmd: str = ""
+
+
+def format_repro_command(workdir: str, command: List[str],
+                         env: Dict[str, str]) -> str:
+    """Build a single-line reproduction command for a probe run.
+
+    Format: cd <workdir> && ENV=...; <command>. Only env vars that differ
+    from the current environment are listed (the runner's overrides).
+    """
+    assignments = " ".join(
+        f"{k}={shlex.quote(v)}"
+        for k, v in sorted(env.items())
+        if v != os.environ.get(k))
+    cmd_str = shlex.join(command)
+    if assignments:
+        return f"cd {shlex.quote(workdir)} && {assignments}; {cmd_str}"
+    return f"cd {shlex.quote(workdir)} && {cmd_str}"
 
 
 def extract_exit_info(log: str) -> Optional[str]:
@@ -105,7 +128,8 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
         probe = BinRadarProbeResult.from_log(result.stderr)
         if probe is None:
             exit_hint = extract_exit_info(result.stderr) or ""
-    return probe, exit_hint, result
+    repro = format_repro_command(workdir, command, proc_env)
+    return probe, exit_hint, result, repro
 
 
 def run_qasan_subject(exp_dir: str, workdir_name: str,
@@ -135,13 +159,16 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
         return result
 
     try:
-        orig_probe, orig_hint, orig_res = run_qasan_probe(
+        orig_probe, orig_hint, orig_res, orig_repro = run_qasan_probe(
             workdir, env, False, testcase, timeout)
-        patched_probe, patched_hint, patched_res = run_qasan_probe(
+        patched_probe, patched_hint, patched_res, patched_repro = run_qasan_probe(
             workdir, env, True, testcase, timeout)
     except Exception as e:
         result.detail = f"execution error: {e}"
         return result
+
+    result.orig_cmd = orig_repro
+    result.patched_cmd = patched_repro
 
     if orig_probe is None:
         reason = "timeout" if not orig_res.success else (orig_hint or "parse failure")
@@ -184,7 +211,7 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
 # Output formatters
 # ---------------------------------------------------------------------------
 
-def format_log_result(result: QasanSubjectResult) -> str:
+def format_log_result(result: QasanSubjectResult, verbose: bool = False) -> str:
     lines = [f"=== {result.exp_dir} ==="]
     if result.status == Status.SKIP:
         lines.append(f"  [STATUS] SKIP: {result.detail}")
@@ -194,6 +221,11 @@ def format_log_result(result: QasanSubjectResult) -> str:
     if result.status != Status.BASELINE:
         lines.append(f"  [patched] exit: {result.patched_exit or 'n/a'}  "
                      f"fault-addr: {result.patched_fault_addr or 'n/a'}")
+    if verbose:
+        if result.orig_cmd:
+            lines.append(f"  [cmd orig] {result.orig_cmd}")
+        if result.patched_cmd:
+            lines.append(f"  [cmd patched] {result.patched_cmd}")
     lines.append(f"  [VERDICT] {result.status} ({result.detail})")
     return "\n".join(lines)
 
@@ -239,7 +271,7 @@ def write_log(output_path: str, args, results: List[QasanSubjectResult],
         "",
     ]
     for r in results:
-        lines.append(format_log_result(r))
+        lines.append(format_log_result(r, verbose=args.verbose))
         lines.append("")
     lines.append("=" * 60)
     lines.append(
@@ -255,6 +287,10 @@ def write_log(output_path: str, args, results: List[QasanSubjectResult],
 # ---------------------------------------------------------------------------
 
 def cmd_qasan(args):
+    if args.verbose and args.format != "log":
+        print("ERROR: --verbose only works with --format=log", file=sys.stderr)
+        sys.exit(1)
+
     exp_file = args.exp
     if not os.path.isfile(exp_file):
         print(f"ERROR: exp list file not found: {exp_file}")
@@ -344,6 +380,10 @@ def main():
     qasan.add_argument(
         "--jobs", type=int, default=1,
         help="number of subjects to test in parallel (default: 1)")
+    qasan.add_argument(
+        "--verbose", action="store_true",
+        help="with --format=log, add a reproduction command line per probe "
+             "(cd <workdir> && ENV=...; <command>); incompatible with csv/tsv")
     qasan.set_defaults(func=cmd_qasan)
 
     args = parser.parse_args()
