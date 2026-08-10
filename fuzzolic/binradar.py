@@ -584,6 +584,7 @@ class BinRadarExecutor:
     # PATCH_RESERVE_RANGE, E9_TRAMPOLINE_RANGE, E9_LOADER_RANGE
     patch_addr_ranges: Tuple[str, str, str]
     total_patches: int
+    e9_relocated_calls: str
     fuzzy: bool
     reverse_directed: bool
     # Data
@@ -595,13 +596,14 @@ class BinRadarExecutor:
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, fuzzy: bool = False, reverse_directed: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
         self.binary = binary
         self.poc_input = poc_input
         self.total_patches = total_patches
+        self.e9_relocated_calls = e9_relocated_calls
         self.fuzzy = fuzzy
         self.reverse_directed = reverse_directed
         self.test_cmd = test_cmd
@@ -651,6 +653,7 @@ class BinRadarExecutor:
                 env["E9_LOADER_RANGE"]
             ),
             total_patches=int(env["TOTAL_PATCHES"]),
+            e9_relocated_calls=env["E9_RELOCATED_CALL_JUMPS"],
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1")
         return binradar
@@ -667,6 +670,7 @@ class BinRadarExecutor:
         config["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
         config["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
         config["TOTAL_PATCHES"] = str(self.total_patches)
+        config["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
         return config
 
     def elapsed_time_ms(self) -> int:

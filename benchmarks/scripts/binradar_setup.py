@@ -3,8 +3,9 @@ import os
 import argparse
 import subprocess
 import struct
+import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional, Union, Tuple
+from typing import List, Dict, Optional, Union, Tuple, cast
 import shutil
 import re
 import enum
@@ -194,13 +195,13 @@ def emit_patch(node: AstNode) -> str:
         return f"v{value}"
 
     if kind == "u+":
-        return emit_patch(node[1])
+        return emit_patch(cast(AstNode, node[1]))
 
     if kind == "u-":
-        return f"-p0{emit_patch(node[1])}"
+        return f"-p0{emit_patch(cast(AstNode, node[1]))}"
 
     if kind == "u~":
-        return f"~{emit_patch(node[1])}"
+        return f"~{emit_patch(cast(AstNode, node[1]))}"
 
     op_map = {
         "+": "+",
@@ -268,6 +269,182 @@ E9_CONFIG_MAGIC = b"E9PATCH\0"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
 E9_MAP_STRUCT = struct.Struct("<iII")
 
+
+def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, bytes, str]]:
+    """Disassemble one E9Patch mapping and return (address, bytes, text)."""
+    with tempfile.NamedTemporaryFile(prefix="e9patch-map-", delete=False) as f:
+        f.write(data)
+        map_path = Path(f.name)
+
+    try:
+        cmd = [
+            "objdump",
+            "-D",
+            "-b",
+            "binary",
+            "-m",
+            "i386:x86-64",
+            "-Mintel",
+            f"--adjust-vma=0x{address:x}",
+            str(map_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "objdump failed")
+
+        instructions: List[Tuple[int, bytes, str]] = []
+        line_re = re.compile(
+            r"^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)(.*)$"
+        )
+        for line in result.stdout.splitlines():
+            match = line_re.match(line)
+            if match is None:
+                continue
+            insn_address = int(match.group(1), 16)
+            insn_bytes = bytes.fromhex(match.group(2))
+            instructions.append((insn_address, insn_bytes, match.group(3).strip()))
+        return instructions
+    finally:
+        map_path.unlink(missing_ok=True)
+
+
+def _parse_e9tool_patch_metadata(path: Path) -> Tuple[Optional[int], Dict[int, Tuple[int, int]]]:
+    """Read patch offset and instruction address/length from e9tool JSON output.
+
+    e9tool's JSON stream contains JSON-RPC instruction messages but the
+    metadata payload can contain trailing commas.  Regex parsing therefore
+    keeps this independent of whether the whole line is strict JSON.
+    """
+    patch_offset: Optional[int] = None
+    instructions: Dict[int, Tuple[int, int]] = {}
+    instruction_re = re.compile(
+        r'"method"\s*:\s*"instruction".*?'
+        r'"address"\s*:\s*"(0x[0-9a-fA-F]+)".*?'
+        r'"length"\s*:\s*(\d+).*?'
+        r'"offset"\s*:\s*(\d+)'
+    )
+    patch_re = re.compile(
+        r'"method"\s*:\s*"patch".*?"offset"\s*:\s*(\d+)'
+    )
+
+    with path.open("r") as f:
+        for line in f:
+            match = instruction_re.search(line)
+            if match is not None:
+                address = int(match.group(1), 16)
+                length = int(match.group(2))
+                offset = int(match.group(3))
+                instructions[offset] = (address, length)
+                continue
+            match = patch_re.search(line)
+            if match is not None:
+                patch_offset = int(match.group(1))
+
+    return patch_offset, instructions
+
+
+def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
+    """Return (direct/indirect/other, direct target) for an x86-64 call."""
+    i = 0
+    prefixes = {
+        0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65,
+        0x66, 0x67, 0xF0, 0xF2, 0xF3,
+    }
+    while i < len(data) and (data[i] in prefixes or 0x40 <= data[i] <= 0x4F):
+        i += 1
+    if i >= len(data):
+        return "other", None
+    if data[i] == 0xE8 and i + 5 <= len(data):
+        displacement = struct.unpack_from("<i", data, i + 1)[0]
+        return "direct", displacement
+    if data[i] == 0xFF and i + 2 <= len(data):
+        modrm = data[i + 1]
+        if ((modrm >> 3) & 0x7) == 0x2:
+            return "indirect", None
+    return "other", None
+
+
+def extract_relocated_call_jumps(
+    brpatched_binary: Path,
+    metadata_path: Path,
+    original_binary: Path,
+    patch_addr: int,
+) -> List[Tuple[int, int, int]]:
+    """Find E9Patch's jump used to emulate the selected original call.
+
+    With the default backend option ``-Ocall=false``, a relocated direct call
+    is emitted as ``push original_next; jmp target``.  The jump is inside an
+    E9Patch trampoline, not at the original patch address.  For a direct call
+    the target is unambiguous; for an indirect call this returns indirect-jump
+    candidates preceded by the return-address setup sequence.
+    """
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
+
+    patch_offset, instructions = _parse_e9tool_patch_metadata(metadata_path)
+    site: Optional[Tuple[int, int]] = None
+    if patch_offset is not None:
+        site = instructions.get(patch_offset)
+    if site is None:
+        for address, length in instructions.values():
+            if address == patch_addr:
+                site = (address, length)
+                break
+    if site is None or patch_offset is None:
+        raise ValueError("could not resolve patched instruction from e9tool metadata")
+
+    _, instruction_length = site
+    with original_binary.open("rb") as f:
+        f.seek(patch_offset)
+        original_instruction = f.read(instruction_length)
+    call_kind, direct_displacement = _decode_call_site(original_instruction)
+    if call_kind == "other":
+        return []
+
+    direct_target: Optional[int] = None
+    if call_kind == "direct":
+        if direct_displacement is None:
+            raise ValueError("direct call has no rel32 displacement")
+        direct_target = patch_addr + instruction_length + direct_displacement
+
+    cfg = parse_e9patch_config(brpatched_binary)
+    original_call_site = site[0]
+    ret_addr = original_call_site + instruction_length
+    candidates: List[Tuple[int, int, int]] = []
+    for mapping in cfg["maps"]:
+        if mapping["type"] != E9MapType.TRAMPOLINE:
+            continue
+        with brpatched_binary.open("rb") as f:
+            f.seek(mapping["file_offset"])
+            data = f.read(mapping["size"])
+        if len(data) != mapping["size"]:
+            raise ValueError("trampoline mapping extends past the patched binary")
+
+        instructions_in_map = _parse_objdump_instructions(data, mapping["address"])
+        for index, (address, _, text) in enumerate(instructions_in_map):
+            if not text.startswith("jmp"):
+                continue
+
+            operand = text[len("jmp"):].strip()
+            target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
+            jump_target = int(target_match.group(1), 16) if target_match else None
+
+            if direct_target is not None:
+                if jump_target == direct_target:
+                    candidates.append((address, original_call_site, ret_addr))
+                continue
+
+            # For an indirect call the rewritten instruction is an indirect
+            # jmp.  It follows the push/lea/xchg return-address setup.  The
+            # short look-back avoids treating E9Patch's conditional-goto
+            # ``jmp *%fs:0x40`` as a call-equivalent jump.
+            if jump_target is None:
+                previous = instructions_in_map[max(0, index - 6):index]
+                if any(item[2].startswith("push") for item in previous):
+                    candidates.append((address, original_call_site, ret_addr))
+
+    return sorted(set(candidates))
+
 def parse_e9patch_config(path: Path) -> Dict:
     """Parse e9patch's embedded e9_config_s from a patched binary.
     
@@ -297,6 +474,7 @@ def parse_e9patch_config(path: Path) -> Dict:
         "loader_base": base,
         "loader_size": loader_size,
         "entry": entry,
+        "maps": [],
         "reserves": [],
         "trampolines": [],
         "refactors": [],
@@ -310,16 +488,28 @@ def parse_e9patch_config(path: Path) -> Dict:
         if map_start + num_maps * 12 > len(data):
             raise ValueError(f"e9patch config maps overflow in {path}")
         for i in range(num_maps):
-            addr_s32, file_off, bitfield = E9_MAP_STRUCT.unpack_from(data, map_start + i * 12)
+            addr_s32, file_off_pages, bitfield = E9_MAP_STRUCT.unpack_from(
+                data, map_start + i * 12
+            )
             size_pages = bitfield & 0xFFFFF
             map_type = (bitfield >> 20) & 0x3
             r = (bitfield >> 28) & 1
             w = (bitfield >> 29) & 1
             x = (bitfield >> 30) & 1
+            absolute = bool((bitfield >> 31) & 1)
 
             vaddr = addr_s32 * PAGE_SIZE
             vsize = size_pages * PAGE_SIZE
             prot = f"{'r' if r else '-'}{'w' if w else '-'}{'x' if x else '-'}"
+            mapping = {
+                "address": vaddr,
+                "file_offset": file_off_pages * PAGE_SIZE,
+                "size": vsize,
+                "type": E9MapType(map_type),
+                "prot": prot,
+                "absolute": absolute,
+            }
+            result["maps"].append(mapping)
 
             # type_name = ["TRAMPOLINE", "RESERVE", "REFACTOR"][map_type]
             if map_type == E9MapType.RESERVE:
@@ -341,7 +531,12 @@ def run_fix(configdir: Path, config_path: Path, workdir: Path):
         print(f"Fix output: {result.stdout}")
 
 
-def extract_trampoline_info(brpatched_binary: Path) -> Dict[str, str]:
+def extract_trampoline_info(
+    brpatched_binary: Path,
+    metadata_path: Optional[Path] = None,
+    original_binary: Optional[Path] = None,
+    patch_addr: Optional[int] = None,
+) -> Dict[str, str]:
     # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
     binradar_env: Dict[str, str] = dict()
     try:
@@ -368,6 +563,24 @@ def extract_trampoline_info(brpatched_binary: Path) -> Dict[str, str]:
             tramp_end = max(t[0] + t[1] for t in trampolines)
             binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
             print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
+
+        if metadata_path is not None and original_binary is not None and patch_addr is not None:
+            call_jumps = extract_relocated_call_jumps(
+                brpatched_binary,
+                metadata_path,
+                original_binary,
+                patch_addr,
+            )
+            if call_jumps:
+                records = ",".join(
+                    f"0x{jump_addr:x}:0x{call_site:x}:0x{ret_addr:x}"
+                    for jump_addr, call_site, ret_addr in call_jumps
+                )
+                binradar_env["E9_RELOCATED_CALL_JUMPS"] = records
+                # binradar_env["E9_RELOCATED_CALL_JUMP_COUNT"] = str(len(call_jumps))
+                print(f"E9 relocated call jump(s): {records}")
+            else:
+                print("No relocated call-equivalent jump found for the patch site")
     except Exception as e:
         print(f"Warning: could not parse e9patch config: {e}")
     return binradar_env
@@ -387,7 +600,14 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     if not predicates_file.exists():
         # In certain bug types, taosc may not generate predicates
         if brpatched_binary.exists():
-            extracted_env = extract_trampoline_info(brpatched_binary)
+            metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+            patch_addr = int(binradar_env["PATCH_LOC"], 0)
+            extracted_env = extract_trampoline_info(
+                brpatched_binary,
+                metadata_path if metadata_path.exists() else None,
+                original_binary,
+                patch_addr,
+            )
             binradar_env.update(extracted_env)
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
@@ -443,9 +663,10 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     
     # Patch the original binary
     patch_addr = binradar_env["PATCH_LOC"]
+    metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
     # dump metadata
     cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
-            "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
+            "-P", "if dest(state)@brpatch goto", "-o", str(metadata_path), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -463,7 +684,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
 
-    extracted_env = extract_trampoline_info(brpatched_binary)
+    extracted_env = extract_trampoline_info(
+        brpatched_binary,
+        metadata_path,
+        original_binary,
+        int(patch_addr, 0),
+    )
     binradar_env.update(extracted_env)
 
 
