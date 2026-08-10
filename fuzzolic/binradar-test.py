@@ -242,20 +242,25 @@ CSV_COLUMNS = [
 
 
 def write_delimited(output_path: str, results: List[QasanSubjectResult],
-                    delimiter: str):
+                    delimiter: str, include_subject_id: bool = True):
+    columns = list(CSV_COLUMNS)
+    if not include_subject_id:
+        columns.remove("experiment")
     with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, delimiter=delimiter)
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter=delimiter)
         writer.writeheader()
         for r in results:
-            writer.writerow({
-                "experiment": r.exp_dir,
+            row = {
                 "verdict": r.status,
                 "detail": r.detail,
                 "orig_exit": r.orig_exit,
                 "orig_fault_addr": r.orig_fault_addr,
                 "patched_exit": r.patched_exit,
                 "patched_fault_addr": r.patched_fault_addr,
-            })
+            }
+            if include_subject_id:
+                row["experiment"] = r.exp_dir
+            writer.writerow(row)
 
 
 def write_log(output_path: str, args, results: List[QasanSubjectResult],
@@ -341,7 +346,8 @@ def cmd_qasan(args):
 
     if args.format in ("csv", "tsv"):
         delimiter = "\t" if args.format == "tsv" else ","
-        write_delimited(output_path, results, delimiter)
+        write_delimited(output_path, results, delimiter,
+                        include_subject_id=not args.no_subject_id)
     else:
         write_log(output_path, args, results, counts, len(resolved))
 
@@ -384,6 +390,9 @@ def main():
         "--verbose", action="store_true",
         help="with --format=log, add a reproduction command line per probe "
              "(cd <workdir> && ENV=...; <command>); incompatible with csv/tsv")
+    qasan.add_argument(
+        "-n", "--no-subject-id", action="store_true",
+        help="omit the experiment subject id column in csv/tsv output")
     qasan.set_defaults(func=cmd_qasan)
 
     args = parser.parse_args()

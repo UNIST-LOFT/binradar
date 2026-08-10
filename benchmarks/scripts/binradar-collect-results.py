@@ -528,13 +528,13 @@ CSV_COLUMNS = [
 ]
 
 
-def format_results_csv(all_results: List[ExperimentResult]) -> List[Dict[str, str]]:
+def format_results_csv(all_results: List[ExperimentResult],
+                       include_subject_id: bool = True) -> List[Dict[str, str]]:
     """Convert a list of ExperimentResults into CSV rows (list of dicts)."""
     rows: List[Dict[str, str]] = []
     for result in all_results:
         if result.error_message:
-            rows.append({
-                "experiment": result.exp_dir,
+            row = {
                 "run": "",
                 "status": f"ERROR: {result.error_message}",
                 "has_final": "",
@@ -545,7 +545,10 @@ def format_results_csv(all_results: List[ExperimentResult]) -> List[Dict[str, st
                 "log_errors_count": "",
                 "tracer_errors_count": "",
                 "error_preview": result.error_message,
-            })
+            }
+            if include_subject_id:
+                row["experiment"] = result.exp_dir
+            rows.append(row)
             continue
 
         for run_res in result.runs:
@@ -554,8 +557,7 @@ def format_results_csv(all_results: List[ExperimentResult]) -> List[Dict[str, st
             error_preview = "; ".join(
                 _truncate(e, 120) for e in all_errors[:3])
 
-            rows.append({
-                "experiment": result.exp_dir,
+            row = {
                 "run": run_res.run_name,
                 "status": run_res.status,
                 "has_final": str(run_res.has_final),
@@ -566,7 +568,10 @@ def format_results_csv(all_results: List[ExperimentResult]) -> List[Dict[str, st
                 "log_errors_count": str(len(run_res.log_errors)),
                 "tracer_errors_count": str(len(run_res.tracer_errors)),
                 "error_preview": error_preview,
-            })
+            }
+            if include_subject_id:
+                row["experiment"] = result.exp_dir
+            rows.append(row)
     return rows
 
 
@@ -630,14 +635,14 @@ SDFUZZ_CSV_COLUMNS = [
 ]
 
 
-def format_sdfuzz_results_csv(all_results: List[SdfuzzResult]) -> List[Dict[str, str]]:
+def format_sdfuzz_results_csv(all_results: List[SdfuzzResult],
+                              include_subject_id: bool = True) -> List[Dict[str, str]]:
     """Convert a list of SdfuzzResults into CSV rows (list of dicts)."""
     rows: List[Dict[str, str]] = []
     for result in all_results:
         error_preview = "; ".join(
             _truncate(e, 120) for e in result.log_errors[:3])
-        rows.append({
-            "experiment": result.exp_dir,
+        row = {
             "status": result.error_message
             if result.error_message else result.status,
             "remaining_patches": result.remaining_patches,
@@ -649,7 +654,10 @@ def format_sdfuzz_results_csv(all_results: List[SdfuzzResult]) -> List[Dict[str,
             "verifier_testcases": str(result.verifier_testcases),
             "log_errors_count": str(len(result.log_errors)),
             "error_preview": error_preview,
-        })
+        }
+        if include_subject_id:
+            row["experiment"] = result.exp_dir
+        rows.append(row)
     return rows
 
 
@@ -688,9 +696,14 @@ def write_output(output_path: str, output_format: str, header: List[str],
             writer.writeheader()
             writer.writerows(csv_rows)
             summary_row = {col: "" for col in header}
-            summary_row["experiment"] = "SUMMARY"
-            summary_row["status"] = " ".join(
-                f"{name}={value}" for name, value in counts.items())
+            if "experiment" in header:
+                summary_row["experiment"] = "SUMMARY"
+                summary_row["status"] = " ".join(
+                    f"{name}={value}" for name, value in counts.items())
+            else:
+                summary_row[header[0]] = "SUMMARY"
+                summary_row[header[1] if len(header) > 1 else header[0]] = " ".join(
+                    f"{name}={value}" for name, value in counts.items())
             writer.writerow(summary_row)
     else:
         with open(output_path, "w") as f:
@@ -735,8 +748,12 @@ def cmd_binradar(args):
               "no_data": no_data_count, "total": len(resolved_dirs)}
 
     if output_format in ("csv", "tsv"):
-        csv_rows = format_results_csv(all_results)
-        write_output(output_path, output_format, CSV_COLUMNS, csv_rows, [],
+        columns = list(CSV_COLUMNS)
+        if args.no_subject_id:
+            columns.remove("experiment")
+        csv_rows = format_results_csv(
+            all_results, include_subject_id=not args.no_subject_id)
+        write_output(output_path, output_format, columns, csv_rows, [],
                      counts)
     else:
         output_lines: List[str] = []
@@ -796,8 +813,12 @@ def cmd_sdfuzz(args):
               "no_data": no_data_count, "total": len(resolved_dirs)}
 
     if output_format in ("csv", "tsv"):
-        csv_rows = format_sdfuzz_results_csv(all_results)
-        write_output(output_path, output_format, SDFUZZ_CSV_COLUMNS, csv_rows,
+        columns = list(SDFUZZ_CSV_COLUMNS)
+        if args.no_subject_id:
+            columns.remove("experiment")
+        csv_rows = format_sdfuzz_results_csv(
+            all_results, include_subject_id=not args.no_subject_id)
+        write_output(output_path, output_format, columns, csv_rows,
                      [], counts)
     else:
         output_lines: List[str] = []
@@ -837,6 +858,9 @@ def main():
     shared.add_argument("--fuzzer", default="sdfuzz",
                         help="Fuzzer output directory name under workdir "
                              "(sdfuzz only, default: sdfuzz)")
+    shared.add_argument(
+        "-n", "--no-subject-id", action="store_true",
+        help="omit the experiment subject id column in csv/tsv output")
 
     parser = argparse.ArgumentParser(
         description="Collect binradar results from experiments",
