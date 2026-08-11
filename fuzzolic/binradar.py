@@ -604,6 +604,7 @@ class BinRadarExecutor:
     run_id: int
     run_dir: str
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
+    filter_result: List[int]
     start_time: float
     def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False):
         self.workdir = os.path.abspath(workdir)
@@ -618,6 +619,7 @@ class BinRadarExecutor:
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.patch_addr_ranges = patch_addr_ranges
+        self.filter_result = list(range(1, total_patches + 1))
 
         self.libc = ctypes.CDLL("libc.so.6")
 
@@ -848,6 +850,7 @@ class BinRadarExecutor:
                 logger.warning("[FILTER] Failed to load the existing filter result. Re-running the filter phase.")
             else:
                 logger.info(f"[FILTER] Loaded existing filter result: {survived_patches}")
+                self.filter_result = survived_patches
                 return survived_patches
         exec_mode = "filter"
         self.save_progress(f"[filter] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
@@ -872,6 +875,7 @@ class BinRadarExecutor:
                     survived_patches.append(patch_id)
         logger.info(f"[FILTER] [survived {survived_patches}]")
         self.save_progress(f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] [survived {survived_patches}]")
+        self.filter_result = survived_patches
         return survived_patches
 
     def check_requirements(self):
@@ -1012,7 +1016,8 @@ class BinRadarExecutor:
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), list(range(1, self.total_patches + 1)))
+        logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), self.filter_result)
         verifier.load_testcases(minimizer_result_file)
         verifier.run_verification_concrete_testcases()
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
@@ -1070,7 +1075,7 @@ class BinRadarExecutor:
         if not os.path.exists(verifier_result_file):
             logger.error("Verifier result file not found. BinRadar results might be incomplete.")
             raise FileNotFoundError(f"Verifier result file not found: {verifier_result_file}")
-        remaining_patches = set(range(1, self.total_patches + 1))
+        remaining_patches = set(self.filter_result)
         concrete_verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verifier_result_file)
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
