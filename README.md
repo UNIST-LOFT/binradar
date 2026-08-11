@@ -107,13 +107,14 @@ Output will be saved in the `out` directory in the working directory. You can ch
 
 These are main phases:
 1. PROBE: run the test cases with original binary to confirm the crash and collect information about the crash (e.g., fault address, patch function entrypoint, patch function hit count, etc.)
-2. FUZZOLIC: run fuzzolic (concolic execution) with the original binary and the test cases to collect more concrete test cases.
-3. DIRECTED: run modified fuzzolic with the original binary and the test cases to collect more directed test cases.
-4. FUZZER: run simple binary-only fuzzer with the original binary and the test cases to collect more fuzzed test cases.
-5. MINIMIZER: remove redundant or non-reachable concrete test cases.
-6. VERIFIER: run patched binary with the collected test cases to check if the patch is correct. If any test case fails, the patch is rejected. If all test cases pass, the patch is verified.
-7. BINRADAR: binradar - directly mutate the memory state and check if the patch is correct.
-8. FINAL: finalize the verification process and save the results.
+2. FILTER: filter out patches that does not fix the crash.
+3. FUZZOLIC: run fuzzolic (concolic execution) with the original binary and the test cases to collect more concrete test cases.
+4. DIRECTED: run modified fuzzolic with the original binary and the test cases to collect more directed test cases.
+5. FUZZER: run simple binary-only fuzzer with the original binary and the test cases to collect more fuzzed test cases.
+6. MINIMIZER: remove redundant or non-reachable concrete test cases.
+7. VERIFIER: run patched binary with the collected test cases to check if the patch is correct. If any test case fails, the patch is rejected. If all test cases pass, the patch is verified.
+8. BINRADAR: binradar - directly mutate the memory state and check if the patch is correct.
+9. FINAL: finalize the verification process and save the results.
 
 Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run in parallel by default. You can run them sequentially by specifying `--seq` option. Also, you can specify which phases to run by using `--run-single-phase` option.
 

@@ -780,7 +780,10 @@ class BinRadarExecutor:
                 env["BINRADAR_TRACE_FILE"] = trace_file
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
                 env["PATCH_ID"] = "123456"
-                env["BINRADAR_PATCH_CNT"] = str(self.total_patches)
+                env["BINRADAR_PATCH_CNT"] = str(len(self.filter_result))
+                filter_file = os.path.join(run_dir, "filter.sbsv")
+                if os.path.exists(filter_file):
+                    env["BINRADAR_PATCH_FILTER_FILE"] = filter_file
         return env
     
     def run_probe(self):
@@ -1179,9 +1182,10 @@ class BinRadarExecutor:
         self.run_probe()
         if phase == BinRadarPhase.PROBE:
             return
-        elif phase == BinRadarPhase.FILTER:
-            self.run_filter()
-        elif phase == BinRadarPhase.FUZZOLIC:
+        self.run_filter()
+        if phase == BinRadarPhase.FILTER:
+            return
+        if phase == BinRadarPhase.FUZZOLIC:
             self.run_fuzzolic()
         elif phase == BinRadarPhase.DIRECTED:
             self.run_directed()
