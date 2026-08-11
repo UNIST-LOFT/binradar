@@ -50,13 +50,14 @@ HANDSHAKE_EXPECTED = 0x41464C00
 class BinRadarPhase(enum.IntEnum):
     ALL = 0
     PROBE = 1
-    FUZZOLIC = 2
-    DIRECTED = 3
-    FUZZER = 4
-    MINIMIZER = 5
-    VERIFIER = 6
-    BINRADAR = 7
-    FINAL = 8
+    FILTER = 2
+    FUZZOLIC = 3
+    DIRECTED = 4
+    FUZZER = 5
+    MINIMIZER = 6
+    VERIFIER = 7
+    BINRADAR = 8
+    FINAL = 9
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -485,16 +486,18 @@ class BinRadarProgress:
     run_id: int
     run_dir: str
     probe_done: bool
+    filter_done: bool
     fuzzolic_done: bool
     directed_done: bool
     fuzzer_done: bool
     minimizer_done: bool
     verifier_done: bool
     done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, filter_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
         self.run_id = run_id
         self.run_dir = run_dir
         self.probe_done = probe_done
+        self.filter_done = filter_done
         self.fuzzolic_done = fuzzolic_done
         self.directed_done = directed_done
         self.fuzzer_done = fuzzer_done
@@ -511,6 +514,7 @@ class BinRadarProgress:
         parser.add_schema("[rundir] [set] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[rundir] [done] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[probe] [done] [prefix: str] [id: int]")
+        parser.add_schema("[filter] [done] [prefix: str] [id: int]")
         parser.add_schema("[fuzzolic] [done] [prefix: str] [id: int]")
         parser.add_schema("[directed] [done] [prefix: str] [id: int]")
         parser.add_schema("[fuzzer] [done] [prefix: str] [id: int]")
@@ -536,6 +540,7 @@ class BinRadarProgress:
             return None
 
         probe_done = False
+        filter_done = False
         fuzzolic_done = False
         directed_done = False
         fuzzer_done = False
@@ -545,6 +550,10 @@ class BinRadarProgress:
         for probe in parser.get_result()["probe"]["done"]:
             if int(probe["id"]) == run_id and probe["prefix"] == run_prefix:
                 probe_done = True
+                break
+        for filter in parser.get_result()["filter"]["done"]:
+            if int(filter["id"]) == run_id and filter["prefix"] == run_prefix:
+                filter_done = True
                 break
         for fuzzolic in parser.get_result()["fuzzolic"]["done"]:
             if int(fuzzolic["id"]) == run_id and fuzzolic["prefix"] == run_prefix:
@@ -570,7 +579,7 @@ class BinRadarProgress:
             if int(verifier["id"]) == run_id and verifier["prefix"] == run_prefix:
                 verifier_done = True
                 break
-        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
+        return BinRadarProgress(run_id, run_dir, probe_done, filter_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
     # Config from binradar.env and command line arguments
@@ -815,6 +824,56 @@ class BinRadarExecutor:
             f.write(f"[probe-info] {probe_result.serialize()}\n")
             f.write(f"[file-trace] {file_trace_result.serialize_file_trace_result()}\n")
     
+    def load_filter_result(self, filter_result_file: str) -> List[int]:
+        survived_patches: List[int] = list()
+        with open(filter_result_file, encoding="utf-8") as f:
+            parser = sbsv.parser()
+            parser.add_schema("[patch] [id: int] [pass: bool]")
+            rows = parser.load(f)
+        for row in rows["patch"]:
+            if row["pass"]:
+                survived_patches.append(row["id"])
+        return survived_patches
+
+    def run_filter(self) -> List[int]:
+        self.check_requirements()
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run filter.")
+            raise RuntimeError("Probe result not found.")
+        filter_result_file = os.path.join(self.run_dir, "filter.sbsv")
+        if os.path.exists(filter_result_file):
+            try:
+                survived_patches = self.load_filter_result(filter_result_file)
+            except Exception:
+                logger.warning("[FILTER] Failed to load the existing filter result. Re-running the filter phase.")
+            else:
+                logger.info(f"[FILTER] Loaded existing filter result: {survived_patches}")
+                return survived_patches
+        exec_mode = "filter"
+        self.save_progress(f"[filter] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        config = self.extract_config()
+        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
+        testcase = self.resolved_poc_input()
+        survived_patches: List[int] = list()
+        with open(filter_result_file, "w", encoding="utf-8") as f:
+            for patch_id in range(1, self.total_patches + 1):
+                result, _ = runner.test_with_patched(str(patch_id), testcase)
+                if result is None:
+                    logger.warning(f"[FILTER] [patch {patch_id}] Failed to run patched binary with the poc input. Keeping the patch.")
+                    passed = True
+                elif result.is_crash() and result.fault_addr == self.probe_result.fault_addr:
+                    passed = False
+                    logger.info(f"[FILTER] [patch {patch_id}] Still crashes at the original fault address {result.fault_addr:#x}. Filtered out.")
+                else:
+                    passed = True
+                    logger.info(f"[FILTER] [patch {patch_id}] Does not crash at the original fault address {self.probe_result.fault_addr:#x} (exit {result.exit_info}, fault-addr {result.fault_addr:#x}). Survived.")
+                f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
+                if passed:
+                    survived_patches.append(patch_id)
+        logger.info(f"[FILTER] [survived {survived_patches}]")
+        self.save_progress(f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] [survived {survived_patches}]")
+        return survived_patches
+
     def check_requirements(self):
         if not os.path.exists(self.original_binary()):
             sys.exit("ERROR: binary does not exist.")
@@ -1087,6 +1146,12 @@ class BinRadarExecutor:
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
+        survived_patches = self.run_filter()
+        if len(survived_patches) == 0:
+            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+            self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
+            self.done()
+            return
         self.run_fuzzolic()
         self.run_directed()
         self.run_fuzzer()
@@ -1109,6 +1174,8 @@ class BinRadarExecutor:
         self.run_probe()
         if phase == BinRadarPhase.PROBE:
             return
+        elif phase == BinRadarPhase.FILTER:
+            self.run_filter()
         elif phase == BinRadarPhase.FUZZOLIC:
             self.run_fuzzolic()
         elif phase == BinRadarPhase.DIRECTED:
@@ -1131,6 +1198,13 @@ class BinRadarExecutor:
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
+
+        survived_patches = self.run_filter()
+        if len(survived_patches) == 0:
+            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+            self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
+            self.done()
+            return
 
         thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
         
@@ -1200,7 +1274,7 @@ def main():
         "--reverse-directed", action="store_true",
         help="prioritize directed candidates from the end of the forward trace (Z3 only)")
     # The following argument is for experiments and debugging
-    phases = ["probe", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
+    phases = ["probe", "filter", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
         choices=phases, help="run a specific phase")
     parser.add_argument("--run-prefix", default="run", help="set the prefix for run directories (default: run)")

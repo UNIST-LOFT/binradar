@@ -56,7 +56,7 @@ def display_path(exp_file_dir: str, path: str) -> str:
     return rel
 
 # Phases that appear in progress.sbsv
-KNOWN_PHASES = {"probe", "binradar", "directed", "fuzzer", "fuzzolic",
+KNOWN_PHASES = {"probe", "filter", "binradar", "directed", "fuzzer", "fuzzolic",
                 "minimizer", "verifier", "final"}
 
 
