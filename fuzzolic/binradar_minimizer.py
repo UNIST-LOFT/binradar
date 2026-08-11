@@ -7,8 +7,10 @@ import subprocess
 import tempfile
 import shutil
 import hashlib
-import logging
 import time
+import threading
+import queue
+import fcntl
 
 from typing import List, Dict, Set, Tuple, Any, Optional
 
@@ -68,7 +70,7 @@ class BinRadarMinimizer:
     files: Set[str]
     testcases: Set[TestcaseInfo]
     config: Dict[str, str]
-    logger: logging.Logger
+    log_file: str
     start_time: float
     def __init__(self, work_dir: str, run_dir: str, probe_result: binradar_verifier.BinRadarProbeResult, testcases_dirs: List[str], config: Dict[str, str]):
         self.work_dir = work_dir
@@ -83,21 +85,24 @@ class BinRadarMinimizer:
         self.config = config
         self.probe_result = probe_result
         self.start_time = time.time()
-        # Setup logger
-        log_file = os.path.join(run_dir, "minimizer.sbsv")
-        self.logger = logging.getLogger(__name__)
-        self.logger.propagate = False
-        self.logger.setLevel(logging.DEBUG)
-        fh = logging.FileHandler(log_file, mode="w")
-        fh.setLevel(logging.DEBUG)
-        fmt = logging.Formatter("%(asctime)s - %(message)s")
-        fh.setFormatter(fmt)
-        self.logger.addHandler(fh)
-    
+        self.log_file = os.path.join(run_dir, "minimizer.sbsv")
+        with open(self.log_file, "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            f.truncate()
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
+
     def log(self, msg: str):
         elapsed = int((time.time() - self.start_time) * 1000)
-        self.logger.info(f"{msg} [time {elapsed}]")
-    
+        ts = time.strftime("%Y-%m-%d %H:%M:%S") + f",{int(time.time() * 1000) % 1000:03d}"
+        line = f"{ts} - {msg} [time {elapsed}]\n"
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(line)
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
+
     def load_testcases(self):
         for testcases_dir in self.testcases_dirs:
             for testcase_file in sorted(glob.glob(os.path.join(testcases_dir, "*"))):
@@ -145,3 +150,39 @@ class BinRadarMinimizer:
                     shutil.copyfile(testcase.filename, os.path.join(self.minimized_dir, save_file))
                 self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_res.serialize()} {patch_res.serialize()}")
                 id += 1
+            self.log("[minimizer] [done]")
+
+
+def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
+                               verifier: "binradar_verifier.BinRadarConcreteVerifier",
+                               minimizer_result_file: str,
+                               poll_interval: float = 0.2) -> None:
+    """Run the minimizer and the concrete verifier concurrently: the verifier
+    streams [testcase] [result] rows from minimizer.sbsv while the minimizer
+    appends them, and finishes when the minimizer ends (or earlier, when every
+    patch is already rejected). The minimizer's exceptions are re-raised here.
+    """
+    exc_queue: "queue.Queue[BaseException]" = queue.Queue()
+
+    def _run_minimizer():
+        try:
+            minimizer.run_testcases()
+        except BaseException as exc:
+            exc_queue.put(exc)
+
+    thread = threading.Thread(target=_run_minimizer, name="minimizer", daemon=True)
+    thread.start()
+    try:
+        verifier.run_verification_streaming(
+            minimizer_result_file,
+            poll_interval=poll_interval,
+            minimizer_thread=thread,
+            minimizer_exc_queue=exc_queue,
+        )
+        thread.join()
+    except BaseException:
+        # Do not orphan the minimizer's subprocesses on the error path.
+        thread.join(timeout=300)
+        raise
+    if not exc_queue.empty():
+        raise exc_queue.get()

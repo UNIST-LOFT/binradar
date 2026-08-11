@@ -99,6 +99,8 @@ Output will be saved in the `out` directory in the working directory. You can ch
 `out/progress.log` file contains information about the progress of the verification process. 
 `[final] [done] [id {run_id}] [remaining_patches {remaining_patches}] [binradar_remaining_patches {binradar_remaining_patches}]` indicates the final result of the verification process.
 
+`minimizer.sbsv` is streamed: the minimizer appends each row holding `fcntl.flock(LOCK_EX)` across write+flush, and the verifier reads new rows with the same lock, so partial rows are never observed. The `[minimizer] [done] [time N]` row signals the end of the stream.
+
 ## Structure
 ### Orchestrator
 - `fuzzolic/binradar.py`: main entry point for the verification process
@@ -111,12 +113,12 @@ These are main phases:
 3. FUZZOLIC: run fuzzolic (concolic execution) with the original binary and the test cases to collect more concrete test cases.
 4. DIRECTED: run modified fuzzolic with the original binary and the test cases to collect more directed test cases.
 5. FUZZER: run simple binary-only fuzzer with the original binary and the test cases to collect more fuzzed test cases.
-6. MINIMIZER: remove redundant or non-reachable concrete test cases.
-7. VERIFIER: run patched binary with the collected test cases to check if the patch is correct. If any test case fails, the patch is rejected. If all test cases pass, the patch is verified.
+6. MINIMIZER: remove redundant or non-reachable concrete test cases. Kept test cases are linked into `minimized/` and recorded as `[testcase] [result]` rows in `minimizer.sbsv`; the final `[minimizer] [done] [time N]` row marks completion.
+7. VERIFIER: run patched binary with the collected test cases to check if the patch is correct. If any test case fails, the patch is rejected. If all test cases pass, the patch is verified. It runs concurrently with the minimizer, streaming its test cases from `minimizer.sbsv` as they are produced; a patch is rejected by the first failing test case and verified when none fails before the minimizer ends.
 8. BINRADAR: binradar - directly mutate the memory state and check if the patch is correct.
 9. FINAL: finalize the verification process and save the results.
 
-Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run in parallel by default. You can run them sequentially by specifying `--seq` option. Also, you can specify which phases to run by using `--run-single-phase` option.
+Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run in parallel by default, and `MINIMIZER`/`VERIFIER` run concurrently with each other: the verifier consumes the minimizer's test cases as they are produced instead of waiting for the minimizer to finish first. You can run them sequentially by specifying `--seq` option (minimizer and verifier remain concurrent with each other). Also, you can specify which phases to run by using `--run-single-phase` option (`verifier` as a single phase replays a completed `minimizer.sbsv` and requires its done marker).
 
 ### tracer
 Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QEMU `4.1.1` with modifications for symbolic execution and type inference.

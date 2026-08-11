@@ -305,24 +305,23 @@ def main():
             workdir, minimizer_dir, probe_result, testcase_dirs, env)
         minimizer.load_testcases()
         logger.info(f"[MINIMIZER] Loaded {len(minimizer.testcases)} unique testcases")
-        minimizer.run_testcases()
-        logger.info(f"[MINIMIZER] Minimized {len(os.listdir(minimizer.minimized_dir))} testcases")
 
-        # 3. Concrete verifier on the filtered patches only
-        minimizer_result_file = os.path.join(minimizer_dir, "minimizer.sbsv")
+        # 3. Concrete verifier (on the filtered patches only) runs concurrently
         runner = binradar_verifier.BinRadarQemuRunner.from_env(workdir, env)
         verifier = binradar_verifier.BinRadarConcreteVerifier(
             workdir, minimizer_dir, runner, probe_result,
             os.path.join(workdir, f"{binary}.brpatched"),
             survived)
-        verifier.load_testcases(minimizer_result_file)
+        minimizer_result_file = os.path.join(minimizer_dir, "minimizer.sbsv")
+        binradar_minimizer.run_minimizer_and_verifier(
+            minimizer, verifier, minimizer_result_file)
+        logger.info(f"[MINIMIZER] Minimized {len(os.listdir(minimizer.minimized_dir))} testcases")
         verifier_testcases = len(verifier.testcases)
-        logger.info(f"[VERIFIER] Loaded {verifier_testcases} testcases")
+        logger.info(f"[VERIFIER] Verified with {verifier_testcases} testcases")
         if verifier_testcases == 0:
             logger.warning(
                 "[VERIFIER] No testcases survived minimization/fault-addr filtering; "
                 "all patches will be reported as remaining (nothing to reject them).")
-        verifier.run_verification_concrete_testcases()
 
         verified_file = os.path.join(eval_dir, "verified.sbsv")
         shutil.copyfile(os.path.join(minimizer_dir, "verifier.sbsv"), verified_file)

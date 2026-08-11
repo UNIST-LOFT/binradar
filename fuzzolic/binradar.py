@@ -1021,8 +1021,29 @@ class BinRadarExecutor:
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), self.filter_result)
-        verifier.load_testcases(minimizer_result_file)
-        verifier.run_verification_concrete_testcases()
+        verifier.run_verification_streaming(minimizer_result_file)
+        self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+
+    def run_minimizer_and_verifier(self):
+        self.check_requirements()
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run minimizer and verifier.")
+            raise RuntimeError("Probe result not found.")
+        self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        config = self.extract_config()
+        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
+        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
+        testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
+        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
+        minimizer.load_testcases()
+        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
+        logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), self.filter_result)
+        minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
+        binradar_minimizer.run_minimizer_and_verifier(minimizer, verifier, minimizer_result_file)
+        self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_binradar(self):
@@ -1163,8 +1184,7 @@ class BinRadarExecutor:
         self.run_fuzzolic()
         self.run_directed()
         self.run_fuzzer()
-        self.run_minimizer()
-        self.run_verifier()
+        self.run_minimizer_and_verifier()
         self.run_binradar()
         self.run_final()
         self.done()
@@ -1249,10 +1269,7 @@ class BinRadarExecutor:
 
         raise_thread_error_if_any()
 
-        # TODO: we can modify minimizer and verifier to be run in parallel as well
-        self.run_minimizer()
-        raise_thread_error_if_any(wait_for_binradar=True)
-        self.run_verifier()
+        self.run_minimizer_and_verifier()
         raise_thread_error_if_any(wait_for_binradar=True)
 
         binradar_thread.join()

@@ -4,6 +4,8 @@ import signal
 import shlex
 import logging
 import time
+import threading
+import fcntl
 from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
 
 import sbsv
@@ -503,28 +505,65 @@ class BinRadarConcreteVerifier:
         fh.setFormatter(fmt)
         self.logger.addHandler(fh)
     
-    def load_testcases(self, minimizer_result: str):
-        parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
-        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[bool]]")
-        with open(minimizer_result, "r", encoding="utf-8") as f:
-            parser.load(f)
-        testcases = parser.get_result()["testcase"]["result"]
-        for testcase in testcases:
-            id=testcase["id"]
-            filename=testcase["file"]
-            exit = testcase["exit"]
-            fault_addr = testcase["fault-addr"]
-            if exit == "crash" and fault_addr != self.probe_result.fault_addr:
-                self.logger.debug(f"[testcase] [skip-fault-diff] [id {id}] [file {filename}] [fault-addr {fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
-                continue
-            self.testcases.append(Testcase(
-                id=id,
-                filename=filename,
-                exit=exit,
-                fault_addr=fault_addr,
-                br=testcase["br"]
-            ))
+    def _testcase_from_result_row(self, row: Dict[str, Any]) -> Optional[Testcase]:
+        id = row["id"]
+        filename = row["file"]
+        exit = row["exit"]
+        fault_addr = row["fault-addr"]
+        if exit == "crash" and fault_addr != self.probe_result.fault_addr:
+            self.logger.debug(f"[testcase] [skip-fault-diff] [id {id}] [file {filename}] [fault-addr {fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+            return None
+        return Testcase(
+            id=id,
+            filename=filename,
+            exit=exit,
+            fault_addr=fault_addr,
+            br=row["br"]
+        )
+
+    def _test_testcase(self, patch: int, testcase: Testcase) -> bool:
+        """Run the patched binary for one (patch, testcase) pair. Returns True
+        iff the patch is rejected by this testcase, False otherwise."""
+        self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+        if testcase.exit == "crash":
+            result, patch_result = self.run_testcase_patched(patch, testcase)
+            if result is None:
+                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                return False
+            if result.is_crash():
+                if result.fault_addr != self.probe_result.fault_addr:
+                    self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    return False
+                self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                return True
+            elif result.is_normal_exit():
+                self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return False
+            elif result.is_timeout():
+                self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return False
+        else:
+            result, patch_result = self.run_testcase_patched(patch, testcase)
+            if result is None:
+                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+                return False
+            if result.is_crash():
+                self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                return True
+            elif result.is_normal_exit():
+                if patch_result is None:
+                    self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
+                    return False
+                if testcase.br == patch_result.br_selection:
+                    self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                    return False
+                else:
+                    self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                    return True
+            elif result.is_timeout():
+                self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return False
+        return False
     
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename))
@@ -533,53 +572,84 @@ class BinRadarConcreteVerifier:
             return None, None
         return result, patch_result
 
-    def run_verification_concrete_testcases(self):
-        for patch in self.patches:
-            patch_reject: Optional[Testcase] = None
-            for testcase in self.testcases:
-                self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
-                if testcase.exit == "crash":
-                    result, patch_result = self.run_testcase_patched(patch, testcase)
-                    if result is None:
-                        self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+    def run_verification_streaming(self, minimizer_result_file: str,
+                                   poll_interval: float = 0.2,
+                                   minimizer_thread: Optional[threading.Thread] = None,
+                                   minimizer_exc_queue: Optional[Any] = None) -> None:
+        """Stream [testcase] [result] rows from minimizer.sbsv and verify the
+        patches against each testcase as it appears. A standalone replay
+        requires the done marker; a live stream may stop consuming rows once
+        every patch is rejected while the minimizer continues to completion.
+        """
+        parser = sbsv.parser()
+        parser.add_custom_type("hex", lambda x: int(x, 16))
+        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[bool]]")
+        parser.add_schema("[minimizer] [done] [time: int]")
+        if not os.path.exists(minimizer_result_file):
+            if minimizer_thread is None:
+                raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+            waited = 0.0
+            while not os.path.exists(minimizer_result_file):
+                if minimizer_thread is not None and not minimizer_thread.is_alive():
+                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
+                        raise minimizer_exc_queue.get_nowait()
+                    raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
+                time.sleep(poll_interval)
+                waited += poll_interval
+                if waited >= 60:
+                    raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+        pending_patches = list(self.patches)
+        done_seen = False
+        dead_without_marker = False
+        with open(minimizer_result_file, "r", encoding="utf-8") as f:
+            offset = f.tell()
+            while True:
+                f.seek(offset)
+                fcntl.flock(f, fcntl.LOCK_EX)
+                data = f.read()
+                offset = f.tell()
+                fcntl.flock(f, fcntl.LOCK_UN)
+                for line in data.split("\n"):
+                    row = parser.parse_line_detached(line)
+                    if row is None:
                         continue
-                    if result.is_crash():
-                        if result.fault_addr != self.probe_result.fault_addr:
-                            self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    if row.schema_name == "testcase$result":
+                        testcase = self._testcase_from_result_row(row.data)
+                        if testcase is None:
                             continue
-                        patch_reject = testcase
-                        self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                        # TODO: check if the crash is same with original crash
-                        break # Patch is incorrect: no need to check further
-                    elif result.is_normal_exit():
-                        self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                    elif result.is_timeout():
-                        self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                        # TODO: retry
-                else:
-                    result, patch_result = self.run_testcase_patched(patch, testcase)
-                    if result is None:
-                        self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                        continue
-                    if result.is_crash():
-                        self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                        patch_reject = testcase
-                        # TODO: check if the crash is same with original crash
-                        break # Patch is incorrect: no need to check further
-                    elif result.is_normal_exit():
-                        if patch_result is None:
-                            self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
-                            continue
-                        if testcase.br == patch_result.br_selection:
-                            self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                        else:
-                            patch_reject = testcase
-                            self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                    elif result.is_timeout():
-                        self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                        # TODO: retry
-            
-            if patch_reject is None:
-                self.logger.info(f"[verifier-result] [res verified] [patch {patch}] [testcase ]")
-            else:
-                self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {patch_reject.filename}]")
+                        self.testcases.append(testcase)
+                        for patch in list(pending_patches):
+                            if self._test_testcase(patch, testcase):
+                                self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {testcase.filename}]")
+                                pending_patches.remove(patch)
+                                if not pending_patches and minimizer_thread is not None:
+                                    return
+                    elif row.schema_name == "minimizer$done":
+                        done_seen = True
+                if minimizer_thread is None:
+                    if done_seen:
+                        break
+                    raise RuntimeError("minimizer.sbsv does not contain a completed minimizer run ([minimizer] [done] missing). Run the minimizer phase first.")
+                if not minimizer_thread.is_alive():
+                    if done_seen:
+                        break
+                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
+                        raise minimizer_exc_queue.get_nowait()
+                    # The marker may have been written between our last read
+                    # and the thread's exit; the file is final once the thread
+                    # is dead, so one more read round is conclusive before
+                    # declaring the run incomplete.
+                    if dead_without_marker:
+                        raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
+                    dead_without_marker = True
+                time.sleep(poll_interval)
+            # Final drain guard: the writer holds the lock across write+flush, so
+            # a non-newline-terminated tail means a torn row from a non-locking writer.
+            f.seek(offset)
+            fcntl.flock(f, fcntl.LOCK_EX)
+            tail = f.read()
+            fcntl.flock(f, fcntl.LOCK_UN)
+            if tail and not tail.endswith("\n"):
+                raise RuntimeError("minimizer.sbsv contains an unterminated line")
+        for patch in pending_patches:
+            self.logger.info(f"[verifier-result] [res verified] [patch {patch}] [testcase ]")
