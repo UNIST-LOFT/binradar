@@ -62,10 +62,10 @@ success command out="success.list":
       > {{out}}
     echo "Successes ({{out}}): $(wc -l < {{out}})"
 
-run cmd argfile="exp.list" jobs="20" workdir="workdir":
+run cmd argfile="exp.list" jobs="30" workdir="workdir":
     just _run-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RUN" {{workdir}}
 
-resume cmd argfile="exp.list" jobs="20" workdir="workdir":
+resume cmd argfile="exp.list" jobs="30" workdir="workdir":
     just _resume-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RESUME" {{workdir}}
 
 
@@ -73,10 +73,10 @@ build-all:
     just run-all "just build"
 
 backup-all workdir_old="workdir" workdir_bak="workdir-bak":
-    just _run-all backup "mv {{workdir_old}} {{workdir_bak}}" 20
+    just _run-all backup "mv {{workdir_old}} {{workdir_bak}}" 30
 
 clean-all workdir="workdir":
-    just _run-all clean "rm -rf {{workdir}}" 20
+    just _run-all clean "rm -rf {{workdir}}" 30
 
-eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/workspace/binradar/benchmarks/sdfuzz":
-    just _run-all eval "just eval {{workdir}} {{fuzzer}} {{fuzz_out_root}}/{}/work-{{fuzzer}}/out" 20
+eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/loftix/loftix-benchmarks":
+    just _run-all eval "just eval {{workdir}} {{fuzzer}} {{fuzz_out_root}}/{}/work-{{fuzzer}}/out" 30

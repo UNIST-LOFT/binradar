@@ -15,7 +15,8 @@ Subcommands:
           1. Checks if the workdir exists and has output
           2. Parses progress.sbsv to determine if the run completed successfully
           3. Looks for errors in binradar.log (and binradar-tracer-msg.log) for each run
-          4. Shows the [final] result (remaining_patches)
+          4. Shows the [filter] result (survived patches) and the [final]
+             result (remaining_patches)
 
     sdfuzz
         Collect external-fuzzer evaluation results from <workdir>/<fuzzer>
@@ -71,6 +72,9 @@ class RunResult:
     verifier_accepted: str = ""  # e.g. "1,3,5" or "" if none accepted
     verifier_rejected: str = ""  # e.g. "2,4,6"
     verifier_data: Dict[int, List[str]] = field(default_factory=dict)  # raw verifier results
+    filter_done: bool = False
+    filter_survived: str = ""  # e.g. "[1, 2]" or "[]"
+    filter_rejected: str = ""  # e.g. "3" or "" if none
     log_errors: List[str] = field(default_factory=list)
     tracer_errors: List[str] = field(default_factory=list)
 
@@ -211,6 +215,26 @@ def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
     return results
 
 
+def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
+    """
+    Parse a filter.sbsv file (written by the FILTER phase):
+      [patch] [id 1] [pass True]
+    Returns dict mapping patch_id -> passed (True) / filtered out (False).
+    """
+    results: Dict[int, bool] = {}
+    if not os.path.isfile(sbsv_path):
+        return results
+
+    with open(sbsv_path, "r") as f:
+        for line in f:
+            m = re.search(
+                r'\[patch\]\s+\[id\s+(\d+)\]\s+\[pass\s+(true|false)\]',
+                line, re.IGNORECASE)
+            if m:
+                results[int(m.group(1))] = m.group(2).lower() == "true"
+    return results
+
+
 def verifier_summary(verifier_results: Dict[int, List[str]]) -> Tuple[str, str]:
     """Return (verified_patches_csv, rejected_patches_csv) from verifier data."""
     verified: List[str] = []
@@ -292,6 +316,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         started: set = set()
         done_phases: set = set()
         final_entry: Optional[Dict[str, str]] = None
+        filter_entry: Optional[Dict[str, str]] = None
 
         for entry in entries:
             phase = entry.get("_phase", "")
@@ -303,6 +328,8 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                 done_phases.add(phase)
                 if phase == "final":
                     final_entry = entry
+                elif phase == "filter":
+                    filter_entry = entry
 
         incomplete_phases = started - done_phases
 
@@ -334,11 +361,32 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             status = "UNKNOWN"
             overall_ok = False
 
+        # Filter result: per-patch rows from filter.sbsv, with the survived
+        # list from the [filter] [done] progress entry as fallback (e.g. when
+        # a resumed run loaded filter.sbsv without logging [filter] [done]).
+        filter_path = os.path.join(run_dir, "filter.sbsv")
+        filter_results = parse_filter_sbsv(filter_path)
+        filter_survived = ""
+        filter_rejected = ""
+        if filter_results:
+            survived = [pid for pid, passed in sorted(filter_results.items())
+                        if passed]
+            rejected = [pid for pid, passed in sorted(filter_results.items())
+                        if not passed]
+            filter_survived = "[" + ", ".join(str(p) for p in survived) + "]"
+            filter_rejected = ",".join(str(p) for p in rejected)
+        elif filter_entry is not None:
+            filter_survived = _fix_bracket_value(
+                filter_entry.get("survived", "[]"))
+
         # Build run result
         run_res = RunResult(
             run_name=run_dir_name,
             status=status,
             has_final=(final_entry is not None),
+            filter_done=("filter" in done_phases or bool(filter_results)),
+            filter_survived=filter_survived,
+            filter_rejected=filter_rejected,
             log_errors=log_errors,
             tracer_errors=tracer_errors,
         )
@@ -486,6 +534,11 @@ def format_result_log(result: ExperimentResult) -> str:
                         f"      patch {pid}: {verified} verified, "
                         f"{rejected} rejected")
 
+        if run_res.filter_done:
+            lines.append(
+                f"    [filter] survived: {run_res.filter_survived or '[]'}  "
+                f"rejected: {run_res.filter_rejected or 'none'}")
+
         if run_res.log_errors:
             lines.append("    [errors from binradar.log]:")
             for err in run_res.log_errors[:10]:
@@ -520,6 +573,8 @@ CSV_COLUMNS = [
     "has_final",
     "remaining_patches",
     "binradar_remaining_patches",
+    "filter_survived_patches",
+    "filter_rejected_patches",
     "verifier_accepted_patches",
     "verifier_rejected_patches",
     "log_errors_count",
@@ -540,6 +595,8 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "has_final": "",
                 "remaining_patches": "",
                 "binradar_remaining_patches": "",
+                "filter_survived_patches": "",
+                "filter_rejected_patches": "",
                 "verifier_accepted_patches": "",
                 "verifier_rejected_patches": "",
                 "log_errors_count": "",
@@ -563,6 +620,8 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "has_final": str(run_res.has_final),
                 "remaining_patches": run_res.remaining_patches,
                 "binradar_remaining_patches": run_res.binradar_remaining_patches,
+                "filter_survived_patches": run_res.filter_survived,
+                "filter_rejected_patches": run_res.filter_rejected,
                 "verifier_accepted_patches": run_res.verifier_accepted,
                 "verifier_rejected_patches": run_res.verifier_rejected,
                 "log_errors_count": str(len(run_res.log_errors)),
