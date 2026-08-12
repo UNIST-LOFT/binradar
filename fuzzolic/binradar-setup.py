@@ -1,18 +1,68 @@
 #!/usr/bin/env python3
-import os
 import argparse
-import subprocess
-import struct
-import tempfile
-from pathlib import Path
-from typing import List, Dict, Optional, Union, Tuple, cast
-import shutil
-import re
 import enum
+import os
+import re
+import sbsv
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, cast
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-BRPATCH_SOURCE = SCRIPT_DIR.parent / "loftix" / "brpatch.c"
+ROOT_DIR = SCRIPT_DIR.parent
+BENCHMARK_SCRIPTS = ROOT_DIR / "benchmarks" / "scripts"
+BRPATCH_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch.c"
+BRPATCH_PREFILTER_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-prefilter.c"
+QEMU_STACKTRACE_RELEASE = ROOT_DIR / "utils" / "binradar-aflplusplus" / "afl-qemu-trace"
 
+
+"""BinRadar workdir setup and patch prefilter (one entry point).
+
+Subcommands:
+  setup       - generate <BINARY>.brpatched and binradar.env from
+                config.env (previously benchmarks/scripts/binradar_setup.py)
+  prefilter   - run the POC once against a capture-instrumented binary
+                (<BINARY>.brprefilter, built from
+                benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
+                configuration used by the FILTER phase, collect the
+                patch-site STATE vectors, evaluate every candidate
+                predicate offline (mirroring brpatch.c::eval with C int64
+                semantics), and write workdir/prefilter.sbsv listing which
+                predicates evaluate non-zero on the POC.  `setup` then
+                keeps only the surviving predicates before applying the
+                top-10 cap, so the expensive binradar pipeline never runs
+                on predicates that the FILTER phase would reject anyway.
+                (previously fuzzolic/binradar-prefilter.py)
+
+Usage:
+  uv run fuzzolic/binradar-setup.py setup -w <workdir>
+  uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
+"""
+
+
+PAGE_SIZE = 0x1000
+PREFILTER_QEMU_TIMEOUT = 60.0  # same as BinRadarQemuRunner.test_with_patched
+
+INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+_MASK64 = (1 << 64) - 1
+
+# sbsv schemas for the rows this module parses:
+#   [prefilter-state] [v0 N] [v1 N] ... [v15 N]  (written by
+#     brpatch-prefilter.c::dest to the PATCH_FD pipe)
+#   [prefilter] [res] [id N] [pass true|false]   (prefilter.sbsv rows)
+#   [prefilter] [done] [total N] [survived N] [time T]  (prefilter.sbsv marker)
+PREFILTER_STATE_SCHEMA = (
+    "[prefilter-state] " + " ".join(f"[v{i}: int]" for i in range(16))
+)
 
 CONSTANTS: Dict[str, int] = {
     "max1": 0,
@@ -69,6 +119,7 @@ AstNode = Union[
     Tuple[str, "AstNode"],        # unary
     Tuple[str, "AstNode", "AstNode"],  # binary
 ]
+
 
 class Parser:
     def __init__(self, tokens: List[str]):
@@ -179,6 +230,7 @@ class Parser:
             return ("var", REGISTER_TO_VAR[tok])
         raise ValueError(f"unknown identifier: {tok}")
 
+
 def emit_patch(node: AstNode) -> str:
     kind = node[0]
 
@@ -228,12 +280,14 @@ def emit_patch(node: AstNode) -> str:
     _, lhs, rhs = node
     return f"{op_map[kind]}{emit_patch(lhs)}{emit_patch(rhs)}"
 
+
 def predicate_to_patch_str(predicate: str) -> str:
     tokens = TOKEN_RE.findall(predicate)
     if not tokens:
         raise ValueError("empty predicate")
     ast = Parser(tokens).parse()
     return emit_patch(ast)
+
 
 def load_env(file: Path) -> Dict[str, str]:
     """
@@ -250,6 +304,7 @@ def load_env(file: Path) -> Dict[str, str]:
                 env[key.strip()] = value.strip().strip('"').strip("'")
     return env
 
+
 def save_env(env: Dict[str, str], file: Path):
     """
     Saves environment variables from a dictionary to a .env file.
@@ -258,12 +313,374 @@ def save_env(env: Dict[str, str], file: Path):
         for key, value in env.items():
             f.write(f"{key}=\"{value}\"\n")
 
-PAGE_SIZE = 0x1000
+
+def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[List[int]]:
+    """Read a prefilter.sbsv file and return the 1-based ids whose
+    [prefilter] [res] [id N] [pass true] rows mark the predicate as
+    surviving.
+
+    Returns None when the file cannot be parsed (caller fails open and
+    keeps every predicate).  Blank lines and the trailing
+    [prefilter] [done] marker written by the `prefilter` subcommand are
+    skipped, not treated as parse errors.
+    """
+    parser = sbsv.parser()
+    parser.add_schema("[prefilter] [res] [id: int] [pass: bool]")
+    parser.add_schema("[prefilter] [done] [total: int] [survived: int] [time: float]")
+    passed_ids: List[int] = list()
+    with prefilter_file.open("r") as f:
+        result = parser.load(f)
+        for row in result["prefilter"]["res"]:
+            if row["pass"]:
+                passed_ids.append(row["id"])
+    return passed_ids
+
+
+class PrefilterTrap(Exception):
+    """Arithmetic that would raise SIGFPE in C (div/mod by zero, INT64_MIN / -1)."""
+
+
+def wrap64(v: int) -> int:
+    """Reinterpret v as a signed 64-bit two's-complement integer."""
+    v &= _MASK64
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
+def _parse_int(s: str, pos: List[int]) -> int:
+    """Parse decimal digits; accumulate with the same wraparound as the
+    int64_t arithmetic in brpatch.c::scani."""
+    i = 0
+    n = len(s)
+    while pos[0] < n and "0" <= s[pos[0]] <= "9":
+        i = wrap64(i * 10 + (ord(s[pos[0]]) - 48))
+        pos[0] += 1
+    return i
+
+
+def _trunc_div(a: int, b: int) -> int:
+    """C truncating division (round toward zero), not Python floor division."""
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
+def eval_patch_str(s: str, env: List[int]) -> int:
+    """Evaluate a prefix-Polish patch string with C int64 x86-64 semantics.
+
+    Mirrors brpatch.c::eval exactly: constants p<N>/n<N>, variable lookup
+    v<N> into env (16 captured STATE slots), unary ~, and the binary prefix
+    operators + - * / % & | ^ l r = ! > >= < <=.  env must have at least
+    16 entries.
+
+    Raises PrefilterTrap on arithmetic that would SIGFPE in C.
+    """
+    pos = [0]
+
+    def ev() -> int:
+        op = s[pos[0]]
+        pos[0] += 1
+        if op == "n":  # negative integer
+            return wrap64(-_parse_int(s, pos))
+        if op == "p":  # positive integer
+            return _parse_int(s, pos)
+        if op == "v":  # variable lookup
+            return env[_parse_int(s, pos)]
+        if op == "~":  # bitwise not
+            return wrap64(~ev())
+
+        eq = pos[0] < len(s) and s[pos[0]] == "=" and op in "<>"
+        if eq:
+            pos[0] += 1
+
+        a = ev()
+        b = ev()
+
+        if op == "=":
+            return 1 if a == b else 0
+        if op == "!":
+            return 1 if a != b else 0
+        if op == ">":
+            return 1 if (a >= b if eq else a > b) else 0
+        if op == "<":
+            return 1 if (a <= b if eq else a < b) else 0
+        if op == "+":
+            return wrap64(a + b)
+        if op == "-":
+            return wrap64(a - b)
+        if op == "*":
+            return wrap64(a * b)
+        if op == "&":
+            return wrap64(a & b)
+        if op == "|":
+            return wrap64(a | b)
+        if op == "^":
+            return wrap64(a ^ b)
+        if op == "l":  # << (x86 masks the shift count to 6 bits)
+            return wrap64(a << (b & 63))
+        if op == "r":  # >> (arithmetic for signed int64; x86 masks the count)
+            return a >> (b & 63)
+        if op == "/":
+            if b == 0:
+                raise PrefilterTrap("division by zero")
+            if a == INT64_MIN and b == -1:
+                raise PrefilterTrap("INT64_MIN / -1")
+            return _trunc_div(a, b)
+        if op == "%":
+            if b == 0:
+                raise PrefilterTrap("modulo by zero")
+            if a == INT64_MIN and b == -1:
+                raise PrefilterTrap("INT64_MIN % -1")
+            q = _trunc_div(a, b)
+            return wrap64(a - q * b)
+        raise ValueError(f"unknown patch operator {op!r}")
+
+    return ev()
+
+
+def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, str]:
+    """Return (keep, note) for one predicate line.
+
+    A predicate is kept iff it evaluates to non-zero on at least one
+    captured state (i.e. the branch would be taken at least once on the
+    POC, so the FILTER phase would not reject the patch as still crashing
+    at the original fault address).
+    """
+    try:
+        patch_str = predicate_to_patch_str(predicate)
+    except Exception as e:
+        # prepare_patch would crash on this predicate anyway; keep it so
+        # the existing pipeline surfaces the error.
+        return True, f"unparseable predicate kept ({e})"
+    for state in states:
+        try:
+            if eval_patch_str(patch_str, state) != 0:
+                return True, ""
+        except PrefilterTrap as e:
+            # The patch would SIGFPE at the patch site (different fault
+            # address), so the FILTER phase would keep it.
+            return True, f"patch would trap in C ({e})"
+    return False, "evaluates to 0 on all captured states"
+
+
+def _pipe_reader(rfd: int, chunks: List[bytes]):
+    try:
+        while True:
+            chunk = os.read(rfd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(rfd)
+        except OSError:
+            pass
+
+
+def _kill_process_group(proc: subprocess.Popen):
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def ensure_original_binary(workdir: Path, configdir: Path, config: dict) -> Path:
+    """Return the original binary path, copying it into the workdir from
+    the guix store (mirroring the `setup` recipe) when missing, so the
+    prefilter can run on a fresh subject before `setup`."""
+    binary = config["BINARY"]
+    original_binary = workdir / f"{binary}.orig"
+    if original_binary.exists():
+        return original_binary
+    cmd = [sys.executable, str(BENCHMARK_SCRIPTS / "binradar_get_binary.py"),
+           "-c", str(configdir)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cannot locate the original binary: {result.stderr.strip()}")
+    src = Path(result.stdout.strip())
+    print(f"Copying original binary {src} -> {original_binary}")
+    shutil.copy(src, original_binary)
+    return original_binary
+
+
+def resolve_poc(configdir: Path, workdir: Path, poc_input: str) -> Optional[Path]:
+    """Resolve the POC input; prefer the workdir (already set up), then the
+    configdir (fresh subject), then as-is."""
+    path = Path(poc_input)
+    candidates = []
+    if not path.is_absolute():
+        candidates += [workdir / path, configdir / path]
+    candidates.append(path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def compile_capture_plugin(workdir: Path) -> None:
+    """Copy and compile brpatch-prefilter.c in the workdir (e9compile)."""
+    shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
+           "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=workdir)
+    if result.returncode != 0:
+        raise RuntimeError(f"e9compile failed with exit code {result.returncode}")
+
+
+def build_capture_binary(workdir: Path, configdir: Path, config: dict,
+                         patch_loc: str) -> Path:
+    """Instrument the original binary with the capture plugin at PATCH_LOC.
+
+    Returns the path of <BINARY>.brprefilter.  Also dumps e9tool JSON
+    metadata (needed by extract_trampoline_info) as
+    <BINARY>.brprefilter.json.
+    """
+    original_binary = ensure_original_binary(workdir, configdir, config)
+    brprefilter = workdir / f"{config['BINARY']}.brprefilter"
+    metadata = workdir / f"{config['BINARY']}.brprefilter.json"
+    for output, fmt in ((metadata, ["--format=json"]), (brprefilter, [])):
+        cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool"] + fmt + [
+            "-100", "-M", f"addr={patch_loc}",
+            "-P", "if dest(state)@brpatch-prefilter goto",
+            "-o", str(output), str(original_binary)]
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"e9tool failed with exit code {result.returncode}: "
+                f"cannot create {output.name}")
+    return brprefilter
+
+
+def capture_states(workdir: Path, configdir: Path, config: dict,
+                   patch_loc: str) -> Optional[List[List[int]]]:
+    """Run the POC once against <BINARY>.brprefilter and return the
+    captured STATE vectors (each a list of 16 signed ints).
+
+    Returns None if the run failed (timeout / subprocess error) so the
+    caller can fail open.
+    """
+    if not QEMU_STACKTRACE_RELEASE.exists():
+        print(f"Warning: {QEMU_STACKTRACE_RELEASE} not found")
+        return None
+
+    compile_capture_plugin(workdir)
+    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc)
+
+    extracted = extract_trampoline_info(
+        brprefilter,
+        workdir / f"{config['BINARY']}.brprefilter.json",
+        ensure_original_binary(workdir, configdir, config),
+        int(patch_loc, 0),
+    )
+    try:
+        exclude_addrs = [extracted["PATCH_RESERVE_RANGE"],
+                         extracted["E9_TRAMPOLINE_RANGE"],
+                         extracted["E9_LOADER_RANGE"]]
+    except KeyError as e:
+        print(f"Warning: could not extract trampoline info from brprefilter: {e}")
+        return None
+    e9_relocated_calls: List[str] = []
+    for record in extracted.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
+        record = record.strip()
+        if record:
+            fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
+            e9_relocated_calls.append(":".join(fields))
+
+    poc = resolve_poc(configdir, workdir, config["POC_INPUT"])
+    if poc is None:
+        print(f"Warning: POC input {config['POC_INPUT']} not found in "
+              f"{workdir} or {configdir}")
+        return None
+    test_cmd = config["TEST_CMD"]
+
+    command = [str(QEMU_STACKTRACE_RELEASE), "--input", str(poc),
+               "--patch-loc", patch_loc, "--asan", "host"]
+    for addr_range in exclude_addrs:
+        command += ["--asan-exclude", addr_range]
+    for record in e9_relocated_calls:
+        command += ["--e9-relocated-call", record]
+    command += [str(brprefilter), "--"] + shlex.split(test_cmd)
+
+    rfd, wfd = os.pipe()
+    env = os.environ.copy()
+    env["AFL_USE_QASAN"] = "1"
+    env["PATCH_ID"] = "0"
+    env["PATCH_FD"] = str(wfd)
+    # The run is expected to crash: the capture plugin never jumps, so the
+    # program follows the original buggy path.  We only need the pipe data.
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=workdir,
+                            start_new_session=True, pass_fds=(wfd,), env=env)
+    os.close(wfd)
+    chunks: List[bytes] = []
+    thread = threading.Thread(target=_pipe_reader, args=(rfd, chunks))
+    thread.start()
+    try:
+        proc.communicate(timeout=PREFILTER_QEMU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print("Warning: QEMU prefilter run timed out")
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            proc.communicate()
+        return None
+    except Exception as e:
+        print(f"Warning: QEMU prefilter run failed: {e}")
+        _kill_process_group(proc)
+        return None
+    finally:
+        thread.join()
+
+    data = b"".join(chunks).decode(errors="ignore")
+    return parse_state_lines(data)
+
+
+def parse_state_lines(data: str) -> List[List[int]]:
+    """Parse [prefilter-state] sbsv lines from the capture pipe, one 16-slot
+    STATE vector per line.  Non-state and malformed lines are skipped."""
+    parser = sbsv.parser()
+    parser.add_schema(PREFILTER_STATE_SCHEMA)
+    states: List[List[int]] = []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line.startswith("[prefilter-state]"):
+            continue
+        try:
+            row = parser.parse_line_detached(line)
+        except ValueError:
+            continue
+        if row is None:
+            continue
+        states.append([row[f"v{i}"] for i in range(16)])
+    return states
+
+
+def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str]],
+                    elapsed: float) -> None:
+    """Write workdir/prefilter.sbsv: one [prefilter] [res] row per predicate
+    (1-based id matching brpatches.inc case numbering) plus a done marker."""
+    survived = 0
+    with prefilter_file.open("w", encoding="utf-8") as f:
+        for idx, passed, _note in results:
+            f.write(f"[prefilter] [res] [id {idx}] [pass {str(passed).lower()}]\n")
+            if passed:
+                survived += 1
+        f.write(f"[prefilter] [done] [total {len(results)}] "
+                f"[survived {survived}] [time {elapsed:.2f}]\n")
+    print(f"[prefilter] [done] [total {len(results)}] "
+          f"[survived {survived}] [time {elapsed:.2f}]")
+
 
 class E9MapType(enum.IntEnum):
     TRAMPOLINE = 0
     RESERVE = 1
     REFACTOR = 2
+
 
 E9_CONFIG_MAGIC = b"E9PATCH\0"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
@@ -445,9 +862,10 @@ def extract_relocated_call_jumps(
 
     return sorted(set(candidates))
 
+
 def parse_e9patch_config(path: Path) -> Dict:
     """Parse e9patch's embedded e9_config_s from a patched binary.
-    
+
     Returns a dict with:
       - loader_base: virtual address of the loader LOAD segment
       - loader_size: size of the loader LOAD segment (page-aligned)
@@ -585,6 +1003,7 @@ def extract_trampoline_info(
         print(f"Warning: could not parse e9patch config: {e}")
     return binradar_env
 
+
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
     # Read predicates
@@ -592,11 +1011,11 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
     brpatched_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
-    
+
     if not original_binary.exists():
         print(f"Error: original binary {original_binary.name} not found in {workdir}")
         exit(1)
-    
+
     if not predicates_file.exists():
         # In certain bug types, taosc may not generate predicates
         if brpatched_binary.exists():
@@ -614,14 +1033,32 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             return
         print(f"Error: {predicates_file.name} file not found in {workdir}")
         exit(1)
-    
+
     with predicates_file.open("r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             predicates.append(line)
-    
+
+    # Apply the offline prefilter results, if any (see the `prefilter`
+    # subcommand).  Predicates whose prefilter row evaluates to true
+    # survive; the rest are discarded before the top-10 cap, so the
+    # binradar pipeline never runs on patches that would be filtered out
+    # anyway.  Fail open on any parse trouble.
+    prefilter_file = workdir / "prefilter.sbsv"
+    if prefilter_file.exists():
+        passed_ids = load_prefilter_passed_ids(prefilter_file)
+        if passed_ids is None:
+            print(f"Warning: failed to parse {prefilter_file.name}; "
+                  f"using all predicates (fail-open)")
+        else:
+            survived = [predicates[i - 1] for i in sorted(passed_ids)
+                        if 1 <= i <= len(predicates)]
+            print(f"[prefilter] loaded {len(predicates)} predicates, "
+                  f"{len(survived)} survived")
+            predicates = survived
+
     # Get patch destination
     destinations_file = workdir / "destinations"
     if not destinations_file.exists():
@@ -651,7 +1088,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             patch_str = predicate_to_patch_str(predicates[i - 1])
             f.write(f"case {i}:\n\treturn \"{patch_str}\";\n")
         f.write("default:\n\treturn \"p0\";\n")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
             "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -660,12 +1097,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch compiled successfully")
-    
+
     # Patch the original binary
     patch_addr = binradar_env["PATCH_LOC"]
     metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
     # dump metadata
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}",
             "-P", "if dest(state)@brpatch goto", "-o", str(metadata_path), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -674,7 +1111,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch metadata dumped successfully")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}", 
+    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}",
             "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -693,7 +1130,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     binradar_env.update(extracted_env)
 
 
-def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:    
+def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
     env = load_env(config_path)
     if "POC_INPUT" not in env:
         print("Error: POC_INPUT not found in config.env")
@@ -703,7 +1140,7 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
         exit(1)
     if not (configdir / env["POC_DIR"]).exists():
         shutil.copytree(configdir / env["POC_DIR"], workdir / env["POC_DIR"])
-    
+
     patch_location_file = workdir / "patch-location"
     if not patch_location_file.exists():
         print(f"Error: {patch_location_file.name} file not found in {workdir}")
@@ -713,32 +1150,125 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
         env["PATCH_LOC"] = f"0x{patch_location}"
     return env
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="binradar_setup: setup config files for binradar")
-    parser.add_argument("-c", "--configdir", type=Path, required=False, default=Path.cwd(), help="Config directory (default: current directory)")
-    parser.add_argument("-w", "--workdir", type=Path, required=False, default=Path.cwd() / "workdir", help="Working directory for the benchmark (default: ./workdir)")
-    args = parser.parse_args()
-    configdir: Path = args.configdir
+
+def cmd_setup(configdir: Path, workdir: Path):
     config_path = configdir / "config.env"
     if not config_path.exists():
         print(f"Error: config.env not found in {configdir}")
         return
-    
-    workdir: Path = args.workdir
+
     if not workdir.exists():
         print(f"Creating working directory at {workdir}")
         workdir.mkdir(parents=True, exist_ok=True)
         if not (workdir / "patch-location").exists():
             run_fix(configdir, configdir / "config.env", workdir)
-    
+
     workdir = workdir.resolve()
     binradar_env = create_binradar_env(configdir, config_path, workdir)
     prepare_patch(configdir, workdir, binradar_env)
     binradar_env_path = workdir / "binradar.env"
     save_env(binradar_env, binradar_env_path)
     print(f"binradar environment variables saved to {binradar_env_path}")
-    
+
+
+def cmd_prefilter(configdir: Path, workdir: Path):
+    configdir = configdir.resolve()
+    workdir = workdir.resolve()
+    prefilter_file = workdir / "prefilter.sbsv"
+    start = time.time()
+
+    config_path = configdir / "config.env"
+    if not config_path.exists():
+        print(f"Error: config.env not found in {configdir}")
+        sys.exit(1)
+    config = load_env(config_path)
+
+    predicates_file = workdir / "predicates"
+    if not predicates_file.exists():
+        # No predicates (CWE synth path); nothing to prefilter.
+        print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
+        sys.exit(0)
+    predicates = [line.strip() for line in predicates_file.open("r")
+                  if line.strip()]
+    if not predicates:
+        write_prefilter(prefilter_file, [], time.time() - start)
+        print("No predicates; prefilter is a no-op.")
+        sys.exit(0)
+
+    for key in ("BINARY", "POC_INPUT", "TEST_CMD"):
+        if key not in config:
+            print(f"Error: {key} not found in config.env")
+            sys.exit(1)
+    patch_location_file = workdir / "patch-location"
+    if not patch_location_file.exists():
+        print(f"Error: {patch_location_file.name} file not found in {workdir}")
+        sys.exit(1)
+    patch_loc = f"0x{patch_location_file.read_text().strip()}"
+
+    states = capture_states(workdir, configdir, config, patch_loc)
+    if states is None:
+        # Fail open, matching run_filter's `result is None -> passed=True`.
+        print("Warning: prefilter capture failed; keeping all predicates "
+              "(fail-open)")
+        results = [(i, True, "capture failed (fail-open)")
+                   for i in range(1, len(predicates) + 1)]
+        write_prefilter(prefilter_file, results, time.time() - start)
+        sys.exit(0)
+    if not states:
+        # The patch site is never hit on the POC, so every predicate would
+        # be filtered out by the FILTER phase anyway (the patch never
+        # activates and the POC still crashes at the original fault).
+        print("Warning: patch site never hit on the POC; discarding all "
+              "predicates")
+        results = [(i, False, "patch site never hit")
+                   for i in range(1, len(predicates) + 1)]
+        write_prefilter(prefilter_file, results, time.time() - start)
+        sys.exit(0)
+
+    print(f"Captured {len(states)} patch-site state vector(s)")
+    results = []
+    for idx, predicate in enumerate(predicates, start=1):
+        passed, note = evaluate_predicate(predicate, states)
+        if note:
+            print(f"[prefilter] [id {idx}] [pass {str(passed).lower()}] "
+                  f"{predicate!r}: {note}")
+        results.append((idx, passed, note))
+    write_prefilter(prefilter_file, results, time.time() - start)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="binradar-setup: setup the binradar workdir and "
+                    "prefilter candidate patches")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, metavar="setup|prefilter")
+
+    setup_parser = subparsers.add_parser(
+        "setup", help="generate <BINARY>.brpatched and binradar.env")
+    setup_parser.add_argument("-c", "--configdir", type=Path, required=False,
+                              default=Path.cwd(),
+                              help="Config directory (default: current directory)")
+    setup_parser.add_argument("-w", "--workdir", type=Path, required=False,
+                              default=Path.cwd() / "workdir",
+                              help="Working directory (default: ./workdir)")
+
+    prefilter_parser = subparsers.add_parser(
+        "prefilter", help="evaluate predicates offline against the POC and "
+                          "write prefilter.sbsv")
+    prefilter_parser.add_argument("-c", "--configdir", type=Path, required=False,
+                                  default=Path.cwd(),
+                                  help="Directory containing config.env "
+                                       "(default: current directory)")
+    prefilter_parser.add_argument("-w", "--workdir", type=Path,
+                                  default=Path.cwd() / "workdir",
+                                  help="Working directory (default: ./workdir)")
+
+    args = parser.parse_args()
+    if args.command == "setup":
+        cmd_setup(args.configdir, args.workdir)
+    else:
+        cmd_prefilter(args.configdir, args.workdir)
+
 
 if __name__ == "__main__":
     main()

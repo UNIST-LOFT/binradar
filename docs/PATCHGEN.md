@@ -35,7 +35,7 @@ These predicates should be converted into the patch string that can be evaluated
 Conversion can be done by
 ```shell
 just setup
-# python3 /path/to/binradar/benchmarks/scripts/binradar_setup.py -w workdir
+# uv run /path/to/binradar/fuzzolic/binradar-setup.py setup -w workdir
 ```
 This setup script will generate `workdir/binradar.env` file with the necessary configuration for binradar, and also generate `workdir/brpatch.inc` file with the patch strings hard-coded.
 The generated patch string will be like this:
