@@ -666,8 +666,8 @@ def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str]],
     (1-based id matching brpatches.inc case numbering) plus a done marker."""
     survived = 0
     with prefilter_file.open("w", encoding="utf-8") as f:
-        for idx, passed, _note in results:
-            f.write(f"[prefilter] [res] [id {idx}] [pass {str(passed).lower()}]\n")
+        for idx, passed, note in results:
+            f.write(f"[prefilter] [res] [id {idx}] [pass {str(passed).lower()}] {note}\n")
             if passed:
                 survived += 1
         f.write(f"[prefilter] [done] [total {len(results)}] "
