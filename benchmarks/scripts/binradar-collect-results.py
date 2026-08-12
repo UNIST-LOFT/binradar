@@ -37,6 +37,7 @@ import argparse
 import csv
 import os
 import re
+import sbsv
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -63,6 +64,55 @@ def display_path(exp_file_dir: str, path: str) -> str:
 # Phases that appear in progress.sbsv
 KNOWN_PHASES = {"probe", "filter", "binradar", "directed", "fuzzer", "fuzzolic",
                 "minimizer", "verifier", "final"}
+
+
+def _build_sbsv_parser() -> sbsv.parser:
+    """Build a parser for the structured rows consumed by this collector."""
+    parser = sbsv.parser()
+    special = {
+        ("rundir", "set"), ("rundir", "done"),
+        ("filter", "done"), ("final", "start"), ("final", "done"),
+    }
+    for phase in ("rundir", "probe", "filter", "fuzzolic", "directed",
+                  "fuzzer", "minimizer", "verifier", "binradar", "final"):
+        for action in ("set", "start", "done"):
+            if (phase, action) not in special:
+                parser.add_schema(
+                    f"[{phase}] [{action}] [prefix: str] [id: str]")
+    parser.add_schema(
+        "[rundir] [set] [prefix: str] [id: str] [dir?: str]")
+    parser.add_schema(
+        "[rundir] [done] [prefix: str] [id: str] [dir?: str]")
+    parser.add_schema(
+        "[filter] [done] [prefix: str] [id: str] [survived?: str]")
+    parser.add_schema("[final] [start] [prefix: str] [id: str]")
+    parser.add_schema(
+        "[final] [done] [prefix: str] [id: str] "
+        "[remaining_patches?: str] [binradar_remaining_patches?: str]")
+    parser.add_schema("[verifier-result] [res: str] [patch: str]")
+    parser.add_schema("[patch] [id: int] [pass: bool]")
+    parser.add_schema("[final] [verifier] [patch: str] [res: str]")
+    return parser
+
+
+def _strip_log_prefix(line: str) -> str:
+    """Remove timestamp/log text before the first SBSV token."""
+    start = line.find("[")
+    return line[start:] if start >= 0 else ""
+
+
+SBSV_PARSER = _build_sbsv_parser()
+PREFILTER_SBSV_PARSER = sbsv.parser()
+PREFILTER_SBSV_PARSER.add_schema(
+    "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
+PREFILTER_SBSV_PARSER.add_schema(
+    "[prefilter] [done] [total: int] [survived: int] [time: float]")
+LEGACY_PREFILTER_SBSV_PARSER = sbsv.parser()
+LEGACY_PREFILTER_SBSV_PARSER.add_schema(
+    "[prefilter] [id: int] [pass: bool]")
+LEGACY_RES_PREFILTER_SBSV_PARSER = sbsv.parser()
+LEGACY_RES_PREFILTER_SBSV_PARSER.add_schema(
+    "[prefilter] [res] [id: int] [pass: bool]")
 
 
 @dataclass
@@ -116,54 +166,27 @@ class SdfuzzResult:
 
 
 def parse_sbsv_line(line: str) -> Optional[Dict[str, str]]:
-    """
-    Parse a single sbsv line like:
-      [phase] [action] [prefix run] [id 0] [remaining_patches [1,2]] ...
-
-    Returns a dict of key->value, plus '_phase' and '_action' keys.
-    Returns None if the line cannot be parsed.
-    """
-    line = line.strip()
-    if not line:
+    """Parse one timestamp-prefixed or plain SBSV row with ``sbsv``."""
+    payload = _strip_log_prefix(line.strip())
+    if not payload:
         return None
-
-    # Find all top-level [...] tokens (handles one level of nesting)
-    tokens = re.findall(r'\[(?:[^\[\]]|\[[^\]]*\])*\]', line)
-    if not tokens:
+    try:
+        row = SBSV_PARSER.parse_line_detached(payload)
+    except Exception:
         return None
-
-    entry: Dict[str, str] = {}
-
-    # First token is always the phase
-    entry["_phase"] = strip_brackets(tokens[0])
-    if len(tokens) >= 2:
-        entry["_action"] = strip_brackets(tokens[1])
-
-    # Process remaining tokens as key-value pairs
-    i = 2
-    while i < len(tokens):
-        inner = strip_brackets(tokens[i])
-        parts = inner.split(None, 1)  # split on first whitespace
-        if len(parts) == 2:
-            entry[parts[0]] = parts[1]
-        elif len(parts) == 1:
-            # Some tokens are standalone (like [crash])
-            pass
-        i += 1
-
+    if row is None:
+        return None
+    schema_parts = row.schema_name.split("$", 1)
+    entry: Dict[str, str] = {"_phase": schema_parts[0]}
+    if len(schema_parts) == 2:
+        entry["_action"] = schema_parts[1]
+    for key, value in row.data.items():
+        entry[key] = str(value)
     return entry
 
 
-def strip_brackets(token: str) -> str:
-    """Remove the outer [ ] from a token like '[key value]'."""
-    token = token.strip()
-    if token.startswith('[') and token.endswith(']'):
-        return token[1:-1]
-    return token
-
-
 def parse_progress_sbsv(sbsv_path: str) -> List[Dict[str, str]]:
-    """Parse a progress.sbsv file. Returns a list of parsed line dicts."""
+    """Parse a progress.sbsv file with the schema-driven SBSV parser."""
     results: List[Dict[str, str]] = []
     if not os.path.isfile(sbsv_path):
         return results
@@ -174,6 +197,25 @@ def parse_progress_sbsv(sbsv_path: str) -> List[Dict[str, str]]:
             if entry:
                 results.append(entry)
     return results
+
+def _parse_row_with_fallback(line: str, parser: sbsv.parser,
+                             legacy_parser: Optional[sbsv.parser] = None):
+    """Parse an SBSV row, optionally retrying a legacy schema parser."""
+    payload = _strip_log_prefix(line.strip())
+    if not payload:
+        return None
+    try:
+        row = parser.parse_line_detached(payload)
+    except Exception:
+        row = None
+    if row is None and legacy_parser is not None:
+        try:
+            row = legacy_parser.parse_line_detached(payload)
+        except Exception:
+            row = None
+    return row
+
+
 
 
 def find_errors_in_log(log_path: str) -> List[str]:
@@ -205,84 +247,62 @@ def find_errors_in_tracer_msg(log_path: str) -> List[str]:
 
 
 def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
-    """
-    Parse a verifier.sbsv file.
-    Returns dict mapping patch_id -> list of result strings.
-    """
+    """Parse verifier-result rows with the schema-driven SBSV parser."""
     results: Dict[int, List[str]] = {}
     if not os.path.isfile(sbsv_path):
         return results
 
     with open(sbsv_path, "r") as f:
         for line in f:
-            m = re.search(
-                r'\[verifier-result\]\s+\[res\s+(\w+)\]\s+\[patch\s+(\d+)\]',
-                line)
-            if m:
-                res = m.group(1)
-                patch_id = int(m.group(2))
-                results.setdefault(patch_id, []).append(res)
+            row = _parse_row_with_fallback(line, SBSV_PARSER)
+            if row is not None and row.schema_name == "verifier-result":
+                patch_id = safe_int(str(row["patch"]))
+                results.setdefault(patch_id, []).append(str(row["res"]))
     return results
 
 
 def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
-    """
-    Parse a filter.sbsv file (written by the FILTER phase):
-      [patch] [id 1] [pass True]
-    Returns dict mapping patch_id -> passed (True) / filtered out (False).
-    """
+    """Parse [patch] rows with the schema-driven SBSV parser."""
     results: Dict[int, bool] = {}
     if not os.path.isfile(sbsv_path):
         return results
 
     with open(sbsv_path, "r") as f:
         for line in f:
-            m = re.search(
-                r'\[patch\]\s+\[id\s+(\d+)\]\s+\[pass\s+(true|false)\]',
-                line, re.IGNORECASE)
-            if m:
-                results[int(m.group(1))] = m.group(2).lower() == "true"
+            row = _parse_row_with_fallback(line, SBSV_PARSER)
+            if row is not None and row.schema_name == "patch":
+                results[int(row["id"])] = bool(row["pass"])
     return results
 
 
 def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
-    """
-    Parse a prefilter.sbsv file (written by the `prefilter` subcommand of
-    fuzzolic/binradar-setup.py, one row per candidate predicate):
+    """Parse prefilter result and done rows with ``sbsv``.
 
-      [prefilter] [res] [id 1] [pass true|false]
-      [prefilter] [done] [total 54880] [survived 26733] [time 1.74]
-
-    Returns {"total": N, "survived": M, "done": 1} from the [done] marker
-    when present, otherwise counts the [res] rows.  Legacy rows without
-    the [res] tag are counted too.  When the file does not exist, all
-    values stay -1 (done 0).
+    Current rows contain ``[new-id]``; legacy rows are accepted only as a
+    compatibility fallback for existing workdirs.  The done marker remains
+    authoritative for total/survived counts.
     """
     result = {"total": -1, "survived": -1, "done": 0}
     if not os.path.isfile(sbsv_path):
         return result
-    row_re = re.compile(
-        r'\[prefilter\]\s+\[(?:res\]\s+\[)?id\s+(\d+)\]\s+'
-        r'\[pass\s+(true|false)\]',
-        re.IGNORECASE)
-    done_re = re.compile(
-        r'\[prefilter\]\s+\[done\]\s+\[total\s+(\d+)\]\s+'
-        r'\[survived\s+(\d+)\]',
-        re.IGNORECASE)
     total = 0
     survived = 0
     with open(sbsv_path, "r") as f:
         for line in f:
-            m = done_re.search(line)
-            if m:
-                result["total"] = int(m.group(1))
-                result["survived"] = int(m.group(2))
-                result["done"] = 1
+            row = _parse_row_with_fallback(
+                line, PREFILTER_SBSV_PARSER, LEGACY_RES_PREFILTER_SBSV_PARSER)
+            if row is None:
+                row = _parse_row_with_fallback(
+                    line, LEGACY_PREFILTER_SBSV_PARSER)
+            if row is None:
                 continue
-            m = row_re.search(line)
-            if m:
+            if row.schema_name == "prefilter$done":
+                result["total"] = int(row["total"])
+                result["survived"] = int(row["survived"])
+                result["done"] = 1
+            elif row.schema_name in ("prefilter$res", "prefilter"):
                 total += 1
-                if m.group(2).lower() == "true":
+                if bool(row["pass"]):
                     survived += 1
     if result["done"] == 0 and total > 0:
         result["total"] = total

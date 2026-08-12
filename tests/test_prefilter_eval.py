@@ -19,7 +19,9 @@ _spec.loader.exec_module(binradar_setup)
 
 eval_patch_str = binradar_setup.eval_patch_str
 evaluate_predicate = binradar_setup.evaluate_predicate
+load_predicates = binradar_setup.load_predicates
 load_prefilter_passed_ids = binradar_setup.load_prefilter_passed_ids
+write_prefilter = binradar_setup.write_prefilter
 PrefilterTrap = binradar_setup.PrefilterTrap
 INT64_MIN = binradar_setup.INT64_MIN
 INT64_MAX = (1 << 63) - 1
@@ -145,34 +147,67 @@ def test_load_prefilter_passed_ids():
 
         # Done marker must be skipped, not treated as a parse error.
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass false]\n"
-            "[prefilter] [res] [id 2] [pass true]\n"
-            "[prefilter] [res] [id 3] [pass true]\n"
+            "[prefilter] [res] [id 1] [pass false] [new-id -1]\n"
+            "[prefilter] [res] [id 2] [pass true] [new-id 1]\n"
+            "[prefilter] [res] [id 3] [pass true] [new-id 2]\n"
             "[prefilter] [done] [total 3] [survived 2] [time 0.01]\n")
-        assert load_prefilter_passed_ids(sbsv) == [2, 3]
+        assert load_prefilter_passed_ids(sbsv) == {2: 1, 3: 2}
 
         # Blank lines are fine.
-        sbsv.write_text("\n[prefilter] [res] [id 7] [pass true]\n\n")
-        assert load_prefilter_passed_ids(sbsv) == [7]
+        sbsv.write_text(
+            "\n[prefilter] [res] [id 7] [pass true] [new-id 1]\n\n")
+        assert load_prefilter_passed_ids(sbsv) == {7: 1}
 
         # A malformed row fails open (None).
-        sbsv.write_text("[prefilter] [res] [id 1] [pass true]\n"
-                        "garbage\n")
+        sbsv.write_text(
+            "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
+            "garbage\n")
         assert load_prefilter_passed_ids(sbsv) is None
 
         # An unknown-schema row fails open (None).
-        sbsv.write_text("[prefilter] [res] [id 1] [pass true]\n"
-                        "[prefiltter] [id 2] [pass true]\n")
+        sbsv.write_text(
+            "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
+            "[prefiltter] [id 2] [pass true]\n")
         assert load_prefilter_passed_ids(sbsv) is None
 
-        # The pre-[res] row format ([prefilter] [id ...] as a root schema)
-        # is not registered and fails open (None).
+        # The pre-[res] row format remains invalid.
         sbsv.write_text("[prefilter] [id 1] [pass true]\n")
         assert load_prefilter_passed_ids(sbsv) is None
 
+        # A passing row must have a positive new-id.
+        sbsv.write_text(
+            "[prefilter] [res] [id 1] [pass true] [new-id -1]\n")
+        assert load_prefilter_passed_ids(sbsv) is None
+
+        # A rejected row must have new-id -1.
+        sbsv.write_text(
+            "[prefilter] [res] [id 1] [pass false] [new-id 1]\n")
+        assert load_prefilter_passed_ids(sbsv) is None
+
         # An all-false file yields no survivors.
-        sbsv.write_text("[prefilter] [res] [id 1] [pass false]\n")
-        assert load_prefilter_passed_ids(sbsv) == []
+        sbsv.write_text(
+            "[prefilter] [res] [id 1] [pass false] [new-id -1]\n")
+        assert load_prefilter_passed_ids(sbsv) == {}
+
+
+def test_predicate_source_and_runtime_ids():
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as tmp:
+        predicates = Path(tmp) / "predicates"
+        predicates.write_text("first\n\nthird\n")
+        assert load_predicates(predicates) == [(1, "first"), (3, "third")]
+
+        sbsv = Path(tmp) / "prefilter.sbsv"
+        write_prefilter(sbsv, [(1, False, ""), (3, True, ""),
+                               (8, True, "")], 0.0)
+        assert "[prefilter] [res] [id 1] [pass false] [new-id -1]" \
+            in sbsv.read_text()
+        assert "[prefilter] [res] [id 3] [pass true] [new-id 1]" \
+            in sbsv.read_text()
+        assert "[prefilter] [res] [id 8] [pass true] [new-id 2]" \
+            in sbsv.read_text()
+        assert load_prefilter_passed_ids(sbsv) == {3: 1, 8: 2}
 
 
 def test_parse_state_lines():

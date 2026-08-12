@@ -58,7 +58,7 @@ _MASK64 = (1 << 64) - 1
 # sbsv schemas for the rows this module parses:
 #   [prefilter-state] [v0 N] [v1 N] ... [v15 N]  (written by
 #     brpatch-prefilter.c::dest to the PATCH_FD pipe)
-#   [prefilter] [res] [id N] [pass true|false]   (prefilter.sbsv rows)
+#   [prefilter] [res] [id N] [pass true|false] [new-id N|-1] (prefilter.sbsv)
 #   [prefilter] [done] [total N] [survived N] [time T]  (prefilter.sbsv marker)
 PREFILTER_STATE_SCHEMA = (
     "[prefilter-state] " + " ".join(f"[v{i}: int]" for i in range(16))
@@ -314,25 +314,58 @@ def save_env(env: Dict[str, str], file: Path):
             f.write(f"{key}=\"{value}\"\n")
 
 
-def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[List[int]]:
-    """Read a prefilter.sbsv file and return the 1-based ids whose
-    [prefilter] [res] [id N] [pass true] rows mark the predicate as
-    surviving.
+def load_predicates(file: Path) -> List[Tuple[int, str]]:
+    """Load non-empty predicates with their physical source line numbers."""
+    predicates: List[Tuple[int, str]] = list()
+    with file.open("r") as f:
+        for line_number, line in enumerate(f, start=1):
+            predicate = line.strip()
+            if predicate:
+                predicates.append((line_number, predicate))
+    return predicates
 
-    Returns None when the file cannot be parsed (caller fails open and
-    keeps every predicate).  Blank lines and the trailing
-    [prefilter] [done] marker written by the `prefilter` subcommand are
-    skipped, not treated as parse errors.
+
+def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[Dict[int, int]]:
+    """Read source predicate IDs and their compact runtime patch IDs.
+
+    Each passing row must contain a positive, unique ``new-id``.  A false
+    row must contain ``new-id -1``.  Returns ``None`` on malformed input so
+    setup fails open and keeps every predicate.
     """
     parser = sbsv.parser()
-    parser.add_schema("[prefilter] [res] [id: int] [pass: bool]")
-    parser.add_schema("[prefilter] [done] [total: int] [survived: int] [time: float]")
-    passed_ids: List[int] = list()
+    parser.add_schema(
+        "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
+    parser.add_schema(
+        "[prefilter] [done] [total: int] [survived: int] [time: float]")
+    passed_ids: Dict[int, int] = dict()
+    used_new_ids = set()
     with prefilter_file.open("r") as f:
-        result = parser.load(f)
-        for row in result["prefilter"]["res"]:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = parser.parse_line_detached(line, line_number)
+            except Exception:
+                return None
+            if row is None:
+                return None
+            if row.schema_name == "prefilter$done":
+                continue
+            if row.schema_name != "prefilter$res":
+                return None
+            source_id = row["id"]
+            new_id = row["new-id"]
             if row["pass"]:
-                passed_ids.append(row["id"])
+                if source_id <= 0 or new_id <= 0:
+                    return None
+                if source_id in passed_ids or new_id in used_new_ids:
+                    return None
+                passed_ids[source_id] = new_id
+                used_new_ids.add(new_id)
+            elif new_id != -1:
+                return None
+    if sorted(used_new_ids) != list(range(1, len(used_new_ids) + 1)):
+        return None
     return passed_ids
 
 
@@ -660,14 +693,22 @@ def parse_state_lines(data: str) -> List[List[int]]:
     return states
 
 
-def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str]],
+def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, str]],
                     elapsed: float) -> None:
-    """Write workdir/prefilter.sbsv: one [prefilter] [res] row per predicate
-    (1-based id matching brpatches.inc case numbering) plus a done marker."""
+    """Write source predicate IDs and compact runtime patch IDs.
+
+    Passing predicates receive consecutive ``new-id`` values starting at 1;
+    rejected predicates receive ``new-id -1``.  Runtime patch IDs therefore
+    remain compatible with ``range(1, TOTAL_PATCHES + 1)`` while ``id``
+    preserves the predicate source line.
+    """
     survived = 0
     with prefilter_file.open("w", encoding="utf-8") as f:
-        for idx, passed, note in results:
-            f.write(f"[prefilter] [res] [id {idx}] [pass {str(passed).lower()}] {note}\n")
+        for idx, passed, note, predicate in results:
+            new_id = survived + 1 if passed else -1
+            f.write(f"[prefilter] [res] [id {idx}] "
+                    f"[pass {str(passed).lower()}] [new-id {new_id}] "
+                    f"{predicate} ({(' ' + note) if note else ''})\n")
             if passed:
                 survived += 1
         f.write(f"[prefilter] [done] [total {len(results)}] "
@@ -1007,7 +1048,7 @@ def extract_trampoline_info(
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
     # Read predicates
-    predicates = list()
+    predicate_records: List[Tuple[int, str]] = list()
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
     brpatched_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
@@ -1033,14 +1074,13 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             return
         print(f"Error: {predicates_file.name} file not found in {workdir}")
         exit(1)
+    predicate_records = load_predicates(predicates_file)
 
-    with predicates_file.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            predicates.append(line)
-
+    patch_records = [
+        (patch_id, source_id, predicate)
+        for patch_id, (source_id, predicate)
+        in enumerate(predicate_records, start=1)
+    ]
     # Apply the offline prefilter results, if any (see the `prefilter`
     # subcommand).  Predicates whose prefilter row evaluates to true
     # survive; the rest are discarded before the top-10 cap, so the
@@ -1053,11 +1093,16 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             print(f"Warning: failed to parse {prefilter_file.name}; "
                   f"using all predicates (fail-open)")
         else:
-            survived = [predicates[i - 1] for i in sorted(passed_ids)
-                        if 1 <= i <= len(predicates)]
-            print(f"[prefilter] loaded {len(predicates)} predicates, "
+            predicate_by_id = dict(predicate_records)
+            survived = list()
+            for source_id, new_id in sorted(
+                    passed_ids.items(), key=lambda item: item[1]):
+                predicate = predicate_by_id.get(source_id)
+                if predicate is not None:
+                    survived.append((new_id, source_id, predicate))
+            print(f"[prefilter] loaded {len(predicate_records)} predicates, "
                   f"{len(survived)} survived")
-            predicates = survived
+            patch_records = survived
 
     # Get patch destination
     destinations_file = workdir / "destinations"
@@ -1077,16 +1122,21 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     # Generate brpatches.inc
     # Currently, we only select top 10 patches.
-    patch_cnt = min(10, len(predicates))
+    # Runtime patch IDs are compact and start at 1.  Each selected record
+    # retains the original predicate source line for traceability.
+    selected_patch_records = patch_records[:10]
+    patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
     shutil.copy(BRPATCH_SOURCE, brpatch_source)
     brpatches_inc = workdir / "brpatches.inc"
     with brpatches_inc.open("w") as f:
         f.write("case 0:\n\treturn \"p0\";\n")
-        for i in range(1, patch_cnt + 1):
-            patch_str = predicate_to_patch_str(predicates[i - 1])
-            f.write(f"case {i}:\n\treturn \"{patch_str}\";\n")
+        for patch_id, source_id, predicate in selected_patch_records:
+            patch_str = predicate_to_patch_str(predicate)
+            f.write(f"case {patch_id}:\n"
+                    f"\treturn \"{patch_str}\"; "
+                    f"/* predicate line {source_id} */\n")
         f.write("default:\n\treturn \"p0\";\n")
     cmd = ["guix", "shell", "e9patch@1.0.0", "--",
             "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
@@ -1188,9 +1238,8 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         # No predicates (CWE synth path); nothing to prefilter.
         print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
         sys.exit(0)
-    predicates = [line.strip() for line in predicates_file.open("r")
-                  if line.strip()]
-    if not predicates:
+    predicate_records = load_predicates(predicates_file)
+    if not predicate_records:
         write_prefilter(prefilter_file, [], time.time() - start)
         print("No predicates; prefilter is a no-op.")
         sys.exit(0)
@@ -1210,8 +1259,8 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         # Fail open, matching run_filter's `result is None -> passed=True`.
         print("Warning: prefilter capture failed; keeping all predicates "
               "(fail-open)")
-        results = [(i, True, "capture failed (fail-open)")
-                   for i in range(1, len(predicates) + 1)]
+        results = [(source_id, True, "capture failed (fail-open)", predicate)
+                   for source_id, predicate in predicate_records]
         write_prefilter(prefilter_file, results, time.time() - start)
         sys.exit(0)
     if not states:
@@ -1220,19 +1269,24 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         # activates and the POC still crashes at the original fault).
         print("Warning: patch site never hit on the POC; discarding all "
               "predicates")
-        results = [(i, False, "patch site never hit")
-                   for i in range(1, len(predicates) + 1)]
+        results = [(source_id, False, "patch site never hit", predicate)
+                   for source_id, predicate in predicate_records]
         write_prefilter(prefilter_file, results, time.time() - start)
         sys.exit(0)
 
     print(f"Captured {len(states)} patch-site state vector(s)")
     results = []
-    for idx, predicate in enumerate(predicates, start=1):
+    next_new_id = 0
+    for source_id, predicate in predicate_records:
         passed, note = evaluate_predicate(predicate, states)
+        if passed:
+            next_new_id += 1
         if note:
-            print(f"[prefilter] [id {idx}] [pass {str(passed).lower()}] "
+            new_id = next_new_id if passed else -1
+            print(f"[prefilter] [res] [id {source_id}] "
+                  f"[pass {str(passed).lower()}] [new-id {new_id}] "
                   f"{predicate!r}: {note}")
-        results.append((idx, passed, note))
+        results.append((source_id, passed, note, predicate))
     write_prefilter(prefilter_file, results, time.time() - start)
 
 
