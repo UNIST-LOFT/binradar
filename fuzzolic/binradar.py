@@ -664,7 +664,7 @@ class BinRadarExecutor:
                 env["E9_LOADER_RANGE"]
             ),
             total_patches=int(env["TOTAL_PATCHES"]),
-            e9_relocated_calls=env["E9_RELOCATED_CALL_JUMPS"],
+            e9_relocated_calls=env.get("E9_RELOCATED_CALL_JUMPS", ""),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1")
         return binradar
