@@ -92,7 +92,7 @@ class AFLppFuzzer(BinRadarFuzzer):
         cmd = [
             os.path.join(AFL_PATH, "afl-fuzz"),
             "-Q",
-            "-t", 3000,
+            "-t", "3000",
             "-i", input_path,
             "-o", self.outdir,
         ]

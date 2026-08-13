@@ -412,13 +412,14 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         result.error_message = "progress.sbsv is empty"
         return result
 
-    # Group entries by (prefix, id) — only those matching run_prefix
+    # Group entries by (prefix, id) — only those matching run_prefix exactly
+    # (so `--run-prefix br` does not also collect `br-test-*` runs).
     runs: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
     for entry in progress:
         prefix = entry.get("prefix", "")
         run_id = entry.get("id", "")
         if prefix and run_id:
-            if not prefix.startswith(run_prefix):
+            if prefix != run_prefix:
                 continue
             key = (prefix, run_id)
             runs.setdefault(key, []).append(entry)
@@ -426,6 +427,15 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
     if not runs:
         result.error_message = f"No runs found with prefix '{run_prefix}'"
         return result
+
+    # Keep only the most recent run (highest numeric id) for the requested
+    # prefix: a subject may have been rerun several times (br-00000, br-00001, ...).
+    latest_run_id = max(safe_int(run_id) for _, run_id in runs.keys())
+    runs = {
+        key: entries
+        for key, entries in runs.items()
+        if safe_int(key[1]) == latest_run_id
+    }
 
     # Workdir-level patch prefilter context (setup-time artifact shared by
     # all runs of this experiment).
