@@ -38,10 +38,13 @@ cd benchmarks/loftix
 just build-all
 just list exp.list # You can edit exp.list to select benchmarks to run.
 just run taosc exp.list 20
+just run prefilter exp.list 20   # optional: prefilter patch predicates before setup
 just run setup exp.list 20
-just run binradar exp.list 20
+just run binradar exp.list 20    # docker runner; use `just run br exp.list 20` to run without docker
 # Run `just failed taosc taosc_failed.list` to check failed runs.
 # You can rerun failed runs with `just resume taosc exp.list 20` based on the joblog or `just run taosc taosc_failed.list 20`.
+# Evaluate patches with external-fuzzer testcases (sdfuzz):
+just eval-all
 ```
 
 ### Configuration
@@ -96,10 +99,57 @@ Timeout can be given as `-t` or `--timeout` option (default: 3600 seconds).
 
 Output will be saved in the `out` directory in the working directory. You can check the logs and results in the output directory.
 
-`out/progress.log` file contains information about the progress of the verification process. 
-`[final] [done] [id {run_id}] [remaining_patches {remaining_patches}] [binradar_remaining_patches {binradar_remaining_patches}]` indicates the final result of the verification process.
+`out/progress.sbsv` file contains information about the progress of the verification process. 
+`[final] [done] [prefix {run_prefix}] [id {run_id}] [remaining_patches {remaining_patches}] [binradar_remaining_patches {binradar_remaining_patches}]` indicates the final result of the verification process, which is also written to `<run_dir>/final.sbsv`.
 
 `minimizer.sbsv` is streamed: the minimizer appends each row holding `fcntl.flock(LOCK_EX)` across write+flush, and the verifier reads new rows with the same lock, so partial rows are never observed. The `[minimizer] [done] [time N]` row signals the end of the stream.
+
+## Running scripts
+`fuzzolic/binradar-setup.py` is the setup entry point (run via `just setup` in the working directory, or `uv run fuzzolic/binradar-setup.py setup -w <workdir>`). It generates `binradar.env` and `<binary>.brpatched` based on the configuration in `config.env`.
+
+Before `just setup`, you can run the patch prefilter (`just prefilter <workdir>`, i.e. `uv run fuzzolic/binradar-setup.py prefilter -w <workdir>`) to evaluate all candidate predicates offline: it instruments `<binary>.orig` with a capture plugin (`benchmarks/loftix/brpatch-prefilter.c`) at `PATCH_LOC`, runs the POC once under `afl-qemu-trace` (same QASAN configuration as the FILTER phase) to record the patch-site `STATE` vectors, evaluates every predicate from `workdir/predicates` with a Python mirror of `brpatch.c::eval` (C int64/x86-64 semantics), and writes `workdir/prefilter.sbsv` (`[prefilter] [res] [id N] [pass true|false] [new-id N|-1]` rows plus a `[prefilter] [done] [total N] [survived N] [time T]` marker). `setup` keeps only the surviving predicates (pass=true) before the top-10 cap. `just binradar` runs the prefilter automatically on fresh workdirs.
+
+### binradar-collect-results.py
+`benchmarks/scripts/binradar-collect-results.py` collects results for the subjects in `exp.list` (one subject dir per line). It uses subcommands:
+- `binradar` (default; omitting the subcommand also works): collects binradar results from `<workdir>/out` (progress.sbsv + verifier.sbsv), plus the patch prefilter context from `<workdir>/prefilter.sbsv` (predicates evaluated/survived; a missing `[prefilter] [done]` marker is reported). Options: `--exp` (default `exp.list`), `--workdir` (default `workdir`), `--run-prefix` (default `run`), `--format log|csv|tsv` (default `log`), `--output <file>`.
+- `sdfuzz`: collects external-fuzzer evaluation results from `<workdir>/<fuzzer>` (output of `binradar-evaluation.py`): `final.sbsv` remaining patches and per-patch verdicts, `evaluation.log` testcase counts/errors, and the `<workdir>/prefilter.sbsv` context. Options: same shared options plus `--fuzzer` (default `sdfuzz`).
+
+Both subcommands share `-n`/`--no-subject-id` to omit the subject id column in csv/tsv output. Output goes to `benchmarks/loftix/logs/<cmd>-<timestamp>.<ext>` (or `--output <file>`); log uses full subject paths, csv/tsv use paths relative to the exp file directory.
+
+### binradar-evaluation.py
+`fuzzolic/binradar-evaluation.py` evaluates binradar patches using test cases produced by an external fuzzer (e.g. sdfuzz). It is designed for a single subject; run it in parallel across subjects with `just eval-all` (or `just eval` for a single subject):
+
+```shell
+uv run fuzzolic/binradar-evaluation.py --fuzzer sdfuzz --fuzz-out /path/to/work-sdfuzz/out --workdir /path/to/loftix/workdir
+```
+
+Options: `--fuzzer <name>` (output dir name under workdir, default `sdfuzz`), `--fuzz-out <dir>` (external fuzzer output dir containing `queue/` and `crashes/`), `--workdir <dir>` (binradar workdir with `binradar.env`, `<binary>.orig`, `<binary>.brpatched`), `--queue-dir`/`--crashes-dir` (defaults `queue`/`crashes`), `--probe-results <file>` (reuse a specific probe result; by default reuses the latest `workdir/out/*/probe-results.sbsv`, otherwise runs the probe), `--filter-results <file>` (reuse a specific filter result; by default reuses the latest `workdir/out/*/filter.sbsv`, otherwise runs the filter).
+
+Flow: probe (reused when possible) -> filter (patched binary + POC, keeps only patches that do not crash at the original fault address; reused when possible) -> minimizer on `<fuzz-out>/queue` + `<fuzz-out>/crashes` -> concrete verifier on the filtered patch candidates only -> final remaining-patches analysis.
+
+Outputs (relative to `--workdir`):
+- `<workdir>/<fuzzer>/minimizer/` — minimizer run dir (`minimized/` testcases, `minimizer.sbsv`)
+- `<workdir>/<fuzzer>/verified.sbsv` — concrete verifier result (only filtered patches)
+- `<workdir>/<fuzzer>/final.sbsv` — final result with `[final] [done] ... [remaining_patches ...] [binradar_remaining_patches ...]`
+- `<workdir>/<fuzzer>/probe-results.sbsv`, `filter.sbsv`, `evaluation.log`
+
+### binradar-test.py
+`fuzzolic/binradar-test.py` runs tests on the benchmark subjects in `exp.list` (one subject dir per line, resolved relative to the exp file directory). It uses subcommands so it can be extended for other tests:
+
+```shell
+cd benchmarks/loftix
+python ../../fuzzolic/binradar-test.py qasan [options]
+```
+
+Subcommand `qasan` runs the probe-style QASAN execution (`afl-qemu-trace --asan host`, `AFL_USE_QASAN=1`) against both `<binary>.orig` and `<binary>.brpatched` (with `PATCH_ID=0`, i.e. original behavior) for each subject and checks that QASAN detects the same crash (same fault address) on both binaries.
+
+Options: `--exp` (default `exp.list`), `--workdir` (default `workdir`), `--timeout` (default 180s per probe run), `--format log|csv|tsv` (default `log`), `--output <file>` (default `logs/qasan-<timestamp>.<ext>`), `--jobs N` (parallel subjects), `-n`/`--no-subject-id` (omit the subject id column in csv/tsv), `--verbose` (only with `--format=log`; adds a single-line reproduction command per probe: `cd <workdir> && ENV=...; <command>`).
+
+Verdicts:
+- PASS: same crash (same fault address) detected on both .orig and .brpatched
+- FAIL: patched binary does not crash, crashes at a different fault address, or the probe on .brpatched fails (timeout / no crash detected)
+- BASELINE-FAIL: the probe on .orig does not reproduce the crash; subject cannot be tested
+- SKIP: workdir / binary / poc input files missing
 
 ## Structure
 ### Orchestrator
