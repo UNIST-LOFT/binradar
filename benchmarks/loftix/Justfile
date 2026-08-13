@@ -78,5 +78,9 @@ backup-all workdir_old="workdir" workdir_bak="workdir-bak":
 clean-all workdir="workdir":
     just _run-all clean "rm -rf {{workdir}}" 30
 
-eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/loftix/loftix-benchmarks":
-    just _run-all eval "just eval {{workdir}} {{fuzzer}} {{fuzz_out_root}}/{}/work-{{fuzzer}}/out" 30
+eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/loftix/loftix-benchmarks" argfile="exp.list" jobs="30":
+    #!/usr/bin/env bash
+    mkdir -p logs/eval-results
+    parallel --tag --joblog logs/eval.tsv --results logs/eval-results -j {{jobs}} \
+      'cd "{}" && just eval "{{workdir}}" "{{fuzzer}}" "{{fuzz_out_root}}/{}/work-{{fuzzer}}/out"' \
+      :::: "{{argfile}}"

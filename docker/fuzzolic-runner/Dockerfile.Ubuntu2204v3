@@ -32,7 +32,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt install -y \
 	linux-libc-dev gcc-multilib \
 	apt-transport-https libtool libtool-bin autoconf \
     git gdb dumb-init valgrind ninja-build \
-	time xxd openssh-server && \
+	time xxd openssh-server bear && \
 	apt clean && \
 	rm -rf /var/lib/apt/lists/*
 
@@ -63,10 +63,10 @@ RUN uv venv && uv sync
 COPY --chown=binradar:binradar . .
 
 # Build QEMU tracer
-RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && make -j 32 
+RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && bear -- make -j 32 
 
 # Build custom Z3
-RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
+RUN cd solver && mkdir build && cd build && cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .. && make -j 32
 
 # Build LibAFL
 
