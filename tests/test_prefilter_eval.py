@@ -128,11 +128,16 @@ def test_evaluate_predicate_keep_discard():
     assert evaluate_predicate(predicate, [[-1] * 16]) == (True, "")
 
 
-def test_evaluate_predicate_fail_open():
-    # Division by zero in the predicate would SIGFPE the patch -> kept.
-    passed, note = evaluate_predicate("1 / rax", [[0] * 16])
-    assert passed is True
-    assert "trap" in note
+def test_evaluate_predicate_trap_rejected():
+    # Division/modulo by zero (or INT64_MIN / -1) would trap the patch at
+    # runtime (reported as `br 2`), so the predicate is rejected.
+    for predicate in ("1 / rax", "1 % rax"):
+        passed, note = evaluate_predicate(predicate, [[0] * 16])
+        assert passed is False
+        assert "trap" in note
+
+
+def test_evaluate_predicate_unparseable_fail_open():
     # Unparseable predicate -> kept (the existing pipeline surfaces the
     # error, same as prepare_patch would).
     passed, _ = evaluate_predicate("??garbage??", [[0] * 16])
@@ -199,8 +204,8 @@ def test_predicate_source_and_runtime_ids():
         assert load_predicates(predicates) == [(1, "first"), (3, "third")]
 
         sbsv = Path(tmp) / "prefilter.sbsv"
-        write_prefilter(sbsv, [(1, False, ""), (3, True, ""),
-                               (8, True, "")], 0.0)
+        write_prefilter(sbsv, [(1, False, "", "first"), (3, True, "", "third"),
+                               (8, True, "", "eighth")], 0.0)
         assert "[prefilter] [res] [id 1] [pass false] [new-id -1]" \
             in sbsv.read_text()
         assert "[prefilter] [res] [id 3] [pass true] [new-id 1]" \

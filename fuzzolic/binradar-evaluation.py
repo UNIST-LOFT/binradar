@@ -142,12 +142,17 @@ def run_filter(workdir: str, env: Dict[str, str],
     survived_patches: List[int] = []
     with open(save_file, "w", encoding="utf-8") as f:
         for patch_id in range(1, total_patches + 1):
-            result, _ = runner.test_with_patched(str(patch_id), testcase)
+            result, patch_result = runner.test_with_patched(str(patch_id), testcase)
             if result is None:
                 logger.warning(
                     f"[FILTER] [patch {patch_id}] Failed to run patched binary "
                     "with the poc input. Keeping the patch.")
                 passed = True
+            elif patch_result is not None and patch_result.crashed():
+                passed = False
+                logger.info(
+                    f"[FILTER] [patch {patch_id}] Patch itself crashed "
+                    "(division/modulo by zero). Filtered out.")
             elif result.is_crash() and result.fault_addr == probe_result.fault_addr:
                 passed = False
                 logger.info(

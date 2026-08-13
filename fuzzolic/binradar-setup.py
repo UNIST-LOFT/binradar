@@ -476,6 +476,11 @@ def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, s
     captured state (i.e. the branch would be taken at least once on the
     POC, so the FILTER phase would not reject the patch as still crashing
     at the original fault address).
+
+    A predicate that would trap in C on any captured state (division or
+    modulo by zero, INT64_MIN / -1) is rejected: brpatch.c reports it as
+    `br 2` and returns NULL, so the patch follows the original path and is
+    filtered out by the FILTER phase.
     """
     try:
         patch_str = predicate_to_patch_str(predicate)
@@ -483,14 +488,15 @@ def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, s
         # prepare_patch would crash on this predicate anyway; keep it so
         # the existing pipeline surfaces the error.
         return True, f"unparseable predicate kept ({e})"
+    # Reject on any trap first, regardless of what other states evaluate to.
     for state in states:
         try:
-            if eval_patch_str(patch_str, state) != 0:
-                return True, ""
+            eval_patch_str(patch_str, state)
         except PrefilterTrap as e:
-            # The patch would SIGFPE at the patch site (different fault
-            # address), so the FILTER phase would keep it.
-            return True, f"patch would trap in C ({e})"
+            return False, f"patch would trap in C ({e})"
+    for state in states:
+        if eval_patch_str(patch_str, state) != 0:
+            return True, ""
     return False, "evaluates to 0 on all captured states"
 
 

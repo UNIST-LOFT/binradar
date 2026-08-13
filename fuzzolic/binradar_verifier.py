@@ -278,10 +278,10 @@ class BinRadarProbeResult:
 
 class BinRadarPatchResult:
     line_parser: sbsv.parser = sbsv.parser()
-    line_parser.add_schema("[patch] [id: int] [br: bool]")
-    line_parser.add_schema("[patch-res] [pid: int] [br: list[bool]]")
+    line_parser.add_schema("[patch] [id: int] [br: int]")
+    line_parser.add_schema("[patch-res] [pid: int] [br: list[int]]")
     
-    def __init__(self, patch_id: int, br_selection: List[bool]):
+    def __init__(self, patch_id: int, br_selection: List[int]):
         self.patch_id = patch_id
         self.br_selection = br_selection
     
@@ -304,7 +304,7 @@ class BinRadarPatchResult:
                 break
         if patch_id == -1:
             return None
-        br_selection: List[bool] = list()
+        br_selection: List[int] = list()
         for entry in result:
             if entry.get_name() == "patch" and entry["id"] == patch_id:
                 br = entry["br"]
@@ -323,6 +323,11 @@ class BinRadarPatchResult:
             if res is not None and res.get_name() == "patch-res":
                 return cls(patch_id=res["pid"], br_selection=res["br"])
         return None
+
+    def crashed(self) -> bool:
+        """True if the patch itself crashed at the patch site (br 2),
+        e.g. a division/modulo by zero in the predicate."""
+        return 2 in self.br_selection
 
 class BinRadarQemuRunner:
     dir: str
@@ -443,8 +448,8 @@ class Testcase:
     filename: str
     exit: str
     fault_addr: int
-    br: List[bool]
-    def __init__(self, id: int, filename: str, exit: str, fault_addr: int, br: List[bool]):
+    br: List[int]
+    def __init__(self, id: int, filename: str, exit: str, fault_addr: int, br: List[int]):
         self.id = id
         self.filename = filename
         self.exit = exit
@@ -530,6 +535,9 @@ class BinRadarConcreteVerifier:
             if result is None:
                 self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
                 return False
+            if patch_result is not None and patch_result.crashed():
+                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return True
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
@@ -547,6 +555,9 @@ class BinRadarConcreteVerifier:
             if result is None:
                 self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
                 return False
+            if patch_result is not None and patch_result.crashed():
+                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return True
             if result.is_crash():
                 self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
@@ -554,6 +565,8 @@ class BinRadarConcreteVerifier:
                 if patch_result is None:
                     self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
                     return False
+                # br is 0/1 here: a `2` (patch crashed) is rejected
+                # explicitly above, before this comparison.
                 if testcase.br == patch_result.br_selection:
                     self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     return False
@@ -583,7 +596,7 @@ class BinRadarConcreteVerifier:
         """
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
-        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[bool]]")
+        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
         parser.add_schema("[minimizer] [done] [time: int]")
         if not os.path.exists(minimizer_result_file):
             if minimizer_thread is None:

@@ -26,6 +26,9 @@ static const char *predicate;
 static const uint32_t *patch_shm = NULL;
 static uint32_t env_patch_id = 0;
 static int patch_fd = 2;
+/* Set by eval() when the predicate itself would trap (division/modulo by
+ * zero or INT64_MIN / -1).  dest() reports this as `br 2`. */
+static int patch_crashed = 0;
 
 /*
  * Get an environment variable and parse as a number.
@@ -124,8 +127,16 @@ int64_t eval(const char **ptr, const int64_t *env)
 	case '*':
 		return a * b;
 	case '/':
+		if (b == 0 || (a == INT64_MIN && b == -1)) {
+			patch_crashed = 1;
+			return 0;
+		}
 		return a / b;
 	case '%':
+		if (b == 0 || (a == INT64_MIN && b == -1)) {
+			patch_crashed = 1;
+			return 0;
+		}
 		return a % b;
 	case '&':
 		return a & b;
@@ -157,9 +168,16 @@ const void *dest(const struct STATE *state)
 		v = patch_shm ? *(patch_shm + 1) : 0;
 	}
 	const char *tmp = get_patch_str(patch_id);
+	patch_crashed = 0;
 	int branch_taken = eval(&tmp, (const int64_t *) state) != 0;
+	if (patch_crashed) {
+		/* The patch itself would crash (div/mod by zero, INT64_MIN / -1).
+		 * Report `br 2` and follow the original path (no jump) so the
+		 * patch is rejected downstream. */
+		branch_taken = 2;
+	}
 	char buf[64];
 	int n = snprintf(buf, sizeof(buf), "[patch] [id %u] [br %d] [v %u]\n", patch_id, branch_taken, v);
 	write(patch_fd, buf, n);
-	return branch_taken ? (const void *)TAOSC_DEST : NULL;
+	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
 }
