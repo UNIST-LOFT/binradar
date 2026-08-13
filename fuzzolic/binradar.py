@@ -1112,6 +1112,7 @@ class BinRadarExecutor:
             if not verified:
                 remaining_patches.discard(result)
         binradar_remaining_patches = remaining_patches.copy()
+        binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
         with open(trace_msg_log_file, "r", encoding="utf-8") as f:
             parser = sbsv.parser()
             parser.add_custom_type("hex", lambda x: int(x, 16))
@@ -1159,17 +1160,44 @@ class BinRadarExecutor:
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] still causes the same crash - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
+                            binradar_reject_reasons[patch] = ("same-crash", iter)
                     elif original["result"] == "normal" and patch_result["result"] == "crash":
                         if patch_result["fault_addr"] == poc_fault_loc:
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] introduces a crash - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
+                            binradar_reject_reasons[patch] = ("introduced-crash", iter)
                     elif original["result"] == "normal" and patch_result["result"] == "normal":
                         if original["br"] != patch_result["br"]:
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}) - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
+                            binradar_reject_reasons[patch] = ("different-br", iter)
         self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
+
+        # Write a self-contained final.sbsv with per-patch verdicts from both
+        # the concrete verifier and the binradar analysis.
+        final_result_file = os.path.join(self.run_dir, "final.sbsv")
+        with open(final_result_file, "w", encoding="utf-8") as f:
+            f.write(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}] "
+                    f"[verifier {os.path.basename(verifier_result_file)}] "
+                    f"[trace {os.path.basename(trace_msg_log_file)}]\n")
+            for patch_id in sorted(self.filter_result):
+                verified = concrete_verifier_result.patch_verified.get(patch_id, True)
+                res = "verified" if verified else "rejected"
+                f.write(f"[final] [verifier] [patch {patch_id}] [res {res}]\n")
+            for patch_id in sorted(remaining_patches):
+                if patch_id in binradar_remaining_patches:
+                    f.write(f"[final] [binradar] [patch {patch_id}] [res verified] "
+                            f"[reason none] [iter -1]\n")
+                else:
+                    reason, reject_iter = binradar_reject_reasons.get(patch_id, ("unknown", -1))
+                    f.write(f"[final] [binradar] [patch {patch_id}] [res rejected] "
+                            f"[reason {reason}] [iter {reject_iter}]\n")
+            f.write(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
+                    f"[remaining_patches {sorted(remaining_patches)}] "
+                    f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]\n")
+        logger.info(f"[FINAL] Saved final result: {final_result_file}")
 
     def done(self):
         self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")

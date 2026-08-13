@@ -43,3 +43,24 @@ def test_parse_timestamped_progress_with_sbsv(tmp_path):
     assert rows[0]["_action"] == "set"
     assert rows[1]["survived"] == "[1, 2]"
     assert rows[2]["remaining_patches"] == "[1]"
+
+
+def test_parse_final_sbsv(tmp_path):
+    path = tmp_path / "final.sbsv"
+    path.write_text(
+        "[final] [start] [prefix run] [id 0] "
+        "[verifier verifier.sbsv] [trace binradar-tracer-msg.log]\n"
+        "[final] [verifier] [patch 1] [res verified]\n"
+        "[final] [verifier] [patch 2] [res rejected]\n"
+        "[final] [binradar] [patch 1] [res verified] [reason none] [iter -1]\n"
+        "[final] [binradar] [patch 2] [res rejected] "
+        "[reason different-br] [iter 3]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches []]\n"
+    )
+    verifier, binradar = collector.parse_final_sbsv(str(path))
+    assert verifier == {1: "verified", 2: "rejected"}
+    assert binradar == {
+        1: {"res": "verified", "reason": "none", "iter": "-1"},
+        2: {"res": "rejected", "reason": "different-br", "iter": "3"},
+    }

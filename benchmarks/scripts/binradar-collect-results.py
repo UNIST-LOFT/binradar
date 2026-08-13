@@ -10,13 +10,15 @@ Usage:
 
 Subcommands:
     binradar (default)
-        Collect results from <workdir>/out (progress.sbsv + verifier.sbsv).
+        Collect results from <workdir>/out (progress.sbsv, verifier.sbsv,
+        final.sbsv).
         For each experiment listed in exp.list, it:
           1. Checks if the workdir exists and has output
           2. Parses progress.sbsv to determine if the run completed successfully
           3. Looks for errors in binradar.log (and binradar-tracer-msg.log) for each run
           4. Shows the [filter] result (survived patches) and the [final]
-             result (remaining_patches)
+             result (remaining_patches), plus per-patch verifier/binradar
+             verdicts from final.sbsv
           5. Shows the patch prefilter context from <workdir>/prefilter.sbsv
              (predicates evaluated/survived) when present
 
@@ -92,6 +94,8 @@ def _build_sbsv_parser() -> sbsv.parser:
     parser.add_schema("[verifier-result] [res: str] [patch: str]")
     parser.add_schema("[patch] [id: int] [pass: bool]")
     parser.add_schema("[final] [verifier] [patch: str] [res: str]")
+    parser.add_schema(
+        "[final] [binradar] [patch: str] [res: str] [reason: str] [iter: int]")
     return parser
 
 
@@ -126,6 +130,9 @@ class RunResult:
     verifier_accepted: str = ""  # e.g. "1,3,5" or "" if none accepted
     verifier_rejected: str = ""  # e.g. "2,4,6"
     verifier_data: Dict[int, List[str]] = field(default_factory=dict)  # raw verifier results
+    binradar_verified: str = ""  # e.g. "1,3,5" or "" if none verified by binradar
+    binradar_rejected: str = ""  # e.g. "2,4,6"
+    binradar_data: Dict[int, Dict[str, str]] = field(default_factory=dict)  # patch -> {res, reason, iter}
     filter_done: bool = False
     filter_survived: str = ""  # e.g. "[1, 2]" or "[]"
     filter_rejected: str = ""  # e.g. "3" or "" if none
@@ -273,6 +280,42 @@ def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
             if row is not None and row.schema_name == "patch":
                 results[int(row["id"])] = bool(row["pass"])
     return results
+
+
+def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str, str]]]:
+    """Parse per-patch verdicts from a final.sbsv file.
+
+    Returns (verifier_verdicts, binradar_verdicts):
+      verifier_verdicts: patch id -> "verified" / "rejected"
+      binradar_verdicts:  patch id -> {"res": ..., "reason": ..., "iter": ...}
+    """
+    verifier_verdicts: Dict[int, str] = {}
+    binradar_verdicts: Dict[int, Dict[str, str]] = {}
+    if not os.path.isfile(sbsv_path):
+        return verifier_verdicts, binradar_verdicts
+
+    with open(sbsv_path, "r") as f:
+        for line in f:
+            entry = parse_sbsv_line(line)
+            if entry is None:
+                continue
+            phase = entry.get("_phase", "")
+            action = entry.get("_action", "")
+            if phase != "final":
+                continue
+            patch = entry.get("patch", "")
+            if not patch.isdigit():
+                continue
+            pid = int(patch)
+            if action == "verifier":
+                verifier_verdicts[pid] = entry.get("res", "")
+            elif action == "binradar":
+                binradar_verdicts[pid] = {
+                    "res": entry.get("res", ""),
+                    "reason": entry.get("reason", ""),
+                    "iter": entry.get("iter", ""),
+                }
+    return verifier_verdicts, binradar_verdicts
 
 
 def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
@@ -487,6 +530,18 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                 run_res.verifier_rejected = rejected
                 run_res.verifier_data = verifier_results
 
+        # Per-patch binradar verdicts from final.sbsv (written by the FINAL phase)
+        final_path = os.path.join(run_dir, "final.sbsv")
+        _, binradar_verdicts = parse_final_sbsv(final_path)
+        if binradar_verdicts:
+            verified = [pid for pid, d in sorted(binradar_verdicts.items())
+                        if d.get("res") == "verified"]
+            rejected = [pid for pid, d in sorted(binradar_verdicts.items())
+                        if d.get("res") == "rejected"]
+            run_res.binradar_verified = ",".join(str(p) for p in verified)
+            run_res.binradar_rejected = ",".join(str(p) for p in rejected)
+            run_res.binradar_data = binradar_verdicts
+
         result.runs.append(run_res)
 
     if not overall_ok:
@@ -624,6 +679,19 @@ def format_result_log(result: ExperimentResult) -> str:
                         f"      patch {pid}: {verified} verified, "
                         f"{rejected} rejected")
 
+            if run_res.binradar_data:
+                lines.append("    [binradar] summary:")
+                for pid in sorted(run_res.binradar_data.keys()):
+                    d = run_res.binradar_data[pid]
+                    if d.get("res") == "rejected":
+                        detail = f" ({d.get('reason')}"
+                        if d.get("iter"):
+                            detail += f", iter {d['iter']}"
+                        detail += ")"
+                        lines.append(f"      patch {pid}: rejected{detail}")
+                    else:
+                        lines.append(f"      patch {pid}: verified")
+
         if run_res.filter_done:
             lines.append(
                 f"    [filter] survived: {run_res.filter_survived or '[]'}  "
@@ -679,6 +747,9 @@ CSV_COLUMNS = [
     "prefilter_done",
     "verifier_accepted_patches",
     "verifier_rejected_patches",
+    "binradar_verified_patches",
+    "binradar_rejected_patches",
+    "binradar_reject_reasons",
     "log_errors_count",
     "tracer_errors_count",
     "error_preview",
@@ -704,6 +775,9 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "prefilter_done": "",
                 "verifier_accepted_patches": "",
                 "verifier_rejected_patches": "",
+                "binradar_verified_patches": "",
+                "binradar_rejected_patches": "",
+                "binradar_reject_reasons": "",
                 "log_errors_count": "",
                 "tracer_errors_count": "",
                 "error_preview": result.error_message,
@@ -734,6 +808,12 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "prefilter_done": str(run_res.prefilter_done),
                 "verifier_accepted_patches": run_res.verifier_accepted,
                 "verifier_rejected_patches": run_res.verifier_rejected,
+                "binradar_verified_patches": run_res.binradar_verified,
+                "binradar_rejected_patches": run_res.binradar_rejected,
+                "binradar_reject_reasons": "; ".join(
+                    f"{pid}:{d.get('reason', '')}"
+                    for pid, d in sorted(run_res.binradar_data.items())
+                    if d.get("res") == "rejected"),
                 "log_errors_count": str(len(run_res.log_errors)),
                 "tracer_errors_count": str(len(run_res.tracer_errors)),
                 "error_preview": error_preview,
