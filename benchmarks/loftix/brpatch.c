@@ -26,9 +26,6 @@ static const char *predicate;
 static const uint32_t *patch_shm = NULL;
 static uint32_t env_patch_id = 0;
 static int patch_fd = 2;
-/* Set by eval() when the predicate itself would trap (division/modulo by
- * zero or INT64_MIN / -1).  dest() reports this as `br 2`. */
-static int patch_crashed = 0;
 
 /*
  * Get an environment variable and parse as a number.
@@ -81,35 +78,76 @@ void init(int argc, const char *const *argv, char **envp)
 	}
 }
 
-/* Parse *p as an integer. */
-int64_t scani(const char **p)
+static int64_t i64_from_bits(uint64_t bits)
 {
-	int64_t i = 0;
+	int64_t value;
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
+
+/* Parse *p as an unsigned bit pattern. */
+uint64_t scani(const char **p)
+{
+	uint64_t i = 0;
 	for (; **p >= '0' && **p <= '9'; ++*p)
 		i = i * 10 + **p - '0';
 	return i;
 }
 
+static int64_t shift_right_arithmetic(int64_t value, uint64_t amount)
+{
+	if (amount == 0)
+		return value;
+	uint64_t bits = (uint64_t)value >> amount;
+	if (value < 0)
+		bits |= ~(uint64_t)0 << (64 - amount);
+	return i64_from_bits(bits);
+}
+
+/* Match std.math.shl(i64): negative counts shift right, large counts saturate. */
+static int64_t shift_left(int64_t value, int64_t amount)
+{
+	if (amount >= 64)
+		return 0;
+	if (amount <= -64)
+		return value < 0 ? -1 : 0;
+	if (amount >= 0)
+		return i64_from_bits((uint64_t)value << (uint64_t)amount);
+	return shift_right_arithmetic(value, (uint64_t)-amount);
+}
+
+/* Match std.math.shr(i64): negative counts shift left, large counts saturate. */
+static int64_t shift_right(int64_t value, int64_t amount)
+{
+	if (amount >= 64)
+		return value < 0 ? -1 : 0;
+	if (amount <= -64)
+		return 0;
+	if (amount >= 0)
+		return shift_right_arithmetic(value, (uint64_t)amount);
+	return i64_from_bits((uint64_t)value << (uint64_t)-amount);
+}
+
 /* Parse and evaluate *ptr in a prefix Polish notation, recursively. */
-int64_t eval(const char **ptr, const int64_t *env)
+int64_t eval(const char **ptr, const int64_t *env, int *crashed)
 {
 	const char op = *(*ptr)++;
 	switch (op) {
 	case 'n': /* negative integer */
-		return -scani(ptr);
+		return i64_from_bits(0 - scani(ptr));
 	case 'p': /* positive integer */
-		return scani(ptr);
+		return i64_from_bits(scani(ptr));
 	case 'v': /* variable look up */
 		return env[scani(ptr)];
 	case '~': /* bitwise not */
-		return ~eval(ptr, env);
+		return ~eval(ptr, env, crashed);
 	}
 
 	const bool eq = (**ptr == '=' && (op == '>' || op == '<'));
 	*ptr += eq;
 
-	const int64_t a = eval(ptr, env);
-	const int64_t b = eval(ptr, env);
+	const int64_t a = eval(ptr, env, crashed);
+	const int64_t b = eval(ptr, env, crashed);
 
 	switch (op) {
 	case '=':
@@ -121,20 +159,20 @@ int64_t eval(const char **ptr, const int64_t *env)
 	case '<':
 		return eq ? (a <= b) : (a < b);
 	case '+':
-		return a + b;
+		return i64_from_bits((uint64_t)a + (uint64_t)b);
 	case '-':
-		return a - b;
+		return i64_from_bits((uint64_t)a - (uint64_t)b);
 	case '*':
-		return a * b;
+		return i64_from_bits((uint64_t)a * (uint64_t)b);
 	case '/':
 		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			patch_crashed = 1;
+			*crashed = 1;
 			return 0;
 		}
 		return a / b;
 	case '%':
 		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			patch_crashed = 1;
+			*crashed = 1;
 			return 0;
 		}
 		return a % b;
@@ -145,14 +183,26 @@ int64_t eval(const char **ptr, const int64_t *env)
 	case '^':
 		return a ^ b;
 	case 'l': /* << */
-		return a << b;
+		return shift_left(a, b);
 	case 'r': /* >> */
-		return a >> b;
+		return shift_right(a, b);
 	default:
 		__builtin_unreachable();
 	}
 }
 
+static void state_to_env(const struct STATE *state, int64_t env[16])
+{
+	const int64_t values[] = {
+		state->rax, state->rbx, state->rcx, state->rdx,
+		state->rsi, state->rdi, state->rsp, state->rbp,
+		state->r8, state->r9, state->r10, state->r11,
+		state->r12, state->r13, state->r14, state->r15,
+	};
+	memcpy(env, values, sizeof(values));
+}
+
+#ifndef BINRADAR_EVAL_ONLY
 const char *get_patch_str(int id) {
 	switch (id) {
 #include "brpatches.inc"
@@ -168,8 +218,10 @@ const void *dest(const struct STATE *state)
 		v = patch_shm ? *(patch_shm + 1) : 0;
 	}
 	const char *tmp = get_patch_str(patch_id);
-	patch_crashed = 0;
-	int branch_taken = eval(&tmp, (const int64_t *) state) != 0;
+	int64_t env[16];
+	state_to_env(state, env);
+	int patch_crashed = 0;
+	int branch_taken = eval(&tmp, env, &patch_crashed) != 0;
 	if (patch_crashed) {
 		/* The patch itself would crash (div/mod by zero, INT64_MIN / -1).
 		 * Report `br 2` and follow the original path (no jump) so the
@@ -181,3 +233,4 @@ const void *dest(const struct STATE *state)
 	write(patch_fd, buf, n);
 	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
 }
+#endif

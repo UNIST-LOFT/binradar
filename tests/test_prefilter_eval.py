@@ -8,6 +8,7 @@ directly:
 """
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +20,8 @@ _spec.loader.exec_module(binradar_setup)
 
 eval_patch_str = binradar_setup.eval_patch_str
 evaluate_predicate = binradar_setup.evaluate_predicate
+predicate_to_patch_str = binradar_setup.predicate_to_patch_str
+predicate_to_branch_patch_str = binradar_setup.predicate_to_branch_patch_str
 load_predicates = binradar_setup.load_predicates
 load_prefilter_passed_ids = binradar_setup.load_prefilter_passed_ids
 write_prefilter = binradar_setup.write_prefilter
@@ -27,6 +30,22 @@ INT64_MIN = binradar_setup.INT64_MIN
 INT64_MAX = (1 << 63) - 1
 
 ZERO_ENV = [0] * 16
+
+
+def test_c_evaluator():
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as tmp:
+        executable = Path(tmp) / "test_brpatch_eval"
+        subprocess.run([
+            "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-Wno-missing-field-initializers", "-Wno-unused-parameter",
+            "-Wno-unused-function", "-Wno-implicit-fallthrough",
+            f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
+            str(ROOT / "tests" / "test_brpatch_eval.c"),
+            "-o", str(executable),
+        ], check=True)
+        subprocess.run([str(executable)], check=True)
 
 
 def test_positive_constant():
@@ -86,12 +105,17 @@ def test_wraparound():
     assert eval_patch_str("*p9223372036854775807p2", ZERO_ENV) == -2
 
 
-def test_shift_masking():
-    # x86 masks the shift count to 6 bits: 64 & 63 == 0
-    assert eval_patch_str("lp1p64", ZERO_ENV) == 1
+def test_shift_semantics():
+    # Zig's std.math helpers saturate large counts and reverse direction for
+    # negative counts.
+    assert eval_patch_str("lp1p64", ZERO_ENV) == 0
     assert eval_patch_str("lp1p1", ZERO_ENV) == 2
-    assert eval_patch_str("lp1p65", ZERO_ENV) == 2  # 65 & 63 == 1
-    assert eval_patch_str("rp1p64", ZERO_ENV) == 1
+    assert eval_patch_str("lp1p65", ZERO_ENV) == 0
+    assert eval_patch_str("lp8n1", ZERO_ENV) == 4
+    assert eval_patch_str("ln1n64", ZERO_ENV) == -1
+    assert eval_patch_str("rp1p64", ZERO_ENV) == 0
+    assert eval_patch_str("rn1p64", ZERO_ENV) == -1
+    assert eval_patch_str("rp1n1", ZERO_ENV) == 2
     assert eval_patch_str("rn1p1", ZERO_ENV) == -1  # arithmetic shift
     assert eval_patch_str("rn8p1", ZERO_ENV) == -4
 
@@ -117,15 +141,22 @@ def test_variable_lookup():
     assert eval_patch_str("+v1v2", env) == 3
 
 
+def test_predicate_conversion_and_branch_polarity():
+    predicate = "max64 + r10 >= ~max1"
+    patch_str = ">=+p9223372036854775807v10~p0"
+    assert predicate_to_patch_str(predicate) == patch_str
+    assert predicate_to_branch_patch_str(predicate) == f"={patch_str}p0"
+
+
 def test_evaluate_predicate_keep_discard():
     # DSL predicate "max1 + r10 <= +max1" (max1 == 0); r10 is variable 10,
-    # which at runtime reads STATE slot 10.  With slot 10 == 1 the branch
-    # is not taken (1 <= 0 is false) -> discarded.
+    # which reads canonical register slot 10.  Taosc jumps when the predicate
+    # is false, so slot 10 == 1 takes the branch (1 <= 0 is false) -> kept.
     predicate = "max1 + r10 <= +max1"
-    assert evaluate_predicate(predicate, [[1] * 16]) == (
+    assert evaluate_predicate(predicate, [[1] * 16]) == (True, "")
+    # With slot 10 == -1 the predicate is true, so no branch is taken.
+    assert evaluate_predicate(predicate, [[-1] * 16]) == (
         False, "evaluates to 0 on all captured states")
-    # With slot 10 == -1 the branch is taken on the first state -> kept.
-    assert evaluate_predicate(predicate, [[-1] * 16]) == (True, "")
 
 
 def test_evaluate_predicate_trap_rejected():

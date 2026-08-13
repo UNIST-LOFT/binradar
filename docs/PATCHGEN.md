@@ -31,23 +31,23 @@ max1 / rax <= +max1
 max1 / rax == +max1
 ```
 
-These predicates should be converted into the patch string that can be evaluated by `eval()` in `benchmarks/loftix/brpatch.c`.
+These predicates should be converted into the patch string that can be evaluated by `eval()` in `benchmarks/loftix/brpatch.c`.  TAOSC jumps when a generated predicate is false, while `brpatch.c` jumps when its encoded expression is nonzero, so setup encodes each candidate as `predicate == 0`.
 Conversion can be done by
 ```shell
 just setup
 # uv run /path/to/binradar/fuzzolic/binradar-setup.py setup -w workdir
 ```
-This setup script will generate `workdir/binradar.env` file with the necessary configuration for binradar, and also generate `workdir/brpatch.inc` file with the patch strings hard-coded.
+This setup script will generate `workdir/binradar.env` file with the necessary configuration for binradar, and also generate `workdir/brpatches.inc` file with the patch strings hard-coded.
 The generated patch string will be like this:
 ```c
 case 0:
 	return "p0";
 case 1:
-	return "</p0v0p0";
+	return "=</p0v0p0p0";
 case 2:
-	return "<=/p0v0p0";
+	return "=<=/p0v0p0p0";
 case 3:
-	return "=/p0v0p0";
+	return "==/p0v0p0p0";
 default:
 	return "p0";
 ```

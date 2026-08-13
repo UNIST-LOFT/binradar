@@ -34,9 +34,10 @@ Subcommands:
                 benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
                 configuration used by the FILTER phase, collect the
                 patch-site STATE vectors, evaluate every candidate
-                predicate offline (mirroring brpatch.c::eval with C int64
-                semantics), and write workdir/prefilter.sbsv listing which
-                predicates evaluate non-zero on the POC.  `setup` then
+                predicate offline (mirroring taosc's i64 semantics and its
+                false-means-jump branch polarity), and write
+                workdir/prefilter.sbsv listing which predicates branch on
+                the POC.  `setup` then
                 keeps only the surviving predicates before applying the
                 top-10 cap, so the expensive binradar pipeline never runs
                 on predicates that the FILTER phase would reject anyway.
@@ -289,6 +290,15 @@ def predicate_to_patch_str(predicate: str) -> str:
     return emit_patch(ast)
 
 
+def predicate_to_branch_patch_str(predicate: str) -> str:
+    """Encode taosc's predicate as BinRadar's branch condition.
+
+    Taosc's generic patch jumps when its generated predicate is zero, while
+    brpatch.c jumps when the encoded expression is non-zero.
+    """
+    return f"={predicate_to_patch_str(predicate)}p0"
+
+
 def load_env(file: Path) -> Dict[str, str]:
     """
     Loads environment variables from a .env file and returns them as a dictionary.
@@ -396,8 +406,30 @@ def _trunc_div(a: int, b: int) -> int:
     return -q if (a < 0) != (b < 0) else q
 
 
+def _shift_left(a: int, b: int) -> int:
+    """Mirror Zig std.math.shl(i64), including negative shift counts."""
+    if b >= 64:
+        return 0
+    if b <= -64:
+        return -1 if a < 0 else 0
+    if b >= 0:
+        return wrap64(a << b)
+    return a >> -b
+
+
+def _shift_right(a: int, b: int) -> int:
+    """Mirror Zig std.math.shr(i64), including negative shift counts."""
+    if b >= 64:
+        return -1 if a < 0 else 0
+    if b <= -64:
+        return 0
+    if b >= 0:
+        return a >> b
+    return wrap64(a << -b)
+
+
 def eval_patch_str(s: str, env: List[int]) -> int:
-    """Evaluate a prefix-Polish patch string with C int64 x86-64 semantics.
+    """Evaluate a prefix-Polish patch string with taosc's i64 semantics.
 
     Mirrors brpatch.c::eval exactly: constants p<N>/n<N>, variable lookup
     v<N> into env (16 captured STATE slots), unary ~, and the binary prefix
@@ -447,10 +479,10 @@ def eval_patch_str(s: str, env: List[int]) -> int:
             return wrap64(a | b)
         if op == "^":
             return wrap64(a ^ b)
-        if op == "l":  # << (x86 masks the shift count to 6 bits)
-            return wrap64(a << (b & 63))
-        if op == "r":  # >> (arithmetic for signed int64; x86 masks the count)
-            return a >> (b & 63)
+        if op == "l":  # Zig std.math.shl
+            return _shift_left(a, b)
+        if op == "r":  # Zig std.math.shr
+            return _shift_right(a, b)
         if op == "/":
             if b == 0:
                 raise PrefilterTrap("division by zero")
@@ -472,10 +504,9 @@ def eval_patch_str(s: str, env: List[int]) -> int:
 def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, str]:
     """Return (keep, note) for one predicate line.
 
-    A predicate is kept iff it evaluates to non-zero on at least one
-    captured state (i.e. the branch would be taken at least once on the
-    POC, so the FILTER phase would not reject the patch as still crashing
-    at the original fault address).
+    Taosc's generic patch jumps when a generated predicate evaluates to zero.
+    The predicate is encoded as ``predicate == 0`` for brpatch.c, then kept
+    iff that branch condition is non-zero on at least one captured state.
 
     A predicate that would trap in C on any captured state (division or
     modulo by zero, INT64_MIN / -1) is rejected: brpatch.c reports it as
@@ -483,7 +514,7 @@ def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, s
     filtered out by the FILTER phase.
     """
     try:
-        patch_str = predicate_to_patch_str(predicate)
+        patch_str = predicate_to_branch_patch_str(predicate)
     except Exception as e:
         # prepare_patch would crash on this predicate anyway; keep it so
         # the existing pipeline surfaces the error.
@@ -1139,7 +1170,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     with brpatches_inc.open("w") as f:
         f.write("case 0:\n\treturn \"p0\";\n")
         for patch_id, source_id, predicate in selected_patch_records:
-            patch_str = predicate_to_patch_str(predicate)
+            patch_str = predicate_to_branch_patch_str(predicate)
             f.write(f"case {patch_id}:\n"
                     f"\treturn \"{patch_str}\"; "
                     f"/* predicate line {source_id} */\n")

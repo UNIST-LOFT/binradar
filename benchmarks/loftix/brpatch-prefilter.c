@@ -74,16 +74,18 @@ void init(int argc, const char *const *argv, char **envp)
 }
 
 /*
- * Capture the patch-site STATE. The struct STATE layout (see
- * utils/e9patch/examples/stdlib.c) is: slot 0 = flags, slot 1 = r15,
- * slot 2 = r14, ..., slot 15 = rax.  brpatch.c::eval reads the same
- * slots as ((const int64_t *)state)[i] for v{i}, so we dump them
- * verbatim -- no remapping.
+ * Capture registers in taosc's Variables.RegisterEnum order so the offline
+ * evaluator and brpatch.c use the same v0..v15 mapping.
  */
 const void *dest(const struct STATE *state)
 {
 	if (hit_count < PREFILTER_MAX_HITS) {
-		const int64_t *v = (const int64_t *) state;
+		const int64_t v[] = {
+			state->rax, state->rbx, state->rcx, state->rdx,
+			state->rsi, state->rdi, state->rsp, state->rbp,
+			state->r8, state->r9, state->r10, state->r11,
+			state->r12, state->r13, state->r14, state->r15,
+		};
 		char buf[256];
 		int n = snprintf(buf, sizeof(buf),
 			"[prefilter-state] [v0 %lld] [v1 %lld] [v2 %lld] [v3 %lld] "
