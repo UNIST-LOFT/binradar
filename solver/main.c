@@ -1868,7 +1868,7 @@ static inline Z3_decl_kind get_op(Z3_app app)
     return Z3_get_decl_kind(smt_solver.ctx, decl);
 }
 
-#define VERBOSE 1
+#define VERBOSE 0
 void smt_bv_resize(Z3_ast* a, Z3_ast* b, ssize_t bytes_size)
 {
 #if VERBOSE
@@ -2455,7 +2455,6 @@ Z3_ast optimize_z3_query_division(Z3_ast e)
             for (size_t i = 0; i < sizeof(div_consts) / sizeof(div_values); i++) {
                 if (is_const(ARG1(ARG1(op1)), &value)
                         && value == div_consts[i]) {
-                    print_z3_ast(e);
                     Z3_ast a = ARG1(ARG2(ARG1(op1)));
                     Z3_ast b = smt_new_const(div_values[i], 32);
                     e = Z3_mk_bvsdiv(ctx, a, b);
@@ -7726,8 +7725,6 @@ static void smt_query(Query* q)
     fprintf(stderr, "[query] [index %lu] [addr %lx] [op %s] [model %d]\n",  
         GET_QUERY_IDX(q), q->address,
         opkind_to_str(q->query->opkind), q->model);
-    print_expr(q->query);
-    fprintf(stderr, "\n[query-end]\n");
     
     switch (q->query->opkind) {
         case SYMBOLIC_PC:
