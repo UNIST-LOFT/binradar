@@ -4,6 +4,7 @@ import csv
 import enum
 import os
 import re
+import sbsv
 import shlex
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,7 @@ from binradar_verifier import (
 )
 
 LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
+TRACER_BIN = os.path.join(SCRIPT_DIR, "..", "tracer", "build", "x86_64-linux-user", "qemu-x86_64")
 
 """
 Run tests on binradar benchmark subjects listed in exp.list.
@@ -66,9 +68,28 @@ Subcommands:
           SKIP          - workdir / binary / poc input files missing, or
                           neither valgrind nor QASAN detects a crash.
 
+    tracer
+        Compare the fuzzolic tracer's reported crash fault address
+        against afl-qemu-trace on <binary>.orig for every subject in
+        exp.list. Runs afl-qemu-trace (--asan host) and the fuzzolic
+        tracer (tracer/build/.../qemu-x86_64, no -symbolic) on .orig
+        with the POC and checks both report the same fault address
+        (the faulting instruction's code address).
+
+        Verdicts:
+          PASS          - tracer and afl-qemu-trace report the same
+                          fault address.
+          FAIL          - tracer does not crash, records a crash but no
+                          fault address, or reports a different fault
+                          address than afl-qemu-trace.
+          BASELINE-FAIL - afl-qemu-trace does not reproduce the crash;
+                          the subject cannot be tested.
+          SKIP          - workdir / binary / poc input / tracer binary
+                          missing.
 Results are summarized in a single file (logs/qasan-<timestamp>.log by
 default, or logs/qasan-<timestamp>.csv / .tsv with --format csv / tsv;
-likewise logs/valgrind-<timestamp>.<ext> for the valgrind subcommand).
+likewise logs/valgrind-<timestamp>.<ext> for the valgrind subcommand,
+and logs/tracer-<timestamp>.<ext> for the tracer subcommand).
 With --format log, --verbose adds a reproduction command line per probe
 (`cd <workdir> && ENV=...; <command>`) so a failing subject can be
 re-run by hand.
@@ -119,6 +140,17 @@ class ValgrindSubjectResult:
     qasan_fault_addr: str = ""
     valgrind_cmd: str = ""
     qasan_cmd: str = ""
+
+
+@dataclass
+class TracerSubjectResult:
+    exp_dir: str
+    status: Status
+    detail: str = ""
+    afl_fault_addr: str = ""
+    tracer_fault_addr: str = ""
+    afl_cmd: str = ""
+    tracer_cmd: str = ""
 
 
 def format_repro_command(workdir: str, command: List[str],
@@ -270,6 +302,42 @@ def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
     return fault_addr, exit_info
 
 
+_TRACER_PARSER = sbsv.parser()
+_TRACER_PARSER.add_custom_type("hex", lambda x: int(x, 16))
+_TRACER_PARSER.add_schema(
+    "[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] "
+    "[guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
+_TRACER_PARSER.add_schema("[snapshot] [exit] [crash] [entrypoint-hit: int]")
+_TRACER_PARSER.add_schema("[snapshot] [exit] [normal] [entrypoint-hit: int]")
+
+
+def extract_tracer_fault_addr(log: str) -> Optional[int]:
+    """Return the fault_addr from a tracer crash log line.
+
+    The tracer records info->fault_addr (= guest_pc, the faulting
+    instruction) in its [snapshot] [crash] line written to
+    BINRADAR_TRACER_LOG_FILE."""
+    for line in log.splitlines():
+        row = _TRACER_PARSER.parse_line_detached(line)
+        if row is not None and row.get_name() == "snapshot$crash":
+            return row["fault_addr"]
+    return None
+
+
+def extract_tracer_exit(log: str) -> str:
+    """Return 'crash' if a [snapshot] [crash] line present, 'ok' if a
+    [snapshot] [exit] [normal] line present, else ''."""
+    for line in log.splitlines():
+        row = _TRACER_PARSER.parse_line_detached(line)
+        if row is None:
+            continue
+        if row.get_name() in ("snapshot$crash", "snapshot$exit$crash"):
+            return "crash"
+        if row.get_name() == "snapshot$exit$normal":
+            return "ok"
+    return ""
+
+
 def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
                     testcase: str, timeout: float):
     """Run the probe-style qasan execution and parse the probe result."""
@@ -286,6 +354,32 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
             exit_hint = extract_exit_info(result.stderr) or ""
     repro = format_repro_command(workdir, command, proc_env)
     return probe, exit_hint, result, repro
+
+
+def run_tracer_probe(workdir: str, env: Dict[str, str],
+                     testcase: str, timeout: float):
+    """Run the fuzzolic tracer on <binary>.orig (no -symbolic) and parse
+    the crash fault_addr from its log. Returns (fault_addr, exit_str,
+    result, repro)."""
+    binary = env.get("BINARY", "")
+    orig_bin = os.path.join(workdir, f"{binary}.orig")
+    test_cmd = env.get("TEST_CMD", "")
+    command = [TRACER_BIN, orig_bin] + shlex.split(
+        test_cmd.replace("@@", testcase))
+    proc_env = dict(os.environ)
+    proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
+    proc_env["BINRADAR_TRACE_FILE"] = "none"
+    # parse_exclude_region_str calls getenv(name) and strchr on the
+    # result; must set all three to avoid NULL deref.
+    proc_env["PATCH_RESERVE_RANGE"] = env.get("PATCH_RESERVE_RANGE", "0x0-0x0")
+    proc_env["E9_TRAMPOLINE_RANGE"] = env.get("E9_TRAMPOLINE_RANGE", "0x0-0x0")
+    proc_env["E9_LOADER_RANGE"] = env.get("E9_LOADER_RANGE", "0x0-0x0")
+    result = binradar_utils.execute(
+        command, cwd=workdir, env=proc_env, timeout=timeout, verbose=False)
+    fault_addr = extract_tracer_fault_addr(result.stderr) if result.success else None
+    exit_str = extract_tracer_exit(result.stderr) if result.success else ""
+    repro = format_repro_command(workdir, command, proc_env)
+    return fault_addr, exit_str, result, repro
 
 
 def run_qasan_subject(exp_dir: str, workdir_name: str,
@@ -464,6 +558,102 @@ def run_valgrind_subject(exp_dir: str, workdir_name: str,
     return result
 
 
+def run_tracer_subject(exp_dir: str, workdir_name: str,
+                       timeout: float) -> TracerSubjectResult:
+    workdir = os.path.join(exp_dir, workdir_name)
+    result = TracerSubjectResult(exp_dir=exp_dir, status=Status.SKIP)
+
+    env_path = os.path.join(workdir, "binradar.env")
+    if not os.path.isfile(env_path):
+        env_path = os.path.join(exp_dir, "config.env")
+    if not os.path.isfile(env_path):
+        result.detail = "binradar.env / config.env not found"
+        return result
+    env = binradar_utils.load_env(env_path)
+
+    binary = env.get("BINARY", "")
+    orig_bin = os.path.join(workdir, f"{binary}.orig")
+    poc_input = env.get("POC_INPUT", "")
+    testcase = (poc_input if os.path.isabs(poc_input)
+                else os.path.join(workdir, poc_input))
+
+    missing = [name for path, name in [
+        (orig_bin, "orig binary"),
+        (testcase, "poc input")] if not os.path.exists(path)]
+    if missing:
+        result.detail = "missing: " + ", ".join(missing)
+        return result
+    if not os.path.isfile(TRACER_BIN):
+        result.detail = f"tracer binary not found: {TRACER_BIN}"
+        return result
+
+    # Build the afl-qemu-trace probe command by hand (like run_valgrind_subject)
+    # instead of using run_qasan_probe, whose BinRadarQemuRunner.from_env
+    # requires PATCH_RESERVE_RANGE / E9_TRAMPOLINE_RANGE / E9_LOADER_RANGE /
+    # PATCH_LOC in the env; subjects with only a config.env fallback lack
+    # those keys. None of them are needed for an .orig probe.
+    try:
+        qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
+                     "--asan", "host"]
+        if env.get("PATCH_LOC"):
+            qasan_cmd += ["--patch-loc", env["PATCH_LOC"]]
+        qasan_cmd += [orig_bin, "--"] + shlex.split(env.get("TEST_CMD", ""))
+        qasan_proc_env = dict(os.environ)
+        qasan_proc_env["AFL_USE_QASAN"] = "1"
+        qasan_proc_env["PATCH_ID"] = "0"
+        afl_res = binradar_utils.execute(
+            qasan_cmd, cwd=workdir, env=qasan_proc_env, timeout=timeout,
+            verbose=False)
+        afl_addr = afl_exit = None
+        if afl_res.success:
+            afl_fault = extract_qasan_fault_addr(afl_res.stderr)
+            if afl_fault is not None:
+                afl_addr, afl_exit = afl_fault
+            else:
+                afl_exit = extract_exit_info(afl_res.stderr) or ""
+        afl_repro = format_repro_command(workdir, qasan_cmd, qasan_proc_env)
+
+        tracer_addr, tracer_exit, tracer_res, tracer_repro = run_tracer_probe(
+            workdir, env, testcase, timeout)
+    except Exception as e:
+        result.detail = f"execution error: {e}"
+        return result
+
+    result.afl_cmd = afl_repro
+    result.tracer_cmd = tracer_repro
+
+    if afl_addr is None:
+        reason = "timeout" if not afl_res.success else (afl_exit or "parse failure")
+        result.status = Status.BASELINE
+        result.detail = f"afl-qemu-trace probe failed ({reason})"
+        return result
+    if afl_exit != "crash":
+        result.status = Status.BASELINE
+        result.detail = f"afl-qemu-trace did not crash (exit: {afl_exit})"
+        return result
+
+    result.afl_fault_addr = hex(afl_addr)
+
+    if not tracer_res.success and tracer_addr is None:
+        result.status = Status.FAIL
+        result.detail = "tracer probe failed (timeout / no crash log)"
+        return result
+    if tracer_addr is None:
+        result.status = Status.FAIL
+        result.detail = f"tracer did not record a crash (exit: {tracer_exit or 'none'})"
+        return result
+
+    result.tracer_fault_addr = hex(tracer_addr)
+
+    if tracer_addr != afl_addr:
+        result.status = Status.FAIL
+        result.detail = "fault address differs"
+        return result
+    result.status = Status.PASS
+    result.detail = "tracer and afl-qemu-trace report the same fault address"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Output formatters
 # ---------------------------------------------------------------------------
@@ -500,6 +690,23 @@ def format_valgrind_log_result(result: ValgrindSubjectResult,
             lines.append(f"  [cmd valgrind] {result.valgrind_cmd}")
         if result.qasan_cmd:
             lines.append(f"  [cmd qasan] {result.qasan_cmd}")
+    lines.append(f"  [VERDICT] {result.status} ({result.detail})")
+    return "\n".join(lines)
+
+
+def format_tracer_log_result(result: TracerSubjectResult,
+                             verbose: bool = False) -> str:
+    lines = [f"=== {result.exp_dir} ==="]
+    if result.status == Status.SKIP:
+        lines.append(f"  [STATUS] SKIP: {result.detail}")
+        return "\n".join(lines)
+    lines.append(f"  [afl]     fault-addr: {result.afl_fault_addr or 'n/a'}")
+    lines.append(f"  [tracer]  fault-addr: {result.tracer_fault_addr or 'n/a'}")
+    if verbose:
+        if result.afl_cmd:
+            lines.append(f"  [cmd afl] {result.afl_cmd}")
+        if result.tracer_cmd:
+            lines.append(f"  [cmd tracer] {result.tracer_cmd}")
     lines.append(f"  [VERDICT] {result.status} ({result.detail})")
     return "\n".join(lines)
 
@@ -567,6 +774,36 @@ def write_valgrind_delimited(output_path: str,
             writer.writerow(row)
 
 
+TRACER_CSV_COLUMNS = [
+    "experiment",
+    "verdict",
+    "detail",
+    "afl_fault_addr",
+    "tracer_fault_addr",
+]
+
+
+def write_tracer_delimited(output_path: str,
+                           results: List[TracerSubjectResult],
+                           delimiter: str, include_subject_id: bool = True):
+    columns = list(TRACER_CSV_COLUMNS)
+    if not include_subject_id:
+        columns.remove("experiment")
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter=delimiter)
+        writer.writeheader()
+        for r in results:
+            row = {
+                "verdict": r.status,
+                "detail": r.detail,
+                "afl_fault_addr": r.afl_fault_addr,
+                "tracer_fault_addr": r.tracer_fault_addr,
+            }
+            if include_subject_id:
+                row["experiment"] = r.exp_dir
+            writer.writerow(row)
+
+
 def write_log(output_path: str, args, results: List[QasanSubjectResult],
               counts: Dict[Status, int], total: int):
     lines = [
@@ -611,6 +848,31 @@ def write_valgrind_log(output_path: str, args,
     lines.append(
         f"SUMMARY: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
         f"{counts[Status.SKIP]} SKIP (total {total})")
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_tracer_log(output_path: str, args,
+                     results: List[TracerSubjectResult],
+                     counts: Dict[Status, int], total: int):
+    lines = [
+        "Tracer vs afl-qemu-trace Fault Address Test Results",
+        f"Generated: {datetime.now().isoformat()}",
+        f"Experiment list: {args.exp}",
+        f"Workdir: {args.workdir}",
+        f"Timeout: {args.timeout}s",
+        f"Total experiments: {total}",
+        "=" * 60,
+        "",
+    ]
+    for r in results:
+        lines.append(format_tracer_log_result(r, verbose=args.verbose))
+        lines.append("")
+    lines.append("=" * 60)
+    lines.append(
+        f"SUMMARY: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+        f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+        f"(total {total})")
     with open(output_path, "w") as f:
         f.write("\n".join(lines))
 
@@ -750,6 +1012,72 @@ def cmd_valgrind(args):
           f"{counts[Status.SKIP]} SKIP (total {len(resolved)})")
 
 
+
+def cmd_tracer(args):
+    if args.verbose and args.format != "log":
+        print("ERROR: --verbose only works with --format=log", file=sys.stderr)
+        sys.exit(1)
+
+    exp_file = args.exp
+    if not os.path.isfile(exp_file):
+        print(f"ERROR: exp list file not found: {exp_file}")
+        sys.exit(1)
+
+    with open(exp_file, "r") as f:
+        exp_dirs = [line.strip() for line in f if line.strip()]
+
+    exp_file_dir = os.path.dirname(os.path.abspath(exp_file))
+    resolved = []
+    display = []
+    for d in exp_dirs:
+        display.append(display_path(exp_file_dir, d))
+        if not os.path.isabs(d):
+            d = os.path.normpath(os.path.join(exp_file_dir, d))
+        resolved.append(d)
+
+    if args.jobs > 1:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            results = list(pool.map(
+                lambda d: run_tracer_subject(d, args.workdir, args.timeout),
+                resolved))
+    else:
+        results = [run_tracer_subject(d, args.workdir, args.timeout)
+                   for d in resolved]
+
+    if args.format in ("csv", "tsv"):
+        for r, name in zip(results, display):
+            r.exp_dir = name
+
+    for r in results:
+        print(f"[{r.status:>13}] {r.exp_dir}"
+              + (f" ({r.detail})" if r.detail else ""))
+
+    counts = {s: sum(1 for r in results if r.status == s)
+              for s in (Status.PASS, Status.FAIL, Status.SKIP, Status.BASELINE)}
+
+    if args.output:
+        output_path = args.output
+    else:
+        logs_dir = os.path.join(LOFTIX_DIR, "logs")
+        if not os.path.isdir(LOFTIX_DIR):
+            logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        ext = args.format if args.format in ("csv", "tsv") else "log"
+        output_path = os.path.join(
+            logs_dir, f"tracer-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.{ext}")
+
+    if args.format in ("csv", "tsv"):
+        delimiter = "\t" if args.format == "tsv" else ","
+        write_tracer_delimited(output_path, results, delimiter,
+                               include_subject_id=not args.no_subject_id)
+    else:
+        write_tracer_log(output_path, args, results, counts, len(resolved))
+
+    print(f"Results written to: {output_path}")
+    print(f"Summary: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+          f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+          f"(total {len(resolved)})")
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -816,6 +1144,36 @@ def main():
         "-n", "--no-subject-id", action="store_true",
         help="omit the experiment subject id column in csv/tsv output")
     valgrind.set_defaults(func=cmd_valgrind)
+
+    tracer = sub.add_parser(
+        "tracer",
+        help="compare fuzzolic tracer fault address against afl-qemu-trace")
+    tracer.add_argument(
+        "--exp", default="exp.list",
+        help="path to experiment list file (one dir per line)")
+    tracer.add_argument(
+        "--workdir", default="workdir",
+        help="work directory name (default: workdir)")
+    tracer.add_argument(
+        "--timeout", type=int, default=180,
+        help="timeout per run in seconds (default: 180)")
+    tracer.add_argument(
+        "--format", choices=["log", "csv", "tsv"], default="log",
+        help="output format: log (default), csv, or tsv")
+    tracer.add_argument(
+        "--output", default="",
+        help="output file path (default: logs/tracer-<timestamp>.<ext>)")
+    tracer.add_argument(
+        "--jobs", type=int, default=1,
+        help="number of subjects to test in parallel (default: 1)")
+    tracer.add_argument(
+        "--verbose", action="store_true",
+        help="with --format=log, add a reproduction command line per run "
+             "(cd <workdir> && ENV=...; <command>); incompatible with csv/tsv")
+    tracer.add_argument(
+        "-n", "--no-subject-id", action="store_true",
+        help="omit the experiment subject id column in csv/tsv output")
+    tracer.set_defaults(func=cmd_tracer)
 
     args = parser.parse_args()
     args.func(args)
