@@ -47,6 +47,7 @@ SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 # Tracer forkserver
 HANDSHAKE_EXPECTED = 0x41464C00
 
+
 class BinRadarPhase(enum.IntEnum):
     ALL = 0
     PROBE = 1
@@ -762,6 +763,8 @@ class BinRadarExecutor:
         env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
         env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
         env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        # Enable QASAN-like concrete bounds checking in the tracer
+        env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -817,6 +820,34 @@ class BinRadarExecutor:
             logger.info("[PROBE] Multiple patch function hits found. Current implementation does not support this case.")
             sys.exit(1)
         self.probe_result = probe_result
+        # Run the tracer on .orig to obtain the tracer's fault address. 
+        # It will be used for analyzing the result of BINRADAR phase in FINAL phase.
+        tracer_cmd = [TRACER_BIN, self.original_binary()] + shlex.split(
+            self.test_cmd.replace("@@", self.resolved_poc_input()))
+        tracer_env = os.environ.copy()
+        tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
+        tracer_env["BINRADAR_TRACE_FILE"] = "none"
+        tracer_env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
+        tracer_env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
+        tracer_env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+        tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")
+        tracer_result = binradar_utils.execute(
+            tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=60.0, verbose=False)
+        parser = sbsv.parser()
+        parser.add_custom_type("hex", lambda x: int(x, 16))
+        parser.add_schema("[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
+        tracer_fault_addr = 0
+        if tracer_result.success:
+            result = parser.loads(tracer_result.stderr)
+            if len(result["snapshot"]["crash"]) > 0:
+                tracer_fault_addr = result["snapshot"]["crash"][0]["fault_addr"]
+
+        if tracer_fault_addr == 0:
+            logger.warning(f"[PROBE] Tracer did not detect a crash fault address. "
+                           f"tracer_fault_addr will be 0; final phase binradar comparison disabled.")
+        probe_result.tracer_fault_addr = tracer_fault_addr
+        logger.info(f"[PROBE] Tracer fault address: {tracer_fault_addr:#x} (afl-qemu-trace fault address: {probe_result.fault_addr:#x})")
         file_trace_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         file_trace_result = file_trace_runner.test_with_file_trace(self.resolved_poc_input(), patch_func_entry=probe_result.patch_func_entry, verbose=True)
         if file_trace_result is None:
@@ -1139,7 +1170,9 @@ class BinRadarExecutor:
                 elif result.schema_name == "binradar$commit":
                     current["br"] = result["br"]
             
-            poc_fault_loc = self.probe_result.fault_addr
+            poc_fault_loc = self.probe_result.tracer_fault_addr
+            if poc_fault_loc == 0:
+                logger.warning("[FINAL] tracer_fault_addr is 0; binradar crash comparison will not match any fault address.")
 
             for iter in iter_map:
                 original = iter_map[iter][0]

@@ -374,6 +374,30 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     proc_env["PATCH_RESERVE_RANGE"] = env.get("PATCH_RESERVE_RANGE", "0x0-0x0")
     proc_env["E9_TRAMPOLINE_RANGE"] = env.get("E9_TRAMPOLINE_RANGE", "0x0-0x0")
     proc_env["E9_LOADER_RANGE"] = env.get("E9_LOADER_RANGE", "0x0-0x0")
+    proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
+    # Look for plt_info.txt in the workdir's out directory.
+    # Regenerate if it doesn't contain malloc/free entries.
+    plt_info = os.path.join(workdir, "out", "plt_info.txt")
+    need_regen = True
+    if os.path.isfile(plt_info):
+        try:
+            with open(plt_info, "r") as f:
+                content = f.read()
+            if "malloc" in content and "free" in content:
+                need_regen = False
+        except Exception:
+            pass
+    if need_regen:
+        find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
+        try:
+            regen_result = binradar_utils.execute(
+                [sys.executable, find_models, "-o", plt_info, orig_bin],
+                cwd=workdir, timeout=30, verbose=False)
+        except Exception:
+            pass
+    if os.path.isfile(plt_info):
+        proc_env["PLT_INFO_FILE"] = plt_info
     result = binradar_utils.execute(
         command, cwd=workdir, env=proc_env, timeout=timeout, verbose=False)
     fault_addr = extract_tracer_fault_addr(result.stderr) if result.success else None

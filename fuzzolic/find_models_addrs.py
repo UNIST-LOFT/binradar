@@ -100,7 +100,7 @@ def process_plt(binary, outfile=None):
         split = el.split(" ")
         addr = int(split[0], 16) - base_address
         name = split[1][1:split[1].find("@")]
-        if name in MODELS:
+        if name in MODELS or name in MODELS_LIBC:
             if outfile is None:
                 print("%s,%s,0x%x" % (os.path.basename(binary), name, addr))
             else:

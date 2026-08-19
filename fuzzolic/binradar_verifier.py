@@ -22,9 +22,9 @@ QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "utils", "binradar-aflplusplus"
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_custom_type("hex", lambda x: int(x, 16))
-    line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
+    line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
-    def __init__(self, patch_loc: int, patch_func_entry: int, stacktrace: List[Tuple[int, str]], exit_info: str, patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int, patch_func_candidates: List[Tuple[int, int]]):
+    def __init__(self, patch_loc: int, patch_func_entry: int, stacktrace: List[Tuple[int, str]], exit_info: str, patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int, patch_func_candidates: List[Tuple[int, int]], tracer_fault_addr: int = 0):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
         self.stacktrace = stacktrace
@@ -33,6 +33,7 @@ class BinRadarProbeResult:
         self.patch_func_hit_cnt = patch_func_hit_cnt
         self.fault_addr = fault_addr
         self.patch_func_candidates = patch_func_candidates
+        self.tracer_fault_addr = tracer_fault_addr
         self.need_file_hook = False
     
     @staticmethod
@@ -125,7 +126,7 @@ class BinRadarProbeResult:
     def from_sbsv(sbsv_file: str) -> Optional["BinRadarProbeResult"]:
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
-        parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
+        parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
         parser.add_schema("[file-trace] [need-file-hook: bool]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
             result = parser.load(f)
@@ -147,6 +148,7 @@ class BinRadarProbeResult:
         patch_hit_cnt = probe_info["patch-hit"]
         patch_func_hit_cnt = probe_info["func-hit"]
         fault_addr = probe_info["fault-addr"]
+        tracer_fault_addr = probe_info["tracer-fault-addr"]
         patch_func_candidates = list()
         for func in probe_info["patch-func-candidates"]:
             entry, hits = func.split(":", 1)
@@ -160,7 +162,8 @@ class BinRadarProbeResult:
             patch_hit_cnt=patch_hit_cnt,
             patch_func_hit_cnt=patch_func_hit_cnt,
             fault_addr=fault_addr,
-            patch_func_candidates=patch_func_candidates
+            patch_func_candidates=patch_func_candidates,
+            tracer_fault_addr=tracer_fault_addr
         )
         probe_result.need_file_hook = need_file_hook
         return probe_result
@@ -221,7 +224,7 @@ class BinRadarProbeResult:
                                 break
 
     def serialize(self) -> str:
-        return f"[exit {self.exit_info}] [patch-loc {self.patch_loc:x}] [func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] [func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] [patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] [stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]"
+        return f"[exit {self.exit_info}] [patch-loc {self.patch_loc:x}] [func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] [func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] [tracer-fault-addr {self.tracer_fault_addr:x}] [patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] [stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]"
 
     def serialize_file_trace_result(self) -> str:
         return f"[need-file-hook {self.need_file_hook}]"
@@ -240,7 +243,8 @@ class BinRadarProbeResult:
                         patch_hit_cnt=res["patch-hit"],
                         patch_func_hit_cnt=res["func-hit"],
                         fault_addr=res["fault-addr"],
-                        patch_func_candidates=[(int(func.split(":")[0], 16), int(func.split(":")[1])) for func in res["patch-func-candidates"]]
+                        patch_func_candidates=[(int(func.split(":")[0], 16), int(func.split(":")[1])) for func in res["patch-func-candidates"]],
+                        tracer_fault_addr=res["tracer-fault-addr"]
                     )
                 elif res.get_name() == "file-trace":
                     tmp = cls(
@@ -252,6 +256,7 @@ class BinRadarProbeResult:
                         patch_func_hit_cnt=0,
                         fault_addr=0,
                         patch_func_candidates=[],
+                        tracer_fault_addr=0
                     )
                     tmp.need_file_hook = res["need-file-hook"]
                     return tmp
