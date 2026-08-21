@@ -118,11 +118,33 @@ Subcommands:
                           the tracer probe itself failed.
           SKIP          - workdir / binary / poc input / tracer binary
                           missing.
+
+    compare-fault-addr
+        Compare the provenance-based detection location (the access
+        instruction PC from the tracer's [prov] [finalize] [finding]
+        record) against the crash locations reported by valgrind
+        (--tool=memcheck) and the QASAN probe (afl-qemu-trace --asan
+        host) on <binary>.orig with the POC. All three locations are raw
+        guest code addresses.
+
+        Verdicts:
+          PASS          - provenance location matches valgrind and/or
+                          QASAN (whichever reproduced the crash).
+          FAIL          - provenance location differs from a reproduced
+                          valgrind/QASAN location, provenance fired while
+                          an oracle was clean, or an oracle fired while
+                          provenance did not.
+          BASELINE-FAIL - no provenance finding and no crash under
+                          valgrind or qasan.
+          SKIP          - workdir / binary / poc input / tracer binary
+                          missing.
 Results are summarized in a single file (logs/qasan-<timestamp>.log by
 default, or logs/qasan-<timestamp>.csv / .tsv with --format csv / tsv;
 likewise logs/valgrind-<timestamp>.<ext> for the valgrind subcommand,
-logs/tracer-<timestamp>.<ext> for the tracer subcommand, and
-logs/memcheck-reach-<timestamp>.<ext> for the memcheck-reach subcommand).
+logs/tracer-<timestamp>.<ext> for the tracer subcommand,
+logs/memcheck-reach-<timestamp>.<ext> for the memcheck-reach subcommand,
+and logs/compare-fault-addr-<timestamp>.<ext> for the
+compare-fault-addr subcommand).
 With --format log, --verbose adds a reproduction command line per probe
 (`cd <workdir> && ENV=...; <command>`) so a failing subject can be
 re-run by hand.
@@ -195,6 +217,24 @@ class MemcheckReachResult:
     crash_reason: str = ""
     fault_addr: str = ""
     tracer_cmd: str = ""
+
+
+@dataclass
+class CompareFaultAddrResult:
+    exp_dir: str
+    status: Status
+    detail: str = ""
+    provenance_access_pc: str = ""
+    provenance_access_addr: str = ""
+    provenance_obj_id: str = ""
+    provenance_offset: str = ""
+    provenance_reason: str = ""
+    valgrind_fault_addr: str = ""
+    qasan_fault_addr: str = ""
+    valgrind_cmd: str = ""
+    qasan_cmd: str = ""
+    tracer_cmd: str = ""
+    tracer_probe: str = ""
 
 
 def format_repro_command(workdir: str, command: List[str],
@@ -331,6 +371,17 @@ def extract_valgrind_signal_addr(
     return None
 
 
+def valgrind_has_memcheck_error(log: str) -> bool:
+    """True when valgrind reported at least one invalid read/write.
+
+    A process that dies from a signal (SIGFPE, SIGSEGV outside memcheck's
+    shadow tracking, ...) is NOT a memory-safety oracle: the provenance
+    memcheck machinery cannot be expected to reproduce it.
+    """
+    return any(re.search(r"Invalid (read|write) of size", line)
+               for line in log.splitlines())
+
+
 def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
     """Return (fault_addr, exit_result) parsed from a QASAN probe log.
 
@@ -353,6 +404,11 @@ _TRACER_PARSER.add_schema(
     "[guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
 _TRACER_PARSER.add_schema("[snapshot] [exit] [crash] [entrypoint-hit: int]")
 _TRACER_PARSER.add_schema("[snapshot] [exit] [normal] [entrypoint-hit: int]")
+_TRACER_PARSER.add_schema(
+    "[prov] [finalize] [finding] [reason: str] [access_pc: hex] "
+    "[access_addr: hex] [width: int] [obj_id: int] [gen: int] "
+    "[obj_base: hex] [size: hex] [offset: int] [producer_pc: hex] "
+    "[kind: int] [last_writer: hex] [is_uaf: int] [ea_reg: int]")
 
 
 def extract_tracer_fault_addr(log: str) -> Optional[int]:
@@ -408,6 +464,40 @@ def extract_tracer_crash_reason(log: str) -> str:
     return ""
 
 
+def extract_tracer_prov_finding(log: str) -> Optional[Dict[str, object]]:
+    """Return the provenance finding from the '[prov] [finalize] [finding]'
+    line, or None.
+
+    The finding is recorded at guest normal exit in
+    snapshot_record_guest_normal_exit and carries the access instruction PC
+    (access_pc), the data address (access_addr), the object identity and
+    tracked offset, and the provenance producer/last-writer PCs. access_pc
+    is the raw (unrelocated) guest PC of the faulting access, so it is
+    directly comparable with the fault addresses reported by valgrind and
+    QASAN -- unlike the '[snapshot] [crash]' line, whose fault_addr is the
+    exit-site guest_pc (relocated for .brpatched binaries)."""
+    for line in log.splitlines():
+        row = _TRACER_PARSER.parse_line_detached(line)
+        if row is not None and row.get_name() == "prov$finalize$finding":
+            return {
+                "reason": row["reason"],
+                "access_pc": row["access_pc"],
+                "access_addr": row["access_addr"],
+                "width": row["width"],
+                "obj_id": row["obj_id"],
+                "gen": row["gen"],
+                "obj_base": row["obj_base"],
+                "size": row["size"],
+                "offset": row["offset"],
+                "producer_pc": row["producer_pc"],
+                "kind": row["kind"],
+                "last_writer": row["last_writer"],
+                "is_uaf": row["is_uaf"],
+                "ea_reg": row["ea_reg"],
+            }
+    return None
+
+
 def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
                     testcase: str, timeout: float):
     """Run the probe-style qasan execution and parse the probe result."""
@@ -461,6 +551,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     if need_regen:
         find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
         try:
+            os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
                 [sys.executable, find_models, "-o", plt_info, orig_bin],
                 cwd=workdir, timeout=30, verbose=False)
@@ -498,7 +589,12 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     BINRADAR_MEMCHECK_ENABLE=1 and BINRADAR_ENTRYPOINT=<entrypoint>, and
     parse whether the target reached the patch function before any
     memcheck-detected crash. Returns (entrypoint_hit, exit_str,
-    crash_reason, fault_addr, result, repro).
+    crash_reason, fault_addr, prov_finding, result, repro).
+
+    prov_finding is the parsed '[prov] [finalize] [finding]' record (or
+    None): the provenance OOB/UAF detection's access instruction PC, data
+    address, object identity and tracked offset. See
+    extract_tracer_prov_finding.
 
     The entrypoint-hit counter is only incremented by the symbolic
     instrumentation (symbolic.c, TCG insn_start), so the tracer must run
@@ -535,6 +631,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     if need_regen:
         find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
         try:
+            os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
                 [sys.executable, find_models, "-o", plt_info, orig_bin],
                 cwd=workdir, timeout=30, verbose=False)
@@ -602,8 +699,11 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
         result.stderr) if result.success else ""
     fault_addr = extract_tracer_fault_addr(
         result.stderr) if result.success else None
+    prov_finding = extract_tracer_prov_finding(
+        result.stderr) if result.success else None
     repro = format_repro_command(workdir, command, proc_env)
-    return entry_hits, exit_str, crash_reason, fault_addr, result, repro
+    return entry_hits, exit_str, crash_reason, fault_addr, prov_finding, \
+        result, repro
 
 
 def run_qasan_subject(exp_dir: str, workdir_name: str,
@@ -928,9 +1028,9 @@ def run_memcheck_reach_subject(exp_dir: str, workdir_name: str,
     result.entrypoint = entrypoint
 
     try:
-        entry_hits, exit_str, crash_reason, fault_addr, res, repro = \
-            run_memcheck_reach_probe(workdir, env, testcase, entrypoint,
-                                     timeout)
+        entry_hits, exit_str, crash_reason, fault_addr, prov_finding, res, \
+            repro = run_memcheck_reach_probe(workdir, env, testcase,
+                                             entrypoint, timeout)
     except Exception as e:
         result.detail = f"execution error: {e}"
         return result
@@ -984,6 +1084,195 @@ def run_memcheck_reach_subject(exp_dir: str, workdir_name: str,
     else:
         result.status = Status.FAIL
         result.detail = "no crash detected by memcheck before the patch function"
+    return result
+
+
+def run_compare_fault_addr_subject(exp_dir: str, workdir_name: str,
+                                   timeout: float) -> CompareFaultAddrResult:
+    """Run the provenance tracer, valgrind, and the QASAN probe on
+    <binary>.orig with the POC and compare the detection locations.
+
+    The provenance detection location is the access instruction PC from the
+    tracer's '[prov] [finalize] [finding]' record (raw guest PC, directly
+    comparable with valgrind/QASAN code addresses -- unlike the
+    '[snapshot] [crash]' fault_addr, which is the exit-site guest_pc and is
+    relocated for patched binaries). Valgrind and QASAN locations are
+    extracted the same way as the 'valgrind' subcommand.
+
+    Verdicts:
+      PASS          - provenance location matches both valgrind and QASAN
+                      (or one of them, when the other does not reproduce).
+      FAIL          - provenance location differs from a reproduced
+                      valgrind/QASAN memory-error location, or provenance
+                      fired where both oracles are clean, or a memory
+                      error was detected that provenance did not find.
+      BASELINE-FAIL - no provenance finding and no memcheck oracle
+                      location: no crash under valgrind/qasan, a crash
+                      that is not a memory error (e.g. SIGFPE), a qasan
+                      non-crash exit, or the tracer probe itself failed
+                      (rc recorded in tracer-probe).
+      SKIP          - workdir / binary / poc input / tracer binary missing.
+    """
+    workdir = os.path.join(exp_dir, workdir_name)
+    result = CompareFaultAddrResult(exp_dir=exp_dir, status=Status.SKIP)
+
+    env_path = os.path.join(workdir, "binradar.env")
+    if not os.path.isfile(env_path):
+        env_path = os.path.join(exp_dir, "config.env")
+    if not os.path.isfile(env_path):
+        result.detail = "binradar.env / config.env not found"
+        return result
+    env = binradar_utils.load_env(env_path)
+
+    binary = env.get("BINARY", "")
+    orig_bin = os.path.join(workdir, f"{binary}.orig")
+    poc_input = env.get("POC_INPUT", "")
+    testcase = (poc_input if os.path.isabs(poc_input)
+                else os.path.join(workdir, poc_input))
+    test_cmd = env.get("TEST_CMD", "")
+
+    missing = [name for path, name in [
+        (orig_bin, "orig binary"),
+        (testcase, "poc input")] if not os.path.exists(path)]
+    if missing:
+        result.detail = "missing: " + ", ".join(missing)
+        return result
+    if not os.path.isfile(TRACER_BIN):
+        result.detail = f"tracer binary not found: {TRACER_BIN}"
+        return result
+
+    try:
+        # Tracer with memcheck enabled (same configuration as
+        # memcheck-reach; entrypoint is not needed for the finding PC).
+        _, _, _, _, prov_finding, tracer_res, tracer_repro = \
+            run_memcheck_reach_probe(workdir, env, testcase, "", timeout)
+        result.tracer_cmd = tracer_repro
+
+        # Valgrind on .orig (native truth).
+        valgrind_cmd = ["valgrind", "--error-exitcode=99", "--tool=memcheck",
+                        orig_bin] + shlex.split(test_cmd.replace("@@", testcase))
+        valgrind_res = binradar_utils.execute(
+            valgrind_cmd, cwd=workdir, timeout=timeout, verbose=False)
+        result.valgrind_cmd = format_repro_command(workdir, valgrind_cmd, {})
+
+        # QASAN probe on .orig (afl-qemu-trace, patch id 0).
+        qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
+                     "--asan", "host"]
+        if env.get("PATCH_LOC"):
+            qasan_cmd += ["--patch-loc", env["PATCH_LOC"]]
+        qasan_cmd += [orig_bin, "--"] + shlex.split(test_cmd)
+        qasan_proc_env = dict(os.environ)
+        qasan_proc_env["AFL_USE_QASAN"] = "1"
+        qasan_proc_env["PATCH_ID"] = "0"
+        qasan_res = binradar_utils.execute(
+            qasan_cmd, cwd=workdir, env=qasan_proc_env, timeout=timeout,
+            verbose=False)
+        result.qasan_cmd = format_repro_command(workdir, qasan_cmd,
+                                                qasan_proc_env)
+        qasan_fault = extract_qasan_fault_addr(qasan_res.stderr) \
+            if qasan_res.success else None
+    except Exception as e:
+        result.detail = f"execution error: {e}"
+        return result
+
+    valgrind_memcheck = valgrind_has_memcheck_error(valgrind_res.stderr)
+    valgrind_fault = extract_valgrind_fault_addr(valgrind_res.stderr, orig_bin)
+    if valgrind_fault is None:
+        valgrind_fault = extract_valgrind_signal_addr(valgrind_res.stderr,
+                                                      orig_bin)
+    if valgrind_fault is not None:
+        result.valgrind_fault_addr = hex(valgrind_fault)
+
+    qasan_addr = qasan_exit = None
+    if qasan_fault is not None:
+        qasan_addr, qasan_exit = qasan_fault
+        result.qasan_fault_addr = hex(qasan_addr)
+
+    # Record why the tracer produced no finding: a timed-out/aborted probe
+    # (result.success=False) is NOT evidence that the tracer ran clean.
+    if not tracer_res.success:
+        result.tracer_probe = f"failed (rc {tracer_res.decode_status()})"
+    else:
+        result.tracer_probe = "ok"
+
+    if prov_finding is None:
+        # The only oracle that matters for a memcheck verdict is a
+        # memory-safety error. A signal death (SIGFPE, ...) or a clean run
+        # establishes no fault location to compare against.
+        if valgrind_fault is None and qasan_addr is None:
+            result.status = Status.BASELINE
+            result.detail = "no provenance finding and no crash under valgrind/qasan"
+            return result
+        if not valgrind_memcheck:
+            # valgrind/qasan addresses come from a non-memory signal
+            # (e.g. SIGFPE divide-by-zero) or a qasan non-crash exit:
+            # not a memcheck oracle for this comparison.
+            result.status = Status.BASELINE
+            result.detail = ("oracle crash is not a memcheck error "
+                             "(signal/exit), provenance ran "
+                             f"{result.tracer_probe}")
+            return result
+        result.status = Status.FAIL
+        result.detail = ("no provenance finding but "
+                         f"{'valgrind' if valgrind_fault is not None else 'qasan'} "
+                         "detected a memory error"
+                         f" (tracer probe {result.tracer_probe})")
+        return result
+
+    result.provenance_access_pc = hex(prov_finding["access_pc"])
+    result.provenance_access_addr = hex(prov_finding["access_addr"])
+    result.provenance_obj_id = str(prov_finding["obj_id"])
+    result.provenance_offset = str(prov_finding["offset"])
+    result.provenance_reason = prov_finding["reason"]
+
+    if valgrind_fault is not None and qasan_addr is None:
+        # Only valgrind reproduced: compare against it.
+        if prov_finding["access_pc"] == valgrind_fault:
+            result.status = Status.PASS
+            result.detail = "provenance location matches valgrind (qasan no crash)"
+            return result
+        result.status = Status.FAIL
+        result.detail = "provenance location differs from valgrind"
+        return result
+
+    if qasan_addr is not None and valgrind_fault is None:
+        if qasan_exit != "crash":
+            result.status = Status.FAIL
+            result.detail = f"qasan did not crash (exit: {qasan_exit})"
+            return result
+        if prov_finding["access_pc"] == qasan_addr:
+            result.status = Status.PASS
+            result.detail = "provenance location matches qasan (valgrind no crash)"
+            return result
+        result.status = Status.FAIL
+        result.detail = "provenance location differs from qasan"
+        return result
+
+    if valgrind_fault is not None and qasan_addr is not None:
+        if qasan_exit != "crash":
+            result.status = Status.FAIL
+            result.detail = f"qasan did not crash (exit: {qasan_exit})"
+            return result
+        if prov_finding["access_pc"] == valgrind_fault and \
+                prov_finding["access_pc"] == qasan_addr:
+            result.status = Status.PASS
+            result.detail = ("provenance location matches valgrind and qasan")
+            return result
+        if prov_finding["access_pc"] == valgrind_fault:
+            result.status = Status.PASS
+            result.detail = "provenance location matches valgrind (qasan differs)"
+            return result
+        if prov_finding["access_pc"] == qasan_addr:
+            result.status = Status.PASS
+            result.detail = "provenance location matches qasan (valgrind differs)"
+            return result
+        result.status = Status.FAIL
+        result.detail = "provenance location differs from both valgrind and qasan"
+        return result
+
+    # Neither oracle reproduced a crash but provenance fired.
+    result.status = Status.FAIL
+    result.detail = "provenance detected a crash neither valgrind nor qasan reproduced"
     return result
 
 
@@ -1057,6 +1346,35 @@ def format_memcheck_reach_log_result(result: MemcheckReachResult,
     if result.fault_addr:
         lines.append(f"  [fault-addr] {result.fault_addr}")
     if verbose:
+        if result.tracer_cmd:
+            lines.append(f"  [cmd tracer] {result.tracer_cmd}")
+    lines.append(f"  [VERDICT] {result.status} ({result.detail})")
+    return "\n".join(lines)
+
+
+def format_compare_fault_addr_log_result(result: CompareFaultAddrResult,
+                                         verbose: bool = False) -> str:
+    lines = [f"=== {result.exp_dir} ==="]
+    if result.status == Status.SKIP:
+        lines.append(f"  [STATUS] SKIP: {result.detail}")
+        return "\n".join(lines)
+    lines.append(f"  [provenance] access-pc: {result.provenance_access_pc or 'n/a'}"
+                 + (f"  access-addr: {result.provenance_access_addr}"
+                    if result.provenance_access_addr else "")
+                 + (f"  obj-id: {result.provenance_obj_id}"
+                    if result.provenance_obj_id else "")
+                 + (f"  offset: {result.provenance_offset}"
+                    if result.provenance_offset else ""))
+    if result.provenance_reason:
+        lines.append(f"  [provenance] reason: {result.provenance_reason}")
+    lines.append(f"  [valgrind] fault-addr: {result.valgrind_fault_addr or 'n/a'}")
+    lines.append(f"  [qasan]    fault-addr: {result.qasan_fault_addr or 'n/a'}")
+    lines.append(f"  [tracer]   probe: {result.tracer_probe or 'n/a'}")
+    if verbose:
+        if result.valgrind_cmd:
+            lines.append(f"  [cmd valgrind] {result.valgrind_cmd}")
+        if result.qasan_cmd:
+            lines.append(f"  [cmd qasan] {result.qasan_cmd}")
         if result.tracer_cmd:
             lines.append(f"  [cmd tracer] {result.tracer_cmd}")
     lines.append(f"  [VERDICT] {result.status} ({result.detail})")
@@ -1191,6 +1509,48 @@ def write_memcheck_reach_delimited(output_path: str,
             writer.writerow(row)
 
 
+COMPARE_FAULT_ADDR_CSV_COLUMNS = [
+    "experiment",
+    "verdict",
+    "detail",
+    "tracer_probe",
+    "provenance_access_pc",
+    "provenance_access_addr",
+    "provenance_obj_id",
+    "provenance_offset",
+    "provenance_reason",
+    "valgrind_fault_addr",
+    "qasan_fault_addr",
+]
+
+
+def write_compare_fault_addr_delimited(
+        output_path: str, results: List[CompareFaultAddrResult],
+        delimiter: str, include_subject_id: bool = True):
+    columns = list(COMPARE_FAULT_ADDR_CSV_COLUMNS)
+    if not include_subject_id:
+        columns.remove("experiment")
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter=delimiter)
+        writer.writeheader()
+        for r in results:
+            row = {
+                "verdict": r.status,
+                "detail": r.detail,
+                "tracer_probe": r.tracer_probe,
+                "provenance_access_pc": r.provenance_access_pc,
+                "provenance_access_addr": r.provenance_access_addr,
+                "provenance_obj_id": r.provenance_obj_id,
+                "provenance_offset": r.provenance_offset,
+                "provenance_reason": r.provenance_reason,
+                "valgrind_fault_addr": r.valgrind_fault_addr,
+                "qasan_fault_addr": r.qasan_fault_addr,
+            }
+            if include_subject_id:
+                row["experiment"] = r.exp_dir
+            writer.writerow(row)
+
+
 def write_log(output_path: str, args, results: List[QasanSubjectResult],
               counts: Dict[Status, int], total: int):
     lines = [
@@ -1279,6 +1639,32 @@ def write_memcheck_reach_log(output_path: str, args,
     ]
     for r in results:
         lines.append(format_memcheck_reach_log_result(r, verbose=args.verbose))
+        lines.append("")
+    lines.append("=" * 60)
+    lines.append(
+        f"SUMMARY: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+        f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+        f"(total {total})")
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_compare_fault_addr_log(output_path: str, args,
+                                 results: List[CompareFaultAddrResult],
+                                 counts: Dict[Status, int], total: int):
+    lines = [
+        "Provenance vs valgrind vs QASAN Detection Location Test Results",
+        f"Generated: {datetime.now().isoformat()}",
+        f"Experiment list: {args.exp}",
+        f"Workdir: {args.workdir}",
+        f"Timeout: {args.timeout}s",
+        f"Total experiments: {total}",
+        "=" * 60,
+        "",
+    ]
+    for r in results:
+        lines.append(format_compare_fault_addr_log_result(r,
+                                                          verbose=args.verbose))
         lines.append("")
     lines.append("=" * 60)
     lines.append(
@@ -1557,6 +1943,74 @@ def cmd_memcheck_reach(args):
           f"(total {len(resolved)})")
 
 
+def cmd_compare_fault_addr(args):
+    if args.verbose and args.format != "log":
+        print("ERROR: --verbose only works with --format=log", file=sys.stderr)
+        sys.exit(1)
+
+    exp_file = args.exp
+    if not os.path.isfile(exp_file):
+        print(f"ERROR: exp list file not found: {exp_file}")
+        sys.exit(1)
+
+    with open(exp_file, "r") as f:
+        exp_dirs = [line.strip() for line in f if line.strip()]
+
+    exp_file_dir = os.path.dirname(os.path.abspath(exp_file))
+    resolved = []
+    display = []
+    for d in exp_dirs:
+        display.append(display_path(exp_file_dir, d))
+        if not os.path.isabs(d):
+            d = os.path.normpath(os.path.join(exp_file_dir, d))
+        resolved.append(d)
+
+    if args.jobs > 1:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            results = list(pool.map(
+                lambda d: run_compare_fault_addr_subject(d, args.workdir,
+                                                         args.timeout),
+                resolved))
+    else:
+        results = [run_compare_fault_addr_subject(d, args.workdir, args.timeout)
+                   for d in resolved]
+
+    if args.format in ("csv", "tsv"):
+        for r, name in zip(results, display):
+            r.exp_dir = name
+
+    for r in results:
+        print(f"[{r.status:>13}] {r.exp_dir}"
+              + (f" ({r.detail})" if r.detail else ""))
+
+    counts = {s: sum(1 for r in results if r.status == s)
+              for s in (Status.PASS, Status.FAIL, Status.SKIP, Status.BASELINE)}
+
+    if args.output:
+        output_path = args.output
+    else:
+        logs_dir = os.path.join(LOFTIX_DIR, "logs")
+        if not os.path.isdir(LOFTIX_DIR):
+            logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        ext = args.format if args.format in ("csv", "tsv") else "log"
+        output_path = os.path.join(
+            logs_dir, f"compare-fault-addr-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.{ext}")
+
+    if args.format in ("csv", "tsv"):
+        delimiter = "\t" if args.format == "tsv" else ","
+        write_compare_fault_addr_delimited(output_path, results, delimiter,
+                                           include_subject_id=not args.no_subject_id)
+    else:
+        write_compare_fault_addr_log(output_path, args, results, counts,
+                                     len(resolved))
+
+    print(f"Results written to: {output_path}")
+    print(f"Summary: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+          f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+          f"(total {len(resolved)})")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1684,6 +2138,36 @@ def main():
         "-n", "--no-subject-id", action="store_true",
         help="omit the experiment subject id column in csv/tsv output")
     memcheck_reach.set_defaults(func=cmd_memcheck_reach)
+
+    compare_fault_addr = sub.add_parser(
+        "compare-fault-addr",
+        help="compare provenance detection location against valgrind and qasan")
+    compare_fault_addr.add_argument(
+        "--exp", default="exp.list",
+        help="path to experiment list file (one dir per line)")
+    compare_fault_addr.add_argument(
+        "--workdir", default="workdir",
+        help="work directory name (default: workdir)")
+    compare_fault_addr.add_argument(
+        "--timeout", type=int, default=180,
+        help="timeout per run in seconds (default: 180)")
+    compare_fault_addr.add_argument(
+        "--format", choices=["log", "csv", "tsv"], default="log",
+        help="output format: log (default), csv, or tsv")
+    compare_fault_addr.add_argument(
+        "--output", default="",
+        help="output file path (default: logs/compare-fault-addr-<timestamp>.<ext>)")
+    compare_fault_addr.add_argument(
+        "--jobs", type=int, default=1,
+        help="number of subjects to test in parallel (default: 1)")
+    compare_fault_addr.add_argument(
+        "--verbose", action="store_true",
+        help="with --format=log, add a reproduction command line per run "
+             "(cd <workdir> && ENV=...; <command>); incompatible with csv/tsv")
+    compare_fault_addr.add_argument(
+        "-n", "--no-subject-id", action="store_true",
+        help="omit the experiment subject id column in csv/tsv output")
+    compare_fault_addr.set_defaults(func=cmd_compare_fault_addr)
 
     args = parser.parse_args()
     args.func(args)
