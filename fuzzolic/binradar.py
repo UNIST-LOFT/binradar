@@ -298,7 +298,12 @@ class TracerExecutor:
             else:
                 logger.error(f"[TRACER] [{self.mode}] Tracer process is still running - sending SIGINT to stop it")
             self.process.send_signal(signal.SIGINT)
-            self.process.wait()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.error(f"[TRACER] [{self.mode}] Tracer did not exit after SIGINT - sending SIGKILL")
+                self.process.kill()
+                self.process.wait()
             raise e
         analyze_result_size = len(analyze_result)
         if analyze_result_size > 0xFFFFFFFF:
@@ -763,8 +768,6 @@ class BinRadarExecutor:
         env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
         env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
         env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
-        # Enable QASAN-like concrete bounds checking in the tracer
-        env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -772,6 +775,7 @@ class BinRadarExecutor:
             env["BINRADAR_TRACE_FILE"] = "none"
         elif mode in ["directed", "binradar"]:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
+            env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(self.timeout))
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             if mode == "directed":
                 env["BINRADAR_REVERSE_DIRECTED"] = "1" if self.reverse_directed else "0"
@@ -1336,7 +1340,11 @@ class BinRadarExecutor:
         self.run_minimizer_and_verifier()
         raise_thread_error_if_any(wait_for_binradar=True)
 
-        binradar_thread.join()
+        binradar_thread.join(timeout=60)
+        if binradar_thread.is_alive():
+            logger.error("[BINRADAR] binradar thread did not finish within 60s after minimizer/verifier - stopping remaining processes")
+            stop_running_processes()
+            binradar_thread.join(timeout=10)
         raise_thread_error_if_any()
         self.run_final()
         self.done()
@@ -1345,6 +1353,7 @@ class BinRadarExecutor:
 def main():
     setlimits()
     signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
 
     parser = argparse.ArgumentParser(
         description="binradar: a binary patch verification tool")

@@ -3,10 +3,15 @@ import argparse
 import csv
 import enum
 import os
+import random
 import re
 import sbsv
 import shlex
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +30,7 @@ from binradar_verifier import (
 
 LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
 TRACER_BIN = os.path.join(SCRIPT_DIR, "..", "tracer", "build", "x86_64-linux-user", "qemu-x86_64")
+SOLVER_BIN = os.path.join(SCRIPT_DIR, "..", "solver", "build", "solver-smt")
 
 """
 Run tests on binradar benchmark subjects listed in exp.list.
@@ -86,10 +92,37 @@ Subcommands:
                           the subject cannot be tested.
           SKIP          - workdir / binary / poc input / tracer binary
                           missing.
+
+    memcheck-reach
+        Check whether the target reaches the patch function entry point
+        when the tracer runs with BINRADAR_MEMCHECK_ENABLE=1 (the
+        QASAN-like concrete bounds checking). The directed/binradar
+        phases enable memcheck and set BINRADAR_ENTRYPOINT to the patch
+        function entry: if the POC triggers a heap-buffer-overflow or
+        use-after-free before that entry point is executed, the tracer
+        dies before the forkserver handshake and the phase fails with
+        "EOF while reading from forkserver". This test runs the fuzzolic
+        tracer (no -symbolic) on <binary>.orig with memcheck enabled and
+        BINRADAR_ENTRYPOINT taken from the latest probe result, then
+        reports the [snapshot] [exit] entrypoint-hit count.
+
+        Verdicts:
+          PASS          - the target reached the patch function
+                          (entrypoint-hit > 0), or ran to completion
+                          without a memcheck-detected crash.
+          FAIL          - the target crashed (e.g. memcheck) before
+                          reaching the patch function (entrypoint-hit 0);
+                          the directed/binradar phases would fail with EOF.
+          BASELINE-FAIL - no probe result found in <workdir>/out (cannot
+                          determine the patch function entry point), or
+                          the tracer probe itself failed.
+          SKIP          - workdir / binary / poc input / tracer binary
+                          missing.
 Results are summarized in a single file (logs/qasan-<timestamp>.log by
 default, or logs/qasan-<timestamp>.csv / .tsv with --format csv / tsv;
 likewise logs/valgrind-<timestamp>.<ext> for the valgrind subcommand,
-and logs/tracer-<timestamp>.<ext> for the tracer subcommand).
+logs/tracer-<timestamp>.<ext> for the tracer subcommand, and
+logs/memcheck-reach-<timestamp>.<ext> for the memcheck-reach subcommand).
 With --format log, --verbose adds a reproduction command line per probe
 (`cd <workdir> && ENV=...; <command>`) so a failing subject can be
 re-run by hand.
@@ -150,6 +183,17 @@ class TracerSubjectResult:
     afl_fault_addr: str = ""
     tracer_fault_addr: str = ""
     afl_cmd: str = ""
+    tracer_cmd: str = ""
+
+@dataclass
+class MemcheckReachResult:
+    exp_dir: str
+    status: Status
+    detail: str = ""
+    entrypoint: str = ""
+    entrypoint_hit: str = ""
+    crash_reason: str = ""
+    fault_addr: str = ""
     tracer_cmd: str = ""
 
 
@@ -338,6 +382,32 @@ def extract_tracer_exit(log: str) -> str:
     return ""
 
 
+def extract_tracer_entrypoint_hit(log: str) -> int:
+    """Return the entrypoint-hit count from the [snapshot] [exit] line.
+
+    The tracer logs [snapshot] [exit] [crash|normal] [entrypoint-hit N]
+    at exit; N is how many times the patch function entry point was
+    reached before the exit. N=0 with a crash means the target crashed
+    (e.g. from memcheck) before reaching the patch function."""
+    for line in log.splitlines():
+        row = _TRACER_PARSER.parse_line_detached(line)
+        if row is None:
+            continue
+        if row.get_name() in ("snapshot$exit$crash", "snapshot$exit$normal"):
+            return row["entrypoint-hit"]
+    return -1
+
+
+def extract_tracer_crash_reason(log: str) -> str:
+    """Return the reason from the [snapshot] [crash] line (e.g.
+    'memcheck: heap-buffer-overflow'), or '' if absent."""
+    for line in log.splitlines():
+        row = _TRACER_PARSER.parse_line_detached(line)
+        if row is not None and row.get_name() == "snapshot$crash":
+            return row["reason"]
+    return ""
+
+
 def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
                     testcase: str, timeout: float):
     """Run the probe-style qasan execution and parse the probe result."""
@@ -404,6 +474,136 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""
     repro = format_repro_command(workdir, command, proc_env)
     return fault_addr, exit_str, result, repro
+
+
+def find_latest_probe_results(out_dir: str) -> Optional[str]:
+    """Find the most recent probe-results.sbsv under <out_dir>/*/."""
+    if not os.path.isdir(out_dir):
+        return None
+    candidates = []
+    for name in os.listdir(out_dir):
+        path = os.path.join(out_dir, name, "probe-results.sbsv")
+        if os.path.isfile(path):
+            candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
+                             testcase: str, entrypoint: str,
+                             timeout: float):
+    """Run the fuzzolic tracer on <binary>.orig in the real directed-mode
+    configuration (-symbolic, solver shared memory) with
+    BINRADAR_MEMCHECK_ENABLE=1 and BINRADAR_ENTRYPOINT=<entrypoint>, and
+    parse whether the target reached the patch function before any
+    memcheck-detected crash. Returns (entrypoint_hit, exit_str,
+    crash_reason, fault_addr, result, repro).
+
+    The entrypoint-hit counter is only incremented by the symbolic
+    instrumentation (symbolic.c, TCG insn_start), so the tracer must run
+    with -symbolic and a live solver providing the shared-memory pool."""
+    binary = env.get("BINARY", "")
+    orig_bin = os.path.join(workdir, f"{binary}.orig")
+    test_cmd = env.get("TEST_CMD", "")
+    command = [TRACER_BIN, "-symbolic", "-d", "page", orig_bin] + shlex.split(
+        test_cmd.replace("@@", testcase))
+    proc_env = dict(os.environ)
+    proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
+    proc_env["BINRADAR_TRACE_FILE"] = "none"
+    # parse_exclude_region_str calls getenv(name) and strchr on the
+    # result; must set all three to avoid NULL deref.
+    proc_env["PATCH_RESERVE_RANGE"] = env.get("PATCH_RESERVE_RANGE", "0x0-0x0")
+    proc_env["E9_TRAMPOLINE_RANGE"] = env.get("E9_TRAMPOLINE_RANGE", "0x0-0x0")
+    proc_env["E9_LOADER_RANGE"] = env.get("E9_LOADER_RANGE", "0x0-0x0")
+    proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    if entrypoint:
+        proc_env["BINRADAR_ENTRYPOINT"] = entrypoint
+    # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
+    # Look for plt_info.txt in the workdir's out directory.
+    # Regenerate if it doesn't contain malloc/free entries.
+    plt_info = os.path.join(workdir, "out", "plt_info.txt")
+    need_regen = True
+    if os.path.isfile(plt_info):
+        try:
+            with open(plt_info, "r") as f:
+                content = f.read()
+            if "malloc" in content and "free" in content:
+                need_regen = False
+        except Exception:
+            pass
+    if need_regen:
+        find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
+        try:
+            regen_result = binradar_utils.execute(
+                [sys.executable, find_models, "-o", plt_info, orig_bin],
+                cwd=workdir, timeout=30, verbose=False)
+        except Exception:
+            pass
+    if os.path.isfile(plt_info):
+        proc_env["PLT_INFO_FILE"] = plt_info
+
+    # The symbolic tracer needs a live solver to attach its expression
+    # pool / query shared memory (the tracer polls for SHM_READY). Run the
+    # same solver command the directed phase uses, with fresh random keys.
+    for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY",
+                "MUTATION_REQ_SHM_KEY"):
+        proc_env[key] = hex(random.getrandbits(32))
+    proc_env["SOLVER_TIMEOUT"] = str(int(timeout) + 10)
+    proc_env["SYMBOLIC_INJECT_INPUT_MODE"] = "FROM_FILE"
+    proc_env["SYMBOLIC_TESTCASE_NAME"] = testcase
+
+    run_dir = tempfile.mkdtemp(prefix="memcheck-reach-")
+    solver = None
+    try:
+        out_dir = os.path.join(run_dir, "solver-out")
+        os.makedirs(out_dir, exist_ok=True)
+        for bitmap in ("global", "context", "memory"):
+            with open(os.path.join(run_dir, f"{bitmap}-bitmap"), "w") as f:
+                pass
+        solver_cmd = ["stdbuf", "-o0", SOLVER_BIN,
+                      "-i", testcase,
+                      "-o", out_dir,
+                      "-b", os.path.join(run_dir, "global-bitmap"),
+                      "-c", os.path.join(run_dir, "context-bitmap"),
+                      "-m", os.path.join(run_dir, "memory-bitmap")]
+        try:
+            solver = subprocess.Popen(
+                solver_cmd, cwd=workdir, env=proc_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except Exception:
+            solver = None
+        # Give the solver time to create and initialize the shared
+        # memories before the tracer attaches.
+        time.sleep(1)
+
+        result = binradar_utils.execute(
+            command, cwd=workdir, env=proc_env, timeout=timeout,
+            verbose=False)
+    finally:
+        if solver is not None:
+            try:
+                solver.terminate()
+                solver.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    solver.kill()
+                    solver.wait(timeout=5)
+                except (subprocess.TimeoutExpired, ProcessLookupError):
+                    pass
+        import shutil
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    entry_hits = extract_tracer_entrypoint_hit(
+        result.stderr) if result.success else -1
+    exit_str = extract_tracer_exit(result.stderr) if result.success else ""
+    crash_reason = extract_tracer_crash_reason(
+        result.stderr) if result.success else ""
+    fault_addr = extract_tracer_fault_addr(
+        result.stderr) if result.success else None
+    repro = format_repro_command(workdir, command, proc_env)
+    return entry_hits, exit_str, crash_reason, fault_addr, result, repro
 
 
 def run_qasan_subject(exp_dir: str, workdir_name: str,
@@ -678,6 +878,115 @@ def run_tracer_subject(exp_dir: str, workdir_name: str,
     return result
 
 
+def run_memcheck_reach_subject(exp_dir: str, workdir_name: str,
+                               timeout: float) -> MemcheckReachResult:
+    """Run the fuzzolic tracer with BINRADAR_MEMCHECK_ENABLE=1 on
+    <binary>.orig and check whether the target reaches the patch
+    function entry point before any memcheck-detected crash.
+
+    The directed/binradar phases set BINRADAR_ENTRYPOINT to the patch
+    function entry and enable memcheck: if the POC triggers a
+    heap-buffer-overflow / use-after-free before that entry point is
+    executed, the tracer dies before the forkserver handshake and the
+    phase fails with EOF. This test detects that condition."""
+    workdir = os.path.join(exp_dir, workdir_name)
+    result = MemcheckReachResult(exp_dir=exp_dir, status=Status.SKIP)
+
+    env_path = os.path.join(workdir, "binradar.env")
+    if not os.path.isfile(env_path):
+        env_path = os.path.join(exp_dir, "config.env")
+    if not os.path.isfile(env_path):
+        result.detail = "binradar.env / config.env not found"
+        return result
+    env = binradar_utils.load_env(env_path)
+
+    binary = env.get("BINARY", "")
+    orig_bin = os.path.join(workdir, f"{binary}.orig")
+    poc_input = env.get("POC_INPUT", "")
+    testcase = (poc_input if os.path.isabs(poc_input)
+                else os.path.join(workdir, poc_input))
+
+    missing = [name for path, name in [
+        (orig_bin, "orig binary"),
+        (testcase, "poc input")] if not os.path.exists(path)]
+    if missing:
+        result.detail = "missing: " + ", ".join(missing)
+        return result
+    if not os.path.isfile(TRACER_BIN):
+        result.detail = f"tracer binary not found: {TRACER_BIN}"
+        return result
+
+    # Determine the patch function entry point from the latest probe
+    # result. The probe result is needed: BINRADAR_ENTRYPOINT must match
+    # what the directed/binradar phases use.
+    probe_file = find_latest_probe_results(os.path.join(workdir, "out"))
+    entrypoint = ""
+    if probe_file is not None:
+        probe = BinRadarProbeResult.from_sbsv(probe_file)
+        if probe is not None and probe.patch_func_entry != 0:
+            entrypoint = hex(probe.patch_func_entry)
+    result.entrypoint = entrypoint
+
+    try:
+        entry_hits, exit_str, crash_reason, fault_addr, res, repro = \
+            run_memcheck_reach_probe(workdir, env, testcase, entrypoint,
+                                     timeout)
+    except Exception as e:
+        result.detail = f"execution error: {e}"
+        return result
+
+    result.tracer_cmd = repro
+
+    if entrypoint == "":
+        # Without a probe result we cannot distinguish "crash before the
+        # patch function" from "crash after it"; run still tells us
+        # whether memcheck fires at all.
+        if not res.success:
+            result.status = Status.BASELINE
+            result.detail = f"tracer probe failed ({'timeout' if not res.success else 'no crash log'})"
+            return result
+        result.status = Status.BASELINE
+        result.detail = (f"no probe result found; tracer exit {exit_str or 'none'}"
+                         + (f" ({crash_reason})" if crash_reason else ""))
+        return result
+
+    if not res.success:
+        result.status = Status.FAIL
+        result.detail = f"tracer probe failed ({'timeout' if not res.success else 'no crash log'})"
+        return result
+
+    result.entrypoint_hit = str(entry_hits)
+    result.crash_reason = crash_reason
+    if fault_addr is not None:
+        result.fault_addr = hex(fault_addr)
+
+    if exit_str == "crash" and entry_hits == 0:
+        result.status = Status.FAIL
+        result.detail = ("crash before reaching the patch function "
+                         f"(entrypoint-hit 0, reason: {crash_reason or 'unknown'})")
+        return result
+
+    if exit_str == "":
+        # No [snapshot] [exit] line at all (e.g. tracer crashed on its
+        # own, or the target exited without snapshot instrumentation).
+        result.status = Status.FAIL
+        result.detail = "no snapshot exit line recorded"
+        return result
+    
+    
+    if entry_hits > 0:
+        if exit_str != "crash":
+            result.status = Status.FAIL
+            result.detail = f"Could not detect crash: {exit_str}"
+            return result
+        result.status = Status.PASS
+        result.detail = f"reached the patch function (entrypoint-hit {entry_hits})"
+    else:
+        result.status = Status.FAIL
+        result.detail = "no crash detected by memcheck before the patch function"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Output formatters
 # ---------------------------------------------------------------------------
@@ -729,6 +1038,25 @@ def format_tracer_log_result(result: TracerSubjectResult,
     if verbose:
         if result.afl_cmd:
             lines.append(f"  [cmd afl] {result.afl_cmd}")
+        if result.tracer_cmd:
+            lines.append(f"  [cmd tracer] {result.tracer_cmd}")
+    lines.append(f"  [VERDICT] {result.status} ({result.detail})")
+    return "\n".join(lines)
+
+
+def format_memcheck_reach_log_result(result: MemcheckReachResult,
+                                     verbose: bool = False) -> str:
+    lines = [f"=== {result.exp_dir} ==="]
+    if result.status == Status.SKIP:
+        lines.append(f"  [STATUS] SKIP: {result.detail}")
+        return "\n".join(lines)
+    lines.append(f"  [entrypoint] {result.entrypoint or 'n/a'}")
+    lines.append(f"  [entrypoint-hit] {result.entrypoint_hit or 'n/a'}")
+    if result.crash_reason:
+        lines.append(f"  [crash-reason] {result.crash_reason}")
+    if result.fault_addr:
+        lines.append(f"  [fault-addr] {result.fault_addr}")
+    if verbose:
         if result.tracer_cmd:
             lines.append(f"  [cmd tracer] {result.tracer_cmd}")
     lines.append(f"  [VERDICT] {result.status} ({result.detail})")
@@ -828,6 +1156,41 @@ def write_tracer_delimited(output_path: str,
             writer.writerow(row)
 
 
+MEMCHECK_REACH_CSV_COLUMNS = [
+    "experiment",
+    "verdict",
+    "detail",
+    "entrypoint",
+    "entrypoint_hit",
+    "crash_reason",
+    "fault_addr",
+]
+
+
+def write_memcheck_reach_delimited(output_path: str,
+                                   results: List[MemcheckReachResult],
+                                   delimiter: str,
+                                   include_subject_id: bool = True):
+    columns = list(MEMCHECK_REACH_CSV_COLUMNS)
+    if not include_subject_id:
+        columns.remove("experiment")
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter=delimiter)
+        writer.writeheader()
+        for r in results:
+            row = {
+                "verdict": r.status,
+                "detail": r.detail,
+                "entrypoint": r.entrypoint,
+                "entrypoint_hit": r.entrypoint_hit,
+                "crash_reason": r.crash_reason,
+                "fault_addr": r.fault_addr,
+            }
+            if include_subject_id:
+                row["experiment"] = r.exp_dir
+            writer.writerow(row)
+
+
 def write_log(output_path: str, args, results: List[QasanSubjectResult],
               counts: Dict[Status, int], total: int):
     lines = [
@@ -891,6 +1254,31 @@ def write_tracer_log(output_path: str, args,
     ]
     for r in results:
         lines.append(format_tracer_log_result(r, verbose=args.verbose))
+        lines.append("")
+    lines.append("=" * 60)
+    lines.append(
+        f"SUMMARY: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+        f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+        f"(total {total})")
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_memcheck_reach_log(output_path: str, args,
+                             results: List[MemcheckReachResult],
+                             counts: Dict[Status, int], total: int):
+    lines = [
+        "Memcheck Patch-Function Reach Test Results",
+        f"Generated: {datetime.now().isoformat()}",
+        f"Experiment list: {args.exp}",
+        f"Workdir: {args.workdir}",
+        f"Timeout: {args.timeout}s",
+        f"Total experiments: {total}",
+        "=" * 60,
+        "",
+    ]
+    for r in results:
+        lines.append(format_memcheck_reach_log_result(r, verbose=args.verbose))
         lines.append("")
     lines.append("=" * 60)
     lines.append(
@@ -1102,6 +1490,73 @@ def cmd_tracer(args):
           f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
           f"(total {len(resolved)})")
 
+
+def cmd_memcheck_reach(args):
+    if args.verbose and args.format != "log":
+        print("ERROR: --verbose only works with --format=log", file=sys.stderr)
+        sys.exit(1)
+
+    exp_file = args.exp
+    if not os.path.isfile(exp_file):
+        print(f"ERROR: exp list file not found: {exp_file}")
+        sys.exit(1)
+
+    with open(exp_file, "r") as f:
+        exp_dirs = [line.strip() for line in f if line.strip()]
+
+    exp_file_dir = os.path.dirname(os.path.abspath(exp_file))
+    resolved = []
+    display = []
+    for d in exp_dirs:
+        display.append(display_path(exp_file_dir, d))
+        if not os.path.isabs(d):
+            d = os.path.normpath(os.path.join(exp_file_dir, d))
+        resolved.append(d)
+
+    if args.jobs > 1:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            results = list(pool.map(
+                lambda d: run_memcheck_reach_subject(d, args.workdir, args.timeout),
+                resolved))
+    else:
+        results = [run_memcheck_reach_subject(d, args.workdir, args.timeout)
+                   for d in resolved]
+
+    if args.format in ("csv", "tsv"):
+        for r, name in zip(results, display):
+            r.exp_dir = name
+
+    for r in results:
+        print(f"[{r.status:>13}] {r.exp_dir}"
+              + (f" ({r.detail})" if r.detail else ""))
+
+    counts = {s: sum(1 for r in results if r.status == s)
+              for s in (Status.PASS, Status.FAIL, Status.SKIP, Status.BASELINE)}
+
+    if args.output:
+        output_path = args.output
+    else:
+        logs_dir = os.path.join(LOFTIX_DIR, "logs")
+        if not os.path.isdir(LOFTIX_DIR):
+            logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        ext = args.format if args.format in ("csv", "tsv") else "log"
+        output_path = os.path.join(
+            logs_dir, f"memcheck-reach-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.{ext}")
+
+    if args.format in ("csv", "tsv"):
+        delimiter = "\t" if args.format == "tsv" else ","
+        write_memcheck_reach_delimited(output_path, results, delimiter,
+                                       include_subject_id=not args.no_subject_id)
+    else:
+        write_memcheck_reach_log(output_path, args, results, counts, len(resolved))
+
+    print(f"Results written to: {output_path}")
+    print(f"Summary: {counts[Status.PASS]} PASS, {counts[Status.FAIL]} FAIL, "
+          f"{counts[Status.BASELINE]} BASELINE-FAIL, {counts[Status.SKIP]} SKIP "
+          f"(total {len(resolved)})")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1198,6 +1653,37 @@ def main():
         "-n", "--no-subject-id", action="store_true",
         help="omit the experiment subject id column in csv/tsv output")
     tracer.set_defaults(func=cmd_tracer)
+
+    memcheck_reach = sub.add_parser(
+        "memcheck-reach",
+        help="check whether the target reaches the patch function under "
+             "BINRADAR_MEMCHECK_ENABLE=1")
+    memcheck_reach.add_argument(
+        "--exp", default="exp.list",
+        help="path to experiment list file (one dir per line)")
+    memcheck_reach.add_argument(
+        "--workdir", default="workdir",
+        help="work directory name (default: workdir)")
+    memcheck_reach.add_argument(
+        "--timeout", type=int, default=180,
+        help="timeout per run in seconds (default: 180)")
+    memcheck_reach.add_argument(
+        "--format", choices=["log", "csv", "tsv"], default="log",
+        help="output format: log (default), csv, or tsv")
+    memcheck_reach.add_argument(
+        "--output", default="",
+        help="output file path (default: logs/memcheck-reach-<timestamp>.<ext>)")
+    memcheck_reach.add_argument(
+        "--jobs", type=int, default=1,
+        help="number of subjects to test in parallel (default: 1)")
+    memcheck_reach.add_argument(
+        "--verbose", action="store_true",
+        help="with --format=log, add a reproduction command line per run "
+             "(cd <workdir> && ENV=...; <command>); incompatible with csv/tsv")
+    memcheck_reach.add_argument(
+        "-n", "--no-subject-id", action="store_true",
+        help="omit the experiment subject id column in csv/tsv output")
+    memcheck_reach.set_defaults(func=cmd_memcheck_reach)
 
     args = parser.parse_args()
     args.func(args)
