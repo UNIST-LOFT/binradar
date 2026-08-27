@@ -80,7 +80,7 @@ clean-all workdir="workdir":
 
 eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/loftix/loftix-benchmarks" argfile="exp.list" jobs="30":
     #!/usr/bin/env bash
-    mkdir -p logs/eval-results
-    parallel --tag --joblog logs/eval.tsv --results logs/eval-results -j {{jobs}} \
+    mkdir -p logs/eval-{{fuzzer}}-results
+    parallel --tag --joblog logs/eval-{{fuzzer}}.tsv --results logs/eval-{{fuzzer}}-results -j {{jobs}} \
       'cd "{}" && just eval "{{workdir}}" "{{fuzzer}}" "{{fuzz_out_root}}/{}/work-{{fuzzer}}/out"' \
       :::: "{{argfile}}"
