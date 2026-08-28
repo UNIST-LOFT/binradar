@@ -84,3 +84,18 @@ eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/lo
     parallel --tag --joblog logs/eval-{{fuzzer}}.tsv --results logs/eval-{{fuzzer}}-results -j {{jobs}} \
       'cd "{}" && just eval "{{workdir}}" "{{fuzzer}}" "{{fuzz_out_root}}/{}/work-{{fuzzer}}/out"' \
       :::: "{{argfile}}"
+
+
+copy-from-workdir:
+    #!/usr/bin/env bash
+    for workdir in */*/workdir; do
+        [ -d "$workdir" ] || continue
+
+        workdir_prebuilt="${workdir%/workdir}/workdir-prebuilt"
+
+        if [ ! -d "$workdir_prebuilt" ] || ! compgen -G "$workdir_prebuilt/*.brpatched" > /dev/null; then
+            echo "Copying: $workdir -> $workdir_prebuilt"
+            rm -rf "$workdir_prebuilt"
+            cp -r "$workdir" "$workdir_prebuilt"
+        fi
+    done

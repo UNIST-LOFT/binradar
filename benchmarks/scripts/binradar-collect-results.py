@@ -41,6 +41,7 @@ import os
 import re
 import sbsv
 import sys
+import enum
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +68,10 @@ def display_path(exp_file_dir: str, path: str) -> str:
 KNOWN_PHASES = {"probe", "filter", "binradar", "directed", "fuzzer", "fuzzolic",
                 "minimizer", "verifier", "final"}
 
+class DoneStatus(enum.Enum):
+    OK = "OK"
+    INCOMPLETE = "INCOMPLETE"
+    SKIPPED = "SKIPPED"
 
 def _build_sbsv_parser() -> sbsv.parser:
     """Build a parser for the structured rows consumed by this collector."""
@@ -138,7 +143,7 @@ class RunResult:
     filter_rejected: str = ""  # e.g. "3" or "" if none
     prefilter_total: int = -1  # predicates evaluated by the prefilter
     prefilter_survived: int = -1  # predicates kept (pass=true)
-    prefilter_done: bool = False  # [prefilter] [done] marker present
+    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
     log_errors: List[str] = field(default_factory=list)
     tracer_errors: List[str] = field(default_factory=list)
 
@@ -168,7 +173,7 @@ class SdfuzzResult:
     verifier_testcases: int = -1  # testcases used by the verifier
     prefilter_total: int = -1  # predicates evaluated by the prefilter
     prefilter_survived: int = -1  # predicates kept (pass=true)
-    prefilter_done: bool = False  # [prefilter] [done] marker present
+    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
     log_errors: List[str] = field(default_factory=list)
 
 
@@ -353,6 +358,23 @@ def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
     return result
 
 
+def prefilter_done_status(workdir: str,
+                          prefilter: Dict[str, int]) -> DoneStatus:
+    """Return the prefilter state represented by a workdir.
+
+    A setup workdir with an existing patched binary but no ``predicates``
+    file uses the prebuilt patch path, so there is no prefilter to run.
+    """
+    if prefilter["done"]:
+        return DoneStatus.OK
+    if (prefilter["total"] < 0
+            and not os.path.isfile(os.path.join(workdir, "predicates"))
+            and any(path.is_file()
+                    for path in Path(workdir).glob("*.brpatched"))):
+        return DoneStatus.SKIPPED
+    return DoneStatus.INCOMPLETE
+
+
 def verifier_summary(verifier_results: Dict[int, List[str]]) -> Tuple[str, str]:
     """Return (verified_patches_csv, rejected_patches_csv) from verifier data."""
     verified: List[str] = []
@@ -521,7 +543,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             filter_rejected=filter_rejected,
             prefilter_total=prefilter["total"],
             prefilter_survived=prefilter["survived"],
-            prefilter_done=bool(prefilter["done"]),
+            prefilter_done=prefilter_done_status(workdir, prefilter),
             log_errors=log_errors,
             tracer_errors=tracer_errors,
         )
@@ -650,7 +672,7 @@ def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
     prefilter = parse_prefilter_sbsv(os.path.join(workdir, "prefilter.sbsv"))
     result.prefilter_total = prefilter["total"]
     result.prefilter_survived = prefilter["survived"]
-    result.prefilter_done = bool(prefilter["done"])
+    result.prefilter_done = prefilter_done_status(workdir, prefilter)
 
     result.status = "ok" if not result.log_errors else "issues"
     return result
@@ -711,10 +733,13 @@ def format_result_log(result: ExperimentResult) -> str:
             pct = ""
             if run_res.prefilter_total > 0:
                 pct = f" ({run_res.prefilter_survived * 100 // run_res.prefilter_total}%)"
-            done_note = "" if run_res.prefilter_done else " (no done marker)"
             lines.append(
                 f"    [prefilter] total: {run_res.prefilter_total}  "
-                f"survived: {run_res.prefilter_survived}{pct}{done_note}")
+                f"survived: {run_res.prefilter_survived}{pct}  "
+                f"status: {run_res.prefilter_done.value}")
+        else:
+            lines.append(
+                f"    [prefilter] status: {run_res.prefilter_done.value}")
 
         if run_res.log_errors:
             lines.append("    [errors from binradar.log]:")
@@ -815,7 +840,7 @@ def format_results_csv(all_results: List[ExperimentResult],
                 if run_res.prefilter_total >= 0 else "",
                 "prefilter_survived": str(run_res.prefilter_survived)
                 if run_res.prefilter_survived >= 0 else "",
-                "prefilter_done": str(run_res.prefilter_done),
+                "prefilter_done": run_res.prefilter_done.value,
                 "verifier_accepted_patches": run_res.verifier_accepted,
                 "verifier_rejected_patches": run_res.verifier_rejected,
                 "binradar_verified_patches": run_res.binradar_verified,
@@ -869,10 +894,13 @@ def format_sdfuzz_result_log(result: SdfuzzResult) -> str:
             f"{result.verifier_testcases}")
 
     if result.prefilter_total >= 0:
-        done_note = "" if result.prefilter_done else " (no done marker)"
         lines.append(
             f"  [prefilter] total: {result.prefilter_total}  "
-            f"survived: {result.prefilter_survived}{done_note}")
+            f"survived: {result.prefilter_survived}  "
+            f"status: {result.prefilter_done.value}")
+    else:
+        lines.append(
+            f"  [prefilter] status: {result.prefilter_done.value}")
 
     if result.log_errors:
         lines.append("    [errors from evaluation.log]:")
@@ -924,7 +952,7 @@ def format_sdfuzz_results_csv(all_results: List[SdfuzzResult],
             if result.prefilter_total >= 0 else "",
             "prefilter_survived": str(result.prefilter_survived)
             if result.prefilter_survived >= 0 else "",
-            "prefilter_done": str(result.prefilter_done),
+            "prefilter_done": result.prefilter_done.value,
             "log_errors_count": str(len(result.log_errors)),
             "error_preview": error_preview,
         }

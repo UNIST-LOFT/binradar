@@ -39,7 +39,7 @@ Subcommands:
                 workdir/prefilter.sbsv listing which predicates branch on
                 the POC.  `setup` then
                 keeps only the surviving predicates before applying the
-                top-10 cap, so the expensive binradar pipeline never runs
+                top-30 cap, so the expensive binradar pipeline never runs
                 on predicates that the FILTER phase would reject anyway.
                 (previously fuzzolic/binradar-prefilter.py)
 
@@ -1120,7 +1120,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     ]
     # Apply the offline prefilter results, if any (see the `prefilter`
     # subcommand).  Predicates whose prefilter row evaluates to true
-    # survive; the rest are discarded before the top-10 cap, so the
+    # survive; the rest are discarded before the top-30 cap, so the
     # binradar pipeline never runs on patches that would be filtered out
     # anyway.  Fail open on any parse trouble.
     prefilter_file = workdir / "prefilter.sbsv"
@@ -1158,10 +1158,10 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: no destination found in {destinations_file}")
         exit(1)
     # Generate brpatches.inc
-    # Currently, we only select top 10 patches.
+    # Currently, we only select top 30 patches.
     # Runtime patch IDs are compact and start at 1.  Each selected record
     # retains the original predicate source line for traceability.
-    selected_patch_records = patch_records[:10]
+    selected_patch_records = patch_records[:30]
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"

@@ -27,6 +27,25 @@ def test_parse_prefilter_new_id_rows(tmp_path):
     }
 
 
+def test_prefilter_skipped_for_existing_brpatched_without_predicates(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    out_dir.mkdir(parents=True)
+    (workdir / "sample.brpatched").touch()
+    (out_dir / "progress.sbsv").write_text(
+        "[filter] [start] [prefix run] [id 0]\n"
+        "[filter] [done] [prefix run] [id 0] [survived []]\n"
+    )
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    assert result.runs[0].prefilter_done is collector.DoneStatus.SKIPPED
+    assert "status: SKIPPED" in collector.format_result_log(result)
+    csv_row = collector.format_results_csv([result])[0]
+    assert csv_row["prefilter_done"] == "SKIPPED"
+
+
 def test_parse_timestamped_progress_with_sbsv(tmp_path):
     path = tmp_path / "progress.sbsv"
     path.write_text(
