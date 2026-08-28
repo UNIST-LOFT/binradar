@@ -602,6 +602,7 @@ class BinRadarExecutor:
     e9_relocated_calls: str
     fuzzy: bool
     reverse_directed: bool
+    disable_binradar: bool
     # Data
     config: Dict[str, str]
     progress_filename: str
@@ -612,7 +613,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -622,6 +623,7 @@ class BinRadarExecutor:
         self.e9_relocated_calls = e9_relocated_calls
         self.fuzzy = fuzzy
         self.reverse_directed = reverse_directed
+        self.disable_binradar = disable_binradar
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.patch_addr_ranges = patch_addr_ranges
@@ -672,7 +674,8 @@ class BinRadarExecutor:
             total_patches=int(env["TOTAL_PATCHES"]),
             e9_relocated_calls=env.get("E9_RELOCATED_CALL_JUMPS", ""),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
-            reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1")
+            reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1",
+            disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1")
         return binradar
     
     def extract_config(self) -> Dict[str, str]:
@@ -1085,6 +1088,9 @@ class BinRadarExecutor:
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_binradar(self):
+        if self.disable_binradar:
+            logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
+            return
         testcase = self.resolved_poc_input()
         self.check_requirements()
         
@@ -1124,16 +1130,14 @@ class BinRadarExecutor:
         self.save_progress(f"[binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_final(self):
-        # Read verifier.sbsv and binradar-trace-msg.log to get final results and save them to progress file
+        # Read verifier.sbsv and, when enabled, binradar-trace-msg.log to
+        # get final results and save them to the progress file.
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run final analysis.")
             raise RuntimeError("Probe result not found.")
         verifier_result_file = os.path.join(self.run_dir, "verifier.sbsv")
         trace_msg_log_file = os.path.join(self.run_dir, "binradar-tracer-msg.log")
         self.save_progress(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        if not os.path.exists(trace_msg_log_file):
-            logger.error("Trace message log file not found. BinRadar results might be incomplete.")
-            raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
         if not os.path.exists(verifier_result_file):
             logger.error("Verifier result file not found. BinRadar results might be incomplete.")
             raise FileNotFoundError(f"Verifier result file not found: {verifier_result_file}")
@@ -1142,13 +1146,21 @@ class BinRadarExecutor:
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
+        if self.disable_binradar:
+            logger.info("[FINAL] BinRadar phase disabled; skipping trace analysis.")
+            trace_file = io.StringIO()
+        else:
+            if not os.path.exists(trace_msg_log_file):
+                logger.error("Trace message log file not found. BinRadar results might be incomplete.")
+                raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
+            trace_file = open(trace_msg_log_file, "r", encoding="utf-8")
         for result in concrete_verifier_result.patch_verified:
             verified = concrete_verifier_result.patch_verified[result]
             if not verified:
                 remaining_patches.discard(result)
         binradar_remaining_patches = remaining_patches.copy()
         binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
-        with open(trace_msg_log_file, "r", encoding="utf-8") as f:
+        with trace_file as f:
             parser = sbsv.parser()
             parser.add_custom_type("hex", lambda x: int(x, 16))
             parser.add_schema("[binradar] [crash] [iter: int] [patch: int] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
@@ -1174,8 +1186,9 @@ class BinRadarExecutor:
                 elif result.schema_name == "binradar$commit":
                     current["br"] = result["br"]
             
-            poc_fault_loc = self.probe_result.tracer_fault_addr
-            if poc_fault_loc == 0:
+            poc_fault_loc = (0 if self.disable_binradar
+                             else self.probe_result.tracer_fault_addr)
+            if not self.disable_binradar and poc_fault_loc == 0:
                 logger.warning("[FINAL] tracer_fault_addr is 0; binradar crash comparison will not match any fault address.")
 
             for iter in iter_map:
@@ -1212,25 +1225,29 @@ class BinRadarExecutor:
                             binradar_reject_reasons[patch] = ("different-br", iter)
         self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
 
-        # Write a self-contained final.sbsv with per-patch verdicts from both
-        # the concrete verifier and the binradar analysis.
+        # Write a self-contained final.sbsv with per-patch verdicts from the
+        # concrete verifier and, when enabled, the binradar analysis.
         final_result_file = os.path.join(self.run_dir, "final.sbsv")
+        trace_metadata = (f"[trace {os.path.basename(trace_msg_log_file)}]"
+                          if not self.disable_binradar
+                          else "[binradar disabled]")
         with open(final_result_file, "w", encoding="utf-8") as f:
             f.write(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}] "
                     f"[verifier {os.path.basename(verifier_result_file)}] "
-                    f"[trace {os.path.basename(trace_msg_log_file)}]\n")
+                    f"{trace_metadata}\n")
             for patch_id in sorted(self.filter_result):
                 verified = concrete_verifier_result.patch_verified.get(patch_id, True)
                 res = "verified" if verified else "rejected"
                 f.write(f"[final] [verifier] [patch {patch_id}] [res {res}]\n")
-            for patch_id in sorted(remaining_patches):
-                if patch_id in binradar_remaining_patches:
-                    f.write(f"[final] [binradar] [patch {patch_id}] [res verified] "
-                            f"[reason none] [iter -1]\n")
-                else:
-                    reason, reject_iter = binradar_reject_reasons.get(patch_id, ("unknown", -1))
-                    f.write(f"[final] [binradar] [patch {patch_id}] [res rejected] "
-                            f"[reason {reason}] [iter {reject_iter}]\n")
+            if not self.disable_binradar:
+                for patch_id in sorted(remaining_patches):
+                    if patch_id in binradar_remaining_patches:
+                        f.write(f"[final] [binradar] [patch {patch_id}] [res verified] "
+                                f"[reason none] [iter -1]\n")
+                    else:
+                        reason, reject_iter = binradar_reject_reasons.get(patch_id, ("unknown", -1))
+                        f.write(f"[final] [binradar] [patch {patch_id}] [res rejected] "
+                                f"[reason {reason}] [iter {reject_iter}]\n")
             f.write(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
                     f"[remaining_patches {sorted(remaining_patches)}] "
                     f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]\n")
@@ -1253,7 +1270,10 @@ class BinRadarExecutor:
         self.run_directed()
         self.run_fuzzer()
         self.run_minimizer_and_verifier()
-        self.run_binradar()
+        if not self.disable_binradar:
+            self.run_binradar()
+        else:
+            logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
         self.run_final()
         self.done()
     
@@ -1304,6 +1324,7 @@ class BinRadarExecutor:
             return
 
         thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
+        binradar_thread: Optional[threading.Thread] = None
         
         def run_captured(name: str, target):
             try:
@@ -1317,14 +1338,17 @@ class BinRadarExecutor:
                 return
             _, exc, tb = thread_errors.get()
             stop_running_processes()
-            if wait_for_binradar:
+            if wait_for_binradar and binradar_thread is not None:
                 binradar_thread.join()
             if tb is not None:
                 raise exc.with_traceback(tb)
             raise exc
 
-        binradar_thread = threading.Thread(target=run_captured, args=("binradar", self.run_binradar))
-        binradar_thread.start()
+        if not self.disable_binradar:
+            binradar_thread = threading.Thread(target=run_captured, args=("binradar", self.run_binradar))
+            binradar_thread.start()
+        else:
+            logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
 
         fuzzolic_thread = threading.Thread(target=run_captured, args=("fuzzolic", self.run_fuzzolic))
         directed_thread = threading.Thread(target=run_captured, args=("directed", self.run_directed))
@@ -1340,11 +1364,12 @@ class BinRadarExecutor:
         self.run_minimizer_and_verifier()
         raise_thread_error_if_any(wait_for_binradar=True)
 
-        binradar_thread.join(timeout=60)
-        if binradar_thread.is_alive():
-            logger.error("[BINRADAR] binradar thread did not finish within 60s after minimizer/verifier - stopping remaining processes")
-            stop_running_processes()
-            binradar_thread.join(timeout=10)
+        if binradar_thread is not None:
+            binradar_thread.join(timeout=60)
+            if binradar_thread.is_alive():
+                logger.error("[BINRADAR] binradar thread did not finish within 60s after minimizer/verifier - stopping remaining processes")
+                stop_running_processes()
+                binradar_thread.join(timeout=10)
         raise_thread_error_if_any()
         self.run_final()
         self.done()
@@ -1370,8 +1395,10 @@ def main():
         "-f", "--fuzzy", action="store_true",
         help="use the Fuzzy-SAT solver")
     parser.add_argument(
-        "--reverse-directed", action="store_true",
+        "--reverse-directed", type=bool, default=True,
         help="prioritize directed candidates from the end of the forward trace (Z3 only)")
+    parser.add_argument("--disable-binradar", action="store_true",
+        help="disable the binradar phase")
     # The following argument is for experiments and debugging
     phases = ["probe", "filter", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1394,6 +1421,7 @@ def main():
     env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
     env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
+    env["BINRADAR_DISABLE_BINRADAR"] = "1" if args.disable_binradar else "0"
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)
