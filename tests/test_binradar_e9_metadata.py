@@ -35,6 +35,12 @@ assert _spec is not None and _spec.loader is not None
 binradar_setup = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar_setup)
 
+_spec_utils = importlib.util.spec_from_file_location(
+    "binradar_utils", ROOT / "fuzzolic" / "binradar_utils.py")
+assert _spec_utils is not None and _spec_utils.loader is not None
+binradar_utils = importlib.util.module_from_spec(_spec_utils)
+_spec_utils.loader.exec_module(binradar_utils)
+
 _spec2 = importlib.util.spec_from_file_location(
     "binradar", ROOT / "fuzzolic" / "binradar.py")
 assert _spec2 is not None and _spec2.loader is not None
@@ -266,11 +272,131 @@ def test_normalize_address_ranges_validation():
         binradar_setup.normalize_address_ranges([(0x2000, 0x1000)])
 
 
+def test_e9_metadata_helpers_roundtrip():
+    """Prefixed set/get helpers round-trip; missing keys yield empty."""
+    env = {}
+    binradar_utils.set_e9_metadata(
+        env, "brpatched", "0x54b000-0x54c000", RECORDS)
+    binradar_utils.set_e9_metadata(
+        env, "prefilter", "0x7c254000-0x7c255000", "")
+    assert env["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
+    assert env["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == RECORDS
+    assert env["PREFILTER_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert env["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == ""
+    assert binradar_utils.get_e9_metadata(env, "brpatched") == \
+        ("0x54b000-0x54c000", RECORDS)
+    assert binradar_utils.get_e9_metadata(env, "brcached") == ("", "")
+
+
+def test_persist_e9_metadata_preserves_subject_fields(tmp_path):
+    """Persistence updates only the prefixed keys of binradar.env."""
+    env_path = tmp_path / "binradar.env"
+    env_path.write_text('BINARY="nm"\nPATCH_LOC="0x4585dd"\n')
+    metadata = binradar_setup.E9RuntimeMetadata(
+        (binradar_setup.AddressRange(0x54b000, 0x54c000),), ())
+    binradar_setup.persist_e9_metadata(tmp_path, "prefilter", metadata)
+    binradar_setup.persist_e9_metadata(
+        tmp_path, "brpatched",
+        binradar_setup.E9RuntimeMetadata(
+            (binradar_setup.AddressRange(0x7c254000, 0x7c255000),),
+            ((0x54b091, 0x4d60a5, 0x4d60aa),)))
+    env = binradar_setup.load_env(env_path)
+    assert env["BINARY"] == "nm"
+    assert env["PATCH_LOC"] == "0x4585dd"
+    assert env["PREFILTER_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
+    assert env["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert env["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == \
+        "0x54b091:0x4d60a5:0x4d60aa"
+    assert "E9_EXCLUDE_RANGES" not in env
+    assert "E9_RELOCATED_CALL_JUMPS" not in env
+
+
+def test_verifier_from_env_stores_all_prefixed_metadata(tmp_path):
+    """BinRadarQemuRunner.from_env stores every artifact's records and
+    selects them by the executed binary path."""
+    env = {
+        "BINARY": "nm",
+        "TEST_CMD": "-l @@",
+        "PATCH_LOC": "0x4585dd",
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
+        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+    }
+    runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
+        str(tmp_path), env)
+    # All prefixed values are stored.
+    assert runner.e9_metadata["brpatched"] == (
+        "0x54b000-0x54c000", ["0x54b091:0x4d60a5:0x4d60aa"])
+    assert runner.e9_metadata["prefilter"] == (
+        "0x7c254000-0x7c255000", ["0x7c254091:0x4d60a5:0x4d60aa"])
+    assert runner.e9_metadata["brcached"] == ("", [])
+    # Selection follows the executed binary path.
+    assert runner.e9_metadata_for_binary(
+        str(tmp_path / "nm.brpatched")) == (
+            "0x54b000-0x54c000", ["0x54b091:0x4d60a5:0x4d60aa"])
+    assert runner.e9_metadata_for_binary(
+        str(tmp_path / "nm.brprefilter")) == (
+            "0x7c254000-0x7c255000", ["0x7c254091:0x4d60a5:0x4d60aa"])
+    # Original binaries have no E9 metadata.
+    assert runner.e9_metadata_for_binary(
+        str(tmp_path / "nm.orig")) == ("", [])
+
+
+def test_verifier_command_selects_records_by_binary(tmp_path):
+    """The stacktrace command carries the executed artifact's records."""
+    env = {
+        "BINARY": "nm",
+        "TEST_CMD": "-l @@",
+        "PATCH_LOC": "0x4585dd",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
+        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+    }
+    runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
+        str(tmp_path), env)
+    patched_cmd = runner.get_qemu_stacktrace_command(True, "poc")
+    assert "--e9-relocated-call" in patched_cmd
+    assert "0x54b091:0x4d60a5:0x4d60aa" in patched_cmd
+    assert "0x7c254091:0x4d60a5:0x4d60aa" not in patched_cmd
+    orig_cmd = runner.get_qemu_stacktrace_command(False, "poc")
+    assert "--e9-relocated-call" not in orig_cmd
+
+
+def test_executor_retains_all_prefixed_metadata(tmp_path):
+    """from_env keeps every artifact's prefixed keys in extract_config."""
+    env = {
+        "BINARY": "nm",
+        "POC_INPUT": "poc/nullderef",
+        "TEST_CMD": "-l @@",
+        "PATCH_LOC": "0x4585dd",
+        "TOTAL_PATCHES": "2",
+        "BINRADAR_OUTDIR": str(tmp_path / "out"),
+        "BINRADAR_TIMEOUT": "60",
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
+        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+    }
+    executor = binradar.BinRadarExecutor.from_env(str(tmp_path), env)
+    config = executor.extract_config()
+    assert config["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
+    assert config["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == \
+        "0x54b091:0x4d60a5:0x4d60aa"
+    assert config["PREFILTER_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert config["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == \
+        "0x7c254091:0x4d60a5:0x4d60aa"
+    # The runner built from that config selects by binary path.
+    runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
+        str(tmp_path), config)
+    assert runner.e9_metadata_for_binary(
+        str(tmp_path / "nm.brpatched"))[1] == ["0x54b091:0x4d60a5:0x4d60aa"]
+
+
 # ---------------------------------------------------------------------------
 # P0-2: relocated-call propagation to symbolic tracer runs
 # ---------------------------------------------------------------------------
 
-def _stub_executor(tmp_path, e9_relocated_calls="", e9_exclude_ranges=""):
+def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.workdir = str(tmp_path)
     executor.outdir = str(tmp_path / "out")
@@ -279,13 +405,14 @@ def _stub_executor(tmp_path, e9_relocated_calls="", e9_exclude_ranges=""):
     executor.poc_input = "poc/nullderef"
     executor.test_cmd = "-l @@"
     executor.patch_loc = "0x4585dd"
-    executor.e9_exclude_ranges = e9_exclude_ranges
+    executor.e9_metadata_prefix = e9_metadata_prefix
+    executor.config = config if config is not None else {}
+    executor.e9_exclude_ranges, executor.e9_relocated_calls = \
+        binradar_utils.get_e9_metadata(executor.config, e9_metadata_prefix)
     executor.total_patches = 2
-    executor.e9_relocated_calls = e9_relocated_calls
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = False
-    executor.config = {}
     executor.probe_result = SimpleNamespace(patch_func_hit_cnt=3)
     executor.filter_result = [1, 2]
     executor.run_dir = str(tmp_path)
@@ -303,9 +430,11 @@ def test_get_env_sets_relocated_calls_for_patched_modes(tmp_path):
     E9_RELOCATED_CALL_JUMPS value retained by from_env()/extract_config()
     never reached the tracer environment.
     """
-    executor = _stub_executor(
-        tmp_path, e9_relocated_calls=RECORDS,
-        e9_exclude_ranges="0x54b000-0x54c000,0x2cc7000-0x2cc9000")
+    config = {
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000,0x2cc7000-0x2cc9000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
+    }
+    executor = _stub_executor(tmp_path, config=config)
     for mode in ("fuzzolic", "directed", "binradar"):
         env = executor.get_env(mode, str(tmp_path))
         assert env.get("E9_RELOCATED_CALL_JUMPS") == RECORDS, mode
@@ -314,6 +443,32 @@ def test_get_env_sets_relocated_calls_for_patched_modes(tmp_path):
         assert "PATCH_RESERVE_RANGE" not in env, mode
         assert "E9_TRAMPOLINE_RANGE" not in env, mode
         assert "E9_LOADER_RANGE" not in env, mode
+
+
+def test_metadata_selection_is_artifact_scoped(tmp_path):
+    """Selecting an artifact selects only its own prefixed metadata.
+
+    Two artifacts with intentionally different ranges and jumps: the
+    brpatched run must never receive the prefilter values and vice versa.
+    """
+    config = {
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
+        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+    }
+    brpatched = _stub_executor(tmp_path, e9_metadata_prefix="brpatched",
+                               config=config)
+    prefilter = _stub_executor(tmp_path, e9_metadata_prefix="prefilter",
+                               config=config)
+    env_b = brpatched.get_env("fuzzolic", str(tmp_path))
+    env_p = prefilter.get_env("fuzzolic", str(tmp_path))
+    assert env_b["E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
+    assert env_b["E9_RELOCATED_CALL_JUMPS"] == \
+        "0x54b091:0x4d60a5:0x4d60aa"
+    assert env_p["E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert env_p["E9_RELOCATED_CALL_JUMPS"] == \
+        "0x7c254091:0x4d60a5:0x4d60aa"
 
 
 def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
@@ -327,8 +482,10 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
     (tmp_path / "poc").mkdir()
     (tmp_path / "poc" / "nullderef").write_bytes(b"")
     executor = _stub_executor(
-        tmp_path, e9_relocated_calls=RECORDS,
-        e9_exclude_ranges="0x54b000-0x54c000")
+        tmp_path, config={
+            "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+            "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
+        })
 
     captured = {}
 

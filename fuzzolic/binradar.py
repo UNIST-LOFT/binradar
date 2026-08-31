@@ -596,11 +596,15 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
-    # Canonical E9_EXCLUDE_RANGES value (exact interval list of the
-    # executing artifact; empty for original-binary runs).
+    # Artifact whose E9 metadata this run executes: "brpatched" (default),
+    # "prefilter", or "brcached".  The prefixed binradar.env keys
+    # (<PREFIX>_E9_EXCLUDE_RANGES / <PREFIX>_E9_RELOCATED_CALL_JUMPS) are
+    # selected at load time; the tracer process env receives the unprefixed
+    # names as its runtime contract.
+    e9_metadata_prefix: str
     e9_exclude_ranges: str
-    total_patches: int
     e9_relocated_calls: str
+    total_patches: int
     fuzzy: bool
     reverse_directed: bool
     disable_binradar: bool
@@ -614,20 +618,21 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_exclude_ranges: str, total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
         self.binary = binary
         self.poc_input = poc_input
         self.total_patches = total_patches
-        self.e9_relocated_calls = e9_relocated_calls
         self.fuzzy = fuzzy
         self.reverse_directed = reverse_directed
         self.disable_binradar = disable_binradar
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
+        self.e9_metadata_prefix = e9_metadata_prefix
         self.e9_exclude_ranges = e9_exclude_ranges
+        self.e9_relocated_calls = e9_relocated_calls
         self.filter_result = list(range(1, total_patches + 1))
 
         self.libc = ctypes.CDLL("libc.so.6")
@@ -659,6 +664,9 @@ class BinRadarExecutor:
 
     @staticmethod
     def from_env(workdir: str, env: Dict[str, str]) -> "BinRadarExecutor":
+        prefix = env.get("E9_METADATA_PREFIX", "brpatched")
+        e9_exclude_ranges, e9_relocated_calls = \
+            binradar_utils.get_e9_metadata(env, prefix)
         binradar = BinRadarExecutor(
             workdir=workdir,
             outdir=env["BINRADAR_OUTDIR"],
@@ -667,14 +675,24 @@ class BinRadarExecutor:
             poc_input=env["POC_INPUT"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            e9_exclude_ranges=env.get("E9_EXCLUDE_RANGES", ""),
+            e9_metadata_prefix=prefix,
+            e9_exclude_ranges=e9_exclude_ranges,
+            e9_relocated_calls=e9_relocated_calls,
             total_patches=int(env["TOTAL_PATCHES"]),
-            e9_relocated_calls=env.get("E9_RELOCATED_CALL_JUMPS", ""),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1",
             disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1")
+        # Retain every artifact's prefixed E9 metadata so extract_config
+        # passes all of it to BinRadarQemuRunner.from_env, which selects
+        # by the executed binary path.
+        for artifact in binradar_utils.E9_METADATA_PREFIXES:
+            ranges_key, calls_key = binradar_utils.e9_metadata_keys(artifact)
+            if ranges_key in env:
+                binradar.config[ranges_key] = env[ranges_key]
+            if calls_key in env:
+                binradar.config[calls_key] = env[calls_key]
         return binradar
-    
+
     def extract_config(self) -> Dict[str, str]:
         config = self.config.copy()
         config["BINRADAR_OUTDIR"] = self.outdir
@@ -683,9 +701,13 @@ class BinRadarExecutor:
         config["POC_INPUT"] = self.poc_input
         config["TEST_CMD"] = self.test_cmd
         config["PATCH_LOC"] = self.patch_loc
-        config["E9_EXCLUDE_RANGES"] = self.e9_exclude_ranges
+        config["E9_METADATA_PREFIX"] = self.e9_metadata_prefix
+        # Re-emit the selected artifact's prefixed keys so downstream
+        # BinRadarQemuRunner.from_env selects the same artifact.
+        binradar_utils.set_e9_metadata(
+            config, self.e9_metadata_prefix,
+            self.e9_exclude_ranges, self.e9_relocated_calls)
         config["TOTAL_PATCHES"] = str(self.total_patches)
-        config["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
         return config
 
     def elapsed_time_ms(self) -> int:

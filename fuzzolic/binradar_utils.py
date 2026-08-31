@@ -6,6 +6,41 @@ from typing import List, Set, Tuple, Dict, Optional, Any
 
 import logger
 
+# E9 runtime metadata keys in binradar.env, prefixed per artifact so a
+# future .brcache can never borrow .brpatched layout values.  All current
+# artifacts are built with the same e9patch invocation, so the values are
+# shared; selection is by prefix at load time.
+E9_METADATA_PREFIXES = {
+    "brpatched": "BRPATCHED",
+    "prefilter": "PREFILTER",
+    "brcached": "BRCACHED",
+}
+
+
+def e9_metadata_keys(prefix: str) -> Tuple[str, str]:
+    """Return (exclude-ranges key, relocated-calls key) for an artifact.
+
+    `prefix` is the artifact name ("brpatched", "prefilter", "brcached");
+    the stored keys carry the uppercase prefix.
+    """
+    upper = E9_METADATA_PREFIXES[prefix]
+    return (f"{upper}_E9_EXCLUDE_RANGES",
+            f"{upper}_E9_RELOCATED_CALL_JUMPS")
+
+
+def set_e9_metadata(env: Dict[str, str], prefix: str,
+                    exclude_ranges: str, relocated_calls: str) -> None:
+    """Write one artifact's E9 metadata into an env dict under its prefix."""
+    ranges_key, calls_key = e9_metadata_keys(prefix)
+    env[ranges_key] = exclude_ranges
+    env[calls_key] = relocated_calls
+
+
+def get_e9_metadata(env: Dict[str, str], prefix: str) -> Tuple[str, str]:
+    """Read one artifact's E9 metadata; missing keys yield empty strings."""
+    ranges_key, calls_key = e9_metadata_keys(prefix)
+    return env.get(ranges_key, ""), env.get(calls_key, "")
+
 class ExecutionResult:
     def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str):
         self.success = success

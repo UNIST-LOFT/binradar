@@ -339,14 +339,17 @@ class BinRadarQemuRunner:
     binary: str
     test_cmd: str
     patch_loc: str
-    e9_relocated_calls: List[str]
+    # E9 metadata per artifact ("brpatched", "prefilter", "brcached"):
+    # (exclude_ranges, [relocated-call records]).  All prefixed values are
+    # stored; the executed binary's path selects the proper one.
+    e9_metadata: Dict[str, Tuple[str, List[str]]]
     run_results: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, e9_relocated_calls: List[str] = []):
+    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, e9_metadata: Optional[Dict[str, Tuple[str, List[str]]]] = None):
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
-        self.e9_relocated_calls = e9_relocated_calls
+        self.e9_metadata = e9_metadata if e9_metadata is not None else {}
         self.run_results = None
     
     @staticmethod
@@ -356,19 +359,37 @@ class BinRadarQemuRunner:
     
     @staticmethod
     def from_env(dir: str, env: Dict[str, str]) -> "BinRadarQemuRunner":
-        e9_relocated_calls: List[str] = []
-        for record in env.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
-            record = record.strip()
-            if record:
-                fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
-                e9_relocated_calls.append(":".join(fields))
+        e9_metadata: Dict[str, Tuple[str, List[str]]] = {}
+        for artifact in binradar_utils.E9_METADATA_PREFIXES:
+            exclude_ranges, relocated_calls_str = \
+                binradar_utils.get_e9_metadata(env, artifact)
+            records: List[str] = []
+            for record in relocated_calls_str.split(","):
+                record = record.strip()
+                if record:
+                    fields = [f"0x{int(field, 0):x}"
+                              for field in record.split(":")]
+                    records.append(":".join(fields))
+            e9_metadata[artifact] = (exclude_ranges, records)
         return BinRadarQemuRunner(
             dir=dir,
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            e9_relocated_calls=e9_relocated_calls
+            e9_metadata=e9_metadata
         )
+
+    def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
+        """(exclude_ranges, relocated-call records) of the artifact the
+        given binary path belongs to.  Original binaries have no E9
+        metadata; .brpatched/.brprefilter/.brcache each select their own
+        prefixed values."""
+        for artifact, suffix in (("brpatched", ".brpatched"),
+                                 ("prefilter", ".brprefilter"),
+                                 ("brcached", ".brcache")):
+            if binary_path.endswith(suffix):
+                return self.e9_metadata.get(artifact, ("", []))
+        return "", []
     
     def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
         env = os.environ.copy()
@@ -393,8 +414,10 @@ class BinRadarQemuRunner:
             binary = self.patched_binary()
             # --asan-exclude is explicitly ignored by the local
             # afl-qemu-trace compatibility runner; only the active
-            # --e9-relocated-call records are passed.
-            for addr in self.e9_relocated_calls:
+            # --e9-relocated-call records are passed.  The records are
+            # selected by the executed binary's artifact.
+            _, relocated_calls = self.e9_metadata_for_binary(binary)
+            for addr in relocated_calls:
                 cmd += ["--e9-relocated-call", addr]
         else:
             binary = self.original_binary()

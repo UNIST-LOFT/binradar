@@ -22,6 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import binradar_taosc_predicates
+import binradar_utils
 from binradar_taosc_predicates import (
     AllocatorTrace,
     Cwe119PointerPredicate,
@@ -257,6 +258,9 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
         ensure_original_binary(workdir, configdir, config),
         int(patch_loc, 0),
     )
+    # Persist the prefilter artifact's metadata under its own prefix so
+    # later phases never borrow .brpatched layout values.
+    persist_e9_metadata(workdir, "prefilter", metadata)
     e9_relocated_calls: List[str] = []
     for record in metadata.relocated_calls_str().split(","):
         record = record.strip()
@@ -432,6 +436,21 @@ def parse_exclude_ranges(value: str) -> Tuple[AddressRange, ...]:
                 f"invalid E9 exclude range {token!r}: start must be < end")
         ranges.append((start, end))
     return normalize_address_ranges(ranges)
+
+
+def persist_e9_metadata(workdir: Path, prefix: str,
+                        metadata: E9RuntimeMetadata) -> None:
+    """Write one artifact's E9 metadata into binradar.env under its prefix.
+
+    Loads the existing binradar.env (creating it when absent) and updates
+    only the prefixed keys, so subject-level fields are preserved.
+    """
+    env_path = workdir / "binradar.env"
+    env_file = load_env(env_path) if env_path.exists() else {}
+    binradar_utils.set_e9_metadata(
+        env_file, prefix,
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    save_env(env_file, env_path)
 
 
 def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, bytes, str]]:
@@ -927,8 +946,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             original_binary,
             int(patch_addr, 0),
         )
-        binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
-        binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
+        binradar_utils.set_e9_metadata(
+            binradar_env, "brpatched",
+            metadata.exclude_ranges_str(), metadata.relocated_calls_str())
         print(f"Using CWE-119 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
         return
@@ -945,8 +965,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                 original_binary,
                 patch_addr,
             )
-            binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
-            binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
+            binradar_utils.set_e9_metadata(
+                binradar_env, "brpatched",
+                metadata.exclude_ranges_str(), metadata.relocated_calls_str())
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
             return
@@ -1082,8 +1103,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         original_binary,
         int(patch_addr, 0),
     )
-    binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
-    binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
+    binradar_utils.set_e9_metadata(
+        binradar_env, "brpatched",
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
