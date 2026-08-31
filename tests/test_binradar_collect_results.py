@@ -27,6 +27,23 @@ def test_parse_prefilter_new_id_rows(tmp_path):
     }
 
 
+def test_parse_prefilter_meta_row(tmp_path):
+    """The versioned [prefilter] [meta] row is accepted and ignored."""
+    path = tmp_path / "prefilter.sbsv"
+    path.write_text(
+        "[prefilter] [meta] [version 1] [kind generic-erm] "
+        "[sha256 0123456789abcdef]\n"
+        "[prefilter] [res] [id 1] [pass false] [new-id -1]\n"
+        "[prefilter] [res] [id 4] [pass true] [new-id 1]\n"
+        "[prefilter] [done] [total 2] [survived 1] [time 0.1]\n"
+    )
+    assert collector.parse_prefilter_sbsv(str(path)) == {
+        "total": 2,
+        "survived": 1,
+        "done": 1,
+    }
+
+
 def test_prefilter_skipped_for_existing_brpatched_without_predicates(tmp_path):
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"

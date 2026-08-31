@@ -247,6 +247,297 @@ def test_load_predicates_keeps_physical_lines():
     assert records[-1][1].startswith("8 * ")
 
 
+# ---------------------------------------------------------------------------
+# Phase B: typed parser and lowering (TAOSC_PREDICATE_COMPATIBILITY_PLAN §6)
+# ---------------------------------------------------------------------------
+
+def test_strict_generic_lexer():
+    """Unknown punctuation is an error, never silently skipped."""
+    tokenize = binradar_setup.tokenize_generic
+    assert tokenize("max1 - rdx == ~max1") == \
+        ["max1", "-", "rdx", "==", "~", "max1"]
+    # Whitespace variants are fine.
+    assert tokenize("  max1\t- rdx  == ~max1 ") == \
+        ["max1", "-", "rdx", "==", "~", "max1"]
+    for bad in ("max1 ? rdx", "max1 @ rdx", "max1 # rdx", "max1; rdx",
+                "max1, rdx", "max1!rdx"):
+        try:
+            tokenize(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"must reject {bad!r}")
+    # "s->rax" is a valid generic token sequence (identifier, -, identifier);
+    # the CWE-119 family detection, not the lexer, routes it to the typed
+    # parser.
+    assert tokenize("s->rax") == ["s", "-", ">", "rax"]
+
+
+def test_parse_cwe119_pointer_descriptors():
+    parse = binradar_setup.parse_cwe119_predicate
+    RegisterCell = binradar_setup.RegisterCell
+    StackCell = binradar_setup.StackCell
+    Cwe119PointerPredicate = binradar_setup.Cwe119PointerPredicate
+
+    pred = parse("s->rax >= i->begin && s->rax < i->end")
+    assert pred == Cwe119PointerPredicate(RegisterCell(0))
+    pred = parse("s->r15 >= i->begin && s->r15 < i->end")
+    assert pred == Cwe119PointerPredicate(RegisterCell(15))
+    pred = parse("((uint64_t *)s->rsp)[3] >= i->begin && "
+                 "((uint64_t *)s->rsp)[3] < i->end")
+    assert pred == Cwe119PointerPredicate(StackCell(64, 3))
+
+
+def test_parse_cwe119_size_descriptors():
+    parse = binradar_setup.parse_cwe119_predicate
+    RegisterCell = binradar_setup.RegisterCell
+    StackCell = binradar_setup.StackCell
+    Cwe119SizePredicate = binradar_setup.Cwe119SizePredicate
+
+    assert parse("1 * s->rbx < i->end - i->begin") == \
+        Cwe119SizePredicate(1, RegisterCell(1))
+    assert parse("8 * s->r15 < i->end - i->begin") == \
+        Cwe119SizePredicate(8, RegisterCell(15))
+    assert parse("2 * ((uint8_t *)s->rsp)[40] < i->end - i->begin") == \
+        Cwe119SizePredicate(2, StackCell(8, 40))
+    assert parse("4 * ((uint16_t *)s->rsp)[8] < i->end - i->begin") == \
+        Cwe119SizePredicate(4, StackCell(16, 8))
+    assert parse("8 * ((uint32_t *)s->rsp)[4] < i->end - i->begin") == \
+        Cwe119SizePredicate(8, StackCell(32, 4))
+
+
+def test_parse_cwe119_rejects_malformed():
+    parse = binradar_setup.parse_cwe119_predicate
+    malformed = [
+        "s->rax >= i->begin && s->rbx < i->end",   # mismatched cells
+        "s->rax >= i->begin && s->rax < i->end && s->rax > i->begin",
+        "s->rax >= i->begin",                       # truncated
+        "1 * s->rax < i->end - i->begin + 1",       # extra term
+        "3 * s->rax < i->end - i->begin",           # unsupported scale
+        "0 * s->rax < i->end - i->begin",           # zero scale
+        "1 * ((uint64_t *)s->rsp)[0] < i->end - i->begin",  # 64-bit size cell
+        "1 * s->rax < i->end",                      # missing - i->begin
+        "s->rax >= i->begin && s->rax < i->end;",   # trailing junk
+        "max1 - rdx == ~max1",                      # generic line
+    ]
+    for line in malformed:
+        try:
+            parse(line)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"must reject {line!r}")
+
+
+def test_detect_family_generic():
+    family, allocator = binradar_setup.detect_predicate_family(
+        FIXTURES / "generic")
+    assert family is binradar_setup.PredicateFamily.GENERIC_ERM
+    assert allocator is None
+
+
+def test_detect_family_cwe119_erm():
+    family, allocator = binradar_setup.detect_predicate_family(
+        FIXTURES / "cwe119-erm")
+    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+    assert allocator is not None
+    assert allocator.kind == "realloc"
+    assert allocator.calls[0] == (0, "486b4f")
+    assert allocator.returns[0] == "486b55"
+
+
+def test_detect_family_cwe119_direct():
+    family, allocator = binradar_setup.detect_predicate_family(
+        FIXTURES / "cwe119-direct")
+    assert family is binradar_setup.PredicateFamily.CWE119_DIRECT
+    assert allocator is not None
+    assert allocator.kind == "malloc"
+
+
+def test_detect_family_taosc_specialized():
+    family, allocator = binradar_setup.detect_predicate_family(
+        FIXTURES / "taosc-specialized")
+    assert family is binradar_setup.PredicateFamily.TAOSC_SPECIALIZED
+    assert allocator is None
+
+
+def test_detect_family_mixed_file_rejected(tmp_path):
+    """Mixed generic/CWE-119 files fail with a source-line diagnostic."""
+    workdir = tmp_path / "workdir"
+    (workdir / "trace").mkdir(parents=True)
+    (workdir / "predicates").write_text(
+        "max1 - rdx == ~max1\n"
+        "s->rax >= i->begin && s->rax < i->end\n")
+    try:
+        binradar_setup.detect_predicate_family(workdir)
+    except ValueError as e:
+        assert "predicates:2:" in str(e)
+    else:
+        raise AssertionError("mixed family must be rejected")
+
+
+def test_detect_family_unknown_punctuation_rejected(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "predicates").write_text("max1 ? rdx == ~max1\n")
+    try:
+        binradar_setup.detect_predicate_family(workdir)
+    except ValueError as e:
+        assert "predicates:1:" in str(e)
+    else:
+        raise AssertionError("unknown punctuation must be rejected")
+
+
+def test_parse_allocator_trace(tmp_path):
+    parse = binradar_setup.parse_allocator_trace
+    trace = tmp_path / "trace"
+    trace.mkdir()
+
+    # No artifacts -> None.
+    assert parse(trace) is None
+
+    # Partial set -> ValueError.
+    (trace / "malloc.calls").write_text("0\t409200\n")
+    try:
+        parse(trace)
+    except ValueError as e:
+        assert "incomplete" in str(e)
+    else:
+        raise AssertionError("partial trace must be rejected")
+
+    # Ambiguous kinds -> ValueError.
+    (trace / "malloc.returns").write_text("409205\n")
+    (trace / "realloc.calls").write_text("0\t486b4f\n")
+    (trace / "realloc.returns").write_text("486b55\n")
+    try:
+        parse(trace)
+    except ValueError as e:
+        assert "ambiguous" in str(e)
+    else:
+        raise AssertionError("ambiguous trace must be rejected")
+
+    # Bit index >= 64 -> ValueError.
+    (trace / "malloc.calls").unlink()
+    (trace / "malloc.returns").unlink()
+    (trace / "realloc.calls").write_text("64\t486b4f\n")
+    (trace / "realloc.returns").write_text("486b55\n")
+    try:
+        parse(trace)
+    except ValueError as e:
+        assert "bit index" in str(e)
+    else:
+        raise AssertionError("bit index >= 64 must be rejected")
+
+    # Malformed call line -> ValueError.
+    (trace / "realloc.calls").write_text("0 486b4f extra\n")
+    try:
+        parse(trace)
+    except ValueError as e:
+        assert "realloc.calls:1" in str(e)
+    else:
+        raise AssertionError("malformed call line must be rejected")
+
+    # Empty files -> ValueError.
+    (trace / "realloc.calls").write_text("")
+    try:
+        parse(trace)
+    except ValueError as e:
+        assert "empty" in str(e)
+    else:
+        raise AssertionError("empty calls must be rejected")
+
+
+def test_parse_allocator_trace_calloc_fixture():
+    allocator = binradar_setup.parse_allocator_trace(
+        FIXTURES / "calloc-trace")
+    assert allocator is not None
+    assert allocator.kind == "calloc"
+    assert allocator.calls[0] == (0, "40675c")
+    assert allocator.returns[0] == "406761"
+
+
+def test_emit_brpatches_inc_generic_and_cwe119(tmp_path):
+    emit = binradar_setup._emit_brpatches_inc
+    PredicateRecord = binradar_setup.PredicateRecord
+    RegisterCell = binradar_setup.RegisterCell
+    StackCell = binradar_setup.StackCell
+    Cwe119PointerPredicate = binradar_setup.Cwe119PointerPredicate
+    Cwe119SizePredicate = binradar_setup.Cwe119SizePredicate
+
+    records = [
+        PredicateRecord(1, 3, "max1 - rdx == ~max1",
+                        "==-p0v3~p0p0"),
+        PredicateRecord(2, 7, "s->rax >= i->begin && s->rax < i->end",
+                        Cwe119PointerPredicate(RegisterCell(0))),
+        PredicateRecord(3, 9, "((uint64_t *)s->rsp)[2] >= i->begin && "
+                        "((uint64_t *)s->rsp)[2] < i->end",
+                        Cwe119PointerPredicate(StackCell(64, 2))),
+        PredicateRecord(4, 30, "1 * s->rbx < i->end - i->begin",
+                        Cwe119SizePredicate(1, RegisterCell(1))),
+        PredicateRecord(5, 42, "2 * ((uint8_t *)s->rsp)[40] < i->end - "
+                        "i->begin",
+                        Cwe119SizePredicate(2, StackCell(8, 40))),
+    ]
+    out = tmp_path / "brpatches.inc"
+    emit(out, records)
+    text = out.read_text()
+    assert 'case 0:\n\treturn "p0";\n' in text
+    assert 'case 1:\n\treturn "==-p0v3~p0p0"; /* predicate line 3 */' in text
+    assert 'case 2:\n\treturn "c1p0"; /* predicate line 7: pointer register */' \
+        in text
+    assert 'case 3:\n\treturn "c1s64i2"; /* predicate line 9: pointer stack cell */' \
+        in text
+    assert 'case 4:\n\treturn "c2p1q1"; /* predicate line 30: size register */' \
+        in text
+    assert 'case 5:\n\treturn "c2s8i40q2"; /* predicate line 42: size stack cell */' \
+        in text
+    assert 'default:\n\treturn "p0";\n' in text
+    # No CWE-119 source text may leak into the generated table.
+    assert "i->begin" not in text and "i->end" not in text
+
+
+def test_prefilter_meta_identity(tmp_path):
+    """prefilter.sbsv metadata pins kind + predicates SHA-256."""
+    load = binradar_setup.load_prefilter_passed_ids
+    write = binradar_setup.write_prefilter
+    sha = binradar_setup.predicates_sha256
+
+    predicates = tmp_path / "predicates"
+    predicates.write_text("max1 - rdx == ~max1\n")
+    sbsv = tmp_path / "prefilter.sbsv"
+    write(sbsv, [(1, True, "", "max1 - rdx == ~max1")], 0.0,
+          kind="generic-erm", sha256=sha(predicates))
+
+    # Matching metadata parses.
+    assert load(sbsv, expected_kind="generic-erm",
+                expected_sha256=sha(predicates)) == {1: 1}
+    # Wrong kind fails open.
+    assert load(sbsv, expected_kind="cwe119-erm",
+                expected_sha256=sha(predicates)) is None
+    # Wrong hash fails open.
+    assert load(sbsv, expected_kind="generic-erm",
+                expected_sha256="0" * 64) is None
+    # Missing metadata fails open when expected.
+    legacy = tmp_path / "legacy.sbsv"
+    legacy.write_text(
+        "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
+        "[prefilter] [done] [total 1] [survived 1] [time 0.01]\n")
+    assert load(legacy, expected_kind="generic-erm",
+                expected_sha256=sha(predicates)) is None
+    # Legacy files without expectations still parse (fail-open path).
+    assert load(legacy) == {1: 1}
+    # The meta row is written first.
+    assert sbsv.read_text().startswith(
+        f"[prefilter] [meta] [version 1] [kind generic-erm] [sha256 {sha(predicates)}]\n")
+
+
+def test_predicates_sha256_stable():
+    sha = binradar_setup.predicates_sha256
+    assert sha(FIXTURES / "generic" / "predicates") == \
+        sha(FIXTURES / "generic" / "predicates")
+    assert len(sha(FIXTURES / "generic" / "predicates")) == 64
+
+
 def _main():
     import sys
     failed = 0

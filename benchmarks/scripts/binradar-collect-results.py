@@ -116,6 +116,8 @@ PREFILTER_SBSV_PARSER.add_schema(
     "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
 PREFILTER_SBSV_PARSER.add_schema(
     "[prefilter] [done] [total: int] [survived: int] [time: float]")
+PREFILTER_SBSV_PARSER.add_schema(
+    "[prefilter] [meta] [version: int] [kind: str] [sha256: str]")
 LEGACY_PREFILTER_SBSV_PARSER = sbsv.parser()
 LEGACY_PREFILTER_SBSV_PARSER.add_schema(
     "[prefilter] [id: int] [pass: bool]")
@@ -348,6 +350,8 @@ def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
                 result["total"] = int(row["total"])
                 result["survived"] = int(row["survived"])
                 result["done"] = 1
+            elif row.schema_name == "prefilter$meta":
+                continue  # versioned kind/hash metadata; no result columns
             elif row.schema_name in ("prefilter$res", "prefilter"):
                 total += 1
                 if bool(row["pass"]):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import enum
+import hashlib
 import os
 import re
 import sbsv
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, cast
 
@@ -111,9 +113,130 @@ REGISTER_TO_VAR: Dict[str, int] = {
     "r15": 15,
 }
 
-TOKEN_RE = re.compile(
-    r"<=|>=|==|!=|<<|>>|[()~+\-*/%&|^<>]|[A-Za-z_][A-Za-z0-9_]*|\d+"
+# Taosc predicate families (see agent-docs/info/TAOSC_PREDICATE_COMPATIBILITY_PLAN.md).
+class PredicateFamily(enum.Enum):
+    GENERIC_ERM = "generic-erm"
+    CWE119_ERM = "cwe119-erm"
+    CWE119_DIRECT = "cwe119-direct"
+    TAOSC_SPECIALIZED = "taosc-specialized"
+
+
+@dataclass(frozen=True)
+class RegisterCell:
+    register_index: int
+
+
+@dataclass(frozen=True)
+class StackCell:
+    width_bits: int  # 8, 16, 32 or 64
+    index: int       # element index, not byte offset
+
+
+StateCell = Union[RegisterCell, StackCell]
+
+
+@dataclass(frozen=True)
+class Cwe119PointerPredicate:
+    cell: StateCell
+
+
+@dataclass(frozen=True)
+class Cwe119SizePredicate:
+    scale: int  # 1, 2, 4 or 8
+    cell: StateCell
+
+
+Cwe119Predicate = Union[Cwe119PointerPredicate, Cwe119SizePredicate]
+
+
+@dataclass(frozen=True)
+class PredicateRecord:
+    runtime_id: int
+    source_line: int
+    source_text: str
+    parsed: Union[str, Cwe119Predicate]  # generic: encoded patch string
+
+
+# The closed CWE-119 grammar emitted by utils/taosc/cwe119/filter.zig
+# (revision 61f9f3a).  Pointer predicates require both textual cell
+# occurrences to be identical; size predicates use scales 1/2/4/8.
+_CWE119_POINTER_RE = re.compile(
+    r"^(?P<c1>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
+    r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) >= i->begin && "
+    r"(?P<c2>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
+    r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) < i->end$")
+_CWE119_SIZE_RE = re.compile(
+    r"^(?P<scale>[1-9][0-9]*) \* "
+    r"(?P<cell>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
+    r"|\(\(uint(?:8|16|32)_t \*\)s->rsp\)\[[0-9]+\]) < i->end - i->begin$")
+_CWE119_STACK_CELL_RE = re.compile(r"\(\(uint(?P<width>8|16|32|64)_t \*\)s->rsp\)\[(?P<index>[0-9]+)\]")
+
+
+def _parse_cwe119_cell(text: str) -> StateCell:
+    """Parse one CWE-119 cell (register or typed stack cell)."""
+    if text.startswith("s->"):
+        return RegisterCell(REGISTER_TO_VAR[text[3:]])
+    match = _CWE119_STACK_CELL_RE.match(text)
+    if match is None:
+        raise ValueError(f"invalid CWE-119 cell: {text!r}")
+    return StackCell(int(match.group("width")), int(match.group("index")))
+
+
+def parse_cwe119_predicate(line: str) -> Cwe119Predicate:
+    """Parse one CWE-119 predicate line into a typed descriptor.
+
+    Raises ValueError with a reason on any line outside the closed
+    filter.zig grammar.
+    """
+    match = _CWE119_POINTER_RE.match(line)
+    if match is not None:
+        if match.group("c1") != match.group("c2"):
+            raise ValueError(
+                "pointer predicate cells differ: "
+                f"{match.group('c1')!r} vs {match.group('c2')!r}")
+        return Cwe119PointerPredicate(_parse_cwe119_cell(match.group("c1")))
+    match = _CWE119_SIZE_RE.match(line)
+    if match is not None:
+        scale = int(match.group("scale"))
+        if scale not in (1, 2, 4, 8):
+            raise ValueError(f"unsupported CWE-119 size scale: {scale}")
+        return Cwe119SizePredicate(scale, _parse_cwe119_cell(match.group("cell")))
+    raise ValueError("not a CWE-119 predicate")
+
+
+def classify_predicate_line(line: str) -> Optional[str]:
+    """Return the family of one non-empty predicate line, or None if it is
+    neither a generic nor a CWE-119 predicate."""
+    if "i->begin" in line or "i->end" in line or "s->" in line:
+        return PredicateFamily.CWE119_ERM.value
+    return PredicateFamily.GENERIC_ERM.value
+
+
+def predicates_sha256(predicates_file: Path) -> str:
+    """SHA-256 of the exact predicates file bytes (prefilter identity)."""
+    return hashlib.sha256(predicates_file.read_bytes()).hexdigest()
+
+# Strict generic lexer: every input byte must be consumed as a token or
+# whitespace.  Unknown punctuation is an error, never silently skipped.
+_GENERIC_TOKEN_RE = re.compile(
+    r"\s+|<=|>=|==|!=|<<|>>|[()~+\-*/%&|^<>]|[A-Za-z_][A-Za-z0-9_]*|\d+"
 )
+
+
+def tokenize_generic(predicate: str) -> List[str]:
+    """Tokenize a generic predicate, rejecting any unrecognized byte."""
+    tokens: List[str] = []
+    pos = 0
+    while pos < len(predicate):
+        match = _GENERIC_TOKEN_RE.match(predicate, pos)
+        if match is None:
+            raise ValueError(
+                f"unexpected character {predicate[pos]!r} at column {pos + 1}")
+        token = match.group(0)
+        if not token.isspace():
+            tokens.append(token)
+        pos = match.end()
+    return tokens
 
 AstNode = Union[
     Tuple[str, int],              # ("const", value) | ("var", index)
@@ -283,7 +406,7 @@ def emit_patch(node: AstNode) -> str:
 
 
 def predicate_to_patch_str(predicate: str) -> str:
-    tokens = TOKEN_RE.findall(predicate)
+    tokens = tokenize_generic(predicate)
     if not tokens:
         raise ValueError("empty predicate")
     ast = Parser(tokens).parse()
@@ -335,20 +458,162 @@ def load_predicates(file: Path) -> List[Tuple[int, str]]:
     return predicates
 
 
-def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[Dict[int, int]]:
+# Taosc allocator trace artifacts (utils/taosc/cwe119/synth.in): the
+# allocator kind is detected from exactly one complete supported set of
+# trace/<fn>.calls and trace/<fn>.returns files.
+ALLOCATOR_KINDS = ("malloc", "calloc", "realloc")
+
+
+@dataclass(frozen=True)
+class AllocatorTrace:
+    kind: str  # "malloc" | "calloc" | "realloc"
+    calls: List[Tuple[int, str]]  # (bit-index, hex address), in order
+    returns: List[str]            # hex addresses, in order
+
+
+def parse_allocator_trace(trace_dir: Path) -> Optional[AllocatorTrace]:
+    """Parse the allocator trace artifacts in a workdir trace directory.
+
+    Returns None when no complete supported artifact set is present.
+    Raises ValueError on ambiguous or malformed artifacts.
+    """
+    present = [kind for kind in ALLOCATOR_KINDS
+               if (trace_dir / f"{kind}.calls").exists()
+               or (trace_dir / f"{kind}.returns").exists()]
+    if not present:
+        return None
+    if len(present) > 1:
+        raise ValueError(
+            "ambiguous allocator trace: multiple of "
+            f"{', '.join(present)} present in {trace_dir}")
+    kind = present[0]
+    calls_path = trace_dir / f"{kind}.calls"
+    returns_path = trace_dir / f"{kind}.returns"
+    if not calls_path.exists() or not returns_path.exists():
+        raise ValueError(
+            f"incomplete allocator trace for {kind}: need both "
+            f"{calls_path.name} and {returns_path.name} in {trace_dir}")
+
+    calls: List[Tuple[int, str]] = []
+    with calls_path.open("r") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            fields = line.split()
+            if len(fields) != 2 or not fields[0].isdigit() \
+                    or not re.fullmatch(r"[0-9a-fA-F]+", fields[1]):
+                raise ValueError(
+                    f"{calls_path.name}:{line_number}: expected "
+                    f"'<bit-index> <hex-address>', got {line!r}")
+            bit_index = int(fields[0])
+            if bit_index >= 64:
+                raise ValueError(
+                    f"{calls_path.name}:{line_number}: bit index {bit_index} "
+                    "does not fit Taosc's 64-bit trace mask")
+            calls.append((bit_index, fields[1].lower()))
+
+    returns: List[str] = []
+    with returns_path.open("r") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F]+", line):
+                raise ValueError(
+                    f"{returns_path.name}:{line_number}: expected a hex "
+                    f"address, got {line!r}")
+            returns.append(line.lower())
+
+    if not calls:
+        raise ValueError(f"{calls_path.name} is empty")
+    if not returns:
+        raise ValueError(f"{returns_path.name} is empty")
+    return AllocatorTrace(kind, calls, returns)
+
+
+def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[AllocatorTrace]]:
+    """Classify the workdir's patch family (plan §6.1).
+
+    Returns (family, allocator_trace).  Raises ValueError with a
+    predicates:<line>: <reason> diagnostic on malformed predicate files.
+    """
+    predicates_file = workdir / "predicates"
+    trace_dir = workdir / "trace"
+    allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
+
+    if allocator is not None:
+        crash_address = (trace_dir / "crash.address").read_text().strip() \
+            if (trace_dir / "crash.address").exists() else ""
+        patch_location = (workdir / "patch-location").read_text().strip() \
+            if (workdir / "patch-location").exists() else ""
+        if crash_address == patch_location:
+            return PredicateFamily.CWE119_DIRECT, allocator
+        if not predicates_file.exists():
+            raise ValueError(
+                f"{predicates_file.name} not found in {workdir} "
+                "(CWE-119 ERM requires non-empty predicates)")
+        records = load_predicates(predicates_file)
+        if not records:
+            raise ValueError(
+                f"{predicates_file.name} is empty in {workdir} "
+                "(CWE-119 ERM requires non-empty predicates)")
+        for source_line, predicate in records:
+            if classify_predicate_line(predicate) != PredicateFamily.CWE119_ERM.value:
+                raise ValueError(
+                    f"predicates:{source_line}: not a CWE-119 predicate: "
+                    f"{predicate!r}")
+            try:
+                parse_cwe119_predicate(predicate)
+            except ValueError as e:
+                raise ValueError(
+                    f"predicates:{source_line}: {e}") from e
+        return PredicateFamily.CWE119_ERM, allocator
+
+    if not predicates_file.exists():
+        return PredicateFamily.TAOSC_SPECIALIZED, None
+    records = load_predicates(predicates_file)
+    if not records:
+        return PredicateFamily.TAOSC_SPECIALIZED, None
+    for source_line, predicate in records:
+        if classify_predicate_line(predicate) != PredicateFamily.GENERIC_ERM.value:
+            raise ValueError(
+                f"predicates:{source_line}: not a generic predicate: "
+                f"{predicate!r}")
+        try:
+            predicate_to_branch_patch_str(predicate)
+        except ValueError as e:
+            raise ValueError(
+                f"predicates:{source_line}: {e}") from e
+    return PredicateFamily.GENERIC_ERM, None
+
+
+def load_prefilter_passed_ids(prefilter_file: Path,
+                              expected_kind: Optional[str] = None,
+                              expected_sha256: Optional[str] = None,
+                              ) -> Optional[Dict[int, int]]:
     """Read source predicate IDs and their compact runtime patch IDs.
 
     Each passing row must contain a positive, unique ``new-id``.  A false
     row must contain ``new-id -1``.  Returns ``None`` on malformed input so
     setup fails open and keeps every predicate.
+
+    A ``[prefilter] [meta]`` row (written by write_prefilter) pins the
+    predicate family and the exact predicates-file SHA-256.  When
+    ``expected_kind``/``expected_sha256`` are given, a mismatching or
+    missing metadata row fails open (returns None) so a stale prefilter
+    from a different predicate file or family is never applied.
     """
     parser = sbsv.parser()
     parser.add_schema(
         "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
     parser.add_schema(
         "[prefilter] [done] [total: int] [survived: int] [time: float]")
+    parser.add_schema(
+        "[prefilter] [meta] [version: int] [kind: str] [sha256: str]")
     passed_ids: Dict[int, int] = dict()
     used_new_ids = set()
+    meta_seen = False
     with prefilter_file.open("r") as f:
         for line_number, line in enumerate(f, start=1):
             if not line.strip():
@@ -360,6 +625,16 @@ def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[Dict[int, int]]:
             if row is None:
                 return None
             if row.schema_name == "prefilter$done":
+                continue
+            if row.schema_name == "prefilter$meta":
+                if meta_seen or row["version"] != 1:
+                    return None
+                meta_seen = True
+                if expected_kind is not None and row["kind"] != expected_kind:
+                    return None
+                if expected_sha256 is not None \
+                        and row["sha256"] != expected_sha256:
+                    return None
                 continue
             if row.schema_name != "prefilter$res":
                 return None
@@ -374,6 +649,8 @@ def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[Dict[int, int]]:
                 used_new_ids.add(new_id)
             elif new_id != -1:
                 return None
+    if expected_kind is not None and not meta_seen:
+        return None
     if sorted(used_new_ids) != list(range(1, len(used_new_ids) + 1)):
         return None
     return passed_ids
@@ -731,16 +1008,24 @@ def parse_state_lines(data: str) -> List[List[int]]:
 
 
 def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, str]],
-                    elapsed: float) -> None:
+                    elapsed: float, kind: Optional[str] = None,
+                    sha256: Optional[str] = None) -> None:
     """Write source predicate IDs and compact runtime patch IDs.
 
     Passing predicates receive consecutive ``new-id`` values starting at 1;
     rejected predicates receive ``new-id -1``.  Runtime patch IDs therefore
     remain compatible with ``range(1, TOTAL_PATCHES + 1)`` while ``id``
     preserves the predicate source line.
+
+    A ``[prefilter] [meta]`` row pins the predicate family and the exact
+    predicates-file SHA-256 so a stale prefilter can never be applied to a
+    different predicate file or family (plan §6.2).
     """
     survived = 0
     with prefilter_file.open("w", encoding="utf-8") as f:
+        if kind is not None and sha256 is not None:
+            f.write(f"[prefilter] [meta] [version 1] [kind {kind}] "
+                    f"[sha256 {sha256}]\n")
         for idx, passed, note, predicate in results:
             new_id = survived + 1 if passed else -1
             f.write(f"[prefilter] [res] [id {idx}] "
@@ -1082,10 +1367,81 @@ def extract_trampoline_info(
     return binradar_env
 
 
+def _emit_brpatches_inc(brpatches_inc: Path,
+                        selected: List[PredicateRecord]) -> None:
+    """Write the typed brpatches.inc table (plan §5.2).
+
+    Entry 0 is BR_PRED_FALSE.  Generic entries retain the current encoded
+    ``predicate == 0`` prefix string; CWE-119 entries contain only validated
+    enum/integer fields, never source text.
+    """
+    with brpatches_inc.open("w") as f:
+        f.write("case 0:\n\treturn \"p0\";\n")
+        for record in selected:
+            if isinstance(record.parsed, str):
+                f.write(f"case {record.runtime_id}:\n"
+                        f"\treturn \"{record.parsed}\"; "
+                        f"/* predicate line {record.source_line} */\n")
+            elif isinstance(record.parsed, Cwe119PointerPredicate):
+                cell = record.parsed.cell
+                if isinstance(cell, RegisterCell):
+                    f.write(f"case {record.runtime_id}:\n"
+                            f"\treturn \"c1p{cell.register_index}\"; "
+                            f"/* predicate line {record.source_line}: "
+                            f"pointer register */\n")
+                else:
+                    f.write(f"case {record.runtime_id}:\n"
+                            f"\treturn \"c1s{cell.width_bits}i{cell.index}\"; "
+                            f"/* predicate line {record.source_line}: "
+                            f"pointer stack cell */\n")
+            else:
+                size = cast(Cwe119SizePredicate, record.parsed)
+                cell = size.cell
+                if isinstance(cell, RegisterCell):
+                    f.write(f"case {record.runtime_id}:\n"
+                            f"\treturn \"c2p{cell.register_index}q{size.scale}\"; "
+                            f"/* predicate line {record.source_line}: "
+                            f"size register */\n")
+                else:
+                    f.write(f"case {record.runtime_id}:\n"
+                            f"\treturn \"c2s{cell.width_bits}i{cell.index}"
+                            f"q{size.scale}\"; "
+                            f"/* predicate line {record.source_line}: "
+                            f"size stack cell */\n")
+        f.write("default:\n\treturn \"p0\";\n")
+
+
+def _parse_predicate_records(predicates_file: Path,
+                             family: PredicateFamily) -> List[PredicateRecord]:
+    """Parse every non-empty predicate line into a PredicateRecord.
+
+    Raises ValueError with a predicates:<line>: <reason> diagnostic on any
+    malformed or mixed-family line.
+    """
+    records: List[PredicateRecord] = []
+    with predicates_file.open("r") as f:
+        for line_number, line in enumerate(f, start=1):
+            predicate = line.strip()
+            if not predicate:
+                continue
+            if family == PredicateFamily.CWE119_ERM:
+                try:
+                    parsed = parse_cwe119_predicate(predicate)
+                except ValueError as e:
+                    raise ValueError(
+                        f"predicates:{line_number}: {e}") from e
+            else:
+                try:
+                    parsed = predicate_to_branch_patch_str(predicate)
+                except ValueError as e:
+                    raise ValueError(
+                        f"predicates:{line_number}: {e}") from e
+            records.append(PredicateRecord(0, line_number, predicate, parsed))
+    return records
+
+
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
-    # Read predicates
-    predicate_records: List[Tuple[int, str]] = list()
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
     brpatched_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
@@ -1094,8 +1450,30 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: original binary {original_binary.name} not found in {workdir}")
         exit(1)
 
-    if not predicates_file.exists():
-        # In certain bug types, taosc may not generate predicates
+    # Classify the workdir before any predicate parsing (plan §6.1).
+    try:
+        family, allocator = detect_predicate_family(workdir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
+    binradar_env["BINRADAR_PATCH_KIND"] = family.value
+
+    if family == PredicateFamily.CWE119_DIRECT:
+        # The direct call-site metapatch has no predicate list: the E9
+        # jnz($mem0,dest) decision is evaluated against the allocation
+        # clamps at runtime.  A leftover predicates file is stale Taosc
+        # output and must not be compiled in.
+        if predicates_file.exists():
+            print(f"Warning: ignoring stale {predicates_file.name} "
+                  f"(CWE-119 direct call-site family)")
+        binradar_env["TOTAL_PATCHES"] = "1"
+        print(f"Using CWE-119 direct call-site patch at "
+              f"{binradar_env['PATCH_LOC']} (candidate id 1)")
+        return
+
+    if family == PredicateFamily.TAOSC_SPECIALIZED:
+        # No predicates: taosc generated a specialized (CWE-369/476/617)
+        # patch.  Reuse the prebuilt binary when present.
         if brpatched_binary.exists():
             metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
             patch_addr = int(binradar_env["PATCH_LOC"], 0)
@@ -1111,32 +1489,50 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             return
         print(f"Error: {predicates_file.name} file not found in {workdir}")
         exit(1)
-    predicate_records = load_predicates(predicates_file)
+
+    # GENERIC_ERM or CWE119_ERM: parse every line strictly.
+    try:
+        predicate_records = _parse_predicate_records(predicates_file, family)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
+    if not predicate_records:
+        print(f"Error: {predicates_file.name} is empty in {workdir}")
+        exit(1)
 
     patch_records = [
-        (patch_id, source_id, predicate)
-        for patch_id, (source_id, predicate)
-        in enumerate(predicate_records, start=1)
+        PredicateRecord(patch_id, record.source_line, record.source_text,
+                        record.parsed)
+        for patch_id, record in enumerate(predicate_records, start=1)
     ]
     # Apply the offline prefilter results, if any (see the `prefilter`
     # subcommand).  Predicates whose prefilter row evaluates to true
     # survive; the rest are discarded before the top-30 cap, so the
     # binradar pipeline never runs on patches that would be filtered out
-    # anyway.  Fail open on any parse trouble.
+    # anyway.  Fail open on any parse trouble.  The prefilter metadata
+    # (family + predicates-file SHA-256) must match, so a stale prefilter
+    # from a different predicate file or family is never applied.
     prefilter_file = workdir / "prefilter.sbsv"
     if prefilter_file.exists():
-        passed_ids = load_prefilter_passed_ids(prefilter_file)
+        passed_ids = load_prefilter_passed_ids(
+            prefilter_file,
+            expected_kind=family.value,
+            expected_sha256=predicates_sha256(predicates_file),
+        )
         if passed_ids is None:
-            print(f"Warning: failed to parse {prefilter_file.name}; "
-                  f"using all predicates (fail-open)")
+            print(f"Warning: failed to parse {prefilter_file.name} "
+                  f"(or metadata mismatch); using all predicates (fail-open)")
         else:
-            predicate_by_id = dict(predicate_records)
+            predicate_by_id = {record.source_line: record
+                               for record in predicate_records}
             survived = list()
             for source_id, new_id in sorted(
                     passed_ids.items(), key=lambda item: item[1]):
-                predicate = predicate_by_id.get(source_id)
-                if predicate is not None:
-                    survived.append((new_id, source_id, predicate))
+                record = predicate_by_id.get(source_id)
+                if record is not None:
+                    survived.append(PredicateRecord(
+                        new_id, record.source_line, record.source_text,
+                        record.parsed))
             print(f"[prefilter] loaded {len(predicate_records)} predicates, "
                   f"{len(survived)} survived")
             patch_records = survived
@@ -1167,14 +1563,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     brpatch_source = workdir / "brpatch.c"
     shutil.copy(BRPATCH_SOURCE, brpatch_source)
     brpatches_inc = workdir / "brpatches.inc"
-    with brpatches_inc.open("w") as f:
-        f.write("case 0:\n\treturn \"p0\";\n")
-        for patch_id, source_id, predicate in selected_patch_records:
-            patch_str = predicate_to_branch_patch_str(predicate)
-            f.write(f"case {patch_id}:\n"
-                    f"\treturn \"{patch_str}\"; "
-                    f"/* predicate line {source_id} */\n")
-        f.write("default:\n\treturn \"p0\";\n")
+    _emit_brpatches_inc(brpatches_inc, selected_patch_records)
     cmd = ["guix", "shell", "e9patch@1.0.0", "--",
             "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
     print(" ".join(cmd))
@@ -1275,9 +1664,25 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         # No predicates (CWE synth path); nothing to prefilter.
         print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
         sys.exit(0)
+
+    # Classify the workdir first (plan §6.1): the CWE-119 direct family
+    # has no predicate list to compact, so the prefilter is a no-op and
+    # FILTER remains the behavioral gate.
+    try:
+        family, _ = detect_predicate_family(workdir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    if family == PredicateFamily.CWE119_DIRECT:
+        print(f"Workdir is {family.value}; prefilter is a no-op "
+              "(FILTER is the behavioral gate).")
+        sys.exit(0)
+
     predicate_records = load_predicates(predicates_file)
     if not predicate_records:
-        write_prefilter(prefilter_file, [], time.time() - start)
+        write_prefilter(prefilter_file, [], time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
         print("No predicates; prefilter is a no-op.")
         sys.exit(0)
 
@@ -1298,7 +1703,9 @@ def cmd_prefilter(configdir: Path, workdir: Path):
               "(fail-open)")
         results = [(source_id, True, "capture failed (fail-open)", predicate)
                    for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start)
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
         sys.exit(0)
     if not states:
         # The patch site is never hit on the POC, so every predicate would
@@ -1308,7 +1715,9 @@ def cmd_prefilter(configdir: Path, workdir: Path):
               "predicates")
         results = [(source_id, False, "patch site never hit", predicate)
                    for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start)
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
         sys.exit(0)
 
     print(f"Captured {len(states)} patch-site state vector(s)")
@@ -1324,7 +1733,9 @@ def cmd_prefilter(configdir: Path, workdir: Path):
                   f"[pass {str(passed).lower()}] [new-id {new_id}] "
                   f"{predicate!r}: {note}")
         results.append((source_id, passed, note, predicate))
-    write_prefilter(prefilter_file, results, time.time() - start)
+    write_prefilter(prefilter_file, results, time.time() - start,
+                    kind=family.value,
+                    sha256=predicates_sha256(predicates_file))
 
 
 def main():
