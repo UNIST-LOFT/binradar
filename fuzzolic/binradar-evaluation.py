@@ -230,8 +230,7 @@ def main():
         sys.exit(f"ERROR: binradar.env not found: {env_path}")
     env = binradar_utils.load_env(env_path)
 
-    for key in ("BINARY", "TEST_CMD", "PATCH_LOC", "TOTAL_PATCHES",
-                "PATCH_RESERVE_RANGE", "E9_TRAMPOLINE_RANGE", "E9_LOADER_RANGE"):
+    for key in ("BINARY", "TEST_CMD", "PATCH_LOC", "TOTAL_PATCHES"):
         if key not in env:
             sys.exit(f"ERROR: {key} not found in binradar.env")
 

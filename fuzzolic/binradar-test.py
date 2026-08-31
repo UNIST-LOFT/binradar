@@ -439,11 +439,11 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     proc_env = dict(os.environ)
     proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
     proc_env["BINRADAR_TRACE_FILE"] = "none"
-    # parse_exclude_region_str calls getenv(name) and strchr on the
-    # result; must set all three to avoid NULL deref.
-    proc_env["PATCH_RESERVE_RANGE"] = env.get("PATCH_RESERVE_RANGE", "0x0-0x0")
-    proc_env["E9_TRAMPOLINE_RANGE"] = env.get("E9_TRAMPOLINE_RANGE", "0x0-0x0")
-    proc_env["E9_LOADER_RANGE"] = env.get("E9_LOADER_RANGE", "0x0-0x0")
+    # The original binary has no E9 mappings: an empty exclusion list and
+    # no relocated calls.  A missing E9_EXCLUDE_RANGES is also safe (the
+    # tracer treats missing/empty as "no E9 regions").
+    proc_env["E9_EXCLUDE_RANGES"] = ""
+    proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
     # Look for plt_info.txt in the workdir's out directory.
@@ -511,11 +511,11 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     proc_env = dict(os.environ)
     proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
     proc_env["BINRADAR_TRACE_FILE"] = "none"
-    # parse_exclude_region_str calls getenv(name) and strchr on the
-    # result; must set all three to avoid NULL deref.
-    proc_env["PATCH_RESERVE_RANGE"] = env.get("PATCH_RESERVE_RANGE", "0x0-0x0")
-    proc_env["E9_TRAMPOLINE_RANGE"] = env.get("E9_TRAMPOLINE_RANGE", "0x0-0x0")
-    proc_env["E9_LOADER_RANGE"] = env.get("E9_LOADER_RANGE", "0x0-0x0")
+    # The original binary has no E9 mappings: an empty exclusion list and
+    # no relocated calls.  A missing E9_EXCLUDE_RANGES is also safe (the
+    # tracer treats missing/empty as "no E9 regions").
+    proc_env["E9_EXCLUDE_RANGES"] = ""
+    proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     if entrypoint:
         proc_env["BINRADAR_ENTRYPOINT"] = entrypoint
@@ -813,9 +813,8 @@ def run_tracer_subject(exp_dir: str, workdir_name: str,
 
     # Build the afl-qemu-trace probe command by hand (like run_valgrind_subject)
     # instead of using run_qasan_probe, whose BinRadarQemuRunner.from_env
-    # requires PATCH_RESERVE_RANGE / E9_TRAMPOLINE_RANGE / E9_LOADER_RANGE /
-    # PATCH_LOC in the env; subjects with only a config.env fallback lack
-    # those keys. None of them are needed for an .orig probe.
+    # requires PATCH_LOC in the env; subjects with only a config.env
+    # fallback lack that key. None of them are needed for an .orig probe.
     try:
         qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
                      "--asan", "host"]

@@ -339,15 +339,13 @@ class BinRadarQemuRunner:
     binary: str
     test_cmd: str
     patch_loc: str
-    exclude_addrs: List[str]
     e9_relocated_calls: List[str]
     run_results: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, exclude_addrs: List[str] = [], e9_relocated_calls: List[str] = []):
+    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, e9_relocated_calls: List[str] = []):
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
-        self.exclude_addrs = exclude_addrs
         self.e9_relocated_calls = e9_relocated_calls
         self.run_results = None
     
@@ -358,7 +356,6 @@ class BinRadarQemuRunner:
     
     @staticmethod
     def from_env(dir: str, env: Dict[str, str]) -> "BinRadarQemuRunner":
-        exclude_addrs: List[str] = [env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
         e9_relocated_calls: List[str] = []
         for record in env.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
             record = record.strip()
@@ -370,7 +367,6 @@ class BinRadarQemuRunner:
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            exclude_addrs=exclude_addrs,
             e9_relocated_calls=e9_relocated_calls
         )
     
@@ -395,8 +391,9 @@ class BinRadarQemuRunner:
             cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"]
         if use_patched_bin:
             binary = self.patched_binary()
-            for addr_range in self.exclude_addrs:
-                cmd += ["--asan-exclude", addr_range]
+            # --asan-exclude is explicitly ignored by the local
+            # afl-qemu-trace compatibility runner; only the active
+            # --e9-relocated-call records are passed.
             for addr in self.e9_relocated_calls:
                 cmd += ["--e9-relocated-call", addr]
         else:

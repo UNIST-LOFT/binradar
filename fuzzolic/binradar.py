@@ -596,8 +596,9 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
-    # PATCH_RESERVE_RANGE, E9_TRAMPOLINE_RANGE, E9_LOADER_RANGE
-    patch_addr_ranges: Tuple[str, str, str]
+    # Canonical E9_EXCLUDE_RANGES value (exact interval list of the
+    # executing artifact; empty for original-binary runs).
+    e9_exclude_ranges: str
     total_patches: int
     e9_relocated_calls: str
     fuzzy: bool
@@ -613,7 +614,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, patch_addr_ranges: Tuple[str, str, str], total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_exclude_ranges: str, total_patches: int, e9_relocated_calls: str = "", fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -626,7 +627,7 @@ class BinRadarExecutor:
         self.disable_binradar = disable_binradar
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
-        self.patch_addr_ranges = patch_addr_ranges
+        self.e9_exclude_ranges = e9_exclude_ranges
         self.filter_result = list(range(1, total_patches + 1))
 
         self.libc = ctypes.CDLL("libc.so.6")
@@ -666,11 +667,7 @@ class BinRadarExecutor:
             poc_input=env["POC_INPUT"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            patch_addr_ranges=(
-                env["PATCH_RESERVE_RANGE"],
-                env["E9_TRAMPOLINE_RANGE"],
-                env["E9_LOADER_RANGE"]
-            ),
+            e9_exclude_ranges=env.get("E9_EXCLUDE_RANGES", ""),
             total_patches=int(env["TOTAL_PATCHES"]),
             e9_relocated_calls=env.get("E9_RELOCATED_CALL_JUMPS", ""),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
@@ -686,9 +683,7 @@ class BinRadarExecutor:
         config["POC_INPUT"] = self.poc_input
         config["TEST_CMD"] = self.test_cmd
         config["PATCH_LOC"] = self.patch_loc
-        config["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
-        config["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
-        config["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        config["E9_EXCLUDE_RANGES"] = self.e9_exclude_ranges
         config["TOTAL_PATCHES"] = str(self.total_patches)
         config["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
         return config
@@ -768,9 +763,7 @@ class BinRadarExecutor:
             open(log_file, "w").close()
         env["BINRADAR_TRACER_LOG_FILE"] = log_file
         # Tracer
-        env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
-        env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
-        env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        env["E9_EXCLUDE_RANGES"] = self.e9_exclude_ranges
         # E9Patch relocated call records (jump:site:return, comma separated).
         # Every patched symbolic tracer mode needs these to reinterpret E9's
         # push original_return; jmp target sequence as the original call.
@@ -838,10 +831,8 @@ class BinRadarExecutor:
         tracer_env = os.environ.copy()
         tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
         tracer_env["BINRADAR_TRACE_FILE"] = "none"
-        tracer_env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
-        tracer_env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
-        tracer_env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
         # The original binary has no E9 mappings and no relocated calls.
+        tracer_env["E9_EXCLUDE_RANGES"] = ""
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")

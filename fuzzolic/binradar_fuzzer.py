@@ -17,7 +17,7 @@ QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "bina
 AFL_PATH = os.path.join(ROOT_DIR, "utils", "AFLplusplus")
 
 class BinRadarFuzzer:
-    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, exclude_addrs: List[str] = []):
+    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -25,7 +25,6 @@ class BinRadarFuzzer:
         self.poc_input = poc_input
         self.patch_loc = patch_loc
         self.test_cmd = test_cmd
-        self.exclude_addrs = exclude_addrs
         self.process: Optional[subprocess.Popen] = None
     
     @classmethod
@@ -42,7 +41,6 @@ class BinRadarFuzzer:
             poc_input=env["POC_INPUT"],
             patch_loc=env["PATCH_LOC"],
             test_cmd=env["TEST_CMD"],
-            exclude_addrs=[env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
         )
     
     def get_patched_binary_path(self) -> str:
@@ -70,8 +68,6 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
             "-o", self.outdir,
             "--asan", "host",
         ]
-        for addr_range in self.exclude_addrs:
-            cmd += ["--asan-exclude", addr_range]
         cmd = cmd + [binary, "--",] + shlex.split(self.test_cmd)
         return cmd
 
@@ -96,8 +92,6 @@ class AFLppFuzzer(BinRadarFuzzer):
             "-i", input_path,
             "-o", self.outdir,
         ]
-        # for addr_range in self.exclude_addrs:
-        #     cmd += ["--asan-exclude", addr_range]
         cmd = cmd + ["--", binary] + shlex.split(self.test_cmd)
         return cmd
 

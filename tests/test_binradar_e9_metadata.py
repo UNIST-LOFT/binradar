@@ -50,12 +50,6 @@ REFACTOR = binradar_setup.E9MapType.REFACTOR
 RECORDS = "0x54b091:0x4d60a5:0x4d60aa,0x54b0a1:0x486b4f:0x486b55"
 
 
-def _parse_ranges(value: str):
-    """Parse a comma-separated 0x..-0x.. interval list into (start, end)."""
-    return [tuple(int(x, 16) for x in part.split("-"))
-            for part in value.split(",")]
-
-
 def _write_synthetic_e9_binary(path, *, loader_base, loader_size, maps,
                                entry=0x401000):
     """Write a minimal binary with an embedded e9_config_s.
@@ -98,8 +92,8 @@ def test_disjoint_trampoline_maps_are_not_enveloped(tmp_path):
     """Three separated trampoline maps keep their exact intervals.
 
     Mirrors the observed xmllint.brpatched layout: 0x54b000-0x54c000 and
-    the adjacent 0x2cc7000-0x2cc8000/0x2cc8000-0x2cc9000 pair.  The current
-    min..max envelope records 0x54b000-0x2cc9000 (~39.5 MiB of excluded
+    the adjacent 0x2cc7000-0x2cc8000/0x2cc8000-0x2cc9000 pair.  The old
+    min..max envelope recorded 0x54b000-0x2cc9000 (~39.5 MiB of excluded
     gaps); the contract is the exact union (adjacent maps may coalesce).
     """
     patched = tmp_path / "xmllint.brpatched"
@@ -111,9 +105,12 @@ def test_disjoint_trampoline_maps_are_not_enveloped(tmp_path):
             (0x2cc7000, 0x2000, PAGE, TRAMPOLINE, False),
             (0x2cc8000, 0x3000, PAGE, TRAMPOLINE, False),
         ])
-    env = binradar_setup.extract_trampoline_info(patched)
-    assert _parse_ranges(env["E9_TRAMPOLINE_RANGE"]) == [
-        (0x54b000, 0x54c000), (0x2cc7000, 0x2cc9000)]
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x54b000, 0x54c000),
+        binradar_setup.AddressRange(0x2cc7000, 0x2cc9000),
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9ea000),
+    )
 
 
 def test_trampoline_gap_is_not_excluded(tmp_path):
@@ -127,17 +124,20 @@ def test_trampoline_gap_is_not_excluded(tmp_path):
             (0x2cc7000, 0x2000, PAGE, TRAMPOLINE, False),
             (0x2cc9000, 0x3000, PAGE, TRAMPOLINE, False),  # gap 0x2cc8000
         ])
-    env = binradar_setup.extract_trampoline_info(patched)
-    assert _parse_ranges(env["E9_TRAMPOLINE_RANGE"]) == [
-        (0x54b000, 0x54c000), (0x2cc7000, 0x2cc8000),
-        (0x2cc9000, 0x2cca000)]
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x54b000, 0x54c000),
+        binradar_setup.AddressRange(0x2cc7000, 0x2cc8000),
+        binradar_setup.AddressRange(0x2cc9000, 0x2cca000),
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9ea000),
+    )
 
 
 def test_disjoint_reserve_maps_are_not_enveloped(tmp_path):
     """P0-1 for RESERVE maps: four separated pages stay separate.
 
-    Mirrors the observed tiffcp.brpatched layout, whose envelope excludes
-    ~1.93 GiB of unmapped address space.
+    Mirrors the observed tiffcp.brpatched layout, whose old envelope
+    excluded ~1.93 GiB of unmapped address space.
     """
     patched = tmp_path / "tiffcp.brpatched"
     _write_synthetic_e9_binary(
@@ -149,10 +149,14 @@ def test_disjoint_reserve_maps_are_not_enveloped(tmp_path):
             (0x7c254000, 0x3000, PAGE, RESERVE, False),
             (0x7ccba000, 0x4000, PAGE, RESERVE, False),
         ])
-    env = binradar_setup.extract_trampoline_info(patched)
-    assert _parse_ranges(env["PATCH_RESERVE_RANGE"]) == [
-        (0x129a000, 0x129b000), (0x1000d000, 0x1000e000),
-        (0x7c254000, 0x7c255000), (0x7ccba000, 0x7ccbb000)]
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x129a000, 0x129b000),
+        binradar_setup.AddressRange(0x1000d000, 0x1000e000),
+        binradar_setup.AddressRange(0x7c254000, 0x7c255000),
+        binradar_setup.AddressRange(0x7ccba000, 0x7ccbb000),
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9ea000),
+    )
 
 
 def test_unsorted_overlapping_adjacent_maps_normalize_to_exact_union(
@@ -168,9 +172,12 @@ def test_unsorted_overlapping_adjacent_maps_normalize_to_exact_union(
             (0x54b000, 0x3000, PAGE, TRAMPOLINE, False),    # overlaps
             (0x2cc7000, 0x4000, PAGE, TRAMPOLINE, False),   # adjacent
         ])
-    env = binradar_setup.extract_trampoline_info(patched)
-    assert _parse_ranges(env["E9_TRAMPOLINE_RANGE"]) == [
-        (0x54b000, 0x54c000), (0x2cc7000, 0x2cc9000)]
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x54b000, 0x54c000),
+        binradar_setup.AddressRange(0x2cc7000, 0x2cc9000),
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9ea000),
+    )
 
 
 def test_loader_range_is_exact(tmp_path):
@@ -178,8 +185,9 @@ def test_loader_range_is_exact(tmp_path):
     patched = tmp_path / "bin.brpatched"
     _write_synthetic_e9_binary(
         patched, loader_base=0x20e9e9000, loader_size=0x2000, maps=[])
-    env = binradar_setup.extract_trampoline_info(patched)
-    assert env["E9_LOADER_RANGE"] == "0x20e9e9000-0x20e9eb000"
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9eb000),)
 
 
 def test_metadata_is_scoped_to_the_parsed_artifact(tmp_path):
@@ -192,19 +200,77 @@ def test_metadata_is_scoped_to_the_parsed_artifact(tmp_path):
     _write_synthetic_e9_binary(
         b, loader_base=0x10000000, loader_size=PAGE,
         maps=[(0x7c254000, 0x1000, PAGE, TRAMPOLINE, False)])
-    env_a = binradar_setup.extract_trampoline_info(a)
-    env_b = binradar_setup.extract_trampoline_info(b)
-    assert env_a["E9_TRAMPOLINE_RANGE"] == "0x54b000-0x54c000"
-    assert env_b["E9_TRAMPOLINE_RANGE"] == "0x7c254000-0x7c255000"
-    assert env_a["E9_LOADER_RANGE"] != env_b["E9_LOADER_RANGE"]
+    meta_a = binradar_setup.extract_e9_runtime_metadata(a)
+    meta_b = binradar_setup.extract_e9_runtime_metadata(b)
+    assert meta_a.exclude_ranges_str() == \
+        "0x54b000-0x54c000,0x20e9e9000-0x20e9ea000"
+    assert meta_b.exclude_ranges_str() == \
+        "0x10000000-0x10001000,0x7c254000-0x7c255000"
+    assert meta_a.exclude_ranges != meta_b.exclude_ranges
+
+
+def test_refactor_maps_are_never_excluded(tmp_path):
+    """REFACTOR maps execute original code and stay out of the list."""
+    patched = tmp_path / "bin.brpatched"
+    _write_synthetic_e9_binary(
+        patched,
+        loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[
+            (0x401000, 0x1000, PAGE, REFACTOR, False),
+            (0x54b000, 0x1000, PAGE, TRAMPOLINE, False),
+        ])
+    metadata = binradar_setup.extract_e9_runtime_metadata(patched)
+    assert metadata.exclude_ranges == (
+        binradar_setup.AddressRange(0x54b000, 0x54c000),
+        binradar_setup.AddressRange(0x20e9e9000, 0x20e9ea000),
+    )
+
+
+def test_absolute_excluded_map_is_rejected(tmp_path):
+    """An absolute RESERVE/TRAMPOLINE map is a configuration error."""
+    patched = tmp_path / "bin.brpatched"
+    _write_synthetic_e9_binary(
+        patched,
+        loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[(0x54b000, 0x1000, PAGE, TRAMPOLINE, True)])
+    with pytest.raises(ValueError, match="absolute"):
+        binradar_setup.extract_e9_runtime_metadata(patched)
+
+
+def test_exclude_ranges_serialize_parse_roundtrip():
+    """Canonical serialization round-trips through the strict parser."""
+    ranges = (
+        binradar_setup.AddressRange(0x54b000, 0x54c000),
+        binradar_setup.AddressRange(0x2cc7000, 0x2cc9000),
+    )
+    text = binradar_setup.serialize_exclude_ranges(ranges)
+    assert text == "0x54b000-0x54c000,0x2cc7000-0x2cc9000"
+    assert binradar_setup.parse_exclude_ranges(text) == ranges
+
+
+def test_parse_exclude_ranges_empty_and_malformed():
+    """Empty is the empty list; malformed non-empty values are errors."""
+    assert binradar_setup.parse_exclude_ranges("") == ()
+    for bad in ("0x1000", "0x1000-0x2000,", "0x1000-0x2000junk",
+                "0x2000-0x1000", "0x1000-0x1000", "1000-0x2000",
+                "0x1000-2000", "0xzz00-0x3000", "0x1000-0x2000,0x3000"):
+        with pytest.raises(ValueError):
+            binradar_setup.parse_exclude_ranges(bad)
+
+
+def test_normalize_address_ranges_validation():
+    """Zero-length and reversed intervals are rejected."""
+    with pytest.raises(ValueError):
+        binradar_setup.normalize_address_ranges([(0x1000, 0x1000)])
+    with pytest.raises(ValueError):
+        binradar_setup.normalize_address_ranges([(0x2000, 0x1000)])
 
 
 # ---------------------------------------------------------------------------
 # P0-2: relocated-call propagation to symbolic tracer runs
 # ---------------------------------------------------------------------------
 
-def _stub_executor(tmp_path, e9_relocated_calls="",
-                   patch_addr_ranges=("0x1-0x2", "0x3-0x4", "0x5-0x6")):
+def _stub_executor(tmp_path, e9_relocated_calls="", e9_exclude_ranges=""):
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.workdir = str(tmp_path)
     executor.outdir = str(tmp_path / "out")
@@ -213,7 +279,7 @@ def _stub_executor(tmp_path, e9_relocated_calls="",
     executor.poc_input = "poc/nullderef"
     executor.test_cmd = "-l @@"
     executor.patch_loc = "0x4585dd"
-    executor.patch_addr_ranges = patch_addr_ranges
+    executor.e9_exclude_ranges = e9_exclude_ranges
     executor.total_patches = 2
     executor.e9_relocated_calls = e9_relocated_calls
     executor.fuzzy = False
@@ -233,28 +299,36 @@ def _stub_executor(tmp_path, e9_relocated_calls="",
 def test_get_env_sets_relocated_calls_for_patched_modes(tmp_path):
     """P0-2: every patched symbolic tracer mode receives the records.
 
-    The current get_env() sets only the three range variables; the
+    The old get_env() set only the three range variables; the
     E9_RELOCATED_CALL_JUMPS value retained by from_env()/extract_config()
-    never reaches the tracer environment.
+    never reached the tracer environment.
     """
-    executor = _stub_executor(tmp_path, e9_relocated_calls=RECORDS)
+    executor = _stub_executor(
+        tmp_path, e9_relocated_calls=RECORDS,
+        e9_exclude_ranges="0x54b000-0x54c000,0x2cc7000-0x2cc9000")
     for mode in ("fuzzolic", "directed", "binradar"):
         env = executor.get_env(mode, str(tmp_path))
         assert env.get("E9_RELOCATED_CALL_JUMPS") == RECORDS, mode
+        assert env.get("E9_EXCLUDE_RANGES") == \
+            "0x54b000-0x54c000,0x2cc7000-0x2cc9000", mode
+        assert "PATCH_RESERVE_RANGE" not in env, mode
+        assert "E9_TRAMPOLINE_RANGE" not in env, mode
+        assert "E9_LOADER_RANGE" not in env, mode
 
 
-def test_original_binary_run_has_no_relocated_calls(tmp_path, monkeypatch):
-    """P0-2: the .orig memcheck run must not receive relocated-call records.
+def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
+    """P0-2: the .orig memcheck run must not receive E9 metadata.
 
     run_probe() executes the tracer on the original binary, which has no
-    E9 mappings; E9_RELOCATED_CALL_JUMPS must be present and empty.  (The
-    three singular range variables still carry patched values until the
-    Phase 4 cutover removes them.)
+    E9 mappings: E9_EXCLUDE_RANGES and E9_RELOCATED_CALL_JUMPS must be
+    present and empty, and the old singular range keys must be gone.
     """
     (tmp_path / "nm.orig").write_bytes(b"")
     (tmp_path / "poc").mkdir()
     (tmp_path / "poc" / "nullderef").write_bytes(b"")
-    executor = _stub_executor(tmp_path)
+    executor = _stub_executor(
+        tmp_path, e9_relocated_calls=RECORDS,
+        e9_exclude_ranges="0x54b000-0x54c000")
 
     captured = {}
 
@@ -285,8 +359,11 @@ def test_original_binary_run_has_no_relocated_calls(tmp_path, monkeypatch):
     executor.run_probe()
 
     env = captured["env"]
-    assert "E9_RELOCATED_CALL_JUMPS" in env
+    assert env["E9_EXCLUDE_RANGES"] == ""
     assert env["E9_RELOCATED_CALL_JUMPS"] == ""
+    for old_key in ("PATCH_RESERVE_RANGE", "E9_TRAMPOLINE_RANGE",
+                    "E9_LOADER_RANGE"):
+        assert old_key not in env, old_key
 
 
 # ---------------------------------------------------------------------------

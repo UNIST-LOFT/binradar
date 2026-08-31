@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -205,7 +206,7 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     generic families patch the single PATCH_LOC site.
 
     Returns the path of <BINARY>.brprefilter.  Also dumps e9tool JSON
-    metadata (needed by extract_trampoline_info) as
+    metadata (needed by extract_e9_runtime_metadata) as
     <BINARY>.brprefilter.json.
     """
     original_binary = ensure_original_binary(workdir, configdir, config)
@@ -250,22 +251,14 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     brprefilter = build_capture_binary(workdir, configdir, config, patch_loc,
                                        allocator)
 
-    extracted = extract_trampoline_info(
+    metadata = extract_e9_runtime_metadata(
         brprefilter,
         workdir / f"{config['BINARY']}.brprefilter.json",
         ensure_original_binary(workdir, configdir, config),
         int(patch_loc, 0),
-        strict=(allocator is not None),
     )
-    try:
-        exclude_addrs = [extracted["PATCH_RESERVE_RANGE"],
-                         extracted["E9_TRAMPOLINE_RANGE"],
-                         extracted["E9_LOADER_RANGE"]]
-    except KeyError as e:
-        print(f"Warning: could not extract trampoline info from brprefilter: {e}")
-        return None
     e9_relocated_calls: List[str] = []
-    for record in extracted.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
+    for record in metadata.relocated_calls_str().split(","):
         record = record.strip()
         if record:
             fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
@@ -280,8 +273,9 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
 
     command = [str(QEMU_STACKTRACE_RELEASE), "--input", str(poc),
                "--patch-loc", patch_loc, "--asan", "host"]
-    for addr_range in exclude_addrs:
-        command += ["--asan-exclude", addr_range]
+    # --asan-exclude is explicitly ignored by the local afl-qemu-trace
+    # compatibility runner; only the active --e9-relocated-call records
+    # are passed.
     for record in e9_relocated_calls:
         command += ["--e9-relocated-call", record]
     command += [str(brprefilter), "--"] + shlex.split(test_cmd)
@@ -349,6 +343,95 @@ E9_CONFIG_MAGIC = b"E9PATCH\0"
 E9_MEM0 = "mem[0].base,mem[0].index,mem[0].scale,mem[0].disp"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
 E9_MAP_STRUCT = struct.Struct("<iII")
+
+
+@dataclass(frozen=True, order=True)
+class AddressRange:
+    """Half-open [start, end) interval of an E9 mapping."""
+
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class E9RuntimeMetadata:
+    """Exact runtime metadata of one E9 artifact.
+
+    exclude_ranges: the exact union of the loader interval, every RESERVE
+        map, and every TRAMPOLINE map (never REFACTOR maps), sorted and
+        coalesced (overlap/adjacency only).
+    relocated_calls: (jump_addr, call_site, ret_addr) records for every
+        instrumented original call relocated into an E9 trampoline.
+    """
+
+    exclude_ranges: Tuple[AddressRange, ...]
+    relocated_calls: Tuple[Tuple[int, int, int], ...]
+
+    def exclude_ranges_str(self) -> str:
+        return serialize_exclude_ranges(self.exclude_ranges)
+
+    def relocated_calls_str(self) -> str:
+        return ",".join(
+            f"0x{jump:x}:0x{site:x}:0x{ret:x}"
+            for jump, site, ret in self.relocated_calls
+        )
+
+
+def normalize_address_ranges(
+    ranges: List[Tuple[int, int]],
+) -> Tuple[AddressRange, ...]:
+    """Validate, sort, and merge overlapping/adjacent half-open intervals.
+
+    Every interval must satisfy start < end.  The result is the exact
+    union: disjoint intervals stay disjoint, and only overlapping or
+    directly adjacent intervals are coalesced.
+    """
+    validated = []
+    for start, end in ranges:
+        if start >= end:
+            raise ValueError(
+                f"invalid E9 address range 0x{start:x}-0x{end:x}: "
+                f"start must be < end")
+        validated.append(AddressRange(start, end))
+    validated.sort()
+    merged: List[AddressRange] = []
+    for rng in validated:
+        if merged and rng.start <= merged[-1].end:
+            if rng.end > merged[-1].end:
+                merged[-1] = AddressRange(merged[-1].start, rng.end)
+        else:
+            merged.append(rng)
+    return tuple(merged)
+
+
+def serialize_exclude_ranges(ranges: Tuple[AddressRange, ...]) -> str:
+    """Canonical comma-separated lowercase hex interval list."""
+    return ",".join(f"0x{r.start:x}-0x{r.end:x}" for r in ranges)
+
+
+def parse_exclude_ranges(value: str) -> Tuple[AddressRange, ...]:
+    """Parse a canonical E9_EXCLUDE_RANGES value.
+
+    An empty string is the empty list.  Every non-empty token must match
+    the exact 0x<hex>-0x<hex> grammar with no trailing data and start <
+    end; a malformed non-empty value is a configuration error.
+    """
+    if value == "":
+        return ()
+    ranges = []
+    for token in value.split(","):
+        match = re.fullmatch(r"0x([0-9a-fA-F]+)-0x([0-9a-fA-F]+)", token)
+        if match is None:
+            raise ValueError(
+                f"malformed E9 exclude range {token!r}: expected "
+                f"0x<hex>-0x<hex>")
+        start = int(match.group(1), 16)
+        end = int(match.group(2), 16)
+        if start >= end:
+            raise ValueError(
+                f"invalid E9 exclude range {token!r}: start must be < end")
+        ranges.append((start, end))
+    return normalize_address_ranges(ranges)
 
 
 def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, bytes, str]]:
@@ -700,62 +783,58 @@ def run_fix(configdir: Path, config_path: Path, workdir: Path):
         print(f"Fix output: {result.stdout}")
 
 
-def extract_trampoline_info(
-    brpatched_binary: Path,
+def extract_e9_runtime_metadata(
+    patched_binary: Path,
     metadata_path: Optional[Path] = None,
     original_binary: Optional[Path] = None,
     patch_addr: Optional[int] = None,
-    strict: bool = False,
-) -> Dict[str, str]:
-    # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
-    binradar_env: Dict[str, str] = dict()
-    try:
-        cfg = parse_e9patch_config(brpatched_binary)
-        loader_base = cfg["loader_base"]
-        loader_size = cfg["loader_size"]
-        binradar_env["E9_LOADER_RANGE"] = f"0x{loader_base:x}-0x{loader_base + loader_size:x}"
-        print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
+) -> E9RuntimeMetadata:
+    """Extract the exact E9 runtime metadata of one patched artifact.
 
-        reserves = cfg["reserves"]
-        if reserves:
-            reserve_start = min(r[0] for r in reserves)
-            reserve_end = max(r[0] + r[1] for r in reserves)
-            binradar_env["PATCH_RESERVE_RANGE"] = f"0x{reserve_start:x}-0x{reserve_end:x}"
-            print(f"Full reserve range: 0x{reserve_start:x}-0x{reserve_end:x}")
-            # for addr, size, prot in sorted(reserves, key=lambda x: x[0]):
-            #     if 'x' in prot and "PATCH_RESERVE_ADDR" not in binradar_env:
-            #         binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
-            #         print(f"Patch reserve addr: 0x{addr:x} prot={prot}")
-            #         break
-        trampolines = cfg["trampolines"]
-        if trampolines:
-            tramp_start = min(t[0] for t in trampolines)
-            tramp_end = max(t[0] + t[1] for t in trampolines)
-            binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
-            print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
+    The exclusion list is the exact union of the loader interval, every
+    RESERVE map, and every TRAMPOLINE map of the parsed artifact.  REFACTOR
+    maps execute relocated original instructions at original virtual
+    addresses and are never excluded.  An excluded map with the absolute
+    flag set is rejected: the current setup only emits relative mappings,
+    and applying load_bias to an absolute address would be wrong.
+    """
+    cfg = parse_e9patch_config(patched_binary)
+    loader_base = cfg["loader_base"]
+    loader_size = cfg["loader_size"]
+    ranges: List[Tuple[int, int]] = [
+        (loader_base, loader_base + loader_size)]
+    print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
 
-        if metadata_path is not None and original_binary is not None and patch_addr is not None:
-            call_jumps = extract_relocated_call_jumps(
-                brpatched_binary,
-                metadata_path,
-                original_binary,
-                patch_addr,
-            )
-            if call_jumps:
-                records = ",".join(
-                    f"0x{jump_addr:x}:0x{call_site:x}:0x{ret_addr:x}"
-                    for jump_addr, call_site, ret_addr in call_jumps
-                )
-                binradar_env["E9_RELOCATED_CALL_JUMPS"] = records
-                # binradar_env["E9_RELOCATED_CALL_JUMP_COUNT"] = str(len(call_jumps))
-                print(f"E9 relocated call jump(s): {records}")
-            else:
-                print("No relocated call-equivalent jump found for the patch site")
-    except Exception as e:
-        if strict:
-            raise
-        print(f"Warning: could not parse e9patch config: {e}")
-    return binradar_env
+    for mapping in cfg["maps"]:
+        if mapping["type"] == E9MapType.REFACTOR:
+            continue
+        if mapping["absolute"]:
+            raise ValueError(
+                f"absolute E9 {mapping['type'].name} map at "
+                f"0x{mapping['address']:x} is not supported: setup only "
+                f"emits relative mappings")
+        ranges.append((mapping["address"],
+                       mapping["address"] + mapping["size"]))
+    exclude_ranges = normalize_address_ranges(ranges)
+    print(f"E9 exclude ranges: {serialize_exclude_ranges(exclude_ranges)}")
+
+    relocated_calls: Tuple[Tuple[int, int, int], ...] = ()
+    if metadata_path is not None and original_binary is not None \
+            and patch_addr is not None:
+        call_jumps = extract_relocated_call_jumps(
+            patched_binary,
+            metadata_path,
+            original_binary,
+            patch_addr,
+        )
+        relocated_calls = tuple(sorted(set(call_jumps)))
+        if relocated_calls:
+            print(f"E9 relocated call jump(s): "
+                  f"{E9RuntimeMetadata((), relocated_calls).relocated_calls_str()}")
+        else:
+            print("No relocated call-equivalent jump found for the patch site")
+
+    return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
@@ -842,14 +921,14 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         else:
             print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
 
-        extracted_env = extract_trampoline_info(
+        metadata = extract_e9_runtime_metadata(
             brpatched_binary,
             metadata_path,
             original_binary,
             int(patch_addr, 0),
-            strict=True,
         )
-        binradar_env.update(extracted_env)
+        binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
+        binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
         print(f"Using CWE-119 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
         return
@@ -860,13 +939,14 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         if brpatched_binary.exists():
             metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
             patch_addr = int(binradar_env["PATCH_LOC"], 0)
-            extracted_env = extract_trampoline_info(
+            metadata = extract_e9_runtime_metadata(
                 brpatched_binary,
                 metadata_path if metadata_path.exists() else None,
                 original_binary,
                 patch_addr,
             )
-            binradar_env.update(extracted_env)
+            binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
+            binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
             return
@@ -996,14 +1076,14 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
 
-    extracted_env = extract_trampoline_info(
+    metadata = extract_e9_runtime_metadata(
         brpatched_binary,
         metadata_path,
         original_binary,
         int(patch_addr, 0),
-        strict=(family == PredicateFamily.CWE119_ERM),
     )
-    binradar_env.update(extracted_env)
+    binradar_env["E9_EXCLUDE_RANGES"] = metadata.exclude_ranges_str()
+    binradar_env["E9_RELOCATED_CALL_JUMPS"] = metadata.relocated_calls_str()
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
