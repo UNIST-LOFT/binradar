@@ -382,11 +382,11 @@ class BinRadarQemuRunner:
     def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
         """(exclude_ranges, relocated-call records) of the artifact the
         given binary path belongs to.  Original binaries have no E9
-        metadata; .brpatched/.brprefilter/.brcache each select their own
+        metadata; .brpatched/.brprefilter/.brcached each select their own
         prefixed values."""
         for artifact, suffix in (("brpatched", ".brpatched"),
                                  ("prefilter", ".brprefilter"),
-                                 ("brcached", ".brcache")):
+                                 ("brcached", ".brcached")):
             if binary_path.endswith(suffix):
                 return self.e9_metadata.get(artifact, ("", []))
         return "", []

@@ -19,6 +19,7 @@ parser without invoking e9tool.
 
 import importlib.util
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -390,6 +391,107 @@ def test_executor_retains_all_prefixed_metadata(tmp_path):
         str(tmp_path), config)
     assert runner.e9_metadata_for_binary(
         str(tmp_path / "nm.brpatched"))[1] == ["0x54b091:0x4d60a5:0x4d60aa"]
+
+
+def test_verifier_selects_brcached_by_binary_path(tmp_path):
+    """The .brcached artifact selects its own BRCACHED_* values."""
+    env = {
+        "BINARY": "nm",
+        "TEST_CMD": "-l @@",
+        "PATCH_LOC": "0x4585dd",
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+    }
+    runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
+        str(tmp_path), env)
+    assert runner.e9_metadata_for_binary(
+        str(tmp_path / "nm.brcached")) == (
+            "0x7c254000-0x7c255000", ["0x7c254091:0x4d60a5:0x4d60aa"])
+    # The .brpatched stacktrace command never unions in cached records.
+    cmd = runner.get_qemu_stacktrace_command(True, "poc")
+    assert "0x54b091:0x4d60a5:0x4d60aa" in cmd
+    assert "0x7c254091:0x4d60a5:0x4d60aa" not in cmd
+
+
+def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
+    """build_cached_binary e9compiles brpatch-cached.c, instruments the
+    original binary, and persists the BRCACHED_* metadata."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "destinations").write_text("4106d8\n")
+    (workdir / "patch-location").write_text("410735")
+    orig = workdir / "imginfo.orig"
+    orig.write_bytes(b"\x7fELF" + b"\0" * 100)
+    binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+
+    calls = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        calls.append((list(cmd), cwd))
+        # e9compile and e9tool both succeed; e9tool writes the outputs.
+        if cmd[0] == "guix" and "e9tool" in cmd:
+            out = cmd[cmd.index("-o") + 1]
+            Path(out).write_bytes(b"\x7fELF" + b"\0" * 100)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(binradar_setup.subprocess, "run", fake_run)
+    metadata = binradar_setup.E9RuntimeMetadata(
+        (binradar_setup.AddressRange(0x7c254000, 0x7c255000),),
+        ((0x7c254091, 0x4d60a5, 0x4d60aa),))
+    monkeypatch.setattr(
+        binradar_setup, "extract_e9_runtime_metadata",
+        lambda *args, **kwargs: metadata)
+
+    out = binradar_setup.build_cached_binary(
+        workdir, tmp_path, binradar_env)
+    assert out == metadata
+    assert (workdir / "imginfo.brcached").exists()
+    assert (workdir / "imginfo.brcached.json").exists()
+    assert (workdir / "brpatch-cached.c").exists()
+
+    # e9compile ran with the destination define.
+    compile_cmds = [c for c, _ in calls
+                    if "e9compile" in c and "brpatch-cached.c" in c]
+    assert compile_cmds, "e9compile brpatch-cached.c not invoked"
+    assert "-DTAOSC_DEST=0x4106d8" in compile_cmds[0]
+    # e9tool ran the JSON and binary commands from one spec.
+    tool_cmds = [c for c, _ in calls if "e9tool" in c]
+    assert len(tool_cmds) == 2
+    json_cmd = tool_cmds[0]
+    bin_cmd = tool_cmds[1]
+    assert "--format=json" in json_cmd
+    assert "--format=json" not in bin_cmd
+    assert "if dest(state)@brpatch-cached goto" in bin_cmd
+    assert any("imginfo.brcached.json" in c for c in json_cmd)
+    assert any("imginfo.brcached" in c for c in bin_cmd)
+
+    # The BRCACHED_* keys landed in binradar.env.
+    env = binradar_setup.load_env(workdir / "binradar.env")
+    assert env["BRCACHED_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert env["BRCACHED_E9_RELOCATED_CALL_JUMPS"] == \
+        "0x7c254091:0x4d60a5:0x4d60aa"
+
+
+def test_cached_artifact_skipped_for_allocator_families(tmp_path, monkeypatch):
+    """CWE-119 families skip the cached build with a warning."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+    allocator = binradar_setup.AllocatorTrace(
+        "realloc", [(0, "0x4066e4")], ["0x4066f0"])
+    called = []
+
+    def fake_build(workdir, configdir, binradar_env):
+        called.append(True)
+        raise AssertionError("must not build for allocator families")
+
+    monkeypatch.setattr(binradar_setup, "build_cached_binary", fake_build)
+    binradar_setup.build_cached_artifact(
+        workdir, tmp_path, binradar_env, allocator)
+    assert not called
+    assert "BRCACHED_E9_EXCLUDE_RANGES" not in binradar_env
 
 
 # ---------------------------------------------------------------------------

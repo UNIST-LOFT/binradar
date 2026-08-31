@@ -197,7 +197,6 @@ const void *dest(const struct STATE *state)
 {
 	int64_t env[16];
 	state_to_env(state, env);
-	write(patch_fd, buf, n);
 	int patch_crashed = 0;
 	char *tmp = predicate;
 	int branch_taken = eval(&tmp, env, &patch_crashed) != 0;
@@ -215,12 +214,12 @@ const void *dest(const struct STATE *state)
 		"[v8 %lld] [v9 %lld] [v10 %lld] [v11 %lld] "
 		"[v12 %lld] [v13 %lld] [v14 %lld] [v15 %lld]\n",
 		predicate ? predicate : "NULL", hit_count, branch_taken, 
-		(long long)v[0], (long long)v[1], (long long)v[2],
-		(long long)v[3], (long long)v[4], (long long)v[5],
-		(long long)v[6], (long long)v[7], (long long)v[8],
-		(long long)v[9], (long long)v[10], (long long)v[11],
-		(long long)v[12], (long long)v[13], (long long)v[14],
-		(long long)v[15]);
+		(long long)env[0], (long long)env[1], (long long)env[2],
+		(long long)env[3], (long long)env[4], (long long)env[5],
+		(long long)env[6], (long long)env[7], (long long)env[8],
+		(long long)env[9], (long long)env[10], (long long)env[11],
+		(long long)env[12], (long long)env[13], (long long)env[14],
+		(long long)env[15]);
 	write(patch_fd, buf, n);
 	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
 }

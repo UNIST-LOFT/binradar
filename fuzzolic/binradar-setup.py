@@ -63,6 +63,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 BENCHMARK_SCRIPTS = ROOT_DIR / "benchmarks" / "scripts"
 BRPATCH_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch.c"
 BRPATCH_PREFILTER_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-prefilter.c"
+BRPATCH_CACHED_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-cached.c"
 QEMU_STACKTRACE_RELEASE = ROOT_DIR / "utils" / "binradar-aflplusplus" / "afl-qemu-trace"
 
 
@@ -229,6 +230,89 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
                 f"e9tool failed with exit code {result.returncode}: "
                 f"cannot create {output.name}")
     return brprefilter
+
+
+def build_cached_binary(workdir: Path, configdir: Path,
+                        binradar_env: Dict[str, str]) -> "E9RuntimeMetadata":
+    """Build <BINARY>.brcached: the taosc-style single-predicate cache
+    artifact (benchmarks/loftix/brpatch-cached.c, TAOSC_PRED + dest()).
+
+    The cache plugin is self-contained (no brpatches.inc, no PATCH_ID
+    switching): it evaluates the TAOSC_PRED predicate at the patch site
+    and jumps to the first destinations entry when it holds.
+
+    Returns the extracted E9RuntimeMetadata.  Also dumps e9tool JSON
+    metadata as <BINARY>.brcached.json and persists the artifact's
+    metadata under the "brcached" prefix in binradar.env.
+    """
+    binary = binradar_env["BINARY"]
+    patch_loc = binradar_env["PATCH_LOC"]
+    original_binary = ensure_original_binary(workdir, configdir, binradar_env)
+    brcached = workdir / f"{binary}.brcached"
+    metadata = workdir / f"{binary}.brcached.json"
+
+    shutil.copy(BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
+    destinations_file = workdir / "destinations"
+    if not destinations_file.exists():
+        raise RuntimeError(
+            f"{destinations_file.name} not found in {workdir}: the cached "
+            f"artifact needs the patch destination")
+    dest = None
+    with destinations_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                dest = f"0x{line}"
+                break
+    if dest is None:
+        raise RuntimeError(f"no destination found in {destinations_file}")
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+           "e9compile", "brpatch-cached.c", f"-DTAOSC_DEST={dest}"]
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=workdir)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"e9compile failed with exit code {result.returncode}")
+
+    spec = InstrumentationSpec(
+        ((patch_loc, "if dest(state)@brpatch-cached goto"),))
+    for output, fmt in ((metadata, "json"), (brcached, None)):
+        cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"e9tool failed with exit code {result.returncode}: "
+                f"cannot create {output.name}")
+
+    e9_metadata = extract_e9_runtime_metadata(
+        brcached, metadata, original_binary, int(patch_loc, 0))
+    persist_e9_metadata(workdir, "brcached", e9_metadata)
+    return e9_metadata
+
+
+def build_cached_artifact(workdir: Path, configdir: Path,
+                          binradar_env: Dict[str, str],
+                          allocator: Optional[AllocatorTrace]) -> None:
+    """Build <BINARY>.brcached alongside .brpatched in the setup phase.
+
+    The cached plugin (brpatch-cached.c) is the taosc-style single-predicate
+    plugin and does not implement the CWE-119 allocator hooks; those
+    families skip the cached artifact with a warning.  The BRCACHED_* keys
+    are set in binradar_env so cmd_setup's save_env persists them.
+    """
+    if allocator is not None:
+        print("Warning: skipping .brcached build (brpatch-cached.c does "
+              "not implement the CWE-119 allocator hooks)")
+        return
+    try:
+        metadata = build_cached_binary(workdir, configdir, binradar_env)
+    except RuntimeError as e:
+        print(f"Error building cached binary: {e}")
+        exit(1)
+    binradar_utils.set_e9_metadata(
+        binradar_env, "brcached",
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
 
 
 def capture_states(workdir: Path, configdir: Path, config: dict,
@@ -951,6 +1035,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             metadata.exclude_ranges_str(), metadata.relocated_calls_str())
         print(f"Using CWE-119 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
+        build_cached_artifact(workdir, configdir, binradar_env, allocator)
         return
 
     if family == PredicateFamily.TAOSC_SPECIALIZED:
@@ -970,6 +1055,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                 metadata.exclude_ranges_str(), metadata.relocated_calls_str())
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
+            build_cached_artifact(workdir, configdir, binradar_env, allocator)
             return
         print(f"Error: {predicates_file.name} file not found in {workdir}")
         exit(1)
@@ -1106,10 +1192,21 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     binradar_utils.set_e9_metadata(
         binradar_env, "brpatched",
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    build_cached_artifact(workdir, configdir, binradar_env, allocator)
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
-    env = load_env(config_path)
+    # Start from the workdir's existing binradar.env (e.g. PREFILTER_* keys
+    # persisted by the prefilter phase) so setup's save_env never clobbers
+    # other artifacts' metadata; config.env overlays the subject fields.
+    env = dict()
+    env_path = workdir / "binradar.env"
+    if env_path.exists():
+        env = load_env(env_path)
+        # The removed unprefixed E9 storage keys must not survive.
+        env.pop("E9_EXCLUDE_RANGES", None)
+        env.pop("E9_RELOCATED_CALL_JUMPS", None)
+    env.update(load_env(config_path))
     if "POC_INPUT" not in env:
         print("Error: POC_INPUT not found in config.env")
         exit(1)

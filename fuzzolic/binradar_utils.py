@@ -7,7 +7,7 @@ from typing import List, Set, Tuple, Dict, Optional, Any
 import logger
 
 # E9 runtime metadata keys in binradar.env, prefixed per artifact so a
-# future .brcache can never borrow .brpatched layout values.  All current
+# future .brcached can never borrow .brpatched layout values.  All current
 # artifacts are built with the same e9patch invocation, so the values are
 # shared; selection is by prefix at load time.
 E9_METADATA_PREFIXES = {
