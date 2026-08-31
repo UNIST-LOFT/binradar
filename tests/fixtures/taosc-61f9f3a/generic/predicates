@@ -1,0 +1,17 @@
+max1 - rdx == ~max1
+max1 - rdx >= ~max1
+max1 + r8 > +max1
+max1 + r8 != +max1
+min2 << r8 == +max1
+min2 >> r8 == ~max1
+max1 / r8 <= +max1
+max1 % r8 <= +max1
+min2 & rdx <= +max1
+max1 | r8 > +max1
+max1 ^ r8 > +max1
+max64 * rdx >= +max1
+min64 * rdx < +max1
+min33 * r8 < +max1
+min17 + r8 < +max1
+min9 + r8 <= +max1
+rax / max1 < +max1
