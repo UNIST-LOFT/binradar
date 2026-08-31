@@ -26,6 +26,7 @@ Grammar source: utils/taosc/cwe119/filter.zig (61f9f3a).
 
 import importlib.util
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -536,6 +537,171 @@ def test_predicates_sha256_stable():
     assert sha(FIXTURES / "generic" / "predicates") == \
         sha(FIXTURES / "generic" / "predicates")
     assert len(sha(FIXTURES / "generic" / "predicates")) == 64
+
+
+# ---------------------------------------------------------------------------
+# Phase C: runtime parity (TAOSC_PREDICATE_COMPATIBILITY_PLAN §7)
+# ---------------------------------------------------------------------------
+
+# Scenario table shared with tests/test_brpatch_dest.c.  Each entry is
+# (name, descriptor, registers, stack bytes, clamps, expected_br).
+# The C test prints "RESULT <name> <br> <jumped>"; the Python mirror must
+# agree on <br> for every scenario.
+CWE119_SCENARIOS = [
+    # (name, predicate, regs, stack, clamps, expected_br)
+    ("ptr-reg-inside", "s->rax >= i->begin && s->rax < i->end",
+     [0x1000] + [0] * 15, b"", [(0x1000, 0x2000)], 0),
+    ("ptr-reg-outside", "s->rax >= i->begin && s->rax < i->end",
+     [0x3000] + [0] * 15, b"", [(0x1000, 0x2000)], 1),
+    ("ptr-reg-boundary", "s->rax >= i->begin && s->rax < i->end",
+     [0x2000] + [0] * 15, b"", [(0x1000, 0x2000)], 1),
+    ("ptr-stack-inside", "((uint64_t *)s->rsp)[0] >= i->begin && "
+     "((uint64_t *)s->rsp)[0] < i->end",
+     [0] * 16, (0x1500).to_bytes(8, "little"), [(0x1000, 0x2000)], 0),
+    ("ptr-zero-clamp", "s->rax >= i->begin && s->rax < i->end",
+     [0] * 16, b"", [(0, 0)], 1),
+    ("size-reg-equal", "1 * s->rbx < i->end - i->begin",
+     [0, 0x1000] + [0] * 14, b"", [(0x1000, 0x2000)], 1),
+    ("size-reg-inside", "1 * s->rbx < i->end - i->begin",
+     [0, 0x800] + [0] * 14, b"", [(0x1000, 0x2000)], 0),
+    ("size-reg-scale8", "8 * s->rbx < i->end - i->begin",
+     [0, 0x1ff] + [0] * 14, b"", [(0x1000, 0x2000)], 0),
+    ("size-reg-overflow", "8 * s->rbx < i->end - i->begin",
+     [0, 0x2000000000000000] + [0] * 14, b"", [(0x1000, 0x2000)], 2),
+    ("size-stack16", "2 * ((uint16_t *)s->rsp)[0] < i->end - i->begin",
+     [0] * 16, (0x500).to_bytes(2, "little"), [(0x1000, 0x2000)], 0),
+    ("size-stack8", "1 * ((uint8_t *)s->rsp)[0] < i->end - i->begin",
+     [0] * 16, b"\xff", [(0x1000, 0x2000)], 0),
+    ("ptr-multi-clamp", "s->rax >= i->begin && s->rax < i->end",
+     [0x2500] + [0] * 15, b"", [(0x1000, 0x2000), (0x2000, 0x3000)], 0),
+    ("size-multi-clamp-none", "1 * s->rbx < i->end - i->begin",
+     [0, 0x5000] + [0] * 14, b"", [(0x1000, 0x2000), (0x2000, 0x3000)], 1),
+]
+
+# jnz() scenarios: (name, patch_id, base, index, size, disp, clamps, br).
+JNZ_SCENARIOS = [
+    ("jnz-id0-inside", 0, 0x1000, 0, 1, 0, [(0x1000, 0x2000)], 0),
+    ("jnz-id1-inside", 1, 0x1000, 0, 1, 0, [(0x1000, 0x2000)], 0),
+    ("jnz-id1-outside", 1, 0x3000, 0, 1, 0, [(0x1000, 0x2000)], 1),
+    ("jnz-id1-indexed", 1, 0x1000, 2, 8, 0x10, [(0x1000, 0x2000)], 0),
+    ("jnz-id1-multi", 1, 0x2500, 0, 1, 0,
+     [(0x1000, 0x2000), (0x2000, 0x3000)], 0),
+]
+
+
+def _build_brpatches_inc(tmp_path):
+    """Write the brpatches.inc used by the C runtime test.
+
+    Descriptor ids must match the scenario ids in test_brpatch_dest.c:
+      0: "p0" (false)            1: "=p1p1" (generic, always true)
+      2: "c1p0"                  3: "c1s64i0"
+      4: "c2p1q1"                5: "c2s16i0q2"
+      6: "c2p1q8"                7: "c1s32i0" (malformed descriptor)
+    """
+    out = tmp_path / "brpatches.inc"
+    out.write_text(
+        'case 0:\n\treturn "p0";\n'
+        'case 1:\n\treturn "=p1p1";\n'
+        'case 2:\n\treturn "c1p0";\n'
+        'case 3:\n\treturn "c1s64i0";\n'
+        'case 4:\n\treturn "c2p1q1";\n'
+        'case 5:\n\treturn "c2s16i0q2";\n'
+        'case 6:\n\treturn "c2p1q8";\n'
+        'case 7:\n\treturn "c1s32i0";\n'
+        'default:\n\treturn "p0";\n')
+    return out
+
+
+def _run_c_runtime_test(tmp_path):
+    """Compile and run tests/test_brpatch_dest.c, returning its output."""
+    executable = tmp_path / "test_brpatch_dest"
+    subprocess.run([
+        "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
+        "-Wno-missing-field-initializers", "-Wno-unused-parameter",
+        "-Wno-unused-function", "-Wno-implicit-fallthrough",
+        "-DBRPATCH_CWE119", "-DBRPATCH_ALLOC_MALLOC",
+        f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
+        f"-I{tmp_path}",
+        str(ROOT / "tests" / "test_brpatch_dest.c"),
+        "-o", str(executable),
+    ], check=True)
+    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_c_runtime_parity():
+    """C dest()/jnz() and the Python mirror agree on every CWE-119 vector."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        _build_brpatches_inc(tmp_path)
+        output = _run_c_runtime_test(tmp_path)
+
+    results = {}
+    for line in output.splitlines():
+        if line.startswith("RESULT "):
+            fields = line.split()
+            results[fields[1]] = fields[2:]
+    assert "ALL-PASS" in output, output
+
+    # dest() scenarios: mirror must agree with the C branch value.
+    for name, text, regs, stack, clamps, expected in CWE119_SCENARIOS:
+        predicate = binradar_setup.parse_cwe119_predicate(text)
+        br = binradar_setup.cwe119_branch_taken(predicate, regs, stack, clamps)
+        assert br == expected, f"{name}: mirror br {br} != expected {expected}"
+        c_br, jumped = results[name]
+        assert int(c_br) == expected, \
+            f"{name}: C br {c_br} != expected {expected}"
+        assert jumped == ("1" if expected == 1 else "0"), \
+            f"{name}: C jumped {jumped} inconsistent with br {c_br}"
+
+    # jnz() scenarios: id 0 never jumps; id 1 jumps iff outside all clamps.
+    for name, patch_id, base, index, size, disp, clamps, expected in \
+            JNZ_SCENARIOS:
+        address = (base + index * size + disp) & ((1 << 64) - 1)
+        if patch_id == 0:
+            assert expected == 0
+        else:
+            inside = any(begin <= address < end for begin, end in clamps)
+            assert expected == (0 if inside else 1)
+        c_br, jumped = results[name]
+        assert int(c_br) == expected, f"{name}: C br {c_br}"
+        assert jumped == ("1" if expected == 1 else "0"), name
+
+    # Dynamic selection: patch_shm {id=1, v=7} overrides env PATCH_ID.
+    assert results["jnz-dynamic"] == ["1", "1", "1", "7"]
+
+    # Tracker semantics: mark arms the hooks; set_size/set_base record.
+    assert results["tracker-record"] == ["PASS"]
+    assert results["tracker-ring"] == ["PASS"]
+
+    # Malformed descriptor and unknown id follow the original path (br 0).
+    assert results["malformed-descriptor"] == ["0", "0"]
+    assert results["unknown-id"] == ["0", "0"]
+    # Generic entry still evaluates: "=p1p1" is always true.
+    assert results["generic-always-true"] == ["1", "1"]
+    # Patch id 0 never jumps.
+    assert results["patch-id-0"] == ["0", "0"]
+
+
+def test_c_runtime_parity_overflow_and_boundary():
+    """Overflow reports br 2; the size boundary is a branch (not <)."""
+    predicate = binradar_setup.parse_cwe119_predicate(
+        "8 * s->rbx < i->end - i->begin")
+    # 8 * 0x2000000000000000 overflows u64 -> br 2.
+    assert binradar_setup.cwe119_branch_taken(
+        predicate, [0, 0x2000000000000000] + [0] * 14, b"",
+        [(0x1000, 0x2000)]) == 2
+    # size == capacity is NOT < capacity -> branch (br 1).
+    assert binradar_setup.cwe119_branch_taken(
+        predicate, [0, 0x200] + [0] * 14, b"",
+        [(0x1000, 0x2000)]) == 1
+    # size < capacity -> no branch (br 0).
+    assert binradar_setup.cwe119_branch_taken(
+        predicate, [0, 0x1ff] + [0] * 14, b"",
+        [(0x1000, 0x2000)]) == 0
 
 
 def _main():

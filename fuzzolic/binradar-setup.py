@@ -808,6 +808,39 @@ def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, s
     return False, "evaluates to 0 on all captured states"
 
 
+def cwe119_branch_taken(predicate: Cwe119Predicate,
+                        registers: List[int], stack: bytes,
+                        clamps: List[Tuple[int, int]]) -> int:
+    """Mirror brpatch.c::cwe119_branch_taken (plan §7.3).
+
+    Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
+    2 (checked-multiply overflow: conservative no-jump, reported as br 2).
+    Cells use the unsigned 64-bit bit-domain; stack loads are x86-64
+    little-endian.  Zero-initialized clamps never match.
+    """
+    cell = predicate.cell
+    if isinstance(cell, RegisterCell):
+        value = registers[cell.register_index] & _MASK64
+    else:
+        width = cell.width_bits // 8
+        offset = cell.index * width
+        value = int.from_bytes(stack[offset:offset + width], "little")
+
+    if isinstance(predicate, Cwe119PointerPredicate):
+        for begin, end in clamps:
+            if begin <= value < end:
+                return 0
+        return 1
+
+    size = predicate.scale * value
+    if size > _MASK64:
+        return 2
+    for begin, end in clamps:
+        if size < (end - begin) & _MASK64:
+            return 0
+    return 1
+
+
 def _pipe_reader(rfd: int, chunks: List[bytes]):
     try:
         while True:
