@@ -34,8 +34,11 @@
 #include "stdlib.c"
 
 static int patch_fd = 2;
-#define PREFILTER_MAX_HITS 65536
+#define PREFILTER_DEFAULT_MAX_HITS 65536
+#define PREFILTER_DEFAULT_MAX_BYTES (8 * 1024 * 1024)
 static uint64_t hit_count = 0;
+static uint64_t prefilter_max_hits = PREFILTER_DEFAULT_MAX_HITS;
+static uint64_t prefilter_max_bytes = PREFILTER_DEFAULT_MAX_BYTES;
 
 /*
  * Get an environment variable and parse as a number.
@@ -71,7 +74,154 @@ void init(int argc, const char *const *argv, char **envp)
 	uint32_t s = getenvul("PATCH_FD");
 	if (s > 2)
 		patch_fd = (int)s;
+	uint64_t h = getenvull("PREFILTER_MAX_HITS");
+	if (h > 0)
+		prefilter_max_hits = h;
+	uint64_t b = getenvull("PREFILTER_MAX_BYTES");
+	if (b > 0)
+		prefilter_max_bytes = b;
 }
+
+#ifdef BRPATCH_CWE119
+#if !defined(BRPATCH_ALLOC_MALLOC) && !defined(BRPATCH_ALLOC_CALLOC) \
+		&& !defined(BRPATCH_ALLOC_REALLOC)
+#error "BRPATCH_CWE119 requires one of BRPATCH_ALLOC_MALLOC/CALLOC/REALLOC"
+#endif
+
+/*
+ * CWE-119 allocation tracker (port of utils/taosc/cwe119/common.c): the
+ * allocator call chain is instrumented with mark/set_size/set_base hooks
+ * before the patch site, so the 256 clamps are history-dependent and
+ * cannot be reconstructed from patch-site registers.
+ */
+static uint64_t trace;
+
+struct clamp {
+	uint64_t begin, end;
+};
+
+static struct clamp buffers[256];
+static uint8_t next;
+
+void mark(uint8_t bit)
+{
+	const uint64_t mask = 1ULL << bit;
+	trace &= ~mask;                        /* unset bit */
+	trace |= mask - 1ULL;                  /* set lower bits */
+}
+
+void set_base(uint64_t rax)
+{
+	if (trace == 1) {
+		buffers[next].begin = rax;
+		buffers[next++].end += rax;
+	}
+}
+
+#ifdef BRPATCH_ALLOC_MALLOC
+void set_size(uint64_t rdi, uint64_t rsi)
+{
+	(void)rsi;
+	if (trace == 1)
+		buffers[next].end = rdi;
+}
+#elif defined(BRPATCH_ALLOC_CALLOC)
+void set_size(uint64_t rdi, uint64_t rsi)
+{
+	if (trace == 1)
+		buffers[next].end = rdi * rsi;
+}
+#elif defined(BRPATCH_ALLOC_REALLOC)
+void set_size(uint64_t rdi, uint64_t rsi)
+{
+	(void)rdi;
+	if (trace == 1)
+		buffers[next].end = rsi;
+}
+#endif
+
+/*
+ * Binary full-context snapshot record (plan §8): a versioned fixed header,
+ * all 256 {begin,end} clamps, the 16 register bit patterns, then exactly
+ * stack-size bytes starting at state->rsp.  Written as one length-checked
+ * record under a mutex with a full-write loop so concurrent hits cannot
+ * interleave records.  Total captured bytes are bounded; when the hit or
+ * byte limit is reached the truncation flag is set and Python fails open
+ * rather than evaluating partial history as complete evidence.
+ */
+#define PREFILTER_SNAPSHOT_VERSION 1
+#define PREFILTER_SNAPSHOT_MAGIC 0x42525046u /* "BRPF" */
+
+struct prefilter_snapshot_header {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t stack_size;
+	uint64_t flags; /* bit 0: truncated */
+};
+
+static uint64_t captured_bytes = 0;
+static int truncated = 0;
+static mutex_t snapshot_mutex = MUTEX_INITIALIZER;
+
+static void write_all(int fd, const void *buf, size_t count)
+{
+	const char *p = buf;
+	while (count > 0) {
+		ssize_t n = write(fd, p, count);
+		if (n <= 0)
+			return; /* pipe closed: drop the rest of the record */
+		p += n;
+		count -= (size_t)n;
+	}
+}
+
+static void capture_snapshot(const struct STATE *state, uint64_t stack_size)
+{
+	if (truncated)
+		return;
+	const uint64_t record_size = sizeof(struct prefilter_snapshot_header)
+		+ sizeof(buffers) + 16 * sizeof(uint64_t) + stack_size;
+	if (hit_count >= prefilter_max_hits
+			|| captured_bytes + record_size > prefilter_max_bytes) {
+		/* Emit a header-only marker with the truncation flag so the
+		 * offline evaluator fails open instead of treating partial
+		 * history as complete evidence. */
+		truncated = 1;
+		struct prefilter_snapshot_header marker = {
+			.magic = PREFILTER_SNAPSHOT_MAGIC,
+			.version = PREFILTER_SNAPSHOT_VERSION,
+			.stack_size = 0,
+			.flags = 1,
+		};
+		write_all(patch_fd, &marker, sizeof(marker));
+		return;
+	}
+	while (mutex_lock(&snapshot_mutex) < 0);
+	struct prefilter_snapshot_header header = {
+		.magic = PREFILTER_SNAPSHOT_MAGIC,
+		.version = PREFILTER_SNAPSHOT_VERSION,
+		.stack_size = stack_size,
+		.flags = 0,
+	};
+	write_all(patch_fd, &header, sizeof(header));
+	write_all(patch_fd, buffers, sizeof(buffers));
+	const uint64_t regs[16] = {
+		(uint64_t)state->rax, (uint64_t)state->rbx,
+		(uint64_t)state->rcx, (uint64_t)state->rdx,
+		(uint64_t)state->rsi, (uint64_t)state->rdi,
+		(uint64_t)state->rsp, (uint64_t)state->rbp,
+		(uint64_t)state->r8, (uint64_t)state->r9,
+		(uint64_t)state->r10, (uint64_t)state->r11,
+		(uint64_t)state->r12, (uint64_t)state->r13,
+		(uint64_t)state->r14, (uint64_t)state->r15,
+	};
+	write_all(patch_fd, regs, sizeof(regs));
+	write_all(patch_fd, (const void *)state->rsp, stack_size);
+	captured_bytes += record_size;
+	hit_count++;
+	mutex_unlock(&snapshot_mutex);
+}
+#endif /* BRPATCH_CWE119 */
 
 /*
  * Capture registers in taosc's Variables.RegisterEnum order so the offline
@@ -79,7 +229,13 @@ void init(int argc, const char *const *argv, char **envp)
  */
 const void *dest(const struct STATE *state)
 {
-	if (hit_count < PREFILTER_MAX_HITS) {
+#ifdef BRPATCH_CWE119
+	uint64_t stack_size = getenvull("PREFILTER_STACK_SIZE");
+	if (stack_size > 0 && stack_size <= 0x100000)
+		capture_snapshot(state, stack_size);
+	else
+#endif
+	if (hit_count < prefilter_max_hits) {
 		const int64_t v[] = {
 			state->rax, state->rbx, state->rcx, state->rdx,
 			state->rsi, state->rdi, state->rsp, state->rbp,

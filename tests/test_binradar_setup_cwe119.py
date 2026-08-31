@@ -26,6 +26,7 @@ Grammar source: utils/taosc/cwe119/filter.zig (61f9f3a).
 
 import importlib.util
 import re
+import struct
 import subprocess
 from pathlib import Path
 
@@ -838,6 +839,214 @@ def test_extract_relocated_call_jumps_requires_patch_site():
         assert "resolves to 0 instrumented site(s)" in str(e)
     else:
         raise AssertionError("missing patch site must fail")
+
+
+# ---------------------------------------------------------------------------
+# Phase E: full-context prefilter (TAOSC_PREDICATE_COMPATIBILITY_PLAN §8)
+# ---------------------------------------------------------------------------
+
+def _build_snapshot(clamps, regs, stack, truncated=False):
+    """Serialize one CWE-119 snapshot record (mirror of the C layout)."""
+    header = binradar_setup.PREFILTER_SNAPSHOT_HEADER.pack(
+        binradar_setup.PREFILTER_SNAPSHOT_MAGIC,
+        binradar_setup.PREFILTER_SNAPSHOT_VERSION,
+        len(stack), 1 if truncated else 0)
+    clamp_bytes = b"".join(
+        struct.pack("<QQ", begin, end) for begin, end in clamps)
+    reg_bytes = struct.pack("<" + "Q" * 16, *regs)
+    return header + clamp_bytes + reg_bytes + stack
+
+
+def test_parse_cwe119_snapshots_roundtrip():
+    """A serialized record round-trips through the parser."""
+    clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
+    regs = tuple(range(16))
+    stack = bytes(range(64))
+    data = _build_snapshot(clamps, regs, stack)
+    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(data)
+    assert truncated is False
+    assert len(snapshots) == 1
+    snap = snapshots[0]
+    assert snap.clamps[0] == (0x1000, 0x2000)
+    assert snap.clamps[1] == (0, 0)
+    assert snap.registers == regs
+    assert snap.stack == stack
+
+
+def test_parse_cwe119_snapshots_multiple_and_truncation():
+    """Many records parse; a truncation marker stops and flags."""
+    clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
+    regs = tuple(range(16))
+    stack = bytes(64)
+    data = (_build_snapshot(clamps, regs, stack)
+            + _build_snapshot(clamps, regs, stack)
+            + _build_snapshot(clamps, regs, stack, truncated=True))
+    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(data)
+    assert truncated is True
+    assert len(snapshots) == 2  # complete records before the marker
+
+
+def test_parse_cwe119_snapshots_malformed():
+    """Bad magic/version and partial trailing records are not evidence."""
+    clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
+    regs = tuple(range(16))
+    stack = bytes(64)
+    good = _build_snapshot(clamps, regs, stack)
+    # Bad magic.
+    bad_magic = bytearray(good)
+    bad_magic[0:4] = b"XXXX"
+    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(bytes(bad_magic))
+    assert snapshots == [] and truncated is False
+    # Partial trailing record (header + half the clamps).
+    partial = good + good[:100]
+    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(partial)
+    assert len(snapshots) == 1 and truncated is False
+    # Bad version after a good record.
+    bad_version = bytearray(good + _build_snapshot(clamps, regs, stack))
+    bad_version[len(good) + 4:len(good) + 8] = struct.pack("<I", 99)
+    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(bytes(bad_version))
+    assert len(snapshots) == 1 and truncated is False
+
+
+def test_cwe119_snapshot_evaluator_matches_branch_taken():
+    """The snapshot evaluator uses the same rules as the plain evaluator."""
+    clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
+    regs = [0x1000] + [0] * 15  # rax inside the clamp
+    stack = bytes(64)
+    snap = binradar_setup.Cwe119Snapshot(
+        tuple(clamps), tuple(regs), stack)
+    predicate = binradar_setup.parse_cwe119_predicate(
+        "s->rax >= i->begin && s->rax < i->end")
+    assert binradar_setup.cwe119_snapshot_branch_taken(predicate, snap) == 0
+    # Outside the clamp -> branch.
+    regs_out = [0x3000] + [0] * 15
+    snap_out = binradar_setup.Cwe119Snapshot(
+        tuple(clamps), tuple(regs_out), stack)
+    assert binradar_setup.cwe119_snapshot_branch_taken(predicate, snap_out) == 1
+    # Stack cell: uint16_t at index 0 reads the first two stack bytes.
+    stack16 = bytes([0x00, 0x05]) + bytes(62)
+    snap16 = binradar_setup.Cwe119Snapshot(
+        tuple(clamps), tuple([0] * 16), stack16)
+    size_pred = binradar_setup.parse_cwe119_predicate(
+        "2 * ((uint16_t *)s->rsp)[0] < i->end - i->begin")
+    # 2 * 0x500 = 0xa00 < 0x1000 -> no branch.
+    assert binradar_setup.cwe119_snapshot_branch_taken(size_pred, snap16) == 0
+    # Overflow: 8 * 0x2000000000000000 -> br 2.
+    regs_ovf = [0, 0x2000000000000000] + [0] * 14
+    snap_ovf = binradar_setup.Cwe119Snapshot(
+        tuple(clamps), tuple(regs_ovf), stack)
+    ovf_pred = binradar_setup.parse_cwe119_predicate(
+        "8 * s->rbx < i->end - i->begin")
+    assert binradar_setup.cwe119_snapshot_branch_taken(ovf_pred, snap_ovf) == 2
+
+
+def _run_c_prefilter_test(tmp_path):
+    """Compile and run tests/test_brpatch_prefilter.c, returning output."""
+    executable = tmp_path / "test_brpatch_prefilter"
+    subprocess.run([
+        "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
+        "-Wno-missing-field-initializers", "-Wno-unused-parameter",
+        "-Wno-unused-function", "-Wno-implicit-fallthrough",
+        "-DBRPATCH_CWE119", "-DBRPATCH_ALLOC_MALLOC",
+        f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
+        str(ROOT / "tests" / "test_brpatch_prefilter.c"),
+        "-o", str(executable),
+    ], check=True)
+    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_c_snapshot_capture_parity():
+    """C capture records parse with the Python parser and agree field-wise.
+
+    The C test drives dest() with a constructed STATE and a recorded
+    clamp {0x6000, 0x200}; the Python parser must recover the same
+    header, clamps, registers, and stack bytes.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        output = _run_c_prefilter_test(Path(tmp))
+
+    results = {}
+    for line in output.splitlines():
+        if line.startswith("RESULT "):
+            fields = line.split()
+            results[fields[1]] = fields[2:]
+    assert "ALL-PASS" in output, output
+
+    # Header: magic, version 1, stack_size 64, flags 0.
+    magic, version, stack_size, flags = results["snap-header"]
+    assert int(magic) == binradar_setup.PREFILTER_SNAPSHOT_MAGIC
+    assert int(version) == binradar_setup.PREFILTER_SNAPSHOT_VERSION
+    assert int(stack_size) == 64
+    assert int(flags) == 0
+
+    # Clamp 0 is the recorded allocation {0x6000, 0x200}; clamp 1 is
+    # zero-initialized and must never match.
+    assert results["snap-clamp0"] == ["6000", "6200"]
+    assert results["snap-clamp1"] == ["0", "0"]
+
+    # Registers: rax..r15 bit patterns (rsp is the stack buffer address).
+    regs = [int(v, 16) for v in results["snap-regs"]]
+    assert regs[0] == 0x1111 and regs[1] == 0x2222 and regs[15] == 0x1000
+    assert regs[6] != 0  # rsp points at the stack buffer
+
+    # Stack bytes: 0xa0..0xdf.
+    stack = bytes(int(v, 16) for v in results["snap-stack"])
+    assert stack == bytes(range(0xa0, 0xe0))
+
+    # Truncation marker: magic, stack_size 0, flags 1.
+    assert results["snap-trunc"] == [
+        str(binradar_setup.PREFILTER_SNAPSHOT_MAGIC), "0", "1"]
+
+    # Generic path still emits the sbsv line.
+    assert results["snap-generic"][0] == "[prefilter-state]"
+    assert results["snap-generic"][1] == "[v0"
+    assert results["snap-generic"][2] == "66]"
+
+
+def test_cwe119_prefilter_decision_parity():
+    """Prefilter decisions equal the C evaluator on the same snapshots.
+
+    The C test's recorded snapshot (clamp {0x6000, 0x200}, rax 0x1111)
+    is evaluated by the Python snapshot evaluator: a pointer predicate on
+    rax (0x1111 outside the clamp) branches; a size predicate on rbx
+    (0x2222 * 1 = 0x2222 >= 0x200) branches; a pointer predicate on a
+    register inside the clamp does not.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        output = _run_c_prefilter_test(Path(tmp))
+
+    results = {}
+    for line in output.splitlines():
+        if line.startswith("RESULT "):
+            fields = line.split()
+            results[fields[1]] = fields[2:]
+
+    clamps = [(int(results["snap-clamp0"][0], 16),
+               int(results["snap-clamp0"][1], 16))] + [(0, 0)] * 255
+    regs = [int(v, 16) for v in results["snap-regs"]]
+    stack = bytes(int(v, 16) for v in results["snap-stack"])
+    snap = binradar_setup.Cwe119Snapshot(tuple(clamps), tuple(regs), stack)
+
+    # rax = 0x1111 is outside {0x6000, 0x6200} -> branch (br 1).
+    ptr_rax = binradar_setup.parse_cwe119_predicate(
+        "s->rax >= i->begin && s->rax < i->end")
+    assert binradar_setup.cwe119_snapshot_branch_taken(ptr_rax, snap) == 1
+    # rbx = 0x2222, scale 1: 0x2222 >= 0x200 -> branch.
+    size_rbx = binradar_setup.parse_cwe119_predicate(
+        "1 * s->rbx < i->end - i->begin")
+    assert binradar_setup.cwe119_snapshot_branch_taken(size_rbx, snap) == 1
+    # A register inside the clamp (0x6000) does not branch.
+    regs_inside = list(regs)
+    regs_inside[0] = 0x6000
+    snap_inside = binradar_setup.Cwe119Snapshot(
+        tuple(clamps), tuple(regs_inside), stack)
+    assert binradar_setup.cwe119_snapshot_branch_taken(ptr_rax, snap_inside) == 0
 
 
 def _main():

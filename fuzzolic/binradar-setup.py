@@ -888,6 +888,82 @@ def cwe119_branch_taken(predicate: Cwe119Predicate,
     return 1
 
 
+# ---------------------------------------------------------------------------
+# CWE-119 full-context prefilter snapshots (plan §8)
+# ---------------------------------------------------------------------------
+
+# Binary record written by brpatch-prefilter.c::capture_snapshot:
+#   header:  magic u32, version u32, stack_size u64, flags u64
+#   clamps:  256 * {begin u64, end u64}
+#   regs:    16 * u64 (rax..r15)
+#   stack:   stack_size bytes starting at state->rsp
+PREFILTER_SNAPSHOT_MAGIC = 0x42525046  # "BRPF"
+PREFILTER_SNAPSHOT_VERSION = 1
+PREFILTER_SNAPSHOT_FLAG_TRUNCATED = 1
+PREFILTER_SNAPSHOT_HEADER = struct.Struct("<IIQQ")
+PREFILTER_SNAPSHOT_CLAMPS = struct.Struct("<" + "QQ" * 256)
+PREFILTER_SNAPSHOT_REGS = struct.Struct("<" + "Q" * 16)
+
+
+@dataclass(frozen=True)
+class Cwe119Snapshot:
+    """One captured patch-site full context (plan §8)."""
+    clamps: Tuple[Tuple[int, int], ...]  # 256 (begin, end) pairs
+    registers: Tuple[int, ...]           # 16 u64 bit patterns, rax..r15
+    stack: bytes                         # exactly stack-size bytes
+    truncated: bool = False              # capture hit the bound
+
+
+def parse_cwe119_snapshots(data: bytes) -> Tuple[List[Cwe119Snapshot], bool]:
+    """Parse the binary snapshot stream from the capture pipe.
+
+    Returns (snapshots, truncated).  A header-only record with the
+    truncation flag set marks the end of complete evidence; any trailing
+    partial record is dropped.  Malformed records (bad magic/version,
+    truncated body) stop parsing at the first bad record.
+    """
+    snapshots: List[Cwe119Snapshot] = []
+    truncated = False
+    offset = 0
+    while offset + PREFILTER_SNAPSHOT_HEADER.size <= len(data):
+        magic, version, stack_size, flags = \
+            PREFILTER_SNAPSHOT_HEADER.unpack_from(data, offset)
+        if magic != PREFILTER_SNAPSHOT_MAGIC or version != \
+                PREFILTER_SNAPSHOT_VERSION:
+            break
+        offset += PREFILTER_SNAPSHOT_HEADER.size
+        if flags & PREFILTER_SNAPSHOT_FLAG_TRUNCATED:
+            truncated = True
+            break
+        body = PREFILTER_SNAPSHOT_CLAMPS.size + PREFILTER_SNAPSHOT_REGS.size \
+            + stack_size
+        if offset + body > len(data):
+            break  # partial trailing record: not complete evidence
+        clamps_raw = PREFILTER_SNAPSHOT_CLAMPS.unpack_from(data, offset)
+        offset += PREFILTER_SNAPSHOT_CLAMPS.size
+        regs = PREFILTER_SNAPSHOT_REGS.unpack_from(data, offset)
+        offset += PREFILTER_SNAPSHOT_REGS.size
+        stack = data[offset:offset + stack_size]
+        offset += stack_size
+        snapshots.append(Cwe119Snapshot(
+            tuple((clamps_raw[i], clamps_raw[i + 1])
+                  for i in range(0, len(clamps_raw), 2)),
+            regs, stack))
+    return snapshots, truncated
+
+
+def cwe119_snapshot_branch_taken(predicate: Cwe119Predicate,
+                                snapshot: Cwe119Snapshot) -> int:
+    """Evaluate one CWE-119 descriptor against one captured snapshot.
+
+    Same cell, unsigned comparison, checked-multiply, and !any_match rules
+    as brpatch.c::cwe119_branch_taken (plan §8): 0 = no jump, 1 = jump,
+    2 = checked-multiply overflow (conservative no-jump).
+    """
+    return cwe119_branch_taken(predicate, list(snapshot.registers),
+                               snapshot.stack, list(snapshot.clamps))
+
+
 def _pipe_reader(rfd: int, chunks: List[bytes]):
     try:
         while True:
@@ -945,11 +1021,20 @@ def resolve_poc(configdir: Path, workdir: Path, poc_input: str) -> Optional[Path
     return None
 
 
-def compile_capture_plugin(workdir: Path) -> None:
-    """Copy and compile brpatch-prefilter.c in the workdir (e9compile)."""
+def compile_capture_plugin(workdir: Path,
+                           allocator: Optional[AllocatorTrace] = None) -> None:
+    """Copy and compile brpatch-prefilter.c in the workdir (e9compile).
+
+    CWE-119 families compile the allocation tracker and binary snapshot
+    capture in (BRPATCH_CWE119 + the allocator kind define); generic
+    families keep the sbsv register capture.
+    """
     shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
     cmd = ["guix", "shell", "e9patch@1.0.1", "--",
            "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
+    if allocator is not None:
+        cmd += ["-DBRPATCH_CWE119",
+                f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -957,8 +1042,13 @@ def compile_capture_plugin(workdir: Path) -> None:
 
 
 def build_capture_binary(workdir: Path, configdir: Path, config: dict,
-                         patch_loc: str) -> Path:
-    """Instrument the original binary with the capture plugin at PATCH_LOC.
+                         patch_loc: str,
+                         allocator: Optional[AllocatorTrace] = None) -> Path:
+    """Instrument the original binary with the capture plugin.
+
+    CWE-119 families use the same ordered multipoint instrumentation spec
+    as the final binary (allocator hooks then the patch site, plan §8);
+    generic families patch the single PATCH_LOC site.
 
     Returns the path of <BINARY>.brprefilter.  Also dumps e9tool JSON
     metadata (needed by extract_trampoline_info) as
@@ -967,11 +1057,14 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     original_binary = ensure_original_binary(workdir, configdir, config)
     brprefilter = workdir / f"{config['BINARY']}.brprefilter"
     metadata = workdir / f"{config['BINARY']}.brprefilter.json"
-    for output, fmt in ((metadata, ["--format=json"]), (brprefilter, [])):
-        cmd = ["guix", "shell", "e9patch@1.0.1", "--", "e9tool"] + fmt + [
-            "-100", "-M", f"addr={patch_loc}",
-            "-P", "if dest(state)@brpatch-prefilter goto",
-            "-o", str(output), str(original_binary)]
+    if allocator is not None:
+        spec = build_instrumentation_spec(
+            allocator, patch_loc, "if dest(state)@brpatch-prefilter goto")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_loc, "if dest(state)@brpatch-prefilter goto"),))
+    for output, fmt in ((metadata, "json"), (brprefilter, None)):
+        cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
         print(" ".join(cmd))
         result = subprocess.run(cmd, cwd=workdir)
         if result.returncode != 0:
@@ -982,25 +1075,32 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
 
 
 def capture_states(workdir: Path, configdir: Path, config: dict,
-                   patch_loc: str) -> Optional[List[List[int]]]:
+                   patch_loc: str,
+                   allocator: Optional[AllocatorTrace] = None,
+                   stack_size: Optional[int] = None,
+                   ) -> Optional[Union[List[List[int]], List[Cwe119Snapshot]]]:
     """Run the POC once against <BINARY>.brprefilter and return the
-    captured STATE vectors (each a list of 16 signed ints).
+    captured patch-site states.
 
-    Returns None if the run failed (timeout / subprocess error) so the
-    caller can fail open.
+    Generic families return a list of 16-slot STATE vectors; CWE-119
+    families return a list of Cwe119Snapshot records (clamps + registers +
+    stack).  Returns None if the run failed (timeout / subprocess error) so
+    the caller can fail open.
     """
     if not QEMU_STACKTRACE_RELEASE.exists():
         print(f"Warning: {QEMU_STACKTRACE_RELEASE} not found")
         return None
 
-    compile_capture_plugin(workdir)
-    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc)
+    compile_capture_plugin(workdir, allocator)
+    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc,
+                                       allocator)
 
     extracted = extract_trampoline_info(
         brprefilter,
         workdir / f"{config['BINARY']}.brprefilter.json",
         ensure_original_binary(workdir, configdir, config),
         int(patch_loc, 0),
+        strict=(allocator is not None),
     )
     try:
         exclude_addrs = [extracted["PATCH_RESERVE_RANGE"],
@@ -1036,6 +1136,14 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     env["AFL_USE_QASAN"] = "1"
     env["PATCH_ID"] = "0"
     env["PATCH_FD"] = str(wfd)
+    if allocator is not None:
+        if stack_size is None:
+            print("Warning: CWE-119 prefilter requires stack-size; "
+                  "failing open")
+            os.close(rfd)
+            os.close(wfd)
+            return None
+        env["PREFILTER_STACK_SIZE"] = str(stack_size)
     # The run is expected to crash: the capture plugin never jumps, so the
     # program follows the original buggy path.  We only need the pipe data.
     proc = subprocess.Popen(command, stdout=subprocess.PIPE,
@@ -1063,8 +1171,15 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     finally:
         thread.join()
 
-    data = b"".join(chunks).decode(errors="ignore")
-    return parse_state_lines(data)
+    data = b"".join(chunks)
+    if allocator is not None:
+        snapshots, truncated = parse_cwe119_snapshots(data)
+        if truncated:
+            print("Warning: CWE-119 prefilter capture truncated; "
+                  "failing open (partial history is not complete evidence)")
+            return None
+        return snapshots
+    return parse_state_lines(data.decode(errors="ignore"))
 
 
 def parse_state_lines(data: str) -> List[List[int]]:
@@ -1924,7 +2039,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
     # has no predicate list to compact, so the prefilter is a no-op and
     # FILTER remains the behavioral gate.
     try:
-        family, _ = detect_predicate_family(workdir)
+        family, allocator = detect_predicate_family(workdir)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -1950,6 +2065,57 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         print(f"Error: {patch_location_file.name} file not found in {workdir}")
         sys.exit(1)
     patch_loc = f"0x{patch_location_file.read_text().strip()}"
+
+    if family == PredicateFamily.CWE119_ERM:
+        # Full-context prefilter (plan §8): the capture binary carries the
+        # same allocator hooks as the final binary and dumps binary
+        # snapshots (clamps + registers + stack) at the patch site.  A
+        # candidate passes iff it branches on at least one complete
+        # captured state.  Truncation fails open (never rejects).
+        assert allocator is not None
+        stack_size_file = workdir / "stack-size"
+        if not stack_size_file.exists():
+            print(f"Error: {stack_size_file.name} file not found in "
+                  f"{workdir} (CWE-119 prefilter needs the stack size)")
+            sys.exit(1)
+        stack_size = int(stack_size_file.read_text().strip())
+        snapshots = capture_states(workdir, configdir, config, patch_loc,
+                                   allocator, stack_size)
+        if snapshots is None:
+            print("Warning: CWE-119 prefilter capture failed; keeping all "
+                  "predicates (fail-open)")
+            results = [(source_id, True, "capture failed (fail-open)",
+                        predicate)
+                       for source_id, predicate in predicate_records]
+            write_prefilter(prefilter_file, results, time.time() - start,
+                            kind=family.value,
+                            sha256=predicates_sha256(predicates_file))
+            sys.exit(0)
+        if not snapshots:
+            print("Warning: patch site never hit on the POC; discarding "
+                  "all predicates")
+            results = [(source_id, False, "patch site never hit",
+                        predicate)
+                       for source_id, predicate in predicate_records]
+            write_prefilter(prefilter_file, results, time.time() - start,
+                            kind=family.value,
+                            sha256=predicates_sha256(predicates_file))
+            sys.exit(0)
+
+        print(f"Captured {len(snapshots)} CWE-119 snapshot(s)")
+        results = []
+        for source_id, predicate in predicate_records:
+            parsed = parse_cwe119_predicate(predicate)
+            passed = any(
+                cwe119_snapshot_branch_taken(parsed, snapshot) == 1
+                for snapshot in snapshots)
+            note = "" if passed else \
+                "evaluates to 0 on all captured snapshots"
+            results.append((source_id, passed, note, predicate))
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
+        sys.exit(0)
 
     states = capture_states(workdir, configdir, config, patch_loc)
     if states is None:
