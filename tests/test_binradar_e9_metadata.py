@@ -494,6 +494,72 @@ def test_cached_artifact_skipped_for_allocator_families(tmp_path, monkeypatch):
     assert "BRCACHED_E9_EXCLUDE_RANGES" not in binradar_env
 
 
+def test_detect_family_cwe119_erm_empty_predicates_no_raise(tmp_path):
+    """Empty CWE-119 predicates classify as CWE119_ERM, not an error."""
+    workdir = tmp_path / "workdir"
+    trace = workdir / "trace"
+    trace.mkdir(parents=True)
+    (trace / "realloc.calls").write_text("0 4066e4\n")
+    (trace / "realloc.returns").write_text("4066f0\n")
+    (trace / "crash.address").write_text("410735")
+    (workdir / "patch-location").write_text("410736")
+    (workdir / "predicates").write_text("")
+    family, allocator = binradar_setup.detect_predicate_family(workdir)
+    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+    assert allocator is not None
+
+
+def test_detect_family_cwe119_erm_missing_predicates_no_raise(tmp_path):
+    """Missing CWE-119 predicates classify as CWE119_ERM, not an error."""
+    workdir = tmp_path / "workdir"
+    trace = workdir / "trace"
+    trace.mkdir(parents=True)
+    (trace / "realloc.calls").write_text("0 4066e4\n")
+    (trace / "realloc.returns").write_text("4066f0\n")
+    (trace / "crash.address").write_text("410735")
+    (workdir / "patch-location").write_text("410736")
+    family, allocator = binradar_setup.detect_predicate_family(workdir)
+    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+    assert allocator is not None
+
+
+def test_prepare_patch_empty_predicates_builds_zero_candidates(
+        tmp_path, monkeypatch):
+    """Empty predicates build brpatched + brcached with TOTAL_PATCHES=0."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "patch-location").write_text("410735")
+    (workdir / "destinations").write_text("4106d8\n")
+    (workdir / "predicates").write_text("")
+    orig = workdir / "imginfo.orig"
+    orig.write_bytes(b"\x7fELF" + b"\0" * 100)
+    binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        if cmd[0] == "guix" and "e9tool" in cmd:
+            out = cmd[cmd.index("-o") + 1]
+            Path(out).write_bytes(b"\x7fELF" + b"\0" * 100)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(binradar_setup.subprocess, "run", fake_run)
+    metadata = binradar_setup.E9RuntimeMetadata(
+        (binradar_setup.AddressRange(0x42209000, 0x4220a000),),
+        ((0x42209114, 0x410735, 0x410737),))
+    monkeypatch.setattr(
+        binradar_setup, "extract_e9_runtime_metadata",
+        lambda *args, **kwargs: metadata)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, binradar_env)
+    assert binradar_env["TOTAL_PATCHES"] == "0"
+    assert binradar_env["BRPATCHED_E9_EXCLUDE_RANGES"] == \
+        "0x42209000-0x4220a000"
+    assert binradar_env["BRCACHED_E9_EXCLUDE_RANGES"] == \
+        "0x42209000-0x4220a000"
+    assert (workdir / "imginfo.brpatched").exists()
+    assert (workdir / "imginfo.brcached").exists()
+    assert (workdir / "brpatches.inc").exists()
+
+
 # ---------------------------------------------------------------------------
 # P0-2: relocated-call propagation to symbolic tracer runs
 # ---------------------------------------------------------------------------

@@ -537,15 +537,14 @@ def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[Al
             if (workdir / "patch-location").exists() else ""
         if crash_address == patch_location:
             return PredicateFamily.CWE119_DIRECT, allocator
+        # Missing or empty predicates are valid: setup still builds the
+        # artifacts with zero candidates (TOTAL_PATCHES=0) and binradar.py
+        # handles the no-patch case.
         if not predicates_file.exists():
-            raise ValueError(
-                f"{predicates_file.name} not found in {workdir} "
-                "(CWE-119 ERM requires non-empty predicates)")
+            return PredicateFamily.CWE119_ERM, allocator
         records = load_predicates(predicates_file)
         if not records:
-            raise ValueError(
-                f"{predicates_file.name} is empty in {workdir} "
-                "(CWE-119 ERM requires non-empty predicates)")
+            return PredicateFamily.CWE119_ERM, allocator
         for source_line, predicate in records:
             if classify_predicate_line(predicate) != PredicateFamily.CWE119_ERM.value:
                 raise ValueError(

@@ -1057,18 +1057,29 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
             build_cached_artifact(workdir, configdir, binradar_env, allocator)
             return
-        print(f"Error: {predicates_file.name} file not found in {workdir}")
-        exit(1)
+        # No prebuilt binary and no predicates: build the artifacts with
+        # zero candidates (TOTAL_PATCHES=0); binradar.py handles the
+        # no-patch case.
+        print(f"Warning: no {predicates_file.name} and no prebuilt "
+              f"brpatched binary in {workdir}; building with zero "
+              f"candidate patches")
 
-    # GENERIC_ERM or CWE119_ERM: parse every line strictly.
-    try:
-        predicate_records = _parse_predicate_records(predicates_file, family)
-    except ValueError as e:
-        print(f"Error: {e}")
-        exit(1)
+    # GENERIC_ERM or CWE119_ERM: parse every line strictly.  A missing
+    # predicates file (specialized family without a prebuilt binary) is
+    # treated as an empty list.
+    predicate_records: List[PredicateRecord] = []
+    if predicates_file.exists():
+        try:
+            predicate_records = _parse_predicate_records(predicates_file,
+                                                         family)
+        except ValueError as e:
+            print(f"Error: {e}")
+            exit(1)
     if not predicate_records:
-        print(f"Error: {predicates_file.name} is empty in {workdir}")
-        exit(1)
+        # Empty predicate list: build the artifacts with zero candidates
+        # (TOTAL_PATCHES=0); binradar.py handles the no-patch case.
+        print(f"Warning: {predicates_file.name} is empty in {workdir}; "
+              f"building with zero candidate patches")
 
     patch_records = [
         PredicateRecord(patch_id, record.source_line, record.source_text,
