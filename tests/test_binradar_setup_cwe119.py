@@ -704,6 +704,142 @@ def test_c_runtime_parity_overflow_and_boundary():
         [(0x1000, 0x2000)]) == 0
 
 
+# ---------------------------------------------------------------------------
+# Phase D: multipoint E9 build (TAOSC_PREDICATE_COMPATIBILITY_PLAN §6.3/§6.4)
+# ---------------------------------------------------------------------------
+
+def test_parse_e9tool_patch_metadata_all_offsets(tmp_path):
+    """All patch offsets are returned, not just the last one."""
+    metadata = tmp_path / "meta.json"
+    metadata.write_text(
+        '{"jsonrpc":"2.0","method":"instruction","params":'
+        '{"address":"0x40de52","length":5,"offset":56914},"id":1}\n'
+        '{"jsonrpc":"2.0","method":"instruction","params":'
+        '{"address":"0x4d60a5","length":5,"offset":876709},"id":2}\n'
+        '{"jsonrpc":"2.0","method":"patch","params":{"trampoline":"$tmp_0",'
+        '"metadata":{},"offset":56914},"id":3}\n'
+        '{"jsonrpc":"2.0","method":"patch","params":{"trampoline":"$tmp_1",'
+        '"metadata":{},"offset":876709,},"id":4}\n')
+    offsets, instructions = binradar_setup._parse_e9tool_patch_metadata(
+        metadata)
+    assert offsets == [56914, 876709]
+    assert instructions[56914] == (0x40de52, 5)
+    assert instructions[876709] == (0x4d60a5, 5)
+
+
+def test_build_instrumentation_spec_order():
+    """First call gets set_size, later calls mark, first return set_base,
+    patch site last (mirrors taosc cwe119/synth.in::e9trace)."""
+    trace = binradar_setup.AllocatorTrace(
+        "malloc",
+        [(0, "409200"), (1, "410370"), (2, "4046a9")],
+        ["409205", "410375", "4046ae"])
+    spec = binradar_setup.build_instrumentation_spec(
+        trace, "0x409249", "if dest(state)@brpatch goto")
+    assert spec.entries == (
+        ("0x409200", "set_size(rdi,rsi)@brpatch"),
+        ("0x410370", "mark(1)@brpatch"),
+        ("0x4046a9", "mark(2)@brpatch"),
+        ("0x409205", "set_base(rax)@brpatch"),
+        ("0x409249", "if dest(state)@brpatch goto"),
+    )
+    assert spec.o0 is True
+
+
+def test_e9tool_command_identical_spec():
+    """JSON-metadata and final-binary commands share one ordered spec."""
+    trace = binradar_setup.AllocatorTrace(
+        "realloc",
+        [(0, "486b4f"), (1, "487287")],
+        ["486b55", "48728c"])
+    spec = binradar_setup.build_instrumentation_spec(
+        trace, "0x4d60a5", "if jnz($mem0,dest)@brpatch goto")
+    json_cmd = binradar_setup.e9tool_command(
+        spec, Path("out.json"), Path("bin.orig"), fmt="json")
+    bin_cmd = binradar_setup.e9tool_command(
+        spec, Path("out.bin"), Path("bin.orig"))
+    # Identical ordered -M/-P pairs; only --format and -o differ.
+    json_pairs = [(json_cmd[i], json_cmd[i + 1])
+                  for i in range(len(json_cmd))
+                  if json_cmd[i] == "-M"]
+    bin_pairs = [(bin_cmd[i], bin_cmd[i + 1])
+                 for i in range(len(bin_cmd)) if bin_cmd[i] == "-M"]
+    assert json_pairs == bin_pairs
+    assert "--format=json" in json_cmd
+    assert "--format=json" not in bin_cmd
+    assert "-O0" in json_cmd and "-O0" in bin_cmd
+    assert json_cmd[-3:] == ["-o", "out.json", "bin.orig"]
+    assert bin_cmd[-3:] == ["-o", "out.bin", "bin.orig"]
+
+
+def test_direct_action_expands_mem0():
+    """The direct call-site action expands Taosc's $mem0 shell variable to
+    the four E9 memory-operand fields (utils/taosc/helpers.in)."""
+    trace = binradar_setup.AllocatorTrace(
+        "malloc",
+        [(0, "40661c"), (1, "404eb4"), (2, "405c4b")],
+        ["406621"])
+    spec = binradar_setup.build_instrumentation_spec(
+        trace, "0x4066d0",
+        f"if jnz({binradar_setup.E9_MEM0},0x4066e4)@brpatch goto")
+    assert spec.entries[-1] == (
+        "0x4066d0",
+        "if jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,"
+        "0x4066e4)@brpatch goto")
+    cmd = binradar_setup.e9tool_command(
+        spec, Path("out.bin"), Path("bin.orig"))
+    assert "if jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp," \
+        "0x4066e4)@brpatch goto" in cmd
+
+
+def _real_multipoint_workdir():
+    """The libxml2 CVE-2016-1839 workdir-013 artifacts (gitignored)."""
+    return ROOT / "benchmarks" / "loftix" / "libxml2" / "CVE-2016-1839" \
+        / "workdir-013"
+
+
+def test_extract_relocated_call_jumps_multipoint_real():
+    """Every instrumented original call maps to one relocation record.
+
+    Uses the stored libxml2 CVE-2016-1839 workdir-013 artifacts (latest
+    taosc output): 13 realloc call sites + the patch site 0x4d60a5.  The
+    set_base hook site (0x486b55, not a call) must not produce a record.
+    """
+    wd = _real_multipoint_workdir()
+    if not (wd / "xmllint.brpatched").exists():
+        import pytest
+        pytest.skip("workdir-013 artifacts not present")
+    jumps = binradar_setup.extract_relocated_call_jumps(
+        wd / "xmllint.brpatched", wd / "xmllint.brpatched.json",
+        wd / "xmllint.orig", 0x4d60a5)
+    sites = {site for _, site, _ in jumps}
+    assert 0x4d60a5 in sites  # the requested patch site
+    assert 0x486b4f in sites  # first realloc call (set_size hook)
+    assert 0x487287 in sites  # later realloc call (mark hook)
+    assert 0x486b55 not in sites  # set_base site is not a call
+    assert len(sites) == 14  # 13 realloc calls + patch site
+    for _, site, ret in jumps:
+        assert ret == site + 5 or ret == site + 6  # call length
+    # Every record is unique.
+    assert len(jumps) == len(set(jumps))
+
+
+def test_extract_relocated_call_jumps_requires_patch_site():
+    """A patch address that resolves to no site fails setup."""
+    wd = _real_multipoint_workdir()
+    if not (wd / "xmllint.brpatched").exists():
+        import pytest
+        pytest.skip("workdir-013 artifacts not present")
+    try:
+        binradar_setup.extract_relocated_call_jumps(
+            wd / "xmllint.brpatched", wd / "xmllint.brpatched.json",
+            wd / "xmllint.orig", 0x123456)
+    except ValueError as e:
+        assert "resolves to 0 instrumented site(s)" in str(e)
+    else:
+        raise AssertionError("missing patch site must fail")
+
+
 def _main():
     import sys
     failed = 0

@@ -471,6 +471,53 @@ class AllocatorTrace:
     returns: List[str]            # hex addresses, in order
 
 
+@dataclass(frozen=True)
+class InstrumentationSpec:
+    """Ordered E9 instrumentation: (address, plugin-action) pairs.
+
+    The same spec renders the JSON-metadata and final-binary e9tool
+    commands, so both describe identical instrumentation (plan §6.3).
+    """
+    entries: Tuple[Tuple[str, str], ...]
+    o0: bool = False
+
+
+def build_instrumentation_spec(allocator: AllocatorTrace, patch_loc: str,
+                               patch_action: str) -> InstrumentationSpec:
+    """Build the CWE-119 multipoint instrumentation spec.
+
+    Mirrors utils/taosc/cwe119/synth.in::e9trace: the first call address
+    receives set_size(rdi,rsi), later call entries receive mark(bit), the
+    first return address receives set_base(rax), then the patch site.
+    """
+    entries = [(f"0x{allocator.calls[0][1]}", "set_size(rdi,rsi)@brpatch")]
+    for bit, address in allocator.calls[1:]:
+        entries.append((f"0x{address}", f"mark({bit})@brpatch"))
+    entries.append((f"0x{allocator.returns[0]}", "set_base(rax)@brpatch"))
+    entries.append((patch_loc, patch_action))
+    return InstrumentationSpec(tuple(entries), o0=True)
+
+
+def e9tool_command(spec: InstrumentationSpec, out_path: Path,
+                   original_binary: Path,
+                   fmt: Optional[str] = None) -> List[str]:
+    """Render the e9tool command for one instrumentation spec.
+
+    The JSON-metadata and final-binary commands differ only in
+    ``--format=json`` and the output path.
+    """
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--", "e9tool"]
+    if fmt is not None:
+        cmd.append(f"--format={fmt}")
+    cmd.append("-100")
+    if spec.o0:
+        cmd.append("-O0")
+    for address, action in spec.entries:
+        cmd += ["-M", f"addr={address}", "-P", action]
+    cmd += ["-o", str(out_path), str(original_binary)]
+    return cmd
+
+
 def parse_allocator_trace(trace_dir: Path) -> Optional[AllocatorTrace]:
     """Parse the allocator trace artifacts in a workdir trace directory.
 
@@ -901,7 +948,7 @@ def resolve_poc(configdir: Path, workdir: Path, poc_input: str) -> Optional[Path
 def compile_capture_plugin(workdir: Path) -> None:
     """Copy and compile brpatch-prefilter.c in the workdir (e9compile)."""
     shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
            "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -921,7 +968,7 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     brprefilter = workdir / f"{config['BINARY']}.brprefilter"
     metadata = workdir / f"{config['BINARY']}.brprefilter.json"
     for output, fmt in ((metadata, ["--format=json"]), (brprefilter, [])):
-        cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool"] + fmt + [
+        cmd = ["guix", "shell", "e9patch@1.0.1", "--", "e9tool"] + fmt + [
             "-100", "-M", f"addr={patch_loc}",
             "-P", "if dest(state)@brpatch-prefilter goto",
             "-o", str(output), str(original_binary)]
@@ -1079,6 +1126,9 @@ class E9MapType(enum.IntEnum):
 
 
 E9_CONFIG_MAGIC = b"E9PATCH\0"
+# Taosc's $mem0 shell expansion (utils/taosc/helpers.in): the four E9
+# memory-operand fields of the matched instruction.
+E9_MEM0 = "mem[0].base,mem[0].index,mem[0].scale,mem[0].disp"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
 E9_MAP_STRUCT = struct.Struct("<iII")
 
@@ -1121,14 +1171,14 @@ def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, by
         map_path.unlink(missing_ok=True)
 
 
-def _parse_e9tool_patch_metadata(path: Path) -> Tuple[Optional[int], Dict[int, Tuple[int, int]]]:
-    """Read patch offset and instruction address/length from e9tool JSON output.
+def _parse_e9tool_patch_metadata(path: Path) -> Tuple[List[int], Dict[int, Tuple[int, int]]]:
+    """Read all patch offsets and instruction address/length from e9tool JSON output.
 
     e9tool's JSON stream contains JSON-RPC instruction messages but the
     metadata payload can contain trailing commas.  Regex parsing therefore
     keeps this independent of whether the whole line is strict JSON.
     """
-    patch_offset: Optional[int] = None
+    patch_offsets: List[int] = []
     instructions: Dict[int, Tuple[int, int]] = {}
     instruction_re = re.compile(
         r'"method"\s*:\s*"instruction".*?'
@@ -1151,9 +1201,178 @@ def _parse_e9tool_patch_metadata(path: Path) -> Tuple[Optional[int], Dict[int, T
                 continue
             match = patch_re.search(line)
             if match is not None:
-                patch_offset = int(match.group(1))
+                patch_offsets.append(int(match.group(1)))
 
-    return patch_offset, instructions
+    return patch_offsets, instructions
+
+
+def _find_executed_trampoline_map(cfg: Dict, site_address: int,
+                                  brpatched_binary: Path) -> Optional[Dict]:
+    """Return the trampoline map that the refactored code at site_address
+    jumps to, or None when the site is not in a refactored region.
+
+    E9Patch -O0 rewrites the code containing a patch site into a REFACTOR
+    map whose copy of the site is a ``jmp <trampoline-entry>``.  The
+    executed call-emulation pair lives in the trampoline map containing
+    that entry; the other trampoline copies of the same bytes are dead.
+    """
+    for mapping in cfg["maps"]:
+        if mapping["type"] != E9MapType.REFACTOR:
+            continue
+        if not (mapping["address"] <= site_address
+                < mapping["address"] + mapping["size"]):
+            continue
+        with brpatched_binary.open("rb") as f:
+            f.seek(mapping["file_offset"])
+            data = f.read(mapping["size"])
+        if len(data) != mapping["size"]:
+            raise ValueError("refactor mapping extends past the patched binary")
+        for address, _, text in _parse_objdump_instructions(
+                data, mapping["address"]):
+            if address != site_address:
+                continue
+            match = re.match(r"jmp\s+(?:0x)?([0-9a-fA-F]+)", text)
+            if match is None:
+                return None
+            entry = int(match.group(1), 16)
+            for trampoline in cfg["maps"]:
+                if trampoline["type"] != E9MapType.TRAMPOLINE:
+                    continue
+                if trampoline["address"] <= entry \
+                        < trampoline["address"] + trampoline["size"]:
+                    return trampoline
+            return None
+        return None
+    return None
+
+
+def extract_relocated_call_jumps(
+    brpatched_binary: Path,
+    metadata_path: Path,
+    original_binary: Path,
+    patch_addr: int,
+) -> List[Tuple[int, int, int]]:
+    """Find E9Patch's jumps used to emulate every instrumented original call.
+
+    With the default backend option ``-Ocall=false``, a relocated direct call
+    is emitted as ``push original_next; jmp target`` inside an E9Patch
+    trampoline.  For a direct call the jump target is unambiguous; for an
+    indirect call the rewritten instruction is an indirect jmp preceded by
+    the return-address setup.
+
+    Every patched original call must map to exactly one trampoline jump
+    (the executed copy, identified through the refactored region); the
+    requested patch address must resolve to exactly one instrumented site.
+    """
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
+
+    patch_offsets, instructions = _parse_e9tool_patch_metadata(metadata_path)
+    if not patch_offsets:
+        raise ValueError("no patch records in e9tool metadata")
+    sites: List[Tuple[int, int, int]] = []
+    for offset in patch_offsets:
+        site = instructions.get(offset)
+        if site is None:
+            raise ValueError(
+                f"patch offset {offset} has no instruction record in "
+                f"e9tool metadata")
+        sites.append((offset, site[0], site[1]))
+
+    # Require the requested patch address to exist exactly once.
+    patch_sites = [site for site in sites if site[1] == patch_addr]
+    if len(patch_sites) != 1:
+        raise ValueError(
+            f"requested patch address 0x{patch_addr:x} resolves to "
+            f"{len(patch_sites)} instrumented site(s); expected exactly one")
+
+    # Deduplicate sites: one address may carry several hooks.
+    unique_sites: List[Tuple[int, int, int]] = []
+    seen = set()
+    for site in sites:
+        if site[1] not in seen:
+            seen.add(site[1])
+            unique_sites.append(site)
+
+    cfg = parse_e9patch_config(brpatched_binary)
+    trampoline_insns: List[Tuple[Dict, List[Tuple[int, bytes, str]]]] = []
+    for mapping in cfg["maps"]:
+        if mapping["type"] != E9MapType.TRAMPOLINE:
+            continue
+        with brpatched_binary.open("rb") as f:
+            f.seek(mapping["file_offset"])
+            data = f.read(mapping["size"])
+        if len(data) != mapping["size"]:
+            raise ValueError("trampoline mapping extends past the patched binary")
+        trampoline_insns.append(
+            (mapping, _parse_objdump_instructions(data, mapping["address"])))
+
+    records: List[Tuple[int, int, int]] = []
+    with original_binary.open("rb") as f:
+        for offset, address, length in unique_sites:
+            f.seek(offset)
+            original_instruction = f.read(length)
+            call_kind, direct_displacement = _decode_call_site(
+                original_instruction)
+            if call_kind == "other":
+                continue
+            ret_addr = address + length
+            direct_target: Optional[int] = None
+            if call_kind == "direct":
+                if direct_displacement is None:
+                    raise ValueError("direct call has no rel32 displacement")
+                direct_target = ret_addr + direct_displacement
+
+            # The executed copy: the trampoline map the refactored site
+            # jumps to (used to prefer the right copy for indirect calls).
+            executed = _find_executed_trampoline_map(cfg, address,
+                                                     brpatched_binary)
+
+            matches: List[Tuple[int, int, int]] = []
+            for mapping, insns in trampoline_insns:
+                for index, (jump_addr, _, text) in enumerate(insns):
+                    if not text.startswith("jmp"):
+                        continue
+                    operand = text[len("jmp"):].strip()
+                    target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
+                    jump_target = int(target_match.group(1), 16) \
+                        if target_match else None
+                    if call_kind == "direct":
+                        if jump_target != direct_target:
+                            continue
+                    elif jump_target is not None:
+                        continue
+                    # Exact return-address setup: the preceding instruction
+                    # pushes the original return address.
+                    if index == 0 \
+                            or not insns[index - 1][2].startswith("push"):
+                        continue
+                    push_operand = insns[index - 1][2][len("push"):].strip()
+                    push_match = re.match(r"(?:0x)?([0-9a-fA-F]+)",
+                                          push_operand)
+                    if push_match is None \
+                            or int(push_match.group(1), 16) != ret_addr:
+                        continue
+                    matches.append((jump_addr, address, ret_addr))
+
+            if not matches:
+                raise ValueError(
+                    f"no relocated call-equivalent jump found for patched "
+                    f"original call at 0x{address:x}")
+
+            # Deduplicate by (site, ret): the same trampoline pages can be
+            # mapped at several VAs, and relative jumps resolve differently
+            # per mapping.  For direct calls the target match already selects
+            # the executed copy; for indirect calls prefer the executed map.
+            if executed is not None:
+                executed_matches = [m for m in matches
+                                    if executed["address"] <= m[0]
+                                    < executed["address"] + executed["size"]]
+                if executed_matches:
+                    matches = executed_matches
+            records.append(sorted(matches)[0])
+
+    return sorted(set(records))
 
 
 def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
@@ -1175,88 +1394,6 @@ def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
         if ((modrm >> 3) & 0x7) == 0x2:
             return "indirect", None
     return "other", None
-
-
-def extract_relocated_call_jumps(
-    brpatched_binary: Path,
-    metadata_path: Path,
-    original_binary: Path,
-    patch_addr: int,
-) -> List[Tuple[int, int, int]]:
-    """Find E9Patch's jump used to emulate the selected original call.
-
-    With the default backend option ``-Ocall=false``, a relocated direct call
-    is emitted as ``push original_next; jmp target``.  The jump is inside an
-    E9Patch trampoline, not at the original patch address.  For a direct call
-    the target is unambiguous; for an indirect call this returns indirect-jump
-    candidates preceded by the return-address setup sequence.
-    """
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
-
-    patch_offset, instructions = _parse_e9tool_patch_metadata(metadata_path)
-    site: Optional[Tuple[int, int]] = None
-    if patch_offset is not None:
-        site = instructions.get(patch_offset)
-    if site is None:
-        for address, length in instructions.values():
-            if address == patch_addr:
-                site = (address, length)
-                break
-    if site is None or patch_offset is None:
-        raise ValueError("could not resolve patched instruction from e9tool metadata")
-
-    _, instruction_length = site
-    with original_binary.open("rb") as f:
-        f.seek(patch_offset)
-        original_instruction = f.read(instruction_length)
-    call_kind, direct_displacement = _decode_call_site(original_instruction)
-    if call_kind == "other":
-        return []
-
-    direct_target: Optional[int] = None
-    if call_kind == "direct":
-        if direct_displacement is None:
-            raise ValueError("direct call has no rel32 displacement")
-        direct_target = patch_addr + instruction_length + direct_displacement
-
-    cfg = parse_e9patch_config(brpatched_binary)
-    original_call_site = site[0]
-    ret_addr = original_call_site + instruction_length
-    candidates: List[Tuple[int, int, int]] = []
-    for mapping in cfg["maps"]:
-        if mapping["type"] != E9MapType.TRAMPOLINE:
-            continue
-        with brpatched_binary.open("rb") as f:
-            f.seek(mapping["file_offset"])
-            data = f.read(mapping["size"])
-        if len(data) != mapping["size"]:
-            raise ValueError("trampoline mapping extends past the patched binary")
-
-        instructions_in_map = _parse_objdump_instructions(data, mapping["address"])
-        for index, (address, _, text) in enumerate(instructions_in_map):
-            if not text.startswith("jmp"):
-                continue
-
-            operand = text[len("jmp"):].strip()
-            target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
-            jump_target = int(target_match.group(1), 16) if target_match else None
-
-            if direct_target is not None:
-                if jump_target == direct_target:
-                    candidates.append((address, original_call_site, ret_addr))
-                continue
-
-            # For an indirect call the rewritten instruction is an indirect
-            # jmp.  It follows the push/lea/xchg return-address setup.  The
-            # short look-back avoids treating E9Patch's conditional-goto
-            # ``jmp *%fs:0x40`` as a call-equivalent jump.
-            if jump_target is None:
-                previous = instructions_in_map[max(0, index - 6):index]
-                if any(item[2].startswith("push") for item in previous):
-                    candidates.append((address, original_call_site, ret_addr))
-
-    return sorted(set(candidates))
 
 
 def parse_e9patch_config(path: Path) -> Dict:
@@ -1350,6 +1487,7 @@ def extract_trampoline_info(
     metadata_path: Optional[Path] = None,
     original_binary: Optional[Path] = None,
     patch_addr: Optional[int] = None,
+    strict: bool = False,
 ) -> Dict[str, str]:
     # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
     binradar_env: Dict[str, str] = dict()
@@ -1396,6 +1534,8 @@ def extract_trampoline_info(
             else:
                 print("No relocated call-equivalent jump found for the patch site")
     except Exception as e:
+        if strict:
+            raise
         print(f"Warning: could not parse e9patch config: {e}")
     return binradar_env
 
@@ -1495,11 +1635,76 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         # The direct call-site metapatch has no predicate list: the E9
         # jnz($mem0,dest) decision is evaluated against the allocation
         # clamps at runtime.  A leftover predicates file is stale Taosc
-        # output and must not be compiled in.
+        # output and must not be compiled in.  The binary is rebuilt with
+        # BinRadar patch-id switching and [patch] logging (plan §7.4).
         if predicates_file.exists():
             print(f"Warning: ignoring stale {predicates_file.name} "
                   f"(CWE-119 direct call-site family)")
         binradar_env["TOTAL_PATCHES"] = "1"
+        dest = None
+        destinations_file = workdir / "destinations"
+        if destinations_file.exists():
+            with destinations_file.open("r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        dest = f"0x{line}"
+                        break
+        if dest is None:
+            print(f"Error: no destination found in {destinations_file}")
+            exit(1)
+        brpatch_source = workdir / "brpatch.c"
+        shutil.copy(BRPATCH_SOURCE, brpatch_source)
+        brpatches_inc = workdir / "brpatches.inc"
+        _emit_brpatches_inc(brpatches_inc, [])
+        compile_defines = [f"-DTAOSC_DEST={dest}", "-DBRPATCH_CWE119",
+                           f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
+        cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+                "e9compile", "brpatch.c"] + compile_defines
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error compiling patch: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Patch compiled successfully")
+
+        # Patch the original binary with the allocator hooks and the
+        # jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,dest)
+        # decision at the patch site.  Taosc's synth.in expands the shell
+        # variable $mem0 to those four E9 memory-operand fields
+        # (utils/taosc/helpers.in); e9tool zeroes them when the site has
+        # no memory operand (e.g. a jne), matching Taosc's own output.
+        patch_addr = binradar_env["PATCH_LOC"]
+        metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+        spec = build_instrumentation_spec(
+            allocator, patch_addr,
+            f"if jnz({E9_MEM0},{dest})@brpatch goto")
+        cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error dumping patch metadata: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Patch metadata dumped successfully")
+        cmd = e9tool_command(spec, brpatched_binary, original_binary)
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error preparing patch: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
+
+        extracted_env = extract_trampoline_info(
+            brpatched_binary,
+            metadata_path,
+            original_binary,
+            int(patch_addr, 0),
+            strict=True,
+        )
+        binradar_env.update(extracted_env)
         print(f"Using CWE-119 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
         return
@@ -1597,8 +1802,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     shutil.copy(BRPATCH_SOURCE, brpatch_source)
     brpatches_inc = workdir / "brpatches.inc"
     _emit_brpatches_inc(brpatches_inc, selected_patch_records)
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
-            "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
+    compile_defines = [f"-DTAOSC_DEST={dest}"]
+    if family == PredicateFamily.CWE119_ERM:
+        compile_defines.append("-DBRPATCH_CWE119")
+        compile_defines.append(f"-DBRPATCH_ALLOC_{allocator.kind.upper()}")
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+            "e9compile", "brpatch.c"] + compile_defines
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1607,12 +1816,25 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Patch compiled successfully")
 
-    # Patch the original binary
+    # Patch the original binary.  The JSON-metadata and final-binary e9tool
+    # commands use one identical ordered instrumentation specification
+    # (plan §6.3): generic ERM patches the single PATCH_LOC site; CWE-119
+    # ERM and direct builds add the allocator hooks (mark/set_size/set_base)
+    # before the patch site.
     patch_addr = binradar_env["PATCH_LOC"]
     metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+    if family == PredicateFamily.CWE119_ERM:
+        spec = build_instrumentation_spec(
+            allocator, patch_addr, "if dest(state)@brpatch goto")
+    elif family == PredicateFamily.CWE119_DIRECT:
+        spec = build_instrumentation_spec(
+            allocator, patch_addr,
+            f"if jnz({E9_MEM0},{dest})@brpatch goto")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_addr, "if dest(state)@brpatch goto"),))
     # dump metadata
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}",
-            "-P", "if dest(state)@brpatch goto", "-o", str(metadata_path), str(original_binary)]
+    cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1620,8 +1842,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch metadata dumped successfully")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}",
-            "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
+    cmd = e9tool_command(spec, brpatched_binary, original_binary)
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1635,6 +1856,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         metadata_path,
         original_binary,
         int(patch_addr, 0),
+        strict=(family == PredicateFamily.CWE119_ERM),
     )
     binradar_env.update(extracted_env)
 
