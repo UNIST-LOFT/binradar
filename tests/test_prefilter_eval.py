@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the Python mirror of brpatch.c::eval
-(fuzzolic/binradar-setup.py, `prefilter` subcommand).  Run with pytest or
-directly:
+(fuzzolic/binradar_taosc_predicates.py, used by the `prefilter`
+subcommand of fuzzolic/binradar-setup.py).  Run with pytest or directly:
 
     uv run pytest tests/test_prefilter_eval.py
     uv run python tests/test_prefilter_eval.py
@@ -14,19 +14,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
-    "binradar_setup", ROOT / "fuzzolic" / "binradar-setup.py")
-binradar_setup = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar_setup)
+    "binradar_taosc_predicates",
+    ROOT / "fuzzolic" / "binradar_taosc_predicates.py")
+binradar_taosc_predicates = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(binradar_taosc_predicates)
 
-eval_patch_str = binradar_setup.eval_patch_str
-evaluate_predicate = binradar_setup.evaluate_predicate
-predicate_to_patch_str = binradar_setup.predicate_to_patch_str
-predicate_to_branch_patch_str = binradar_setup.predicate_to_branch_patch_str
-load_predicates = binradar_setup.load_predicates
-load_prefilter_passed_ids = binradar_setup.load_prefilter_passed_ids
-write_prefilter = binradar_setup.write_prefilter
-PrefilterTrap = binradar_setup.PrefilterTrap
-INT64_MIN = binradar_setup.INT64_MIN
+eval_patch_str = binradar_taosc_predicates.eval_patch_str
+evaluate_predicate = binradar_taosc_predicates.evaluate_predicate
+predicate_to_patch_str = binradar_taosc_predicates.predicate_to_patch_str
+predicate_to_branch_patch_str = \
+    binradar_taosc_predicates.predicate_to_branch_patch_str
+load_predicates = binradar_taosc_predicates.load_predicates
+load_prefilter_passed_ids = binradar_taosc_predicates.load_prefilter_passed_ids
+write_prefilter = binradar_taosc_predicates.write_prefilter
+PrefilterTrap = binradar_taosc_predicates.PrefilterTrap
+INT64_MIN = binradar_taosc_predicates.INT64_MIN
 INT64_MAX = (1 << 63) - 1
 
 ZERO_ENV = [0] * 16
@@ -247,7 +249,7 @@ def test_predicate_source_and_runtime_ids():
 
 
 def test_parse_state_lines():
-    parse_state_lines = binradar_setup.parse_state_lines
+    parse_state_lines = binradar_taosc_predicates.parse_state_lines
     # A full 16-slot line (negative and > 2^31 values) parses; stray,
     # truncated, and non-state lines are skipped.
     data = (
