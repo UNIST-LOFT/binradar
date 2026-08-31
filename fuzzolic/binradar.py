@@ -1285,7 +1285,8 @@ class BinRadarExecutor:
         else:
             self.run_id = int(run_id)
             self.run_prefix = run_prefix
-            self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
+            self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{self.run_id:05d}")
+            os.makedirs(self.run_dir, exist_ok=True)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
         if phase == BinRadarPhase.PROBE:

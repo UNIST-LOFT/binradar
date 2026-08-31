@@ -22,12 +22,12 @@ taosc workdir="workdir":
 taosc-prebuilt workdir="workdir":
     uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}}
 
+prefilter workdir="workdir":
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py prefilter -w {{workdir}}
+
 setup workdir="workdir":
     [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py setup -w {{workdir}}
-
-prefilter workdir="workdir":
-    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py prefilter -w {{workdir}}
 
 @_ensure_binradar_is_ready workdir="workdir":
     [ -d "{{workdir}}" ] || just taosc {{workdir}}

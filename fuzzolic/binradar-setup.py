@@ -483,17 +483,22 @@ class InstrumentationSpec:
 
 
 def build_instrumentation_spec(allocator: AllocatorTrace, patch_loc: str,
-                               patch_action: str) -> InstrumentationSpec:
+                               patch_action: str,
+                               plugin_name: str = "brpatch") -> InstrumentationSpec:
     """Build the CWE-119 multipoint instrumentation spec.
 
     Mirrors utils/taosc/cwe119/synth.in::e9trace: the first call address
     receives set_size(rdi,rsi), later call entries receive mark(bit), the
     first return address receives set_base(rax), then the patch site.
+
+    The allocator hooks and the patch action all use the same e9compile
+    plugin (``plugin_name``); the prefilter uses ``brpatch-prefilter`` so
+    its capture plugin is not confused with the final binary's brpatch.
     """
-    entries = [(f"0x{allocator.calls[0][1]}", "set_size(rdi,rsi)@brpatch")]
+    entries = [(f"0x{allocator.calls[0][1]}", f"set_size(rdi,rsi)@{plugin_name}")]
     for bit, address in allocator.calls[1:]:
-        entries.append((f"0x{address}", f"mark({bit})@brpatch"))
-    entries.append((f"0x{allocator.returns[0]}", "set_base(rax)@brpatch"))
+        entries.append((f"0x{address}", f"mark({bit})@{plugin_name}"))
+    entries.append((f"0x{allocator.returns[0]}", f"set_base(rax)@{plugin_name}"))
     entries.append((patch_loc, patch_action))
     return InstrumentationSpec(tuple(entries), o0=True)
 
@@ -1059,7 +1064,8 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     metadata = workdir / f"{config['BINARY']}.brprefilter.json"
     if allocator is not None:
         spec = build_instrumentation_spec(
-            allocator, patch_loc, "if dest(state)@brpatch-prefilter goto")
+            allocator, patch_loc, "if dest(state)@brpatch-prefilter goto",
+            plugin_name="brpatch-prefilter")
     else:
         spec = InstrumentationSpec(
             ((patch_loc, "if dest(state)@brpatch-prefilter goto"),))
