@@ -771,6 +771,10 @@ class BinRadarExecutor:
         env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
         env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
         env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        # E9Patch relocated call records (jump:site:return, comma separated).
+        # Every patched symbolic tracer mode needs these to reinterpret E9's
+        # push original_return; jmp target sequence as the original call.
+        env["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
         if mode == "fuzzolic":
             env["BINRADAR_PROBE_FILE"] = os.path.join(run_dir, "probe-result-fuzzolic.sbsv")
             env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -837,6 +841,8 @@ class BinRadarExecutor:
         tracer_env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
         tracer_env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]
         tracer_env["E9_LOADER_RANGE"] = self.patch_addr_ranges[2]
+        # The original binary has no E9 mappings and no relocated calls.
+        tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")
         tracer_result = binradar_utils.execute(
