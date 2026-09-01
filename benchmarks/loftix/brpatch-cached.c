@@ -1,225 +1,216 @@
 /*
- * Dynamic patch
- * Copyright (C) 2024-2025  Nguyễn Gia Phong
+ * Multi-predicate execution cache for BinRadar's concrete verifier.
  *
- * This file is part of taosc.
+ * The verifier selects one runtime predicate with PATCH_ID.  This plugin
+ * executes that predicate exactly as brpatch.c does and records every
+ * pre-branch state plus the selected branch on PATCH_FD.  Python evaluates
+ * the other runtime predicates over those states and reuses the process
+ * result only when their complete branch vectors are identical.
  *
- * Taosc is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Taosc is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with taosc.  If not, see <https://www.gnu.org/licenses/>.
+ * Generic ERM records contain the 16 register slots.  BRPATCH_CWE805 builds
+ * also contain the 256 allocation clamps and BRCACHE_STACK_SIZE bytes from
+ * state->rsp, populated by the same mark/set_size/set_base instrumentation as
+ * the final .brpatched artifact.
  */
 
-#include "stdlib.c"
+#define BINRADAR_EVAL_ONLY
+#define init brpatch_base_init
+#include "brpatch.c"
+#undef init
 
-static const char *predicate;
-#define MAGIC_VALUE_PATCH 123456
-// patch_shm size is 8 bytes: patch_shm[0] is patch_id, patch_shm[1] is for index
-static const uint32_t *patch_shm = NULL;
-static uint32_t env_patch_id = 0;
-static int patch_fd = 2;
-static int hit_count = 0;
+#ifndef TAOSC_DEST
+#error "TAOSC_DEST must be the patch destination address"
+#endif
+#ifndef BRPATCH_TOTAL_PATCHES
+#error "BRPATCH_TOTAL_PATCHES must be the number of compiled predicates"
+#endif
 
-/*
- * Get an environment variable and parse as a number.
- * Return 0 on error.
- */
-static uint64_t getenvull(const char *name)
-{
-	const char *const str = getenv(name);
-	if (str == NULL)
-		return 0ULL;
-	errno = 0;
-	const uint64_t ull = strtoull(str, NULL, 0);
-	if (errno)
-		return 0ULL;
-	return ull;
-}
+#define BRCACHE_SNAPSHOT_MAGIC 0x48435242u /* little-endian bytes "BRCH" */
+#define BRCACHE_SNAPSHOT_VERSION 1u
+#define BRCACHE_FLAG_TRUNCATED 1u
+#define BRCACHE_FLAG_CWE805 2u
+#define BRCACHE_FLAG_INVALID 4u
+#define BRCACHE_DEFAULT_MAX_HITS 65536u
+#define BRCACHE_DEFAULT_MAX_BYTES (8u * 1024u * 1024u)
+#define BRCACHE_MAX_STACK_SIZE (1024u * 1024u)
 
-static uint32_t getenvul(const char *name)
-{
-	const char *const str = getenv(name);
-	if (str == NULL)
-		return 0UL;
-	errno = 0;
-	const uint32_t ull = strtoul(str, NULL, 0);
-	if (errno)
-		return 0UL;
-	return ull;
-}
+struct brcache_snapshot_header {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t patch_id;
+	uint32_t branch;
+	uint64_t stack_size;
+	uint64_t flags;
+};
+
+_Static_assert(sizeof(struct brcache_snapshot_header) == 32,
+	"cached snapshot header layout changed");
+
+static uint64_t cache_stack_size;
+static uint64_t cache_max_hits = BRCACHE_DEFAULT_MAX_HITS;
+static uint64_t cache_max_bytes = BRCACHE_DEFAULT_MAX_BYTES;
+static uint64_t cache_hit_count;
+static uint64_t cache_captured_bytes;
+static int cache_truncated;
+static mutex_t cache_mutex = MUTEX_INITIALIZER;
 
 void init(int argc, const char *const *argv, char **envp)
 {
-	environ = envp;
-	predicate = getenv("TAOSC_PRED");
-	if (predicate == NULL)
-		predicate = "p0"; /* false */
-	
-	uint32_t s = getenvul("PATCH_FD");
-	if (s > 2) {
-		patch_fd = (int)s;
+	brpatch_base_init(argc, argv, envp);
+	if (getenvul("PATCH_FD") <= 2)
+		patch_fd = -1;
+	const uint64_t stack_size = getenvull("BRCACHE_STACK_SIZE");
+	if (stack_size <= BRCACHE_MAX_STACK_SIZE)
+		cache_stack_size = stack_size;
+	const uint64_t max_hits = getenvull("BRCACHE_MAX_HITS");
+	if (max_hits > 0)
+		cache_max_hits = max_hits;
+	const uint64_t max_bytes = getenvull("BRCACHE_MAX_BYTES");
+	if (max_bytes > 0)
+		cache_max_bytes = max_bytes;
+}
+
+static const char *get_cached_patch_str(uint32_t id)
+{
+	switch (id) {
+#include "brpatches.inc"
 	}
 }
 
-static int64_t i64_from_bits(uint64_t bits)
+static int write_all(int fd, const void *buf, size_t count)
 {
-	int64_t value;
-	memcpy(&value, &bits, sizeof(value));
-	return value;
-}
-
-/* Parse *p as an unsigned bit pattern. */
-uint64_t scani(const char **p)
-{
-	uint64_t i = 0;
-	for (; **p >= '0' && **p <= '9'; ++*p)
-		i = i * 10 + **p - '0';
-	return i;
-}
-
-static int64_t shift_right_arithmetic(int64_t value, uint64_t amount)
-{
-	if (amount == 0)
-		return value;
-	uint64_t bits = (uint64_t)value >> amount;
-	if (value < 0)
-		bits |= ~(uint64_t)0 << (64 - amount);
-	return i64_from_bits(bits);
-}
-
-/* Match std.math.shl(i64): negative counts shift right, large counts saturate. */
-static int64_t shift_left(int64_t value, int64_t amount)
-{
-	if (amount >= 64)
-		return 0;
-	if (amount <= -64)
-		return value < 0 ? -1 : 0;
-	if (amount >= 0)
-		return i64_from_bits((uint64_t)value << (uint64_t)amount);
-	return shift_right_arithmetic(value, (uint64_t)-amount);
-}
-
-/* Match std.math.shr(i64): negative counts shift left, large counts saturate. */
-static int64_t shift_right(int64_t value, int64_t amount)
-{
-	if (amount >= 64)
-		return value < 0 ? -1 : 0;
-	if (amount <= -64)
-		return 0;
-	if (amount >= 0)
-		return shift_right_arithmetic(value, (uint64_t)amount);
-	return i64_from_bits((uint64_t)value << (uint64_t)-amount);
-}
-
-/* Parse and evaluate *ptr in a prefix Polish notation, recursively. */
-int64_t eval(const char **ptr, const int64_t *env, int *crashed)
-{
-	const char op = *(*ptr)++;
-	switch (op) {
-	case 'n': /* negative integer */
-		return i64_from_bits(0 - scani(ptr));
-	case 'p': /* positive integer */
-		return i64_from_bits(scani(ptr));
-	case 'v': /* variable look up */
-		return env[scani(ptr)];
-	case '~': /* bitwise not */
-		return ~eval(ptr, env, crashed);
+	const char *p = buf;
+	while (count > 0) {
+		const ssize_t n = write(fd, p, count);
+		if (n <= 0)
+			return -1;
+		p += n;
+		count -= (size_t)n;
 	}
-
-	const bool eq = (**ptr == '=' && (op == '>' || op == '<'));
-	*ptr += eq;
-
-	const int64_t a = eval(ptr, env, crashed);
-	const int64_t b = eval(ptr, env, crashed);
-
-	switch (op) {
-	case '=':
-		return a == b;
-	case '!':
-		return a != b;
-	case '>':
-		return eq ? (a >= b) : (a > b);
-	case '<':
-		return eq ? (a <= b) : (a < b);
-	case '+':
-		return i64_from_bits((uint64_t)a + (uint64_t)b);
-	case '-':
-		return i64_from_bits((uint64_t)a - (uint64_t)b);
-	case '*':
-		return i64_from_bits((uint64_t)a * (uint64_t)b);
-	case '/':
-		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			*crashed = 1;
-			return 0;
-		}
-		return a / b;
-	case '%':
-		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			*crashed = 1;
-			return 0;
-		}
-		return a % b;
-	case '&':
-		return a & b;
-	case '|':
-		return a | b;
-	case '^':
-		return a ^ b;
-	case 'l': /* << */
-		return shift_left(a, b);
-	case 'r': /* >> */
-		return shift_right(a, b);
-	default:
-		__builtin_unreachable();
-	}
+	return 0;
 }
 
-static void state_to_env(const struct STATE *state, int64_t env[16])
+static void write_marker(uint32_t patch_id, int branch, uint64_t flags)
 {
-	const int64_t values[] = {
-		state->rax, state->rbx, state->rcx, state->rdx,
-		state->rsi, state->rdi, state->rsp, state->rbp,
-		state->r8, state->r9, state->r10, state->r11,
-		state->r12, state->r13, state->r14, state->r15,
+	const struct brcache_snapshot_header header = {
+		.magic = BRCACHE_SNAPSHOT_MAGIC,
+		.version = BRCACHE_SNAPSHOT_VERSION,
+		.patch_id = patch_id,
+		.branch = (uint32_t)branch,
+		.stack_size = 0,
+		.flags = flags,
 	};
-	memcpy(env, values, sizeof(values));
+	(void)write_all(patch_fd, &header, sizeof(header));
 }
 
+static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
+                             int branch, int invalid)
+{
+	if (patch_fd < 0)
+		return;
+	while (mutex_lock(&cache_mutex) < 0);
+	if (cache_truncated) {
+		mutex_unlock(&cache_mutex);
+		return;
+	}
+
+	uint64_t flags = 0;
+#ifdef BRPATCH_CWE805
+	flags |= BRCACHE_FLAG_CWE805;
+	if (cache_stack_size == 0)
+		invalid = 1;
+#endif
+	if (invalid) {
+		write_marker(patch_id, branch, flags | BRCACHE_FLAG_INVALID);
+		mutex_unlock(&cache_mutex);
+		return;
+	}
+
+	uint64_t record_size = sizeof(struct brcache_snapshot_header)
+		+ 16 * sizeof(uint64_t);
+#ifdef BRPATCH_CWE805
+	record_size += sizeof(buffers) + cache_stack_size;
+#endif
+	if (cache_hit_count >= cache_max_hits
+			|| record_size > cache_max_bytes -
+				(cache_captured_bytes <= cache_max_bytes
+				 ? cache_captured_bytes : cache_max_bytes)) {
+		cache_truncated = 1;
+		write_marker(patch_id, branch, flags | BRCACHE_FLAG_TRUNCATED);
+		mutex_unlock(&cache_mutex);
+		return;
+	}
+
+	const struct brcache_snapshot_header header = {
+		.magic = BRCACHE_SNAPSHOT_MAGIC,
+		.version = BRCACHE_SNAPSHOT_VERSION,
+		.patch_id = patch_id,
+		.branch = (uint32_t)branch,
+#ifdef BRPATCH_CWE805
+		.stack_size = cache_stack_size,
+#else
+		.stack_size = 0,
+#endif
+		.flags = flags,
+	};
+	int64_t signed_regs[16];
+	uint64_t regs[16];
+	state_to_env(state, signed_regs);
+	memcpy(regs, signed_regs, sizeof(regs));
+
+	int failed = write_all(patch_fd, &header, sizeof(header));
+#ifdef BRPATCH_CWE805
+	if (!failed)
+		failed = write_all(patch_fd, buffers, sizeof(buffers));
+#endif
+	if (!failed)
+		failed = write_all(patch_fd, regs, sizeof(regs));
+#ifdef BRPATCH_CWE805
+	if (!failed)
+		failed = write_all(patch_fd, (const void *)state->rsp,
+		                   cache_stack_size);
+#endif
+	if (failed) {
+		cache_truncated = 1;
+	} else {
+		cache_captured_bytes += record_size;
+		cache_hit_count++;
+	}
+	mutex_unlock(&cache_mutex);
+}
+
+/* E9 action: if dest(state)@brpatch-cached goto */
 const void *dest(const struct STATE *state)
 {
-	int64_t env[16];
-	state_to_env(state, env);
-	int patch_crashed = 0;
-	char *tmp = predicate;
-	int branch_taken = eval(&tmp, env, &patch_crashed) != 0;
-	if (patch_crashed) {
-		/* The patch itself would crash (div/mod by zero, INT64_MIN / -1).
-		 * Report `br 2` and follow the original path (no jump) so the
-		 * patch is rejected downstream. */
-		branch_taken = 2;
+	uint32_t ignored_iteration = 0;
+	const uint32_t patch_id = select_patch_id(&ignored_iteration);
+	int branch = 0;
+	int invalid = patch_id == 0 || patch_id > BRPATCH_TOTAL_PATCHES;
+	struct br_predicate predicate = {0};
+	const char *encoded = get_cached_patch_str(patch_id);
+	if (!invalid && parse_predicate(encoded, &predicate) < 0)
+		invalid = 1;
+
+	if (!invalid && predicate.kind == BR_PRED_GENERIC) {
+		int64_t env[16];
+		state_to_env(state, env);
+		int crashed = 0;
+		const char *cursor = predicate.generic_branch_expression;
+		branch = eval(&cursor, env, &crashed) != 0;
+		if (*cursor != '\0') {
+			invalid = 1;
+			branch = 0;
+		} else if (crashed) {
+			branch = 2;
+		}
+	} else if (!invalid) {
+#ifdef BRPATCH_CWE805
+		branch = CWE805_branch_taken(state, &predicate);
+#else
+		invalid = 1;
+#endif
 	}
-	char buf[1024];
-	int n = snprintf(buf, sizeof(buf),
-		"[snapshot] [predicate %s] [hit-count %d] [br %d] "
-		"[v0 %lld] [v1 %lld] [v2 %lld] [v3 %lld] "
-		"[v4 %lld] [v5 %lld] [v6 %lld] [v7 %lld] "
-		"[v8 %lld] [v9 %lld] [v10 %lld] [v11 %lld] "
-		"[v12 %lld] [v13 %lld] [v14 %lld] [v15 %lld]\n",
-		predicate ? predicate : "NULL", hit_count, branch_taken, 
-		(long long)env[0], (long long)env[1], (long long)env[2],
-		(long long)env[3], (long long)env[4], (long long)env[5],
-		(long long)env[6], (long long)env[7], (long long)env[8],
-		(long long)env[9], (long long)env[10], (long long)env[11],
-		(long long)env[12], (long long)env[13], (long long)env[14],
-		(long long)env[15]);
-	write(patch_fd, buf, n);
-	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
+
+	capture_snapshot(state, patch_id, branch, invalid);
+	return branch == 1 ? (const void *)TAOSC_DEST : NULL;
 }

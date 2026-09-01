@@ -13,15 +13,15 @@ revision 61f9f3a6ad09bb0a7a6712a71c32d9da922333ed output, taken from the
 stored workdirs:
 
   generic/            jasper/CVE-2016-8691/workdir (82,365 generic lines)
-  cwe119-erm/         libxml2/CVE-2016-1839/workdir-013 (342 CWE-119 lines,
+  cwe805-erm/         libxml2/CVE-2016-1839/workdir-013 (342 CWE-119 lines,
                       realloc allocator, crash.address != patch-location)
-  cwe119-direct/      libtiff/CVE-2017-5225/workdir (malloc allocator,
+  cwe805-direct/      libtiff/CVE-2017-5225/workdir (malloc allocator,
                       crash.address == patch-location, stale predicates)
   calloc-trace/       potrace/CVE-2013-7437/workdir-013 (calloc allocator)
   taosc-specialized/  libjpeg/CVE-2012-2806/workdir (no predicates, no
                       allocator trace; CWE-369/476/617-style prebuilt)
 
-Grammar source: utils/taosc/cwe119/filter.zig (61f9f3a).
+Grammar source: utils/taosc/CWE805/filter.zig (61f9f3a).
 """
 
 import importlib.util
@@ -45,7 +45,7 @@ load_predicates = binradar_setup.load_predicates
 REGISTERS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
 
-# The closed CWE-119 grammar emitted by cwe119/filter.zig (plan §2.1).
+# The closed CWE-119 grammar emitted by CWE805/filter.zig (plan §2.1).
 POINTER_REGEX = re.compile(
     r"^(?P<c1>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
     r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) >= i->begin && "
@@ -64,7 +64,7 @@ def _load_lines(name: str) -> list:
 def test_fixture_revision_recorded():
     """The Taosc revision and grammar source are recorded in the tests."""
     assert TAOSC_REV == "61f9f3a6ad09bb0a7a6712a71c32d9da922333ed"
-    assert (ROOT / "utils" / "taosc" / "cwe119" / "filter.zig").exists()
+    assert (ROOT / "utils" / "taosc" / "cwe805" / "filter.zig").exists()
 
 
 def test_generic_fixture_is_generic():
@@ -75,7 +75,7 @@ def test_generic_fixture_is_generic():
         assert predicate_to_branch_patch_str(line), line
 
 
-def test_generic_fixture_has_no_cwe119_forms():
+def test_generic_fixture_has_no_CWE805_forms():
     for line in _load_lines("generic"):
         assert "i->begin" not in line and "i->end" not in line
         assert not line.startswith("s->")
@@ -93,10 +93,10 @@ def test_generic_fixture_covers_operator_forms():
     assert re.search(r"(?<![<>=!])[+-]max1", text)
 
 
-def test_cwe119_erm_fixture_matches_closed_grammar():
+def test_cwe805_erm_fixture_matches_closed_grammar():
     """Every CWE-119 ERM line matches the closed filter.zig grammar."""
-    lines = _load_lines("cwe119-erm")
-    assert lines, "cwe119-erm fixture must not be empty"
+    lines = _load_lines("cwe805-erm")
+    assert lines, "cwe805-erm fixture must not be empty"
     for line in lines:
         m = POINTER_REGEX.match(line)
         if m:
@@ -109,9 +109,9 @@ def test_cwe119_erm_fixture_matches_closed_grammar():
             f"unexpected size scale: {line!r}"
 
 
-def test_cwe119_erm_fixture_covers_all_forms():
+def test_cwe805_erm_fixture_covers_all_forms():
     """All 16 registers, both cell kinds, all widths, and all 4 scales."""
-    lines = _load_lines("cwe119-erm")
+    lines = _load_lines("cwe805-erm")
     text = "\n".join(lines)
 
     for reg in REGISTERS:
@@ -131,20 +131,20 @@ def test_cwe119_erm_fixture_covers_all_forms():
                          r"i->begin", text)
 
 
-def test_cwe119_erm_fixture_stack_bounds():
+def test_cwe805_erm_fixture_stack_bounds():
     """Stack cell indices stay within stack-size (104 bytes)."""
-    stack_size = int((FIXTURES / "cwe119-erm" / "stack-size").read_text())
+    stack_size = int((FIXTURES / "cwe805-erm" / "stack-size").read_text())
     assert stack_size == 104
-    for line in _load_lines("cwe119-erm"):
+    for line in _load_lines("cwe805-erm"):
         for m in re.finditer(r"\(\(uint(8|16|32|64)_t \*\)s->rsp\)\[([0-9]+)\]",
                              line):
             width, index = int(m.group(1)), int(m.group(2))
             assert (index + 1) * (width // 8) <= stack_size, line
 
 
-def test_cwe119_erm_fixture_allocator_trace():
+def test_cwe805_erm_fixture_allocator_trace():
     """The realloc calls/returns pair is present and well-formed."""
-    trace = FIXTURES / "cwe119-erm" / "trace"
+    trace = FIXTURES / "cwe805-erm" / "trace"
     calls = trace.joinpath("realloc.calls").read_text().splitlines()
     returns = trace.joinpath("realloc.returns").read_text().splitlines()
     assert calls and returns
@@ -159,24 +159,24 @@ def test_cwe119_erm_fixture_allocator_trace():
     assert all(int(line.split()[0]) < 64 for line in calls)
 
 
-def test_cwe119_erm_fixture_crash_address_differs_from_patch_location():
-    crash = (FIXTURES / "cwe119-erm" / "trace" / "crash.address").read_text()
-    patch = (FIXTURES / "cwe119-erm" / "patch-location").read_text()
+def test_cwe805_erm_fixture_crash_address_differs_from_patch_location():
+    crash = (FIXTURES / "cwe805-erm" / "trace" / "crash.address").read_text()
+    patch = (FIXTURES / "cwe805-erm" / "patch-location").read_text()
     assert crash.strip() == "4d56d6"
     assert patch.strip() == "4d60a5"
     assert crash.strip() != patch.strip()
 
 
-def test_cwe119_direct_fixture_manifest():
+def test_cwe805_direct_fixture_manifest():
     """crash.address == patch-location; stale predicates are generic."""
-    trace = FIXTURES / "cwe119-direct" / "trace"
+    trace = FIXTURES / "cwe805-direct" / "trace"
     crash = trace.joinpath("crash.address").read_text().strip()
-    patch = (FIXTURES / "cwe119-direct" / "patch-location").read_text().strip()
+    patch = (FIXTURES / "cwe805-direct" / "patch-location").read_text().strip()
     assert crash == patch == "4066d0"
     assert trace.joinpath("malloc.calls").exists()
     assert trace.joinpath("malloc.returns").exists()
     # The leftover predicates file is stale generic output, not CWE-119.
-    for line in _load_lines("cwe119-direct"):
+    for line in _load_lines("cwe805-direct"):
         assert "i->begin" not in line and "i->end" not in line
 
 
@@ -202,13 +202,13 @@ def test_taosc_specialized_fixture_manifest():
     assert crash != patch
 
 
-def test_current_converter_rejects_cwe119_erm():
+def test_current_converter_rejects_CWE805_erm():
     """The current converter must fail loudly on CWE-119 lines.
 
     This is the Phase A regression pin: the plan's §2.3 observed breakage.
     Later phases replace this with typed-descriptor parsing.
     """
-    for line in _load_lines("cwe119-erm"):
+    for line in _load_lines("cwe805-erm"):
         try:
             predicate_to_branch_patch_str(line)
         except ValueError as e:
@@ -220,7 +220,7 @@ def test_current_converter_rejects_cwe119_erm():
                 f"{line!r}")
 
 
-def test_current_converter_rejects_malformed_cwe119():
+def test_current_converter_rejects_malformed_CWE805():
     """Malformed CWE-119 variants fail loudly, never silently mis-parse."""
     malformed = [
         "s->rax >= i->begin && s->rbx < i->end",   # mismatched cells
@@ -242,7 +242,7 @@ def test_current_converter_rejects_malformed_cwe119():
 
 def test_load_predicates_keeps_physical_lines():
     """load_predicates retains physical source line numbers."""
-    records = load_predicates(FIXTURES / "cwe119-erm" / "predicates")
+    records = load_predicates(FIXTURES / "cwe805-erm" / "predicates")
     assert len(records) == 342
     assert records[0] == (1, "s->rax >= i->begin && s->rax < i->end")
     assert records[-1][0] == 342
@@ -275,41 +275,41 @@ def test_strict_generic_lexer():
     assert tokenize("s->rax") == ["s", "-", ">", "rax"]
 
 
-def test_parse_cwe119_pointer_descriptors():
-    parse = binradar_setup.parse_cwe119_predicate
+def test_parse_CWE805_pointer_descriptors():
+    parse = binradar_setup.parse_CWE805_predicate
     RegisterCell = binradar_setup.RegisterCell
     StackCell = binradar_setup.StackCell
-    Cwe119PointerPredicate = binradar_setup.Cwe119PointerPredicate
+    CWE805PointerPredicate = binradar_setup.CWE805PointerPredicate
 
     pred = parse("s->rax >= i->begin && s->rax < i->end")
-    assert pred == Cwe119PointerPredicate(RegisterCell(0))
+    assert pred == CWE805PointerPredicate(RegisterCell(0))
     pred = parse("s->r15 >= i->begin && s->r15 < i->end")
-    assert pred == Cwe119PointerPredicate(RegisterCell(15))
+    assert pred == CWE805PointerPredicate(RegisterCell(15))
     pred = parse("((uint64_t *)s->rsp)[3] >= i->begin && "
                  "((uint64_t *)s->rsp)[3] < i->end")
-    assert pred == Cwe119PointerPredicate(StackCell(64, 3))
+    assert pred == CWE805PointerPredicate(StackCell(64, 3))
 
 
-def test_parse_cwe119_size_descriptors():
-    parse = binradar_setup.parse_cwe119_predicate
+def test_parse_CWE805_size_descriptors():
+    parse = binradar_setup.parse_CWE805_predicate
     RegisterCell = binradar_setup.RegisterCell
     StackCell = binradar_setup.StackCell
-    Cwe119SizePredicate = binradar_setup.Cwe119SizePredicate
+    CWE805SizePredicate = binradar_setup.CWE805SizePredicate
 
     assert parse("1 * s->rbx < i->end - i->begin") == \
-        Cwe119SizePredicate(1, RegisterCell(1))
+        CWE805SizePredicate(1, RegisterCell(1))
     assert parse("8 * s->r15 < i->end - i->begin") == \
-        Cwe119SizePredicate(8, RegisterCell(15))
+        CWE805SizePredicate(8, RegisterCell(15))
     assert parse("2 * ((uint8_t *)s->rsp)[40] < i->end - i->begin") == \
-        Cwe119SizePredicate(2, StackCell(8, 40))
+        CWE805SizePredicate(2, StackCell(8, 40))
     assert parse("4 * ((uint16_t *)s->rsp)[8] < i->end - i->begin") == \
-        Cwe119SizePredicate(4, StackCell(16, 8))
+        CWE805SizePredicate(4, StackCell(16, 8))
     assert parse("8 * ((uint32_t *)s->rsp)[4] < i->end - i->begin") == \
-        Cwe119SizePredicate(8, StackCell(32, 4))
+        CWE805SizePredicate(8, StackCell(32, 4))
 
 
-def test_parse_cwe119_rejects_malformed():
-    parse = binradar_setup.parse_cwe119_predicate
+def test_parse_CWE805_rejects_malformed():
+    parse = binradar_setup.parse_CWE805_predicate
     malformed = [
         "s->rax >= i->begin && s->rbx < i->end",   # mismatched cells
         "s->rax >= i->begin && s->rax < i->end && s->rax > i->begin",
@@ -338,20 +338,20 @@ def test_detect_family_generic():
     assert allocator is None
 
 
-def test_detect_family_cwe119_erm():
+def test_detect_family_CWE805_erm():
     family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "cwe119-erm")
-    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+        FIXTURES / "cwe805-erm")
+    assert family is binradar_setup.PredicateFamily.CWE805_ERM
     assert allocator is not None
     assert allocator.kind == "realloc"
     assert allocator.calls[0] == (0, "486b4f")
     assert allocator.returns[0] == "486b55"
 
 
-def test_detect_family_cwe119_direct():
+def test_detect_family_CWE805_direct():
     family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "cwe119-direct")
-    assert family is binradar_setup.PredicateFamily.CWE119_DIRECT
+        FIXTURES / "cwe805-direct")
+    assert family is binradar_setup.PredicateFamily.CWE805_DIRECT
     assert allocator is not None
     assert allocator.kind == "malloc"
 
@@ -458,27 +458,27 @@ def test_parse_allocator_trace_calloc_fixture():
     assert allocator.returns[0] == "406761"
 
 
-def test_emit_brpatches_inc_generic_and_cwe119(tmp_path):
+def test_emit_brpatches_inc_generic_and_CWE805(tmp_path):
     emit = binradar_setup._emit_brpatches_inc
     PredicateRecord = binradar_setup.PredicateRecord
     RegisterCell = binradar_setup.RegisterCell
     StackCell = binradar_setup.StackCell
-    Cwe119PointerPredicate = binradar_setup.Cwe119PointerPredicate
-    Cwe119SizePredicate = binradar_setup.Cwe119SizePredicate
+    CWE805PointerPredicate = binradar_setup.CWE805PointerPredicate
+    CWE805SizePredicate = binradar_setup.CWE805SizePredicate
 
     records = [
         PredicateRecord(1, 3, "max1 - rdx == ~max1",
                         "==-p0v3~p0p0"),
         PredicateRecord(2, 7, "s->rax >= i->begin && s->rax < i->end",
-                        Cwe119PointerPredicate(RegisterCell(0))),
+                        CWE805PointerPredicate(RegisterCell(0))),
         PredicateRecord(3, 9, "((uint64_t *)s->rsp)[2] >= i->begin && "
                         "((uint64_t *)s->rsp)[2] < i->end",
-                        Cwe119PointerPredicate(StackCell(64, 2))),
+                        CWE805PointerPredicate(StackCell(64, 2))),
         PredicateRecord(4, 30, "1 * s->rbx < i->end - i->begin",
-                        Cwe119SizePredicate(1, RegisterCell(1))),
+                        CWE805SizePredicate(1, RegisterCell(1))),
         PredicateRecord(5, 42, "2 * ((uint8_t *)s->rsp)[40] < i->end - "
                         "i->begin",
-                        Cwe119SizePredicate(2, StackCell(8, 40))),
+                        CWE805SizePredicate(2, StackCell(8, 40))),
     ]
     out = tmp_path / "brpatches.inc"
     emit(out, records)
@@ -514,7 +514,7 @@ def test_prefilter_meta_identity(tmp_path):
     assert load(sbsv, expected_kind="generic-erm",
                 expected_sha256=sha(predicates)) == {1: 1}
     # Wrong kind fails open.
-    assert load(sbsv, expected_kind="cwe119-erm",
+    assert load(sbsv, expected_kind="cwe805-erm",
                 expected_sha256=sha(predicates)) is None
     # Wrong hash fails open.
     assert load(sbsv, expected_kind="generic-erm",
@@ -548,7 +548,7 @@ def test_predicates_sha256_stable():
 # (name, descriptor, registers, stack bytes, clamps, expected_br).
 # The C test prints "RESULT <name> <br> <jumped>"; the Python mirror must
 # agree on <br> for every scenario.
-CWE119_SCENARIOS = [
+CWE805_SCENARIOS = [
     # (name, predicate, regs, stack, clamps, expected_br)
     ("ptr-reg-inside", "s->rax >= i->begin && s->rax < i->end",
      [0x1000] + [0] * 15, b"", [(0x1000, 0x2000)], 0),
@@ -579,13 +579,20 @@ CWE119_SCENARIOS = [
      [0, 0x5000] + [0] * 14, b"", [(0x1000, 0x2000), (0x2000, 0x3000)], 1),
 ]
 
-# jnz() scenarios: (name, patch_id, base, index, size, disp, clamps, br).
+# jnz scenarios:
+# (name, patch_id, base, index, scale, disp, access_size, clamps, br).
 JNZ_SCENARIOS = [
-    ("jnz-id0-inside", 0, 0x1000, 0, 1, 0, [(0x1000, 0x2000)], 0),
-    ("jnz-id1-inside", 1, 0x1000, 0, 1, 0, [(0x1000, 0x2000)], 0),
-    ("jnz-id1-outside", 1, 0x3000, 0, 1, 0, [(0x1000, 0x2000)], 1),
-    ("jnz-id1-indexed", 1, 0x1000, 2, 8, 0x10, [(0x1000, 0x2000)], 0),
-    ("jnz-id1-multi", 1, 0x2500, 0, 1, 0,
+    ("jnz-id0-inside", 0, 0x1000, 0, 1, 0, 1,
+     [(0x1000, 0x2000)], 0),
+    ("jnz-id1-inside", 1, 0x1000, 0, 1, 0, 1,
+     [(0x1000, 0x2000)], 0),
+    ("jnz-id1-outside", 1, 0x3000, 0, 1, 0, 1,
+     [(0x1000, 0x2000)], 1),
+    ("jnz-id1-indexed", 1, 0x1000, 2, 8, 0x10, 4,
+     [(0x1000, 0x2000)], 0),
+    ("jnz-id1-boundary", 1, 0x1FFF, 0, 1, 0, 1,
+     [(0x1000, 0x2000)], 1),
+    ("jnz-id1-multi", 1, 0x2500, 0, 1, 0, 1,
      [(0x1000, 0x2000), (0x2000, 0x3000)], 0),
 ]
 
@@ -620,7 +627,7 @@ def _run_c_runtime_test(tmp_path):
         "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
         "-Wno-missing-field-initializers", "-Wno-unused-parameter",
         "-Wno-unused-function", "-Wno-implicit-fallthrough",
-        "-DBRPATCH_CWE119", "-DBRPATCH_ALLOC_MALLOC",
+        "-DBRPATCH_CWE805", "-DBRPATCH_ALLOC_MALLOC",
         f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
         f"-I{tmp_path}",
         str(ROOT / "tests" / "test_brpatch_dest.c"),
@@ -648,9 +655,9 @@ def test_c_runtime_parity():
     assert "ALL-PASS" in output, output
 
     # dest() scenarios: mirror must agree with the C branch value.
-    for name, text, regs, stack, clamps, expected in CWE119_SCENARIOS:
-        predicate = binradar_setup.parse_cwe119_predicate(text)
-        br = binradar_setup.cwe119_branch_taken(predicate, regs, stack, clamps)
+    for name, text, regs, stack, clamps, expected in CWE805_SCENARIOS:
+        predicate = binradar_setup.parse_CWE805_predicate(text)
+        br = binradar_setup.CWE805_branch_taken(predicate, regs, stack, clamps)
         assert br == expected, f"{name}: mirror br {br} != expected {expected}"
         c_br, jumped = results[name]
         assert int(c_br) == expected, \
@@ -658,14 +665,16 @@ def test_c_runtime_parity():
         assert jumped == ("1" if expected == 1 else "0"), \
             f"{name}: C jumped {jumped} inconsistent with br {c_br}"
 
-    # jnz() scenarios: id 0 never jumps; id 1 jumps iff outside all clamps.
-    for name, patch_id, base, index, size, disp, clamps, expected in \
-            JNZ_SCENARIOS:
-        address = (base + index * size + disp) & ((1 << 64) - 1)
+    # jnz() scenarios: id 0 never jumps; id 1 matches Taosc joob.
+    for name, patch_id, base, index, scale, disp, access_size, clamps, \
+            expected in JNZ_SCENARIOS:
+        address = (base + index * scale + disp) & ((1 << 64) - 1)
+        access_end = (address + access_size) & ((1 << 64) - 1)
         if patch_id == 0:
             assert expected == 0
         else:
-            inside = any(begin <= address < end for begin, end in clamps)
+            inside = any(begin <= address and access_end < end
+                         for begin, end in clamps)
             assert expected == (0 if inside else 1)
         c_br, jumped = results[name]
         assert int(c_br) == expected, f"{name}: C br {c_br}"
@@ -687,20 +696,108 @@ def test_c_runtime_parity():
     assert results["patch-id-0"] == ["0", "0"]
 
 
+def _run_cached_runtime_test(tmp_path, cwe805):
+    if cwe805:
+        descriptors = (
+            'case 0: return "p0";\n'
+            'case 1: return "c1p0";\n'
+            'case 2: return "c1p1";\n'
+            'default: return "p0";\n')
+    else:
+        descriptors = (
+            'case 0: return "p0";\n'
+            'case 1: return "=p0p0";\n'
+            'case 2: return "=p1p0";\n'
+            'default: return "p0";\n')
+    (tmp_path / "brpatches.inc").write_text(descriptors)
+    executable = tmp_path / ("cached-cwe805" if cwe805 else "cached-generic")
+    cmd = [
+        "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
+        "-Wno-unused-function", "-Wno-unused-parameter",
+        "-Wno-missing-field-initializers", "-Wno-implicit-fallthrough",
+        "-DBRPATCH_TOTAL_PATCHES=2",
+        f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
+        f"-I{tmp_path}",
+        str(ROOT / "tests" / "test_brpatch_cached.c"),
+        "-o", str(executable),
+    ]
+    if cwe805:
+        cmd[1:1] = ["-DBRPATCH_CWE805", "-DBRPATCH_ALLOC_MALLOC"]
+    subprocess.run(cmd, check=True)
+    return subprocess.run(
+        [str(executable)], check=True, capture_output=True).stdout
+
+
+def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
+    predicates = binradar_setup.binradar_taosc_predicates
+
+    generic_data = _run_cached_runtime_test(tmp_path, False)
+    snapshots, error = predicates.parse_cached_snapshots(generic_data)
+    assert error is None
+    assert [snapshot.patch_id for snapshot in snapshots] == [1, 2]
+    assert [snapshot.branch for snapshot in snapshots] == [1, 0]
+    assert all(not snapshot.is_CWE805 for snapshot in snapshots)
+    assert predicates.evaluate_cached_predicate(
+        "=p0p0", [snapshots[0]]) == [1]
+
+    cwe805_data = _run_cached_runtime_test(tmp_path, True)
+    snapshots, error = predicates.parse_cached_snapshots(cwe805_data)
+    assert error is None
+    assert [snapshot.patch_id for snapshot in snapshots] == [1, 2]
+    assert [snapshot.branch for snapshot in snapshots] == [0, 1]
+    assert all(snapshot.is_CWE805 for snapshot in snapshots)
+    assert all(len(snapshot.clamps) == 256 for snapshot in snapshots)
+    assert all(len(snapshot.stack) == 8 for snapshot in snapshots)
+    assert snapshots[0].clamps[0] == (0x1000, 0x2000)
+
+
+def test_runtime_predicate_manifest_round_trip(tmp_path):
+    predicates = binradar_setup.binradar_taosc_predicates
+    selected = [
+        predicates.PredicateRecord(1, 7, "pointer",
+                                   predicates.CWE805PointerPredicate(
+                                       predicates.RegisterCell(0))),
+        predicates.PredicateRecord(2, 9, "size",
+                                   predicates.CWE805SizePredicate(
+                                       4, predicates.StackCell(16, 3))),
+    ]
+    path = tmp_path / "brpatches.json"
+    predicates.write_runtime_predicates(
+        path, predicates.PredicateFamily.CWE805_ERM, selected)
+    family, loaded = predicates.load_runtime_predicates(path)
+    assert family is predicates.PredicateFamily.CWE805_ERM
+    assert loaded == {record.runtime_id: record.parsed for record in selected}
+
+
+def test_cached_snapshot_truncation_disables_inference():
+    predicates = binradar_setup.binradar_taosc_predicates
+    marker = predicates.CACHED_SNAPSHOT_HEADER.pack(
+        predicates.CACHED_SNAPSHOT_MAGIC,
+        predicates.CACHED_SNAPSHOT_VERSION,
+        1,
+        0,
+        0,
+        predicates.CACHED_SNAPSHOT_FLAG_TRUNCATED,
+    )
+    snapshots, error = predicates.parse_cached_snapshots(marker)
+    assert snapshots == []
+    assert error == "cached snapshot capture truncated"
+
+
 def test_c_runtime_parity_overflow_and_boundary():
     """Overflow reports br 2; the size boundary is a branch (not <)."""
-    predicate = binradar_setup.parse_cwe119_predicate(
+    predicate = binradar_setup.parse_CWE805_predicate(
         "8 * s->rbx < i->end - i->begin")
     # 8 * 0x2000000000000000 overflows u64 -> br 2.
-    assert binradar_setup.cwe119_branch_taken(
+    assert binradar_setup.CWE805_branch_taken(
         predicate, [0, 0x2000000000000000] + [0] * 14, b"",
         [(0x1000, 0x2000)]) == 2
     # size == capacity is NOT < capacity -> branch (br 1).
-    assert binradar_setup.cwe119_branch_taken(
+    assert binradar_setup.CWE805_branch_taken(
         predicate, [0, 0x200] + [0] * 14, b"",
         [(0x1000, 0x2000)]) == 1
     # size < capacity -> no branch (br 0).
-    assert binradar_setup.cwe119_branch_taken(
+    assert binradar_setup.CWE805_branch_taken(
         predicate, [0, 0x1ff] + [0] * 14, b"",
         [(0x1000, 0x2000)]) == 0
 
@@ -730,7 +827,7 @@ def test_parse_e9tool_patch_metadata_all_offsets(tmp_path):
 
 def test_build_instrumentation_spec_order():
     """First call gets set_size, later calls mark, first return set_base,
-    patch site last (mirrors taosc cwe119/synth.in::e9trace)."""
+    patch site last (mirrors taosc CWE805/synth.in::e9trace)."""
     trace = binradar_setup.AllocatorTrace(
         "malloc",
         [(0, "409200"), (1, "410370"), (2, "4046a9")],
@@ -774,23 +871,22 @@ def test_e9tool_command_identical_spec():
 
 
 def test_direct_action_expands_mem0():
-    """The direct call-site action expands Taosc's $mem0 shell variable to
-    the four E9 memory-operand fields (utils/taosc/helpers.in)."""
+    """The direct action passes Taosc's four $mem0 fields plus the memory
+    access width required by joob's complete-access bounds check."""
     trace = binradar_setup.AllocatorTrace(
         "malloc",
         [(0, "40661c"), (1, "404eb4"), (2, "405c4b")],
         ["406621"])
     spec = binradar_setup.build_instrumentation_spec(
         trace, "0x4066d0",
-        f"if jnz({binradar_setup.E9_MEM0},0x4066e4)@brpatch goto")
-    assert spec.entries[-1] == (
-        "0x4066d0",
+        f"if jnz({binradar_setup.E9_MEM0_ACCESS},0x4066e4)@brpatch goto")
+    action = (
         "if jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,"
-        "0x4066e4)@brpatch goto")
+        "mem[0].size,0x4066e4)@brpatch goto")
+    assert spec.entries[-1] == ("0x4066d0", action)
     cmd = binradar_setup.e9tool_command(
         spec, Path("out.bin"), Path("bin.orig"))
-    assert "if jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp," \
-        "0x4066e4)@brpatch goto" in cmd
+    assert action in cmd
 
 
 def _real_multipoint_workdir():
@@ -857,13 +953,13 @@ def _build_snapshot(clamps, regs, stack, truncated=False):
     return header + clamp_bytes + reg_bytes + stack
 
 
-def test_parse_cwe119_snapshots_roundtrip():
+def test_parse_CWE805_snapshots_roundtrip():
     """A serialized record round-trips through the parser."""
     clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
     regs = tuple(range(16))
     stack = bytes(range(64))
     data = _build_snapshot(clamps, regs, stack)
-    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(data)
+    snapshots, truncated = binradar_setup.parse_CWE805_snapshots(data)
     assert truncated is False
     assert len(snapshots) == 1
     snap = snapshots[0]
@@ -873,7 +969,7 @@ def test_parse_cwe119_snapshots_roundtrip():
     assert snap.stack == stack
 
 
-def test_parse_cwe119_snapshots_multiple_and_truncation():
+def test_parse_CWE805_snapshots_multiple_and_truncation():
     """Many records parse; a truncation marker stops and flags."""
     clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
     regs = tuple(range(16))
@@ -881,12 +977,12 @@ def test_parse_cwe119_snapshots_multiple_and_truncation():
     data = (_build_snapshot(clamps, regs, stack)
             + _build_snapshot(clamps, regs, stack)
             + _build_snapshot(clamps, regs, stack, truncated=True))
-    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(data)
+    snapshots, truncated = binradar_setup.parse_CWE805_snapshots(data)
     assert truncated is True
     assert len(snapshots) == 2  # complete records before the marker
 
 
-def test_parse_cwe119_snapshots_malformed():
+def test_parse_CWE805_snapshots_malformed():
     """Bad magic/version and partial trailing records are not evidence."""
     clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
     regs = tuple(range(16))
@@ -895,49 +991,49 @@ def test_parse_cwe119_snapshots_malformed():
     # Bad magic.
     bad_magic = bytearray(good)
     bad_magic[0:4] = b"XXXX"
-    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(bytes(bad_magic))
+    snapshots, truncated = binradar_setup.parse_CWE805_snapshots(bytes(bad_magic))
     assert snapshots == [] and truncated is False
     # Partial trailing record (header + half the clamps).
     partial = good + good[:100]
-    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(partial)
+    snapshots, truncated = binradar_setup.parse_CWE805_snapshots(partial)
     assert len(snapshots) == 1 and truncated is False
     # Bad version after a good record.
     bad_version = bytearray(good + _build_snapshot(clamps, regs, stack))
     bad_version[len(good) + 4:len(good) + 8] = struct.pack("<I", 99)
-    snapshots, truncated = binradar_setup.parse_cwe119_snapshots(bytes(bad_version))
+    snapshots, truncated = binradar_setup.parse_CWE805_snapshots(bytes(bad_version))
     assert len(snapshots) == 1 and truncated is False
 
 
-def test_cwe119_snapshot_evaluator_matches_branch_taken():
+def test_cwe805_snapshot_evaluator_matches_branch_taken():
     """The snapshot evaluator uses the same rules as the plain evaluator."""
     clamps = [(0x1000, 0x2000)] + [(0, 0)] * 255
     regs = [0x1000] + [0] * 15  # rax inside the clamp
     stack = bytes(64)
-    snap = binradar_setup.Cwe119Snapshot(
+    snap = binradar_setup.CWE805Snapshot(
         tuple(clamps), tuple(regs), stack)
-    predicate = binradar_setup.parse_cwe119_predicate(
+    predicate = binradar_setup.parse_CWE805_predicate(
         "s->rax >= i->begin && s->rax < i->end")
-    assert binradar_setup.cwe119_snapshot_branch_taken(predicate, snap) == 0
+    assert binradar_setup.CWE805_snapshot_branch_taken(predicate, snap) == 0
     # Outside the clamp -> branch.
     regs_out = [0x3000] + [0] * 15
-    snap_out = binradar_setup.Cwe119Snapshot(
+    snap_out = binradar_setup.CWE805Snapshot(
         tuple(clamps), tuple(regs_out), stack)
-    assert binradar_setup.cwe119_snapshot_branch_taken(predicate, snap_out) == 1
+    assert binradar_setup.CWE805_snapshot_branch_taken(predicate, snap_out) == 1
     # Stack cell: uint16_t at index 0 reads the first two stack bytes.
     stack16 = bytes([0x00, 0x05]) + bytes(62)
-    snap16 = binradar_setup.Cwe119Snapshot(
+    snap16 = binradar_setup.CWE805Snapshot(
         tuple(clamps), tuple([0] * 16), stack16)
-    size_pred = binradar_setup.parse_cwe119_predicate(
+    size_pred = binradar_setup.parse_CWE805_predicate(
         "2 * ((uint16_t *)s->rsp)[0] < i->end - i->begin")
     # 2 * 0x500 = 0xa00 < 0x1000 -> no branch.
-    assert binradar_setup.cwe119_snapshot_branch_taken(size_pred, snap16) == 0
+    assert binradar_setup.CWE805_snapshot_branch_taken(size_pred, snap16) == 0
     # Overflow: 8 * 0x2000000000000000 -> br 2.
     regs_ovf = [0, 0x2000000000000000] + [0] * 14
-    snap_ovf = binradar_setup.Cwe119Snapshot(
+    snap_ovf = binradar_setup.CWE805Snapshot(
         tuple(clamps), tuple(regs_ovf), stack)
-    ovf_pred = binradar_setup.parse_cwe119_predicate(
+    ovf_pred = binradar_setup.parse_CWE805_predicate(
         "8 * s->rbx < i->end - i->begin")
-    assert binradar_setup.cwe119_snapshot_branch_taken(ovf_pred, snap_ovf) == 2
+    assert binradar_setup.CWE805_snapshot_branch_taken(ovf_pred, snap_ovf) == 2
 
 
 def _run_c_prefilter_test(tmp_path):
@@ -947,7 +1043,7 @@ def _run_c_prefilter_test(tmp_path):
         "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
         "-Wno-missing-field-initializers", "-Wno-unused-parameter",
         "-Wno-unused-function", "-Wno-implicit-fallthrough",
-        "-DBRPATCH_CWE119", "-DBRPATCH_ALLOC_MALLOC",
+        "-DBRPATCH_CWE805", "-DBRPATCH_ALLOC_MALLOC",
         f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
         str(ROOT / "tests" / "test_brpatch_prefilter.c"),
         "-o", str(executable),
@@ -1007,7 +1103,7 @@ def test_c_snapshot_capture_parity():
     assert results["snap-generic"][2] == "66]"
 
 
-def test_cwe119_prefilter_decision_parity():
+def test_cwe805_prefilter_decision_parity():
     """Prefilter decisions equal the C evaluator on the same snapshots.
 
     The C test's recorded snapshot (clamp {0x6000, 0x200}, rax 0x1111)
@@ -1031,22 +1127,22 @@ def test_cwe119_prefilter_decision_parity():
                int(results["snap-clamp0"][1], 16))] + [(0, 0)] * 255
     regs = [int(v, 16) for v in results["snap-regs"]]
     stack = bytes(int(v, 16) for v in results["snap-stack"])
-    snap = binradar_setup.Cwe119Snapshot(tuple(clamps), tuple(regs), stack)
+    snap = binradar_setup.CWE805Snapshot(tuple(clamps), tuple(regs), stack)
 
     # rax = 0x1111 is outside {0x6000, 0x6200} -> branch (br 1).
-    ptr_rax = binradar_setup.parse_cwe119_predicate(
+    ptr_rax = binradar_setup.parse_CWE805_predicate(
         "s->rax >= i->begin && s->rax < i->end")
-    assert binradar_setup.cwe119_snapshot_branch_taken(ptr_rax, snap) == 1
+    assert binradar_setup.CWE805_snapshot_branch_taken(ptr_rax, snap) == 1
     # rbx = 0x2222, scale 1: 0x2222 >= 0x200 -> branch.
-    size_rbx = binradar_setup.parse_cwe119_predicate(
+    size_rbx = binradar_setup.parse_CWE805_predicate(
         "1 * s->rbx < i->end - i->begin")
-    assert binradar_setup.cwe119_snapshot_branch_taken(size_rbx, snap) == 1
+    assert binradar_setup.CWE805_snapshot_branch_taken(size_rbx, snap) == 1
     # A register inside the clamp (0x6000) does not branch.
     regs_inside = list(regs)
     regs_inside[0] = 0x6000
-    snap_inside = binradar_setup.Cwe119Snapshot(
+    snap_inside = binradar_setup.CWE805Snapshot(
         tuple(clamps), tuple(regs_inside), stack)
-    assert binradar_setup.cwe119_snapshot_branch_taken(ptr_rax, snap_inside) == 0
+    assert binradar_setup.CWE805_snapshot_branch_taken(ptr_rax, snap_inside) == 0
 
 
 def _main():

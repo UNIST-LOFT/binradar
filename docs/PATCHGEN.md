@@ -49,11 +49,11 @@ default:
 	return "p0";
 ```
 
-### CWE-119 ERM (`cwe119-erm`)
+### CWE-805 ERM (`CWE805-erm`)
 
 Heap-buffer-overflow predicates over typed cells (registers and stack slots)
 quantified against 256 tracked allocation clamps.  The closed grammar emitted
-by `utils/taosc/cwe119/filter.zig` is:
+by `utils/taosc/cwe805/filter.zig` is:
 ```
 pointer := CELL >= i->begin && CELL < i->end
 size    := {1|2|4|8} * CELL < i->end - i->begin
@@ -77,12 +77,12 @@ case 45:
 	return "c2s8i16q1";     /* size predicate, uint8_t stack[16], scale 1 */
 ```
 
-### CWE-119 direct call-site (`cwe119-direct`)
+### CWE-805 direct call-site (`CWE805-direct`)
 
 When the crash address equals the patch location, Taosc emits a direct
 call-site metapatch with no predicate list.  The decision is
 `jnz($mem0,dest)`: branch when the computed effective address lies outside
-every tracked clamp.  This uses the same allocation tracker as CWE-119 ERM
+every tracked clamp.  This uses the same allocation tracker as CWE-805 ERM
 but exposes exactly one candidate (id 1).  Setup rebuilds the binary with
 BinRadar patch-id switching and `[patch]` logging instead of reusing Taosc's
 incompatible `no_call`/`jnz` output.
@@ -101,7 +101,7 @@ the taosc-style single-predicate plugin: it evaluates the `TAOSC_PRED`
 environment predicate at the patch site and jumps to the first `destinations`
 entry when it holds. The cached build uses the same e9tool invocation as
 `.brpatched`, so the E9 layout values are shared; its metadata is stored under
-the `BRCACHED_*` prefix in `binradar.env`. CWE-119 families skip the cached
+the `BRCACHED_*` prefix in `binradar.env`. CWE-805 families skip the cached
 build with a warning because the plugin does not implement the allocator
 hooks.
 
@@ -121,8 +121,8 @@ just prefilter <workdir>
 # uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
 ```
 The prefilter keeps only predicates that branch on the POC, so the expensive
-pipeline never runs on patches the FILTER phase would reject.  For CWE-119
+pipeline never runs on patches the FILTER phase would reject.  For CWE-805
 ERM it captures full-context snapshots (clamps + registers + stack) and
-evaluates descriptors offline; for CWE-119 direct it is a no-op (FILTER is the
+evaluates descriptors offline; for CWE-805 direct it is a no-op (FILTER is the
 behavioral gate).  `just binradar` runs the prefilter automatically on fresh
 workdirs.

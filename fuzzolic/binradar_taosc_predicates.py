@@ -2,13 +2,14 @@
 """
 Taosc predicate management for BinRadar workdir setup.
 Parsing, classification, evaluation, and lowering of the Taosc predicate
-families (generic ERM, CWE-119 ERM, CWE-119 direct, taosc-specialized),
+families (generic ERM, CWE-805 ERM, CWE-805 direct, taosc-specialized),
 plus the allocator-trace instrumentation spec shared by the prefilter
 and final binaries.  Split out of fuzzolic/binradar-setup.py.
 """
 
 import enum
 import hashlib
+import json
 import re
 import struct
 import sbsv
@@ -77,8 +78,8 @@ REGISTER_TO_VAR: Dict[str, int] = {
 # Taosc predicate families
 class PredicateFamily(enum.Enum):
     GENERIC_ERM = "generic-erm"
-    CWE119_ERM = "cwe119-erm"
-    CWE119_DIRECT = "cwe119-direct"
+    CWE805_ERM = "CWE805-erm"
+    CWE805_DIRECT = "CWE805-direct"
     TAOSC_SPECIALIZED = "taosc-specialized"
 
 
@@ -97,17 +98,18 @@ StateCell = Union[RegisterCell, StackCell]
 
 
 @dataclass(frozen=True)
-class Cwe119PointerPredicate:
+class CWE805PointerPredicate:
     cell: StateCell
 
 
 @dataclass(frozen=True)
-class Cwe119SizePredicate:
+class CWE805SizePredicate:
     scale: int  # 1, 2, 4 or 8
     cell: StateCell
 
 
-Cwe119Predicate = Union[Cwe119PointerPredicate, Cwe119SizePredicate]
+CWE805Predicate = Union[CWE805PointerPredicate, CWE805SizePredicate]
+ParsedPredicate = Union[str, CWE805Predicate]
 
 
 @dataclass(frozen=True)
@@ -115,61 +117,61 @@ class PredicateRecord:
     runtime_id: int
     source_line: int
     source_text: str
-    parsed: Union[str, Cwe119Predicate]  # generic: encoded patch string
+    parsed: ParsedPredicate  # generic: encoded branch expression
 
 
-# The closed CWE-119 grammar emitted by utils/taosc/cwe119/filter.zig
+# The closed CWE-805 grammar emitted by utils/taosc/CWE805/filter.zig
 # (revision 61f9f3a).  Pointer predicates require both textual cell
 # occurrences to be identical; size predicates use scales 1/2/4/8.
-_CWE119_POINTER_RE = re.compile(
+_CWE805_POINTER_RE = re.compile(
     r"^(?P<c1>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
     r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) >= i->begin && "
     r"(?P<c2>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
     r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) < i->end$")
-_CWE119_SIZE_RE = re.compile(
+_CWE805_SIZE_RE = re.compile(
     r"^(?P<scale>[1-9][0-9]*) \* "
     r"(?P<cell>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
     r"|\(\(uint(?:8|16|32)_t \*\)s->rsp\)\[[0-9]+\]) < i->end - i->begin$")
-_CWE119_STACK_CELL_RE = re.compile(r"\(\(uint(?P<width>8|16|32|64)_t \*\)s->rsp\)\[(?P<index>[0-9]+)\]")
+_CWE805_STACK_CELL_RE = re.compile(r"\(\(uint(?P<width>8|16|32|64)_t \*\)s->rsp\)\[(?P<index>[0-9]+)\]")
 
 
-def _parse_cwe119_cell(text: str) -> StateCell:
-    """Parse one CWE-119 cell (register or typed stack cell)."""
+def _parse_CWE805_cell(text: str) -> StateCell:
+    """Parse one CWE-805 cell (register or typed stack cell)."""
     if text.startswith("s->"):
         return RegisterCell(REGISTER_TO_VAR[text[3:]])
-    match = _CWE119_STACK_CELL_RE.match(text)
+    match = _CWE805_STACK_CELL_RE.match(text)
     if match is None:
-        raise ValueError(f"invalid CWE-119 cell: {text!r}")
+        raise ValueError(f"invalid CWE-805 cell: {text!r}")
     return StackCell(int(match.group("width")), int(match.group("index")))
 
 
-def parse_cwe119_predicate(line: str) -> Cwe119Predicate:
-    """Parse one CWE-119 predicate line into a typed descriptor.
+def parse_CWE805_predicate(line: str) -> CWE805Predicate:
+    """Parse one CWE-805 predicate line into a typed descriptor.
 
     Raises ValueError with a reason on any line outside the closed
     filter.zig grammar.
     """
-    match = _CWE119_POINTER_RE.match(line)
+    match = _CWE805_POINTER_RE.match(line)
     if match is not None:
         if match.group("c1") != match.group("c2"):
             raise ValueError(
                 "pointer predicate cells differ: "
                 f"{match.group('c1')!r} vs {match.group('c2')!r}")
-        return Cwe119PointerPredicate(_parse_cwe119_cell(match.group("c1")))
-    match = _CWE119_SIZE_RE.match(line)
+        return CWE805PointerPredicate(_parse_CWE805_cell(match.group("c1")))
+    match = _CWE805_SIZE_RE.match(line)
     if match is not None:
         scale = int(match.group("scale"))
         if scale not in (1, 2, 4, 8):
-            raise ValueError(f"unsupported CWE-119 size scale: {scale}")
-        return Cwe119SizePredicate(scale, _parse_cwe119_cell(match.group("cell")))
-    raise ValueError("not a CWE-119 predicate")
+            raise ValueError(f"unsupported CWE-805 size scale: {scale}")
+        return CWE805SizePredicate(scale, _parse_CWE805_cell(match.group("cell")))
+    raise ValueError("not a CWE-805 predicate")
 
 
 def classify_predicate_line(line: str) -> Optional[str]:
     """Return the family of one non-empty predicate line, or None if it is
-    neither a generic nor a CWE-119 predicate."""
+    neither a generic nor a CWE-805 predicate."""
     if "i->begin" in line or "i->end" in line or "s->" in line:
-        return PredicateFamily.CWE119_ERM.value
+        return PredicateFamily.CWE805_ERM.value
     return PredicateFamily.GENERIC_ERM.value
 
 
@@ -394,7 +396,7 @@ def load_predicates(file: Path) -> List[Tuple[int, str]]:
     return predicates
 
 
-# Taosc allocator trace artifacts (utils/taosc/cwe119/synth.in): the
+# Taosc allocator trace artifacts (utils/taosc/CWE805/synth.in): the
 # allocator kind is detected from exactly one complete supported set of
 # trace/<fn>.calls and trace/<fn>.returns files.
 ALLOCATOR_KINDS = ("malloc", "calloc", "realloc")
@@ -421,9 +423,9 @@ class InstrumentationSpec:
 def build_instrumentation_spec(allocator: AllocatorTrace, patch_loc: str,
                                patch_action: str,
                                plugin_name: str = "brpatch") -> InstrumentationSpec:
-    """Build the CWE-119 multipoint instrumentation spec.
+    """Build the CWE-805 multipoint instrumentation spec.
 
-    Mirrors utils/taosc/cwe119/synth.in::e9trace: the first call address
+    Mirrors utils/taosc/CWE805/synth.in::e9trace: the first call address
     receives set_size(rdi,rsi), later call entries receive mark(bit), the
     first return address receives set_base(rax), then the patch site.
 
@@ -536,26 +538,26 @@ def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[Al
         patch_location = (workdir / "patch-location").read_text().strip() \
             if (workdir / "patch-location").exists() else ""
         if crash_address == patch_location:
-            return PredicateFamily.CWE119_DIRECT, allocator
+            return PredicateFamily.CWE805_DIRECT, allocator
         # Missing or empty predicates are valid: setup still builds the
         # artifacts with zero candidates (TOTAL_PATCHES=0) and binradar.py
         # handles the no-patch case.
         if not predicates_file.exists():
-            return PredicateFamily.CWE119_ERM, allocator
+            return PredicateFamily.CWE805_ERM, allocator
         records = load_predicates(predicates_file)
         if not records:
-            return PredicateFamily.CWE119_ERM, allocator
+            return PredicateFamily.CWE805_ERM, allocator
         for source_line, predicate in records:
-            if classify_predicate_line(predicate) != PredicateFamily.CWE119_ERM.value:
+            if classify_predicate_line(predicate) != PredicateFamily.CWE805_ERM.value:
                 raise ValueError(
-                    f"predicates:{source_line}: not a CWE-119 predicate: "
+                    f"predicates:{source_line}: not a CWE-805 predicate: "
                     f"{predicate!r}")
             try:
-                parse_cwe119_predicate(predicate)
+                parse_CWE805_predicate(predicate)
             except ValueError as e:
                 raise ValueError(
                     f"predicates:{source_line}: {e}") from e
-        return PredicateFamily.CWE119_ERM, allocator
+        return PredicateFamily.CWE805_ERM, allocator
 
     if not predicates_file.exists():
         return PredicateFamily.TAOSC_SPECIALIZED, None
@@ -795,10 +797,10 @@ def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, s
     return False, "evaluates to 0 on all captured states"
 
 
-def cwe119_branch_taken(predicate: Cwe119Predicate,
+def CWE805_branch_taken(predicate: CWE805Predicate,
                         registers: List[int], stack: bytes,
                         clamps: List[Tuple[int, int]]) -> int:
-    """Mirror brpatch.c::cwe119_branch_taken (plan §7.3).
+    """Mirror brpatch.c::CWE805_branch_taken (plan §7.3).
 
     Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
     2 (checked-multiply overflow: conservative no-jump, reported as br 2).
@@ -813,7 +815,7 @@ def cwe119_branch_taken(predicate: Cwe119Predicate,
         offset = cell.index * width
         value = int.from_bytes(stack[offset:offset + width], "little")
 
-    if isinstance(predicate, Cwe119PointerPredicate):
+    if isinstance(predicate, CWE805PointerPredicate):
         for begin, end in clamps:
             if begin <= value < end:
                 return 0
@@ -829,7 +831,7 @@ def cwe119_branch_taken(predicate: Cwe119Predicate,
 
 
 # ---------------------------------------------------------------------------
-# CWE-119 full-context prefilter snapshots (plan §8)
+# CWE-805 full-context prefilter snapshots (plan §8)
 # ---------------------------------------------------------------------------
 
 # Binary record written by brpatch-prefilter.c::capture_snapshot:
@@ -846,7 +848,7 @@ PREFILTER_SNAPSHOT_REGS = struct.Struct("<" + "Q" * 16)
 
 
 @dataclass(frozen=True)
-class Cwe119Snapshot:
+class CWE805Snapshot:
     """One captured patch-site full context (plan §8)."""
     clamps: Tuple[Tuple[int, int], ...]  # 256 (begin, end) pairs
     registers: Tuple[int, ...]           # 16 u64 bit patterns, rax..r15
@@ -854,7 +856,7 @@ class Cwe119Snapshot:
     truncated: bool = False              # capture hit the bound
 
 
-def parse_cwe119_snapshots(data: bytes) -> Tuple[List[Cwe119Snapshot], bool]:
+def parse_CWE805_snapshots(data: bytes) -> Tuple[List[CWE805Snapshot], bool]:
     """Parse the binary snapshot stream from the capture pipe.
 
     Returns (snapshots, truncated).  A header-only record with the
@@ -862,7 +864,7 @@ def parse_cwe119_snapshots(data: bytes) -> Tuple[List[Cwe119Snapshot], bool]:
     partial record is dropped.  Malformed records (bad magic/version,
     truncated body) stop parsing at the first bad record.
     """
-    snapshots: List[Cwe119Snapshot] = []
+    snapshots: List[CWE805Snapshot] = []
     truncated = False
     offset = 0
     while offset + PREFILTER_SNAPSHOT_HEADER.size <= len(data):
@@ -885,23 +887,141 @@ def parse_cwe119_snapshots(data: bytes) -> Tuple[List[Cwe119Snapshot], bool]:
         offset += PREFILTER_SNAPSHOT_REGS.size
         stack = data[offset:offset + stack_size]
         offset += stack_size
-        snapshots.append(Cwe119Snapshot(
+        snapshots.append(CWE805Snapshot(
             tuple((clamps_raw[i], clamps_raw[i + 1])
                   for i in range(0, len(clamps_raw), 2)),
             regs, stack))
     return snapshots, truncated
 
 
-def cwe119_snapshot_branch_taken(predicate: Cwe119Predicate,
-                                snapshot: Cwe119Snapshot) -> int:
-    """Evaluate one CWE-119 descriptor against one captured snapshot.
+def CWE805_snapshot_branch_taken(predicate: CWE805Predicate,
+                                snapshot: CWE805Snapshot) -> int:
+    """Evaluate one CWE-805 descriptor against one captured snapshot.
 
     Same cell, unsigned comparison, checked-multiply, and !any_match rules
-    as brpatch.c::cwe119_branch_taken (plan §8): 0 = no jump, 1 = jump,
+    as brpatch.c::CWE805_branch_taken (plan §8): 0 = no jump, 1 = jump,
     2 = checked-multiply overflow (conservative no-jump).
     """
-    return cwe119_branch_taken(predicate, list(snapshot.registers),
+    return CWE805_branch_taken(predicate, list(snapshot.registers),
                                snapshot.stack, list(snapshot.clamps))
+
+
+# Binary records emitted by brpatch-cached.c.  Each record contains the
+# selected predicate's branch plus enough pre-branch state to evaluate every
+# other predicate offline.  CWE-805 records additionally contain all clamps
+# and the measured stack prefix.
+CACHED_SNAPSHOT_MAGIC = 0x48435242  # little-endian bytes "BRCH"
+CACHED_SNAPSHOT_VERSION = 1
+CACHED_SNAPSHOT_FLAG_TRUNCATED = 1
+CACHED_SNAPSHOT_FLAG_CWE805 = 2
+CACHED_SNAPSHOT_FLAG_INVALID = 4
+CACHED_SNAPSHOT_HEADER = struct.Struct("<IIIIQQ")
+CACHED_SNAPSHOT_CLAMPS = PREFILTER_SNAPSHOT_CLAMPS
+CACHED_SNAPSHOT_REGS = PREFILTER_SNAPSHOT_REGS
+
+
+@dataclass(frozen=True)
+class CachedSnapshot:
+    patch_id: int
+    branch: int
+    registers: Tuple[int, ...]
+    clamps: Tuple[Tuple[int, int], ...] = ()
+    stack: bytes = b""
+
+    @property
+    def is_CWE805(self) -> bool:
+        return bool(self.clamps)
+
+
+def parse_cached_snapshots(
+    data: bytes,
+) -> Tuple[List[CachedSnapshot], Optional[str]]:
+    """Parse a complete brpatch-cached binary stream.
+
+    Returns ``(snapshots, error)``.  An empty stream is valid and means that
+    the patch site was not reached.  Any malformed, invalid, truncated, or
+    partial record disables cache inference for the run.
+    """
+    snapshots: List[CachedSnapshot] = []
+    offset = 0
+    known_flags = CACHED_SNAPSHOT_FLAG_TRUNCATED \
+        | CACHED_SNAPSHOT_FLAG_CWE805 | CACHED_SNAPSHOT_FLAG_INVALID
+    while offset < len(data):
+        if offset + CACHED_SNAPSHOT_HEADER.size > len(data):
+            return [], "partial cached snapshot header"
+        magic, version, patch_id, branch, stack_size, flags = \
+            CACHED_SNAPSHOT_HEADER.unpack_from(data, offset)
+        offset += CACHED_SNAPSHOT_HEADER.size
+        if magic != CACHED_SNAPSHOT_MAGIC:
+            return [], f"bad cached snapshot magic 0x{magic:x}"
+        if version != CACHED_SNAPSHOT_VERSION:
+            return [], f"unsupported cached snapshot version {version}"
+        if flags & ~known_flags:
+            return [], f"unknown cached snapshot flags 0x{flags:x}"
+        if flags & CACHED_SNAPSHOT_FLAG_TRUNCATED:
+            return [], "cached snapshot capture truncated"
+        if flags & CACHED_SNAPSHOT_FLAG_INVALID:
+            return [], "cached runtime rejected the selected predicate"
+        if branch not in (0, 1, 2):
+            return [], f"invalid cached branch value {branch}"
+
+        is_CWE805 = bool(flags & CACHED_SNAPSHOT_FLAG_CWE805)
+        if not is_CWE805 and stack_size != 0:
+            return [], "generic cached snapshot has a stack payload"
+        if stack_size > 0x100000:
+            return [], f"cached stack payload too large: {stack_size}"
+
+        clamps: Tuple[Tuple[int, int], ...] = ()
+        if is_CWE805:
+            if offset + CACHED_SNAPSHOT_CLAMPS.size > len(data):
+                return [], "partial cached clamp payload"
+            raw = CACHED_SNAPSHOT_CLAMPS.unpack_from(data, offset)
+            offset += CACHED_SNAPSHOT_CLAMPS.size
+            clamps = tuple((raw[i], raw[i + 1])
+                           for i in range(0, len(raw), 2))
+
+        if offset + CACHED_SNAPSHOT_REGS.size + stack_size > len(data):
+            return [], "partial cached state payload"
+        registers = CACHED_SNAPSHOT_REGS.unpack_from(data, offset)
+        offset += CACHED_SNAPSHOT_REGS.size
+        stack = data[offset:offset + stack_size]
+        offset += stack_size
+        snapshots.append(CachedSnapshot(
+            patch_id=patch_id,
+            branch=branch,
+            registers=registers,
+            clamps=clamps,
+            stack=stack,
+        ))
+    return snapshots, None
+
+
+def evaluate_cached_predicate(
+    predicate: ParsedPredicate,
+    snapshots: List[CachedSnapshot],
+) -> List[int]:
+    """Evaluate one runtime predicate over every captured pre-branch state."""
+    branches: List[int] = []
+    for snapshot in snapshots:
+        if isinstance(predicate, str):
+            if snapshot.is_CWE805:
+                raise ValueError("generic predicate with a CWE-805 snapshot")
+            env = [wrap64(value) for value in snapshot.registers]
+            try:
+                branch = int(eval_patch_str(predicate, env) != 0)
+            except PrefilterTrap:
+                branch = 2
+        else:
+            if not snapshot.is_CWE805:
+                raise ValueError("CWE-805 predicate with a generic snapshot")
+            branch = CWE805_branch_taken(
+                predicate,
+                list(snapshot.registers),
+                snapshot.stack,
+                list(snapshot.clamps),
+            )
+        branches.append(branch)
+    return branches
 
 
 def parse_state_lines(data: str) -> List[List[int]]:
@@ -956,47 +1076,137 @@ def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, st
           f"[survived {survived}] [time {elapsed:.2f}]")
 
 
+RUNTIME_PREDICATES_VERSION = 1
+
+
+def predicate_descriptor(predicate: ParsedPredicate) -> str:
+    """Encode one validated runtime predicate for brpatches.inc/JSON."""
+    if isinstance(predicate, str):
+        return predicate
+    cell = predicate.cell
+    if isinstance(cell, RegisterCell):
+        encoded_cell = f"p{cell.register_index}"
+    else:
+        encoded_cell = f"s{cell.width_bits}i{cell.index}"
+    if isinstance(predicate, CWE805PointerPredicate):
+        return f"c1{encoded_cell}"
+    return f"c2{encoded_cell}q{predicate.scale}"
+
+
+def parse_predicate_descriptor(descriptor: str) -> ParsedPredicate:
+    """Parse the compact descriptor accepted by brpatch.c."""
+    if not descriptor.startswith("c"):
+        if not descriptor:
+            raise ValueError("empty generic predicate descriptor")
+        return descriptor
+
+    match = re.fullmatch(r"c1p([0-9]+)", descriptor)
+    if match is not None:
+        index = int(match.group(1))
+        if index > 15:
+            raise ValueError(f"register index out of range: {index}")
+        return CWE805PointerPredicate(RegisterCell(index))
+    match = re.fullmatch(r"c1s64i([0-9]+)", descriptor)
+    if match is not None:
+        return CWE805PointerPredicate(StackCell(64, int(match.group(1))))
+    match = re.fullmatch(r"c2p([0-9]+)q([0-9]+)", descriptor)
+    if match is not None:
+        index, scale = int(match.group(1)), int(match.group(2))
+        if index > 15:
+            raise ValueError(f"register index out of range: {index}")
+        if scale not in (1, 2, 4, 8):
+            raise ValueError(f"invalid size scale: {scale}")
+        return CWE805SizePredicate(scale, RegisterCell(index))
+    match = re.fullmatch(r"c2s(8|16|32)i([0-9]+)q([0-9]+)", descriptor)
+    if match is not None:
+        width, index, scale = map(int, match.groups())
+        if scale not in (1, 2, 4, 8):
+            raise ValueError(f"invalid size scale: {scale}")
+        return CWE805SizePredicate(scale, StackCell(width, index))
+    raise ValueError(f"invalid CWE-805 predicate descriptor: {descriptor!r}")
+
+
+def write_runtime_predicates(
+    path: Path,
+    family: PredicateFamily,
+    selected: List[PredicateRecord],
+) -> None:
+    """Persist the exact compact runtime-id mapping used by both binaries."""
+    if family not in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        raise ValueError(f"predicate cache does not support {family.value}")
+    expected_ids = list(range(1, len(selected) + 1))
+    if [record.runtime_id for record in selected] != expected_ids:
+        raise ValueError("runtime predicate ids must be consecutive from 1")
+    data = {
+        "version": RUNTIME_PREDICATES_VERSION,
+        "kind": family.value,
+        "predicates": [
+            {
+                "id": record.runtime_id,
+                "source_line": record.source_line,
+                "descriptor": predicate_descriptor(record.parsed),
+            }
+            for record in selected
+        ],
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def load_runtime_predicates(
+    path: Path,
+) -> Tuple[PredicateFamily, Dict[int, ParsedPredicate]]:
+    """Load and validate the runtime-id mapping emitted by setup."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read runtime predicates: {e}") from e
+    if not isinstance(data, dict) or data.get("version") != \
+            RUNTIME_PREDICATES_VERSION:
+        raise ValueError("unsupported runtime predicate manifest")
+    try:
+        family = PredicateFamily(data["kind"])
+    except (KeyError, ValueError) as e:
+        raise ValueError("invalid runtime predicate family") from e
+    if family not in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        raise ValueError(f"predicate cache does not support {family.value}")
+    rows = data.get("predicates")
+    if not isinstance(rows, list):
+        raise ValueError("runtime predicates must be a list")
+
+    predicates: Dict[int, ParsedPredicate] = {}
+    for expected_id, row in enumerate(rows, start=1):
+        if not isinstance(row, dict) or row.get("id") != expected_id \
+                or not isinstance(row.get("source_line"), int) \
+                or not isinstance(row.get("descriptor"), str):
+            raise ValueError(
+                f"invalid runtime predicate row at index {expected_id}")
+        parsed = parse_predicate_descriptor(row["descriptor"])
+        if family == PredicateFamily.GENERIC_ERM and not isinstance(parsed, str):
+            raise ValueError("CWE-805 descriptor in generic manifest")
+        if family == PredicateFamily.CWE805_ERM and isinstance(parsed, str):
+            raise ValueError("generic descriptor in CWE-805 manifest")
+        predicates[expected_id] = parsed
+    return family, predicates
+
+
 def _emit_brpatches_inc(brpatches_inc: Path,
                         selected: List[PredicateRecord]) -> None:
-    """Write the typed brpatches.inc table (plan §5.2).
-
-    Entry 0 is BR_PRED_FALSE.  Generic entries retain the current encoded
-    ``predicate == 0`` prefix string; CWE-119 entries contain only validated
-    enum/integer fields, never source text.
-    """
+    """Write the compact predicate table included by the C runtimes."""
     with brpatches_inc.open("w") as f:
         f.write("case 0:\n\treturn \"p0\";\n")
         for record in selected:
-            if isinstance(record.parsed, str):
-                f.write(f"case {record.runtime_id}:\n"
-                        f"\treturn \"{record.parsed}\"; "
-                        f"/* predicate line {record.source_line} */\n")
-            elif isinstance(record.parsed, Cwe119PointerPredicate):
-                cell = record.parsed.cell
-                if isinstance(cell, RegisterCell):
-                    f.write(f"case {record.runtime_id}:\n"
-                            f"\treturn \"c1p{cell.register_index}\"; "
-                            f"/* predicate line {record.source_line}: "
-                            f"pointer register */\n")
-                else:
-                    f.write(f"case {record.runtime_id}:\n"
-                            f"\treturn \"c1s{cell.width_bits}i{cell.index}\"; "
-                            f"/* predicate line {record.source_line}: "
-                            f"pointer stack cell */\n")
-            else:
-                size = cast(Cwe119SizePredicate, record.parsed)
-                cell = size.cell
-                if isinstance(cell, RegisterCell):
-                    f.write(f"case {record.runtime_id}:\n"
-                            f"\treturn \"c2p{cell.register_index}q{size.scale}\"; "
-                            f"/* predicate line {record.source_line}: "
-                            f"size register */\n")
-                else:
-                    f.write(f"case {record.runtime_id}:\n"
-                            f"\treturn \"c2s{cell.width_bits}i{cell.index}"
-                            f"q{size.scale}\"; "
-                            f"/* predicate line {record.source_line}: "
-                            f"size stack cell */\n")
+            descriptor = predicate_descriptor(record.parsed)
+            detail = ""
+            if isinstance(record.parsed, CWE805PointerPredicate):
+                detail = "pointer register" if isinstance(
+                    record.parsed.cell, RegisterCell) else "pointer stack cell"
+            elif isinstance(record.parsed, CWE805SizePredicate):
+                detail = "size register" if isinstance(
+                    record.parsed.cell, RegisterCell) else "size stack cell"
+            suffix = f": {detail}" if detail else ""
+            f.write(f"case {record.runtime_id}:\n"
+                    f"\treturn \"{descriptor}\"; "
+                    f"/* predicate line {record.source_line}{suffix} */\n")
         f.write("default:\n\treturn \"p0\";\n")
 
 
@@ -1013,9 +1223,9 @@ def _parse_predicate_records(predicates_file: Path,
             predicate = line.strip()
             if not predicate:
                 continue
-            if family == PredicateFamily.CWE119_ERM:
+            if family == PredicateFamily.CWE805_ERM:
                 try:
-                    parsed = parse_cwe119_predicate(predicate)
+                    parsed = parse_CWE805_predicate(predicate)
                 except ValueError as e:
                     raise ValueError(
                         f"predicates:{line_number}: {e}") from e

@@ -200,7 +200,7 @@ static void state_to_env(const struct STATE *state, int64_t env[16])
 /*
  * Typed predicate table (generated in brpatches.inc by
  * fuzzolic/binradar-setup.py).  Entry 0 is BR_PRED_FALSE ("p0").  Generic
- * entries are the encoded ``predicate == 0`` prefix strings; CWE-119
+ * entries are the encoded ``predicate == 0`` prefix strings; CWE-805
  * entries are compact descriptors containing only validated enum/integer
  * fields, never source text:
  *
@@ -212,8 +212,8 @@ static void state_to_env(const struct STATE *state, int64_t env[16])
 enum br_predicate_kind {
 	BR_PRED_FALSE,
 	BR_PRED_GENERIC,
-	BR_PRED_CWE119_POINTER,
-	BR_PRED_CWE119_SIZE,
+	BR_PRED_CWE805_POINTER,
+	BR_PRED_CWE805_SIZE,
 };
 
 enum br_cell_kind {
@@ -246,9 +246,9 @@ static int parse_predicate(const char *s, struct br_predicate *out)
 {
 	if (s[0] == 'c') {
 		if (s[1] == '1')
-			out->kind = BR_PRED_CWE119_POINTER;
+			out->kind = BR_PRED_CWE805_POINTER;
 		else if (s[1] == '2')
-			out->kind = BR_PRED_CWE119_SIZE;
+			out->kind = BR_PRED_CWE805_SIZE;
 		else
 			return -1;
 		const char *p = s + 2;
@@ -275,14 +275,14 @@ static int parse_predicate(const char *s, struct br_predicate *out)
 		} else {
 			return -1;
 		}
-		if (out->kind == BR_PRED_CWE119_POINTER
+		if (out->kind == BR_PRED_CWE805_POINTER
 				&& out->cell_kind != BR_CELL_REGISTER
 				&& out->cell_kind != BR_CELL_STACK64)
 			return -1; /* pointer cells are registers or uint64_t stack */
-		if (out->kind == BR_PRED_CWE119_SIZE
+		if (out->kind == BR_PRED_CWE805_SIZE
 				&& out->cell_kind == BR_CELL_STACK64)
 			return -1; /* size cells are registers or uint{8,16,32}_t */
-		if (out->kind == BR_PRED_CWE119_SIZE) {
+		if (out->kind == BR_PRED_CWE805_SIZE) {
 			if (*p != 'q')
 				return -1;
 			++p;
@@ -328,14 +328,14 @@ static void log_patch(uint32_t patch_id, int branch_taken, uint32_t v)
 	write(patch_fd, buf, n);
 }
 
-#ifdef BRPATCH_CWE119
+#ifdef BRPATCH_CWE805
 #if !defined(BRPATCH_ALLOC_MALLOC) && !defined(BRPATCH_ALLOC_CALLOC) \
 		&& !defined(BRPATCH_ALLOC_REALLOC)
-#error "BRPATCH_CWE119 requires one of BRPATCH_ALLOC_MALLOC/CALLOC/REALLOC"
+#error "BRPATCH_CWE805 requires one of BRPATCH_ALLOC_MALLOC/CALLOC/REALLOC"
 #endif
 
 /*
- * CWE-119 allocation tracker (port of utils/taosc/cwe119/common.c): the
+ * CWE-805 allocation tracker (port of utils/taosc/CWE805/common.c): the
  * allocator call chain is instrumented with mark/set_size/set_base hooks
  * before the patch site, so the 256 clamps are history-dependent and cannot
  * be reconstructed from patch-site registers.
@@ -408,18 +408,18 @@ static uint64_t read_cell(const struct STATE *state,
 }
 
 /*
- * Evaluate one CWE-119 descriptor against the tracked clamps.
+ * Evaluate one CWE-805 descriptor against the tracked clamps.
  * Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
  * 2 (checked-multiply overflow: conservative no-jump, reported as br 2).
  * Zero-initialized clamps never match.
  */
-static int cwe119_branch_taken(const struct STATE *state,
+static int CWE805_branch_taken(const struct STATE *state,
                                const struct br_predicate *pred)
 {
 	const uint64_t value = read_cell(state, pred->cell_kind,
 	                                 pred->cell_index);
 	struct clamp *i = buffers + 256;
-	if (pred->kind == BR_PRED_CWE119_POINTER) {
+	if (pred->kind == BR_PRED_CWE805_POINTER) {
 		while (i-- > buffers)
 			if (value >= i->begin && value < i->end)
 				return 0;
@@ -435,21 +435,23 @@ static int cwe119_branch_taken(const struct STATE *state,
 }
 
 /*
- * CWE-119 direct call-site decision: branch only when the computed
- * effective address lies outside every tracked clamp, and only for
- * candidate id 1.  Patch id 0 returns NULL and logs br 0.
+ * CWE-805 direct call-site decision: match Taosc's joob($mem0,
+ * mem[0].size,dest).  A clamp accepts the complete memory access only when
+ * address >= begin and address + access_size < end.  Candidate id 1 jumps
+ * when no clamp accepts it; patch id 0 never jumps.
  */
-const void *jnz(uint64_t base, uint64_t index, uint8_t size, uint32_t disp,
-                const void *dest)
+const void *jnz(uint64_t base, uint64_t index, uint8_t scale, uint32_t disp,
+                uint64_t access_size, const void *dest)
 {
 	uint32_t v = 0;
 	const uint32_t patch_id = select_patch_id(&v);
-	const uint64_t address = base + index * size + disp;
+	const uint64_t address = base + index * scale + disp;
+	const uint64_t access_end = address + access_size;
 	int branch_taken = 0;
 	if (patch_id == 1) {
 		struct clamp *i = buffers + 256;
 		while (i-- > buffers)
-			if (address >= i->begin && address < i->end)
+			if (address >= i->begin && access_end < i->end)
 				break;
 		if (i < buffers) /* no clamp matched */
 			branch_taken = 1;
@@ -457,7 +459,7 @@ const void *jnz(uint64_t base, uint64_t index, uint8_t size, uint32_t disp,
 	log_patch(patch_id, branch_taken, v);
 	return branch_taken ? dest : NULL;
 }
-#endif /* BRPATCH_CWE119 */
+#endif /* BRPATCH_CWE805 */
 
 #ifndef BINRADAR_EVAL_ONLY
 const char *get_patch_str(int id) {
@@ -490,10 +492,10 @@ const void *dest(const struct STATE *state)
 			branch_taken = 2;
 		}
 	} else {
-#ifdef BRPATCH_CWE119
-		branch_taken = cwe119_branch_taken(state, &pred);
+#ifdef BRPATCH_CWE805
+		branch_taken = CWE805_branch_taken(state, &pred);
 #else
-		/* A CWE-119 descriptor cannot occur without the tracker. */
+		/* A CWE-805 descriptor cannot occur without the tracker. */
 		branch_taken = 0;
 #endif
 	}

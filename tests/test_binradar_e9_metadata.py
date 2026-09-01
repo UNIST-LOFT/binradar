@@ -371,6 +371,8 @@ def test_executor_retains_all_prefixed_metadata(tmp_path):
         "TEST_CMD": "-l @@",
         "PATCH_LOC": "0x4585dd",
         "TOTAL_PATCHES": "2",
+        "BINRADAR_PATCH_KIND": "CWE805-erm",
+        "BRCACHE_STACK_SIZE": "256",
         "BINRADAR_OUTDIR": str(tmp_path / "out"),
         "BINRADAR_TIMEOUT": "60",
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
@@ -386,11 +388,15 @@ def test_executor_retains_all_prefixed_metadata(tmp_path):
     assert config["PREFILTER_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
     assert config["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == \
         "0x7c254091:0x4d60a5:0x4d60aa"
+    assert config["BINRADAR_PATCH_KIND"] == "CWE805-erm"
+    assert config["BRCACHE_STACK_SIZE"] == "256"
     # The runner built from that config selects by binary path.
     runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
         str(tmp_path), config)
     assert runner.e9_metadata_for_binary(
         str(tmp_path / "nm.brpatched"))[1] == ["0x54b091:0x4d60a5:0x4d60aa"]
+    assert runner.patch_kind == "CWE805-erm"
+    assert runner.brcache_stack_size == 256
 
 
 def test_verifier_selects_brcached_by_binary_path(tmp_path):
@@ -424,7 +430,15 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
     (workdir / "patch-location").write_text("410735")
     orig = workdir / "imginfo.orig"
     orig.write_bytes(b"\x7fELF" + b"\0" * 100)
-    binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+    (workdir / "brpatch.c").write_text("/* generated */\n")
+    (workdir / "brpatches.inc").write_text(
+        'case 0: return "p0";\ncase 1: return "p1";\n'
+        'case 2: return "p0";\ndefault: return "p0";\n')
+    binradar_env = {
+        "BINARY": "imginfo",
+        "PATCH_LOC": "0x410735",
+        "BINRADAR_PATCH_KIND": "generic-erm",
+    }
 
     calls = []
 
@@ -445,7 +459,8 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
         lambda *args, **kwargs: metadata)
 
     out = binradar_setup.build_cached_binary(
-        workdir, tmp_path, binradar_env)
+        workdir, tmp_path, binradar_env,
+        binradar_setup.PredicateFamily.GENERIC_ERM, None, 2)
     assert out == metadata
     assert (workdir / "imginfo.brcached").exists()
     assert (workdir / "imginfo.brcached.json").exists()
@@ -456,6 +471,8 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
                     if "e9compile" in c and "brpatch-cached.c" in c]
     assert compile_cmds, "e9compile brpatch-cached.c not invoked"
     assert "-DTAOSC_DEST=0x4106d8" in compile_cmds[0]
+    assert "-DBRPATCH_TOTAL_PATCHES=2" in compile_cmds[0]
+    assert "-DBRPATCH_CWE805" not in compile_cmds[0]
     # e9tool ran the JSON and binary commands from one spec.
     tool_cmds = [c for c, _ in calls if "e9tool" in c]
     assert len(tool_cmds) == 2
@@ -474,28 +491,149 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
         "0x7c254091:0x4d60a5:0x4d60aa"
 
 
-def test_cached_artifact_skipped_for_allocator_families(tmp_path, monkeypatch):
-    """CWE-119 families skip the cached build with a warning."""
+def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
     workdir = tmp_path / "workdir"
     workdir.mkdir()
-    binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+    (workdir / "destinations").write_text("4106d8\n")
+    (workdir / "brpatch.c").write_text("/* generated */\n")
+    (workdir / "brpatches.inc").write_text(
+        'case 0: return "p0";\ncase 1: return "c1p0";\n'
+        'case 2: return "c1p1";\ndefault: return "p0";\n')
+    (workdir / "imginfo.orig").write_bytes(b"\x7fELF" + b"\0" * 100)
+    env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
     allocator = binradar_setup.AllocatorTrace(
-        "realloc", [(0, "0x4066e4")], ["0x4066f0"])
-    called = []
+        "malloc", [(0, "40661c"), (1, "404eb4")], ["406621"])
+    calls = []
 
-    def fake_build(workdir, configdir, binradar_env):
-        called.append(True)
-        raise AssertionError("must not build for allocator families")
+    def fake_run(cmd, cwd=None, **kwargs):
+        calls.append(list(cmd))
+        if "e9tool" in cmd:
+            Path(cmd[cmd.index("-o") + 1]).write_bytes(
+                b"\x7fELF" + b"\0" * 100)
+        return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(binradar_setup, "build_cached_binary", fake_build)
+    monkeypatch.setattr(binradar_setup.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        binradar_setup, "extract_e9_runtime_metadata",
+        lambda *args, **kwargs: binradar_setup.E9RuntimeMetadata((), ()))
+
+    binradar_setup.build_cached_binary(
+        workdir, tmp_path, env,
+        binradar_setup.PredicateFamily.CWE805_ERM, allocator, 2)
+
+    compile_cmd = next(cmd for cmd in calls if "e9compile" in cmd)
+    assert "-DBRPATCH_CWE805" in compile_cmd
+    assert "-DBRPATCH_ALLOC_MALLOC" in compile_cmd
+    tool_cmds = [cmd for cmd in calls if "e9tool" in cmd]
+    assert len(tool_cmds) == 2
+    for cmd in tool_cmds:
+        assert "-O0" in cmd
+        joined = " ".join(cmd)
+        assert "set_size(rdi,rsi)@brpatch-cached" in joined
+        assert "mark(1)@brpatch-cached" in joined
+        assert "set_base(rax)@brpatch-cached" in joined
+        assert "if dest(state)@brpatch-cached goto" in joined
+
+
+def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
+    workdir = tmp_path / "workdir"
+    run_dir = tmp_path / "run"
+    (run_dir / "minimized").mkdir(parents=True)
+    workdir.mkdir()
+    (workdir / "imginfo.brcached").write_bytes(b"cache")
+
+    predicates = binradar_setup.binradar_taosc_predicates
+    selected = [
+        predicates.PredicateRecord(1, 1, "p1", "=v0p0"),
+        predicates.PredicateRecord(2, 2, "p2", "=v1p0"),
+        predicates.PredicateRecord(3, 3, "p3", "=v2p0"),
+    ]
+    predicates.write_runtime_predicates(
+        workdir / "brpatches.json",
+        predicates.PredicateFamily.GENERIC_ERM,
+        selected,
+    )
+
+    normal_result = SimpleNamespace(
+        fault_addr=0,
+        patch_hit_cnt=1,
+        is_crash=lambda: False,
+        is_normal_exit=lambda: True,
+        is_timeout=lambda: False,
+    )
+
+    class FakeRunner:
+        patch_kind = "generic-erm"
+        brcache_stack_size = 0
+
+        def __init__(self):
+            self.cached_calls = []
+            self.patched_calls = []
+
+        def cached_binary(self):
+            return str(workdir / "imginfo.brcached")
+
+        def test_with_cached(self, patch_id, testcase):
+            self.cached_calls.append(patch_id)
+            snapshot = binradar.binradar_verifier.CachedSnapshot(
+                patch_id=patch_id,
+                branch=1,
+                registers=(0, 0, 1) + (0,) * 13,
+            )
+            return normal_result, binradar.binradar_verifier.BinRadarCachedRun(
+                patch_id, [snapshot])
+
+        def test_with_patched(self, patch_id, testcase):
+            self.patched_calls.append(int(patch_id))
+            return normal_result, binradar.binradar_verifier.BinRadarPatchResult(
+                int(patch_id), [0])
+
+    runner = FakeRunner()
+    verifier = binradar.binradar_verifier.BinRadarConcreteVerifier(
+        str(workdir), str(run_dir), runner,
+        SimpleNamespace(fault_addr=0xDEAD),
+        str(workdir / "imginfo.brpatched"), [1, 2, 3])
+    testcase = binradar.binradar_verifier.Testcase(
+        0, "input", "ok", 0, [0])
+    verifier.testcases.append(testcase)
+
+    rejected = verifier._test_testcase_batch([1, 2, 3], testcase)
+    assert rejected == {1, 2}
+    assert runner.cached_calls == [1]
+    assert runner.patched_calls == [3]
+
+
+def test_cached_artifact_skips_single_predicate_and_removes_stale_files(
+        tmp_path, monkeypatch):
+    """Caching is useful only when at least two predicates can share a run."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "imginfo.brcached").write_bytes(b"stale")
+    (workdir / "brpatches.json").write_text("{}")
+    binradar_env = {
+        "BINARY": "imginfo",
+        "PATCH_LOC": "0x410735",
+        "BRCACHED_E9_EXCLUDE_RANGES": "stale",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "stale",
+        "BRCACHE_STACK_SIZE": "99",
+    }
+    selected = [binradar_setup.PredicateRecord(1, 1, "max1", "=p0p0")]
+
+    monkeypatch.setattr(
+        binradar_setup, "build_cached_binary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("single predicate must not build a cache")))
     binradar_setup.build_cached_artifact(
-        workdir, tmp_path, binradar_env, allocator)
-    assert not called
+        workdir, tmp_path, binradar_env,
+        binradar_setup.PredicateFamily.GENERIC_ERM, None, selected)
+    assert not (workdir / "imginfo.brcached").exists()
+    assert not (workdir / "brpatches.json").exists()
     assert "BRCACHED_E9_EXCLUDE_RANGES" not in binradar_env
+    assert "BRCACHE_STACK_SIZE" not in binradar_env
 
 
-def test_detect_family_cwe119_erm_empty_predicates_no_raise(tmp_path):
-    """Empty CWE-119 predicates classify as CWE119_ERM, not an error."""
+def test_detect_family_CWE805_erm_empty_predicates_no_raise(tmp_path):
+    """Empty CWE-119 predicates classify as CWE805_ERM, not an error."""
     workdir = tmp_path / "workdir"
     trace = workdir / "trace"
     trace.mkdir(parents=True)
@@ -505,12 +643,12 @@ def test_detect_family_cwe119_erm_empty_predicates_no_raise(tmp_path):
     (workdir / "patch-location").write_text("410736")
     (workdir / "predicates").write_text("")
     family, allocator = binradar_setup.detect_predicate_family(workdir)
-    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+    assert family is binradar_setup.PredicateFamily.CWE805_ERM
     assert allocator is not None
 
 
-def test_detect_family_cwe119_erm_missing_predicates_no_raise(tmp_path):
-    """Missing CWE-119 predicates classify as CWE119_ERM, not an error."""
+def test_detect_family_CWE805_erm_missing_predicates_no_raise(tmp_path):
+    """Missing CWE-119 predicates classify as CWE805_ERM, not an error."""
     workdir = tmp_path / "workdir"
     trace = workdir / "trace"
     trace.mkdir(parents=True)
@@ -519,13 +657,13 @@ def test_detect_family_cwe119_erm_missing_predicates_no_raise(tmp_path):
     (trace / "crash.address").write_text("410735")
     (workdir / "patch-location").write_text("410736")
     family, allocator = binradar_setup.detect_predicate_family(workdir)
-    assert family is binradar_setup.PredicateFamily.CWE119_ERM
+    assert family is binradar_setup.PredicateFamily.CWE805_ERM
     assert allocator is not None
 
 
 def test_prepare_patch_empty_predicates_builds_zero_candidates(
         tmp_path, monkeypatch):
-    """Empty predicates build brpatched + brcached with TOTAL_PATCHES=0."""
+    """Empty predicates build brpatched only; no cache can save a run."""
     workdir = tmp_path / "workdir"
     workdir.mkdir()
     (workdir / "patch-location").write_text("410735")
@@ -553,10 +691,9 @@ def test_prepare_patch_empty_predicates_builds_zero_candidates(
     assert binradar_env["TOTAL_PATCHES"] == "0"
     assert binradar_env["BRPATCHED_E9_EXCLUDE_RANGES"] == \
         "0x42209000-0x4220a000"
-    assert binradar_env["BRCACHED_E9_EXCLUDE_RANGES"] == \
-        "0x42209000-0x4220a000"
+    assert "BRCACHED_E9_EXCLUDE_RANGES" not in binradar_env
     assert (workdir / "imginfo.brpatched").exists()
-    assert (workdir / "imginfo.brcached").exists()
+    assert not (workdir / "imginfo.brcached").exists()
     assert (workdir / "brpatches.inc").exists()
 
 

@@ -6,6 +6,7 @@ import logging
 import time
 import threading
 import fcntl
+from pathlib import Path
 from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
 
 import sbsv
@@ -13,6 +14,14 @@ import sbsv
 import logger
 
 import binradar_utils
+from binradar_taosc_predicates import (
+    CachedSnapshot,
+    ParsedPredicate,
+    PredicateFamily,
+    evaluate_cached_predicate,
+    load_runtime_predicates,
+    parse_cached_snapshots,
+)
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
@@ -334,6 +343,17 @@ class BinRadarPatchResult:
         e.g. a division/modulo by zero in the predicate."""
         return 2 in self.br_selection
 
+
+class BinRadarCachedRun:
+    def __init__(self, patch_id: int, snapshots: List[CachedSnapshot]):
+        self.patch_id = patch_id
+        self.snapshots = snapshots
+
+    @property
+    def br_selection(self) -> List[int]:
+        return [snapshot.branch for snapshot in self.snapshots]
+
+
 class BinRadarQemuRunner:
     dir: str
     binary: str
@@ -343,13 +363,19 @@ class BinRadarQemuRunner:
     # (exclude_ranges, [relocated-call records]).  All prefixed values are
     # stored; the executed binary's path selects the proper one.
     e9_metadata: Dict[str, Tuple[str, List[str]]]
+    patch_kind: str
+    brcache_stack_size: int
     run_results: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, e9_metadata: Optional[Dict[str, Tuple[str, List[str]]]] = None):
+    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str,
+                 e9_metadata: Optional[Dict[str, Tuple[str, List[str]]]] = None,
+                 patch_kind: str = "", brcache_stack_size: int = 0):
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.e9_metadata = e9_metadata if e9_metadata is not None else {}
+        self.patch_kind = patch_kind
+        self.brcache_stack_size = brcache_stack_size
         self.run_results = None
     
     @staticmethod
@@ -376,7 +402,9 @@ class BinRadarQemuRunner:
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            e9_metadata=e9_metadata
+            e9_metadata=e9_metadata,
+            patch_kind=env.get("BINRADAR_PATCH_KIND", ""),
+            brcache_stack_size=int(env.get("BRCACHE_STACK_SIZE", "0"), 0),
         )
 
     def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
@@ -406,23 +434,31 @@ class BinRadarQemuRunner:
     def patched_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.brpatched")
 
-    def get_qemu_stacktrace_command(self, use_patched_bin: bool, input_file: str, patch_func_entry: int = 0) -> List[str]:
-        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc, "--asan", "host"]
+    def cached_binary(self) -> str:
+        return os.path.join(self.dir, f"{self.binary}.brcached")
+
+    def get_qemu_stacktrace_command_for_binary(
+        self, binary: str, input_file: str, patch_func_entry: int = 0,
+    ) -> List[str]:
+        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file,
+               "--patch-loc", self.patch_loc, "--asan", "host"]
         if patch_func_entry != 0:
-            cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"]
-        if use_patched_bin:
-            binary = self.patched_binary()
-            # --asan-exclude is explicitly ignored by the local
-            # afl-qemu-trace compatibility runner; only the active
-            # --e9-relocated-call records are passed.  The records are
-            # selected by the executed binary's artifact.
-            _, relocated_calls = self.e9_metadata_for_binary(binary)
-            for addr in relocated_calls:
-                cmd += ["--e9-relocated-call", addr]
-        else:
-            binary = self.original_binary()
+            cmd += ["--patch-func-entry", f"0x{patch_func_entry:x}"]
+        _, relocated_calls = self.e9_metadata_for_binary(binary)
+        for addr in relocated_calls:
+            cmd += ["--e9-relocated-call", addr]
         cmd += [binary, "--"] + shlex.split(self.test_cmd)
         return cmd
+
+    def get_qemu_stacktrace_command(
+        self, use_patched_bin: bool, input_file: str,
+        patch_func_entry: int = 0,
+    ) -> List[str]:
+        binary = self.patched_binary() if use_patched_bin \
+            else self.original_binary()
+        return self.get_qemu_stacktrace_command_for_binary(
+            binary, input_file, patch_func_entry)
+
 
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(False, testcase)
@@ -446,26 +482,63 @@ class BinRadarQemuRunner:
             return None
         return probe_result
 
-    def test_with_patched(self, patch_id: str, testcase: str, verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
-        command = self.get_qemu_stacktrace_command(True, testcase)
+    def _test_with_capture(
+        self, binary: str, patch_id: str, testcase: str,
+        verbose: bool = False, extra_env: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes]]:
+        command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         rfd, wfd = os.pipe()
         env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd)
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
+        if extra_env is not None:
+            env.update(extra_env)
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
         os.close(wfd)
-        thread, patch_result_chunks = binradar_utils.create_pipe_reader_thread(rfd, verbose=verbose)
-        result = binradar_utils.execute_await(proc, timeout=60.0, verbose=verbose)
-        thread.join() # Read all patch results and close the pipe(rfd)
-        
-        patch_result_data = b"".join(patch_result_chunks).decode(errors="ignore")
+        thread, chunks = binradar_utils.create_pipe_reader_thread(
+            rfd, verbose=verbose)
+        result = binradar_utils.execute_await(
+            proc, timeout=60.0, verbose=verbose)
+        thread.join()
         if not result.success:
             logger.error("Failed to execute the command")
             return None, None
-        patch_result = BinRadarPatchResult.from_log(patch_result_data)
-        if patch_result is None:
-            # logger.error("Failed to parse patch result from the log.")
-            # logger.debug(f"Failed to parse patch result with id {patch_id}, {testcase}")
+        return BinRadarProbeResult.from_log(result.stderr), b"".join(chunks)
+
+    def test_with_patched(
+        self, patch_id: str, testcase: str, verbose: bool = False,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        probe, data = self._test_with_capture(
+            self.patched_binary(), patch_id, testcase, verbose)
+        if probe is None or data is None:
             return None, None
-        return BinRadarProbeResult.from_log(result.stderr), patch_result
+        patch_result = BinRadarPatchResult.from_log(
+            data.decode(errors="ignore"))
+        if patch_result is None:
+            return None, None
+        return probe, patch_result
+
+    def test_with_cached(
+        self, patch_id: int, testcase: str, verbose: bool = False,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        probe, data = self._test_with_capture(
+            self.cached_binary(), str(patch_id), testcase, verbose,
+            {"BRCACHE_STACK_SIZE": str(self.brcache_stack_size)})
+        if probe is None or data is None:
+            return None, None
+        snapshots, error = parse_cached_snapshots(data)
+        if error is not None:
+            logger.warning(f"Cached capture rejected: {error}")
+            return probe, None
+        if any(snapshot.patch_id != patch_id for snapshot in snapshots):
+            logger.warning("Cached capture contains the wrong patch id")
+            return probe, None
+        if probe.patch_hit_cnt != len(snapshots):
+            logger.warning(
+                f"Cached capture hit mismatch: probe={probe.patch_hit_cnt} "
+                f"snapshots={len(snapshots)}")
+            return probe, None
+        return probe, BinRadarCachedRun(patch_id, snapshots)
 
 
 class Testcase:
@@ -514,6 +587,8 @@ class BinRadarConcreteVerifier:
     start_time: float
     logger: logging.Logger
     minimized_dir: str
+    cached_predicates: Dict[int, ParsedPredicate]
+    cache_family: Optional[PredicateFamily]
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
@@ -534,6 +609,30 @@ class BinRadarConcreteVerifier:
         fmt = logging.Formatter("%(asctime)s - %(message)s")
         fh.setFormatter(fmt)
         self.logger.addHandler(fh)
+
+        self.cached_predicates = {}
+        self.cache_family = None
+        manifest = Path(dir) / "brpatches.json"
+        cached_binary = Path(runner.cached_binary())
+        if len(patches) > 1 and manifest.is_file() and cached_binary.is_file():
+            try:
+                family, predicates = load_runtime_predicates(manifest)
+                if runner.patch_kind and runner.patch_kind != family.value:
+                    raise ValueError(
+                        f"manifest family {family.value} != "
+                        f"configured family {runner.patch_kind}")
+                missing = [patch for patch in patches
+                           if patch not in predicates]
+                if missing:
+                    raise ValueError(f"missing runtime patch ids {missing}")
+                if family == PredicateFamily.CWE805_ERM \
+                        and runner.brcache_stack_size <= 0:
+                    raise ValueError("missing CWE-805 cache stack size")
+                self.cache_family = family
+                self.cached_predicates = predicates
+            except ValueError as e:
+                self.logger.warning(
+                    f"[verifier-cache] [disabled] [reason {e}]")
     
     def _testcase_from_result_row(self, row: Dict[str, Any]) -> Optional[Testcase]:
         id = row["id"]
@@ -551,64 +650,144 @@ class BinRadarConcreteVerifier:
             br=row["br"]
         )
 
-    def _test_testcase(self, patch: int, testcase: Testcase) -> bool:
-        """Run the patched binary for one (patch, testcase) pair. Returns True
-        iff the patch is rejected by this testcase, False otherwise."""
-        self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+    def _test_result(
+        self, patch: int, testcase: Testcase, result: BinRadarProbeResult,
+        patch_result: Optional[BinRadarPatchResult],
+    ) -> bool:
+        """Return whether one observed execution rejects the candidate."""
+        if patch_result is not None and patch_result.crashed():
+            self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+            return True
         if testcase.exit == "crash":
-            result, patch_result = self.run_testcase_patched(patch, testcase)
-            if result is None:
-                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                return False
-            if patch_result is not None and patch_result.crashed():
-                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                return True
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
                     return False
                 self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
-            elif result.is_normal_exit():
+            if result.is_normal_exit():
                 self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
-            elif result.is_timeout():
+            if result.is_timeout():
                 self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         else:
-            result, patch_result = self.run_testcase_patched(patch, testcase)
-            if result is None:
-                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                return False
-            if patch_result is not None and patch_result.crashed():
-                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                return True
             if result.is_crash():
                 self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
-            elif result.is_normal_exit():
+            if result.is_normal_exit():
                 if patch_result is None:
                     self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
                     return False
-                # br is 0/1 here: a `2` (patch crashed) is rejected
-                # explicitly above, before this comparison.
                 if testcase.br == patch_result.br_selection:
                     self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     return False
-                else:
-                    self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                    return True
-            elif result.is_timeout():
+                self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return True
+            if result.is_timeout():
                 self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         return False
-    
+
+    def _test_testcase(self, patch: int, testcase: Testcase) -> bool:
+        """Run one candidate normally and return whether it is rejected."""
+        self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+        result, patch_result = self.run_testcase_patched(patch, testcase)
+        if result is None:
+            self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+            return False
+        return self._test_result(patch, testcase, result, patch_result)
+
+    def _cached_branches(
+        self, patch: int, snapshots: List[CachedSnapshot],
+    ) -> Optional[List[int]]:
+        predicate = self.cached_predicates.get(patch)
+        if predicate is None:
+            return None
+        try:
+            return evaluate_cached_predicate(predicate, snapshots)
+        except (IndexError, ValueError) as e:
+            self.logger.warning(
+                f"[verifier-cache] [predicate-error] [patch {patch}] "
+                f"[reason {e}]")
+            return None
+
+    def _test_testcase_batch(
+        self, patches: List[int], testcase: Testcase,
+    ) -> Set[int]:
+        """Run one representative per distinct complete branch vector."""
+        if self.cache_family is None or len(patches) <= 1:
+            return {patch for patch in patches
+                    if self._test_testcase(patch, testcase)}
+
+        rejected: Set[int] = set()
+        remaining = list(patches)
+        while remaining:
+            if len(remaining) == 1:
+                patch = remaining.pop()
+                if self._test_testcase(patch, testcase):
+                    rejected.add(patch)
+                continue
+
+            representative = remaining.pop(0)
+            self.logger.info(
+                f"[verifier-cache] [miss] [patch {representative}] "
+                f"[id {testcase.id}] [file {testcase.filename}]")
+            result, cached = self.run_testcase_cached(
+                representative, testcase)
+            if result is None or cached is None:
+                self.logger.warning(
+                    f"[verifier-cache] [fallback] [patch {representative}] "
+                    f"[id {testcase.id}]")
+                if self._test_testcase(representative, testcase):
+                    rejected.add(representative)
+                continue
+
+            observed = cached.br_selection
+            evaluated = self._cached_branches(
+                representative, cached.snapshots)
+            if evaluated is None or evaluated != observed:
+                self.logger.warning(
+                    f"[verifier-cache] [runtime-mismatch] "
+                    f"[patch {representative}] [id {testcase.id}]")
+                if self._test_testcase(representative, testcase):
+                    rejected.add(representative)
+                continue
+
+            representative_result = BinRadarPatchResult(
+                representative, observed)
+            if self._test_result(
+                    representative, testcase, result,
+                    representative_result):
+                rejected.add(representative)
+
+            equivalent: List[Tuple[int, List[int]]] = []
+            for patch in remaining:
+                branches = self._cached_branches(patch, cached.snapshots)
+                if branches is not None and branches == observed:
+                    equivalent.append((patch, branches))
+            for patch, branches in equivalent:
+                remaining.remove(patch)
+                self.logger.info(
+                    f"[verifier-cache] [hit] [patch {patch}] "
+                    f"[representative {representative}] "
+                    f"[id {testcase.id}]")
+                if self._test_result(
+                        patch, testcase, result,
+                        BinRadarPatchResult(patch, branches)):
+                    rejected.add(patch)
+        return rejected
+
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename))
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
             return None, None
         return result, patch_result
+
+    def run_testcase_cached(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        return self.runner.test_with_cached(
+            patch_id, os.path.join(self.minimized_dir, testcase.filename))
 
     def run_verification_streaming(self, minimizer_result_file: str,
                                    poll_interval: float = 0.2,
@@ -656,12 +835,15 @@ class BinRadarConcreteVerifier:
                         if testcase is None:
                             continue
                         self.testcases.append(testcase)
+                        rejected = self._test_testcase_batch(
+                            list(pending_patches), testcase)
                         for patch in list(pending_patches):
-                            if self._test_testcase(patch, testcase):
-                                self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {testcase.filename}]")
-                                pending_patches.remove(patch)
-                                if not pending_patches and minimizer_thread is not None:
-                                    return
+                            if patch not in rejected:
+                                continue
+                            self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {testcase.filename}]")
+                            pending_patches.remove(patch)
+                        if not pending_patches and minimizer_thread is not None:
+                            return
                     elif row.schema_name == "minimizer$done":
                         done_seen = True
                 if minimizer_thread is None:

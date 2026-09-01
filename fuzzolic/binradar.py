@@ -691,6 +691,9 @@ class BinRadarExecutor:
                 binradar.config[ranges_key] = env[ranges_key]
             if calls_key in env:
                 binradar.config[calls_key] = env[calls_key]
+        for key in ("BINRADAR_PATCH_KIND", "BRCACHE_STACK_SIZE"):
+            if key in env:
+                binradar.config[key] = env[key]
         return binradar
 
     def extract_config(self) -> Dict[str, str]:

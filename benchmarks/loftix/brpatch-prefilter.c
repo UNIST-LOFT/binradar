@@ -82,14 +82,14 @@ void init(int argc, const char *const *argv, char **envp)
 		prefilter_max_bytes = b;
 }
 
-#ifdef BRPATCH_CWE119
+#ifdef BRPATCH_CWE805
 #if !defined(BRPATCH_ALLOC_MALLOC) && !defined(BRPATCH_ALLOC_CALLOC) \
 		&& !defined(BRPATCH_ALLOC_REALLOC)
-#error "BRPATCH_CWE119 requires one of BRPATCH_ALLOC_MALLOC/CALLOC/REALLOC"
+#error "BRPATCH_CWE805 requires one of BRPATCH_ALLOC_MALLOC/CALLOC/REALLOC"
 #endif
 
 /*
- * CWE-119 allocation tracker (port of utils/taosc/cwe119/common.c): the
+ * CWE-805 allocation tracker (port of utils/taosc/CWE805/common.c): the
  * allocator call chain is instrumented with mark/set_size/set_base hooks
  * before the patch site, so the 256 clamps are history-dependent and
  * cannot be reconstructed from patch-site registers.
@@ -221,7 +221,7 @@ static void capture_snapshot(const struct STATE *state, uint64_t stack_size)
 	hit_count++;
 	mutex_unlock(&snapshot_mutex);
 }
-#endif /* BRPATCH_CWE119 */
+#endif /* BRPATCH_CWE805 */
 
 /*
  * Capture registers in taosc's Variables.RegisterEnum order so the offline
@@ -229,7 +229,7 @@ static void capture_snapshot(const struct STATE *state, uint64_t stack_size)
  */
 const void *dest(const struct STATE *state)
 {
-#ifdef BRPATCH_CWE119
+#ifdef BRPATCH_CWE805
 	uint64_t stack_size = getenvull("PREFILTER_STACK_SIZE");
 	if (stack_size > 0 && stack_size <= 0x100000)
 		capture_snapshot(state, stack_size);

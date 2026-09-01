@@ -20,7 +20,7 @@ taosc workdir="workdir":
     guix shell taosc -- taosc-fix 10 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
 
 taosc-prebuilt workdir="workdir":
-    uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}}
+    uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}} --substitute-urls=http://10.20.26.21:2425
 
 prefilter workdir="workdir":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py prefilter -w {{workdir}}

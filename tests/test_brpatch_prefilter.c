@@ -2,11 +2,11 @@
  * Runtime tests for brpatch-prefilter.c's CWE-119 binary snapshot capture
  * (plan §8).
  *
- * Compiled WITHOUT BINRADAR_EVAL_ONLY with BRPATCH_CWE119 +
+ * Compiled WITHOUT BINRADAR_EVAL_ONLY with BRPATCH_CWE805 +
  * BRPATCH_ALLOC_MALLOC so the tracker and capture path are compiled in.
  * The test drives dest() with a constructed STATE and reads the pipe
  * records, printing parsed fields as RESULT lines that the Python test
- * (tests/test_binradar_setup_cwe119.py) asserts against.
+ * (tests/test_binradar_setup_CWE805.py) asserts against.
  *
  * Record layout (little-endian, x86-64):
  *   header:  magic u32, version u32, stack_size u64, flags u64

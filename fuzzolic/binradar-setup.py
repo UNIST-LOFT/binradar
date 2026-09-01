@@ -25,9 +25,9 @@ import binradar_taosc_predicates
 import binradar_utils
 from binradar_taosc_predicates import (
     AllocatorTrace,
-    Cwe119PointerPredicate,
-    Cwe119SizePredicate,
-    Cwe119Snapshot,
+    CWE805PointerPredicate,
+    CWE805SizePredicate,
+    CWE805Snapshot,
     InstrumentationSpec,
     INT64_MIN,
     PREFILTER_SNAPSHOT_HEADER,
@@ -42,21 +42,22 @@ from binradar_taosc_predicates import (
     _emit_brpatches_inc,
     _parse_predicate_records,
     build_instrumentation_spec,
-    cwe119_branch_taken,
-    cwe119_snapshot_branch_taken,
+    CWE805_branch_taken,
+    CWE805_snapshot_branch_taken,
     detect_predicate_family,
     e9tool_command,
     evaluate_predicate,
     load_prefilter_passed_ids,
     load_predicates,
     parse_allocator_trace,
-    parse_cwe119_predicate,
-    parse_cwe119_snapshots,
+    parse_CWE805_predicate,
+    parse_CWE805_snapshots,
     parse_state_lines,
     predicate_to_branch_patch_str,
     predicates_sha256,
     tokenize_generic,
     write_prefilter,
+    write_runtime_predicates,
 )
 
 ROOT_DIR = SCRIPT_DIR.parent
@@ -182,15 +183,15 @@ def compile_capture_plugin(workdir: Path,
                            allocator: Optional[AllocatorTrace] = None) -> None:
     """Copy and compile brpatch-prefilter.c in the workdir (e9compile).
 
-    CWE-119 families compile the allocation tracker and binary snapshot
-    capture in (BRPATCH_CWE119 + the allocator kind define); generic
+    CWE-805 families compile the allocation tracker and binary snapshot
+    capture in (BRPATCH_CWE805 + the allocator kind define); generic
     families keep the sbsv register capture.
     """
     shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
     cmd = ["guix", "shell", "e9patch@1.0.1", "--",
            "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
     if allocator is not None:
-        cmd += ["-DBRPATCH_CWE119",
+        cmd += ["-DBRPATCH_CWE805",
                 f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
@@ -203,7 +204,7 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
                          allocator: Optional[AllocatorTrace] = None) -> Path:
     """Instrument the original binary with the capture plugin.
 
-    CWE-119 families use the same ordered multipoint instrumentation spec
+    CWE-805 families use the same ordered multipoint instrumentation spec
     as the final binary (allocator hooks then the patch site, plan §8);
     generic families patch the single PATCH_LOC site.
 
@@ -232,24 +233,35 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     return brprefilter
 
 
-def build_cached_binary(workdir: Path, configdir: Path,
-                        binradar_env: Dict[str, str]) -> "E9RuntimeMetadata":
-    """Build <BINARY>.brcached: the taosc-style single-predicate cache
-    artifact (benchmarks/loftix/brpatch-cached.c, TAOSC_PRED + dest()).
+def build_cached_binary(
+    workdir: Path,
+    configdir: Path,
+    binradar_env: Dict[str, str],
+    family: PredicateFamily,
+    allocator: Optional[AllocatorTrace],
+    patch_count: int,
+) -> "E9RuntimeMetadata":
+    """Build the verifier's selected-predicate capture artifact.
 
-    The cache plugin is self-contained (no brpatches.inc, no PATCH_ID
-    switching): it evaluates the TAOSC_PRED predicate at the patch site
-    and jumps to the first destinations entry when it holds.
-
-    Returns the extracted E9RuntimeMetadata.  Also dumps e9tool JSON
-    metadata as <BINARY>.brcached.json and persists the artifact's
-    metadata under the "brcached" prefix in binradar.env.
+    Generic ERM instruments only PATCH_LOC.  CWE-805 ERM uses the same
+    allocator hooks and ordered multipoint specification as .brpatched.
+    ``brpatches.inc`` supplies the shared runtime-id mapping.
     """
+    if family not in (PredicateFamily.GENERIC_ERM,
+                      PredicateFamily.CWE805_ERM):
+        raise RuntimeError(f"cannot cache patch family {family.value}")
+    if patch_count <= 1:
+        raise RuntimeError("the predicate cache requires multiple patches")
+
     binary = binradar_env["BINARY"]
     patch_loc = binradar_env["PATCH_LOC"]
     original_binary = ensure_original_binary(workdir, configdir, binradar_env)
     brcached = workdir / f"{binary}.brcached"
     metadata = workdir / f"{binary}.brcached.json"
+    if not (workdir / "brpatch.c").exists() \
+            or not (workdir / "brpatches.inc").exists():
+        raise RuntimeError("brpatch.c and brpatches.inc must be prepared "
+                           "before building .brcached")
 
     shutil.copy(BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
     destinations_file = workdir / "destinations"
@@ -266,16 +278,31 @@ def build_cached_binary(workdir: Path, configdir: Path,
                 break
     if dest is None:
         raise RuntimeError(f"no destination found in {destinations_file}")
+
+    compile_defines = [f"-DTAOSC_DEST={dest}",
+                       f"-DBRPATCH_TOTAL_PATCHES={patch_count}"]
+    if family == PredicateFamily.CWE805_ERM:
+        if allocator is None:
+            raise RuntimeError("CWE-805 cache requires an allocator trace")
+        compile_defines += ["-DBRPATCH_CWE805",
+                            f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
     cmd = ["guix", "shell", "e9patch@1.0.1", "--",
-           "e9compile", "brpatch-cached.c", f"-DTAOSC_DEST={dest}"]
+           "e9compile", "brpatch-cached.c"] + compile_defines
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
         raise RuntimeError(
             f"e9compile failed with exit code {result.returncode}")
 
-    spec = InstrumentationSpec(
-        ((patch_loc, "if dest(state)@brpatch-cached goto"),))
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
+        spec = build_instrumentation_spec(
+            allocator, patch_loc,
+            "if dest(state)@brpatch-cached goto",
+            plugin_name="brpatch-cached")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_loc, "if dest(state)@brpatch-cached goto"),))
     for output, fmt in ((metadata, "json"), (brcached, None)):
         cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
         print(" ".join(cmd))
@@ -291,22 +318,51 @@ def build_cached_binary(workdir: Path, configdir: Path,
     return e9_metadata
 
 
-def build_cached_artifact(workdir: Path, configdir: Path,
-                          binradar_env: Dict[str, str],
-                          allocator: Optional[AllocatorTrace]) -> None:
-    """Build <BINARY>.brcached alongside .brpatched in the setup phase.
+def _remove_cached_artifact(workdir: Path,
+                            binradar_env: Dict[str, str]) -> None:
+    binary = binradar_env["BINARY"]
+    for name in (f"{binary}.brcached", f"{binary}.brcached.json",
+                 "brpatch-cached.c", "brpatches.json"):
+        (workdir / name).unlink(missing_ok=True)
+    for key in binradar_utils.e9_metadata_keys("brcached"):
+        binradar_env.pop(key, None)
+    binradar_env.pop("BRCACHE_STACK_SIZE", None)
 
-    The cached plugin (brpatch-cached.c) is the taosc-style single-predicate
-    plugin and does not implement the CWE-119 allocator hooks; those
-    families skip the cached artifact with a warning.  The BRCACHED_* keys
-    are set in binradar_env so cmd_setup's save_env persists them.
-    """
-    if allocator is not None:
-        print("Warning: skipping .brcached build (brpatch-cached.c does "
-              "not implement the CWE-119 allocator hooks)")
+
+def build_cached_artifact(
+    workdir: Path,
+    configdir: Path,
+    binradar_env: Dict[str, str],
+    family: PredicateFamily,
+    allocator: Optional[AllocatorTrace],
+    selected: List[PredicateRecord],
+) -> None:
+    """Build .brcached only when branch-equivalence can skip executions."""
+    _remove_cached_artifact(workdir, binradar_env)
+    if family not in (PredicateFamily.GENERIC_ERM,
+                      PredicateFamily.CWE805_ERM) or len(selected) <= 1:
         return
+
+    if family == PredicateFamily.CWE805_ERM:
+        stack_size_file = workdir / "stack-size"
+        try:
+            stack_size = int(stack_size_file.read_text().strip(), 0)
+        except (OSError, ValueError) as e:
+            print(f"Error: CWE-805 cache needs a valid {stack_size_file.name}: "
+                  f"{e}")
+            exit(1)
+        if stack_size <= 0 or stack_size > 0x100000:
+            print(f"Error: invalid CWE-805 cache stack size {stack_size}")
+            exit(1)
+        binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
+    else:
+        binradar_env["BRCACHE_STACK_SIZE"] = "0"
+
+    write_runtime_predicates(
+        workdir / "brpatches.json", family, selected)
     try:
-        metadata = build_cached_binary(workdir, configdir, binradar_env)
+        metadata = build_cached_binary(
+            workdir, configdir, binradar_env, family, allocator, len(selected))
     except RuntimeError as e:
         print(f"Error building cached binary: {e}")
         exit(1)
@@ -319,12 +375,12 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
                    patch_loc: str,
                    allocator: Optional[AllocatorTrace] = None,
                    stack_size: Optional[int] = None,
-                   ) -> Optional[Union[List[List[int]], List[Cwe119Snapshot]]]:
+                   ) -> Optional[Union[List[List[int]], List[CWE805Snapshot]]]:
     """Run the POC once against <BINARY>.brprefilter and return the
     captured patch-site states.
 
-    Generic families return a list of 16-slot STATE vectors; CWE-119
-    families return a list of Cwe119Snapshot records (clamps + registers +
+    Generic families return a list of 16-slot STATE vectors; CWE-805
+    families return a list of CWE805Snapshot records (clamps + registers +
     stack).  Returns None if the run failed (timeout / subprocess error) so
     the caller can fail open.
     """
@@ -375,7 +431,7 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     env["PATCH_FD"] = str(wfd)
     if allocator is not None:
         if stack_size is None:
-            print("Warning: CWE-119 prefilter requires stack-size; "
+            print("Warning: CWE-805 prefilter requires stack-size; "
                   "failing open")
             os.close(rfd)
             os.close(wfd)
@@ -410,9 +466,9 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
 
     data = b"".join(chunks)
     if allocator is not None:
-        snapshots, truncated = parse_cwe119_snapshots(data)
+        snapshots, truncated = parse_CWE805_snapshots(data)
         if truncated:
-            print("Warning: CWE-119 prefilter capture truncated; "
+            print("Warning: CWE-805 prefilter capture truncated; "
                   "failing open (partial history is not complete evidence)")
             return None
         return snapshots
@@ -429,6 +485,7 @@ E9_CONFIG_MAGIC = b"E9PATCH\0"
 # Taosc's $mem0 shell expansion (utils/taosc/helpers.in): the four E9
 # memory-operand fields of the matched instruction.
 E9_MEM0 = "mem[0].base,mem[0].index,mem[0].scale,mem[0].disp"
+E9_MEM0_ACCESS = f"{E9_MEM0},mem[0].size"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
 E9_MAP_STRUCT = struct.Struct("<iII")
 
@@ -958,15 +1015,16 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     binradar_env["BINRADAR_PATCH_KIND"] = family.value
 
-    if family == PredicateFamily.CWE119_DIRECT:
+    if family == PredicateFamily.CWE805_DIRECT:
+        assert allocator is not None
         # The direct call-site metapatch has no predicate list: the E9
-        # jnz($mem0,dest) decision is evaluated against the allocation
-        # clamps at runtime.  A leftover predicates file is stale Taosc
+        # jnz($mem0,mem[0].size,dest) decision evaluates the complete access
+        # against the allocation clamps.  A leftover predicates file is stale Taosc
         # output and must not be compiled in.  The binary is rebuilt with
         # BinRadar patch-id switching and [patch] logging (plan §7.4).
         if predicates_file.exists():
             print(f"Warning: ignoring stale {predicates_file.name} "
-                  f"(CWE-119 direct call-site family)")
+                  f"(CWE-805 direct call-site family)")
         binradar_env["TOTAL_PATCHES"] = "1"
         dest = None
         destinations_file = workdir / "destinations"
@@ -984,7 +1042,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         shutil.copy(BRPATCH_SOURCE, brpatch_source)
         brpatches_inc = workdir / "brpatches.inc"
         _emit_brpatches_inc(brpatches_inc, [])
-        compile_defines = [f"-DTAOSC_DEST={dest}", "-DBRPATCH_CWE119",
+        compile_defines = [f"-DTAOSC_DEST={dest}", "-DBRPATCH_CWE805",
                            f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
         cmd = ["guix", "shell", "e9patch@1.0.1", "--",
                 "e9compile", "brpatch.c"] + compile_defines
@@ -997,16 +1055,15 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             print(f"Patch compiled successfully")
 
         # Patch the original binary with the allocator hooks and the
-        # jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,dest)
-        # decision at the patch site.  Taosc's synth.in expands the shell
-        # variable $mem0 to those four E9 memory-operand fields
-        # (utils/taosc/helpers.in); e9tool zeroes them when the site has
-        # no memory operand (e.g. a jne), matching Taosc's own output.
+        # jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,
+        #     mem[0].size,dest) decision at the patch site. Taosc's $mem0
+        # expands to the first four fields; mem[0].size preserves joob's
+        # complete-access boundary check.
         patch_addr = binradar_env["PATCH_LOC"]
         metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
         spec = build_instrumentation_spec(
             allocator, patch_addr,
-            f"if jnz({E9_MEM0},{dest})@brpatch goto")
+            f"if jnz({E9_MEM0_ACCESS},{dest})@brpatch goto")
         cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
         print(" ".join(cmd))
         result = subprocess.run(cmd, cwd=workdir)
@@ -1033,9 +1090,10 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         binradar_utils.set_e9_metadata(
             binradar_env, "brpatched",
             metadata.exclude_ranges_str(), metadata.relocated_calls_str())
-        print(f"Using CWE-119 direct call-site patch at "
+        print(f"Using CWE-805 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
-        build_cached_artifact(workdir, configdir, binradar_env, allocator)
+        build_cached_artifact(
+            workdir, configdir, binradar_env, family, allocator, [])
         return
 
     if family == PredicateFamily.TAOSC_SPECIALIZED:
@@ -1055,7 +1113,8 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                 metadata.exclude_ranges_str(), metadata.relocated_calls_str())
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
-            build_cached_artifact(workdir, configdir, binradar_env, allocator)
+            build_cached_artifact(
+                workdir, configdir, binradar_env, family, allocator, [])
             return
         # No prebuilt binary and no predicates: build the artifacts with
         # zero candidates (TOTAL_PATCHES=0); binradar.py handles the
@@ -1064,7 +1123,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
               f"brpatched binary in {workdir}; building with zero "
               f"candidate patches")
 
-    # GENERIC_ERM or CWE119_ERM: parse every line strictly.  A missing
+    # GENERIC_ERM or CWE805_ERM: parse every line strictly.  A missing
     # predicates file (specialized family without a prebuilt binary) is
     # treated as an empty list.
     predicate_records: List[PredicateRecord] = []
@@ -1146,8 +1205,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     brpatches_inc = workdir / "brpatches.inc"
     _emit_brpatches_inc(brpatches_inc, selected_patch_records)
     compile_defines = [f"-DTAOSC_DEST={dest}"]
-    if family == PredicateFamily.CWE119_ERM:
-        compile_defines.append("-DBRPATCH_CWE119")
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
+        compile_defines.append("-DBRPATCH_CWE805")
         compile_defines.append(f"-DBRPATCH_ALLOC_{allocator.kind.upper()}")
     cmd = ["guix", "shell", "e9patch@1.0.1", "--",
             "e9compile", "brpatch.c"] + compile_defines
@@ -1161,18 +1221,19 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
 
     # Patch the original binary.  The JSON-metadata and final-binary e9tool
     # commands use one identical ordered instrumentation specification
-    # (plan §6.3): generic ERM patches the single PATCH_LOC site; CWE-119
+    # (plan §6.3): generic ERM patches the single PATCH_LOC site; CWE-805
     # ERM and direct builds add the allocator hooks (mark/set_size/set_base)
     # before the patch site.
     patch_addr = binradar_env["PATCH_LOC"]
     metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
-    if family == PredicateFamily.CWE119_ERM:
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
         spec = build_instrumentation_spec(
             allocator, patch_addr, "if dest(state)@brpatch goto")
-    elif family == PredicateFamily.CWE119_DIRECT:
+    elif family == PredicateFamily.CWE805_DIRECT:
         spec = build_instrumentation_spec(
             allocator, patch_addr,
-            f"if jnz({E9_MEM0},{dest})@brpatch goto")
+            f"if jnz({E9_MEM0_ACCESS},{dest})@brpatch goto")
     else:
         spec = InstrumentationSpec(
             ((patch_addr, "if dest(state)@brpatch goto"),))
@@ -1203,7 +1264,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     binradar_utils.set_e9_metadata(
         binradar_env, "brpatched",
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
-    build_cached_artifact(workdir, configdir, binradar_env, allocator)
+    build_cached_artifact(
+        workdir, configdir, binradar_env, family, allocator,
+        selected_patch_records)
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
@@ -1275,7 +1338,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
         sys.exit(0)
 
-    # Classify the workdir first (plan §6.1): the CWE-119 direct family
+    # Classify the workdir first (plan §6.1): the CWE-805 direct family
     # has no predicate list to compact, so the prefilter is a no-op and
     # FILTER remains the behavioral gate.
     try:
@@ -1283,7 +1346,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    if family == PredicateFamily.CWE119_DIRECT:
+    if family == PredicateFamily.CWE805_DIRECT:
         print(f"Workdir is {family.value}; prefilter is a no-op "
               "(FILTER is the behavioral gate).")
         sys.exit(0)
@@ -1306,7 +1369,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         sys.exit(1)
     patch_loc = f"0x{patch_location_file.read_text().strip()}"
 
-    if family == PredicateFamily.CWE119_ERM:
+    if family == PredicateFamily.CWE805_ERM:
         # Full-context prefilter (plan §8): the capture binary carries the
         # same allocator hooks as the final binary and dumps binary
         # snapshots (clamps + registers + stack) at the patch site.  A
@@ -1316,13 +1379,13 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         stack_size_file = workdir / "stack-size"
         if not stack_size_file.exists():
             print(f"Error: {stack_size_file.name} file not found in "
-                  f"{workdir} (CWE-119 prefilter needs the stack size)")
+                  f"{workdir} (CWE-805 prefilter needs the stack size)")
             sys.exit(1)
         stack_size = int(stack_size_file.read_text().strip())
         snapshots = capture_states(workdir, configdir, config, patch_loc,
                                    allocator, stack_size)
         if snapshots is None:
-            print("Warning: CWE-119 prefilter capture failed; keeping all "
+            print("Warning: CWE-805 prefilter capture failed; keeping all "
                   "predicates (fail-open)")
             results = [(source_id, True, "capture failed (fail-open)",
                         predicate)
@@ -1342,12 +1405,12 @@ def cmd_prefilter(configdir: Path, workdir: Path):
                             sha256=predicates_sha256(predicates_file))
             sys.exit(0)
 
-        print(f"Captured {len(snapshots)} CWE-119 snapshot(s)")
+        print(f"Captured {len(snapshots)} CWE-805 snapshot(s)")
         results = []
         for source_id, predicate in predicate_records:
-            parsed = parse_cwe119_predicate(predicate)
+            parsed = parse_CWE805_predicate(predicate)
             passed = any(
-                cwe119_snapshot_branch_taken(parsed, snapshot) == 1
+                CWE805_snapshot_branch_taken(parsed, snapshot) == 1
                 for snapshot in snapshots)
             note = "" if passed else \
                 "evaluates to 0 on all captured snapshots"
