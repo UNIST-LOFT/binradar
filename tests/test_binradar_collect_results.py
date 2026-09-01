@@ -100,3 +100,41 @@ def test_parse_final_sbsv(tmp_path):
         1: {"res": "verified", "reason": "none", "iter": "-1"},
         2: {"res": "rejected", "reason": "different-br", "iter": "3"},
     }
+
+
+def test_collect_taosc_counts_original_and_prefiltered_predicates(tmp_path):
+    workdir = tmp_path / "workdir-013"
+    workdir.mkdir()
+    (workdir / "predicates").write_text("first\n\nsecond\n")
+    (workdir / "prefilter.sbsv").write_text(
+        "[prefilter] [meta] [version 1] [kind generic-erm] [sha256 abc]\n"
+        "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
+        "[prefilter] [res] [id 2] [pass false] [new-id -1]\n"
+        "[prefilter] [done] [total 2] [survived 1] [time 0.1]\n"
+    )
+
+    result = collector.collect_taosc_experiment(str(tmp_path), "workdir-013")
+
+    assert result.status == "ok"
+    assert result.original_predicates == 2
+    assert result.prefiltered_predicates == 1
+    assert result.prefilter_total == 2
+    assert result.prefilter_done is collector.DoneStatus.OK
+    assert "original predicates: 2" in collector.format_taosc_result_log(result)
+    assert "prefiltered predicates: 1" in collector.format_taosc_result_log(result)
+
+    row = collector.format_taosc_results_csv([result])[0]
+    assert row["original_predicates"] == "2"
+    assert row["prefiltered_predicates"] == "1"
+
+
+def test_collect_taosc_skips_prefilter_without_predicates(tmp_path):
+    workdir = tmp_path / "workdir-013"
+    workdir.mkdir()
+
+    result = collector.collect_taosc_experiment(str(tmp_path), "workdir-013")
+
+    assert result.status == "ok"
+    assert result.original_predicates == 0
+    assert result.prefiltered_predicates == 0
+    assert result.prefilter_done is collector.DoneStatus.SKIPPED

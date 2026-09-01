@@ -90,7 +90,20 @@ incompatible `no_call`/`jnz` output.
 ### Taosc specialized (`taosc-specialized`)
 
 No predicates and no allocator trace: Taosc generated a CWE-369/476/617 patch.
-Setup reuses the prebuilt `.brpatched` binary when present.
+Setup reuses the prebuilt `.brpatched` binary when present; otherwise it
+builds the artifacts with `TOTAL_PATCHES=0` (an empty `predicates` file is
+valid — `binradar.py` handles the no-patch case).
+
+### Cached artifact (`.brcached`)
+
+`setup` also builds `<binary>.brcached` from `benchmarks/loftix/brpatch-cached.c`,
+the taosc-style single-predicate plugin: it evaluates the `TAOSC_PRED`
+environment predicate at the patch site and jumps to the first `destinations`
+entry when it holds. The cached build uses the same e9tool invocation as
+`.brpatched`, so the E9 layout values are shared; its metadata is stored under
+the `BRCACHED_*` prefix in `binradar.env`. CWE-119 families skip the cached
+build with a warning because the plugin does not implement the allocator
+hooks.
 
 ## Setup and prefilter
 ```shell

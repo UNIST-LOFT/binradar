@@ -7,6 +7,7 @@ Usage:
     python ../scripts/binradar-collect-results.py binradar --exp exp.list --workdir workdir --run-prefix run
     python ../scripts/binradar-collect-results.py binradar --exp exp.list --format csv
     python ../scripts/binradar-collect-results.py sdfuzz --exp exp.list --workdir workdir
+    python ../scripts/binradar-collect-results.py taosc --exp exp.list --workdir workdir-013
 
 Subcommands:
     binradar (default)
@@ -31,7 +32,14 @@ Subcommands:
           4. Reports the patch prefilter context from <workdir>/prefilter.sbsv
              when present
 
-Output is saved to logs/binradar-<datetime>.log / logs/sdfuzz-<datetime>.log
+    taosc
+        Collect predicate counts from <workdir>/predicates and
+        <workdir>/prefilter.sbsv.  The latter contains the predicates that
+        survived BinRadar's prefilter.  Workdirs with no predicates are
+        reported with zero counts and a skipped prefilter status.
+
+Output is saved to logs/binradar-<datetime>.log / logs/sdfuzz-<datetime>.log /
+logs/taosc-<datetime>.log
 (or .csv/.tsv with --format csv / tsv)
 """
 
@@ -177,6 +185,18 @@ class SdfuzzResult:
     prefilter_survived: int = -1  # predicates kept (pass=true)
     prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
     log_errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class TaoscResult:
+    """Structured predicate result for one taosc workdir."""
+    exp_dir: str
+    status: str  # "ok", "issues", "no_data"
+    error_message: str = ""  # for workdir-not-found, etc.
+    original_predicates: int = -1
+    prefiltered_predicates: int = -1
+    prefilter_total: int = -1
+    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
 
 
 def parse_sbsv_line(line: str) -> Optional[Dict[str, str]]:
@@ -603,6 +623,14 @@ def extract_count(log_path: str, pattern: str) -> int:
     return last
 
 
+def count_predicates(predicates_path: str) -> int:
+    """Count non-empty original taosc predicates, or return -1 if absent."""
+    if not os.path.isfile(predicates_path):
+        return -1
+    with open(predicates_path, "r") as f:
+        return sum(1 for line in f if line.strip())
+
+
 def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
                               fuzzer_name: str) -> SdfuzzResult:
     """
@@ -679,6 +707,37 @@ def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
     result.prefilter_done = prefilter_done_status(workdir, prefilter)
 
     result.status = "ok" if not result.log_errors else "issues"
+    return result
+
+
+def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
+    """Collect original and prefiltered predicate counts from one workdir."""
+    workdir = os.path.join(exp_dir, workdir_name)
+    result = TaoscResult(exp_dir=exp_dir, status="no_data")
+
+    if not os.path.isdir(workdir):
+        result.error_message = "workdir not found"
+        return result
+
+    original = count_predicates(os.path.join(workdir, "predicates"))
+    result.original_predicates = max(original, 0)
+
+    prefilter_path = os.path.join(workdir, "prefilter.sbsv")
+    prefilter = parse_prefilter_sbsv(prefilter_path)
+    result.prefilter_total = prefilter["total"]
+    if prefilter["survived"] >= 0:
+        result.prefiltered_predicates = prefilter["survived"]
+
+    if prefilter["done"]:
+        result.prefilter_done = DoneStatus.OK
+    elif not os.path.isfile(prefilter_path) and result.original_predicates == 0:
+        # Direct-call and specialized taosc patches have no predicate file and
+        # do not run BinRadar's predicate prefilter.
+        result.prefiltered_predicates = 0
+        result.prefilter_done = DoneStatus.SKIPPED
+
+    result.status = ("ok" if result.prefilter_done in
+                     (DoneStatus.OK, DoneStatus.SKIPPED) else "issues")
     return result
 
 
@@ -917,6 +976,39 @@ def format_sdfuzz_result_log(result: SdfuzzResult) -> str:
     return "\n".join(lines)
 
 
+def format_taosc_result_log(result: TaoscResult) -> str:
+    """Format a TaoscResult as a human-readable log block."""
+    lines: List[str] = []
+    lines.append(f"=== {result.exp_dir} ===")
+
+    if result.error_message:
+        lines.append(f"  [STATUS] ERROR: {result.error_message}")
+        return "\n".join(lines)
+
+    original = (str(result.original_predicates)
+                if result.original_predicates >= 0 else "N/A")
+    prefiltered = (str(result.prefiltered_predicates)
+                   if result.prefiltered_predicates >= 0 else "N/A")
+    lines.append(f"  [taosc] original predicates: {original}")
+    lines.append(f"  [taosc] prefiltered predicates: {prefiltered}")
+
+    if result.prefilter_total >= 0:
+        pct = ""
+        if result.prefilter_total > 0:
+            pct = (f" ({result.prefiltered_predicates * 100 // result.prefilter_total}%)")
+        lines.append(
+            f"  [prefilter] total: {result.prefilter_total}  "
+            f"survived: {prefiltered}{pct}  "
+            f"status: {result.prefilter_done.value}")
+    else:
+        lines.append(f"  [prefilter] status: {result.prefilter_done.value}")
+
+    overall = "OK" if result.status == "ok" else "HAS ISSUES"
+    lines.append(f"  [OVERALL] {overall}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 SDFUZZ_CSV_COLUMNS = [
     "experiment",
     "status",
@@ -959,6 +1051,41 @@ def format_sdfuzz_results_csv(all_results: List[SdfuzzResult],
             "prefilter_done": result.prefilter_done.value,
             "log_errors_count": str(len(result.log_errors)),
             "error_preview": error_preview,
+        }
+        if include_subject_id:
+            row["experiment"] = result.exp_dir
+        rows.append(row)
+    return rows
+
+
+TAOSC_CSV_COLUMNS = [
+    "experiment",
+    "status",
+    "original_predicates",
+    "prefiltered_predicates",
+    "prefilter_total",
+    "prefilter_done",
+    "error_preview",
+]
+
+
+def format_taosc_results_csv(all_results: List[TaoscResult],
+                             include_subject_id: bool = True) -> List[Dict[str, str]]:
+    """Convert TaoscResults into CSV rows (list of dicts)."""
+    rows: List[Dict[str, str]] = []
+    for result in all_results:
+        row = {
+            "status": (f"ERROR: {result.error_message}"
+                        if result.error_message else result.status),
+            "original_predicates": (str(result.original_predicates)
+                                     if not result.error_message else ""),
+            "prefiltered_predicates": (str(result.prefiltered_predicates)
+                                        if not result.error_message else ""),
+            "prefilter_total": (str(result.prefilter_total)
+                                 if result.prefilter_total >= 0 else ""),
+            "prefilter_done": (result.prefilter_done.value
+                               if not result.error_message else ""),
+            "error_preview": result.error_message,
         }
         if include_subject_id:
             row["experiment"] = result.exp_dir
@@ -1148,6 +1275,64 @@ def cmd_sdfuzz(args):
                      counts)
 
 
+def cmd_taosc(args):
+    exp_file = args.exp
+    workdir_name = args.workdir
+    output_format = args.format
+
+    _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
+
+    # Create logs directory
+    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    all_results: List[TaoscResult] = []
+    for exp_dir, display in zip(resolved_dirs, display_dirs):
+        result = collect_taosc_experiment(exp_dir, workdir_name)
+        if output_format in ("csv", "tsv"):
+            result.exp_dir = display
+        all_results.append(result)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ext = output_format if output_format in ("csv", "tsv") else "log"
+    output_path = (args.output if args.output
+                   else os.path.join(logs_dir, f"taosc-{timestamp}.{ext}"))
+
+    ok_count = sum(1 for r in all_results if r.status == "ok")
+    issues_count = sum(1 for r in all_results if r.status == "issues")
+    no_data_count = sum(1 for r in all_results if r.status == "no_data")
+    counts = {"OK": ok_count, "issues": issues_count,
+              "no_data": no_data_count, "total": len(resolved_dirs)}
+
+    if output_format in ("csv", "tsv"):
+        columns = list(TAOSC_CSV_COLUMNS)
+        if args.no_subject_id:
+            columns.remove("experiment")
+        csv_rows = format_taosc_results_csv(
+            all_results, include_subject_id=not args.no_subject_id)
+        write_output(output_path, output_format, columns, csv_rows, [], counts)
+    else:
+        output_lines: List[str] = []
+        output_lines.append("Taosc Results Collection")
+        output_lines.append(f"Generated: {datetime.now().isoformat()}")
+        output_lines.append(f"Experiment list: {exp_file}")
+        output_lines.append(f"Workdir: {workdir_name}")
+        output_lines.append(f"Total experiments: {len(resolved_dirs)}")
+        output_lines.append("=" * 60)
+        output_lines.append("")
+
+        for result in all_results:
+            output_lines.append(format_taosc_result_log(result))
+
+        output_lines.append("=" * 60)
+        output_lines.append(
+            f"SUMMARY: {ok_count} OK, {issues_count} with issues, "
+            f"{no_data_count} no data")
+        output_lines.append(f"Total: {len(resolved_dirs)} experiments")
+        write_output(output_path, output_format, [], [], output_lines,
+                     counts)
+
+
 def main():
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--exp", default="exp.list",
@@ -1180,13 +1365,19 @@ def main():
         "sdfuzz", parents=[shared],
         help="collect external fuzzer evaluation results from workdir/<fuzzer>")
 
+    sub.add_parser(
+        "taosc", parents=[shared],
+        help="collect original and prefiltered taosc predicate counts")
+
     args = parser.parse_args()
 
     # Default to binradar when no subcommand is given (backward compatible)
     if args.command is None or args.command == "binradar":
         cmd_binradar(args)
-    else:
+    elif args.command == "sdfuzz":
         cmd_sdfuzz(args)
+    else:
+        cmd_taosc(args)
 
 
 if __name__ == "__main__":
