@@ -1,11 +1,12 @@
 /*
  * Multi-predicate execution cache for BinRadar's concrete verifier.
  *
- * The verifier selects one runtime predicate with PATCH_ID.  This plugin
- * executes that predicate exactly as brpatch.c does and records every
- * pre-branch state plus the selected branch on PATCH_FD.  Python evaluates
- * the other runtime predicates over those states and reuses the process
- * result only when their complete branch vectors are identical.
+ * The verifier selects one runtime predicate per run through TAOSC_PRED
+ * (PATCH_ID stays 0).  This plugin executes that predicate exactly as
+ * brpatch.c does and records every pre-branch state plus the selected
+ * branch on PATCH_FD.  Python evaluates the other runtime predicates over
+ * those states and reuses the process result only when their complete
+ * branch vectors are identical.
  *
  * Generic ERM records contain the 16 register slots.  BRPATCH_CWE805 builds
  * also contain the 256 allocation clamps and BRCACHE_STACK_SIZE bytes from
@@ -20,9 +21,6 @@
 
 #ifndef TAOSC_DEST
 #error "TAOSC_DEST must be the patch destination address"
-#endif
-#ifndef BRPATCH_TOTAL_PATCHES
-#error "BRPATCH_TOTAL_PATCHES must be the number of compiled predicates"
 #endif
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u /* little-endian bytes "BRCH" */
@@ -70,13 +68,6 @@ void init(int argc, const char *const *argv, char **envp)
 		cache_max_bytes = max_bytes;
 }
 
-static const char *get_cached_patch_str(uint32_t id)
-{
-	switch (id) {
-#include "brpatches.inc"
-	}
-}
-
 static int write_all(int fd, const void *buf, size_t count)
 {
 	const char *p = buf;
@@ -90,12 +81,12 @@ static int write_all(int fd, const void *buf, size_t count)
 	return 0;
 }
 
-static void write_marker(uint32_t patch_id, int branch, uint64_t flags)
+static void write_marker(int branch, uint64_t flags)
 {
 	const struct brcache_snapshot_header header = {
 		.magic = BRCACHE_SNAPSHOT_MAGIC,
 		.version = BRCACHE_SNAPSHOT_VERSION,
-		.patch_id = patch_id,
+		.patch_id = 0,
 		.branch = (uint32_t)branch,
 		.stack_size = 0,
 		.flags = flags,
@@ -103,7 +94,7 @@ static void write_marker(uint32_t patch_id, int branch, uint64_t flags)
 	(void)write_all(patch_fd, &header, sizeof(header));
 }
 
-static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
+static void capture_snapshot(const struct STATE *state,
                              int branch, int invalid)
 {
 	if (patch_fd < 0)
@@ -121,7 +112,7 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 		invalid = 1;
 #endif
 	if (invalid) {
-		write_marker(patch_id, branch, flags | BRCACHE_FLAG_INVALID);
+		write_marker(branch, flags | BRCACHE_FLAG_INVALID);
 		mutex_unlock(&cache_mutex);
 		return;
 	}
@@ -136,7 +127,7 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 				(cache_captured_bytes <= cache_max_bytes
 				 ? cache_captured_bytes : cache_max_bytes)) {
 		cache_truncated = 1;
-		write_marker(patch_id, branch, flags | BRCACHE_FLAG_TRUNCATED);
+		write_marker(branch, flags | BRCACHE_FLAG_TRUNCATED);
 		mutex_unlock(&cache_mutex);
 		return;
 	}
@@ -144,7 +135,7 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 	const struct brcache_snapshot_header header = {
 		.magic = BRCACHE_SNAPSHOT_MAGIC,
 		.version = BRCACHE_SNAPSHOT_VERSION,
-		.patch_id = patch_id,
+		.patch_id = 0,
 		.branch = (uint32_t)branch,
 #ifdef BRPATCH_CWE805
 		.stack_size = cache_stack_size,
@@ -182,12 +173,13 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 /* E9 action: if dest(state)@brpatch-cached goto */
 const void *dest(const struct STATE *state)
 {
-	uint32_t ignored_iteration = 0;
-	const uint32_t patch_id = select_patch_id(&ignored_iteration);
 	int branch = 0;
-	int invalid = patch_id == 0 || patch_id > BRPATCH_TOTAL_PATCHES;
+	int invalid = 0;
 	struct br_predicate predicate = {0};
-	const char *encoded = get_cached_patch_str(patch_id);
+	const char *encoded = getenv("TAOSC_PRED");
+	if (encoded == NULL) {
+		invalid = 1;
+	}
 	if (!invalid && parse_predicate(encoded, &predicate) < 0)
 		invalid = 1;
 
@@ -211,6 +203,6 @@ const void *dest(const struct STATE *state)
 #endif
 	}
 
-	capture_snapshot(state, patch_id, branch, invalid);
+	capture_snapshot(state, branch, invalid);
 	return branch == 1 ? (const void *)TAOSC_DEST : NULL;
 }

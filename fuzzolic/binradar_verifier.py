@@ -21,6 +21,7 @@ from binradar_taosc_predicates import (
     evaluate_cached_predicate,
     load_runtime_predicates,
     parse_cached_snapshots,
+    predicate_descriptor,
 )
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -519,19 +520,20 @@ class BinRadarQemuRunner:
         return probe, patch_result
 
     def test_with_cached(
-        self, patch_id: int, testcase: str, verbose: bool = False,
+        self, patch_id: int, predicate: ParsedPredicate, testcase: str,
+        verbose: bool = False,
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
         probe, data = self._test_with_capture(
-            self.cached_binary(), str(patch_id), testcase, verbose,
-            {"BRCACHE_STACK_SIZE": str(self.brcache_stack_size)})
+            self.cached_binary(), "0", testcase, verbose,
+            {
+                "TAOSC_PRED": predicate_descriptor(predicate),
+                "BRCACHE_STACK_SIZE": str(self.brcache_stack_size),
+            })
         if probe is None or data is None:
             return None, None
         snapshots, error = parse_cached_snapshots(data)
         if error is not None:
             logger.warning(f"Cached capture rejected: {error}")
-            return probe, None
-        if any(snapshot.patch_id != patch_id for snapshot in snapshots):
-            logger.warning("Cached capture contains the wrong patch id")
             return probe, None
         if probe.patch_hit_cnt != len(snapshots):
             logger.warning(
@@ -786,8 +788,12 @@ class BinRadarConcreteVerifier:
         return result, patch_result
 
     def run_testcase_cached(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        predicate = self.cached_predicates.get(patch_id)
+        if predicate is None:
+            return None, None
         return self.runner.test_with_cached(
-            patch_id, os.path.join(self.minimized_dir, testcase.filename))
+            patch_id, predicate,
+            os.path.join(self.minimized_dir, testcase.filename))
 
     def run_verification_streaming(self, minimizer_result_file: str,
                                    poll_interval: float = 0.2,

@@ -922,11 +922,12 @@ CACHED_SNAPSHOT_REGS = PREFILTER_SNAPSHOT_REGS
 
 @dataclass(frozen=True)
 class CachedSnapshot:
+    """One brpatch-cached record (patch_id is the captured runtime id)."""
     patch_id: int
     branch: int
     registers: Tuple[int, ...]
     clamps: Tuple[Tuple[int, int], ...] = ()
-    stack: bytes = b""
+    stack: bytes = ""
 
     @property
     def is_CWE805(self) -> bool:
@@ -944,6 +945,7 @@ def parse_cached_snapshots(
     """
     snapshots: List[CachedSnapshot] = []
     offset = 0
+    expected_patch_id: Optional[int] = None
     known_flags = CACHED_SNAPSHOT_FLAG_TRUNCATED \
         | CACHED_SNAPSHOT_FLAG_CWE805 | CACHED_SNAPSHOT_FLAG_INVALID
     while offset < len(data):
@@ -964,6 +966,10 @@ def parse_cached_snapshots(
             return [], "cached runtime rejected the selected predicate"
         if branch not in (0, 1, 2):
             return [], f"invalid cached branch value {branch}"
+        if expected_patch_id is None:
+            expected_patch_id = patch_id
+        elif patch_id != expected_patch_id:
+            return [], "cached snapshot patch ids differ within one run"
 
         is_CWE805 = bool(flags & CACHED_SNAPSHOT_FLAG_CWE805)
         if not is_CWE805 and stack_size != 0:

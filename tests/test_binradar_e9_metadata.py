@@ -460,7 +460,7 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
 
     out = binradar_setup.build_cached_binary(
         workdir, tmp_path, binradar_env,
-        binradar_setup.PredicateFamily.GENERIC_ERM, None, 2)
+        binradar_setup.PredicateFamily.GENERIC_ERM, None)
     assert out == metadata
     assert (workdir / "imginfo.brcached").exists()
     assert (workdir / "imginfo.brcached.json").exists()
@@ -471,7 +471,6 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
                     if "e9compile" in c and "brpatch-cached.c" in c]
     assert compile_cmds, "e9compile brpatch-cached.c not invoked"
     assert "-DTAOSC_DEST=0x4106d8" in compile_cmds[0]
-    assert "-DBRPATCH_TOTAL_PATCHES=2" in compile_cmds[0]
     assert "-DBRPATCH_CWE805" not in compile_cmds[0]
     # e9tool ran the JSON and binary commands from one spec.
     tool_cmds = [c for c, _ in calls if "e9tool" in c]
@@ -519,7 +518,7 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
 
     binradar_setup.build_cached_binary(
         workdir, tmp_path, env,
-        binradar_setup.PredicateFamily.CWE805_ERM, allocator, 2)
+        binradar_setup.PredicateFamily.CWE805_ERM, allocator)
 
     compile_cmd = next(cmd for cmd in calls if "e9compile" in cmd)
     assert "-DBRPATCH_CWE805" in compile_cmd
@@ -542,11 +541,13 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
     workdir.mkdir()
     (workdir / "imginfo.brcached").write_bytes(b"cache")
 
+    # Over zero registers: "=p1p0" and "=v1p0" are both false (branch 0);
+    # "=p0p0" is true (branch 1). Patch 3 therefore needs its own run.
     predicates = binradar_setup.binradar_taosc_predicates
     selected = [
-        predicates.PredicateRecord(1, 1, "p1", "=v0p0"),
-        predicates.PredicateRecord(2, 2, "p2", "=v1p0"),
-        predicates.PredicateRecord(3, 3, "p3", "=v2p0"),
+        predicates.PredicateRecord(1, 1, "p1", "=p1p0"),
+        predicates.PredicateRecord(2, 2, "p2", "=p0p0"),
+        predicates.PredicateRecord(3, 3, "p3", "=v1p0"),
     ]
     predicates.write_runtime_predicates(
         workdir / "brpatches.json",
@@ -573,12 +574,15 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
         def cached_binary(self):
             return str(workdir / "imginfo.brcached")
 
-        def test_with_cached(self, patch_id, testcase):
-            self.cached_calls.append(patch_id)
+        def test_with_cached(self, patch_id, predicate, testcase):
+            self.cached_calls.append((patch_id, predicate))
+            # Mirror the real plugin: branch 0 while rax and rbx are zero,
+            # branch 1 for a predicate that is true there ("=p0p0").
+            branch = 1 if predicate == "=p0p0" else 0
             snapshot = binradar.binradar_verifier.CachedSnapshot(
                 patch_id=patch_id,
-                branch=1,
-                registers=(0, 0, 1) + (0,) * 13,
+                branch=branch,
+                registers=(0,) * 16,
             )
             return normal_result, binradar.binradar_verifier.BinRadarCachedRun(
                 patch_id, [snapshot])
@@ -593,14 +597,20 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
         str(workdir), str(run_dir), runner,
         SimpleNamespace(fault_addr=0xDEAD),
         str(workdir / "imginfo.brpatched"), [1, 2, 3])
+    # The cached run (representative patch 1) took branch 0; the minimizer
+    # observed the same branch vector [0] for the original run, so patches
+    # with that vector pass and differing vectors are rejected.
     testcase = binradar.binradar_verifier.Testcase(
         0, "input", "ok", 0, [0])
     verifier.testcases.append(testcase)
 
     rejected = verifier._test_testcase_batch([1, 2, 3], testcase)
-    assert rejected == {1, 2}
-    assert runner.cached_calls == [1]
-    assert runner.patched_calls == [3]
+    assert rejected == {2, 3}
+    # One representative run per distinct branch vector. Both representatives
+    # reuse the cached artifact; only the third predicate's vector differs
+    # from the representative's, and it is judged offline from the snapshot.
+    assert runner.cached_calls == [(1, "=p1p0"), (2, "=p0p0")]
+    assert runner.patched_calls == []
 
 
 def test_cached_artifact_skips_single_predicate_and_removes_stale_files(

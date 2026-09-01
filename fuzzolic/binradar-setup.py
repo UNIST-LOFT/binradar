@@ -239,19 +239,16 @@ def build_cached_binary(
     binradar_env: Dict[str, str],
     family: PredicateFamily,
     allocator: Optional[AllocatorTrace],
-    patch_count: int,
 ) -> "E9RuntimeMetadata":
     """Build the verifier's selected-predicate capture artifact.
 
     Generic ERM instruments only PATCH_LOC.  CWE-805 ERM uses the same
     allocator hooks and ordered multipoint specification as .brpatched.
-    ``brpatches.inc`` supplies the shared runtime-id mapping.
+    The selected predicate is provided per run through TAOSC_PRED.
     """
     if family not in (PredicateFamily.GENERIC_ERM,
                       PredicateFamily.CWE805_ERM):
         raise RuntimeError(f"cannot cache patch family {family.value}")
-    if patch_count <= 1:
-        raise RuntimeError("the predicate cache requires multiple patches")
 
     binary = binradar_env["BINARY"]
     patch_loc = binradar_env["PATCH_LOC"]
@@ -279,8 +276,7 @@ def build_cached_binary(
     if dest is None:
         raise RuntimeError(f"no destination found in {destinations_file}")
 
-    compile_defines = [f"-DTAOSC_DEST={dest}",
-                       f"-DBRPATCH_TOTAL_PATCHES={patch_count}"]
+    compile_defines = [f"-DTAOSC_DEST={dest}"]
     if family == PredicateFamily.CWE805_ERM:
         if allocator is None:
             raise RuntimeError("CWE-805 cache requires an allocator trace")
@@ -362,7 +358,7 @@ def build_cached_artifact(
         workdir / "brpatches.json", family, selected)
     try:
         metadata = build_cached_binary(
-            workdir, configdir, binradar_env, family, allocator, len(selected))
+            workdir, configdir, binradar_env, family, allocator)
     except RuntimeError as e:
         print(f"Error building cached binary: {e}")
         exit(1)

@@ -706,8 +706,8 @@ def _run_cached_runtime_test(tmp_path, cwe805):
     else:
         descriptors = (
             'case 0: return "p0";\n'
-            'case 1: return "=p0p0";\n'
-            'case 2: return "=p1p0";\n'
+            'case 1: return "=p1p0";\n'
+            'case 2: return "=p0p0";\n'
             'default: return "p0";\n')
     (tmp_path / "brpatches.inc").write_text(descriptors)
     executable = tmp_path / ("cached-cwe805" if cwe805 else "cached-generic")
@@ -715,7 +715,6 @@ def _run_cached_runtime_test(tmp_path, cwe805):
         "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-function", "-Wno-unused-parameter",
         "-Wno-missing-field-initializers", "-Wno-implicit-fallthrough",
-        "-DBRPATCH_TOTAL_PATCHES=2",
         f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
         f"-I{tmp_path}",
         str(ROOT / "tests" / "test_brpatch_cached.c"),
@@ -734,16 +733,16 @@ def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
     generic_data = _run_cached_runtime_test(tmp_path, False)
     snapshots, error = predicates.parse_cached_snapshots(generic_data)
     assert error is None
-    assert [snapshot.patch_id for snapshot in snapshots] == [1, 2]
-    assert [snapshot.branch for snapshot in snapshots] == [1, 0]
+    assert all(snapshot.patch_id == 0 for snapshot in snapshots)
+    assert [snapshot.branch for snapshot in snapshots] == [0, 1]
     assert all(not snapshot.is_CWE805 for snapshot in snapshots)
     assert predicates.evaluate_cached_predicate(
-        "=p0p0", [snapshots[0]]) == [1]
+        "=p1p0", [snapshots[0]]) == [0]
 
     cwe805_data = _run_cached_runtime_test(tmp_path, True)
     snapshots, error = predicates.parse_cached_snapshots(cwe805_data)
     assert error is None
-    assert [snapshot.patch_id for snapshot in snapshots] == [1, 2]
+    assert all(snapshot.patch_id == 0 for snapshot in snapshots)
     assert [snapshot.branch for snapshot in snapshots] == [0, 1]
     assert all(snapshot.is_CWE805 for snapshot in snapshots)
     assert all(len(snapshot.clamps) == 256 for snapshot in snapshots)
