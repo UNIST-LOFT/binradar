@@ -1013,6 +1013,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
 
     if family == PredicateFamily.CWE805_DIRECT:
         assert allocator is not None
+        binradar_env["PATCH_TYPE"] = family.value
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
         # The direct call-site metapatch has no predicate list: the E9
         # jnz($mem0,mem[0].size,dest) decision evaluates the complete access
         # against the allocation clamps.  A leftover predicates file is stale Taosc
@@ -1095,6 +1098,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     if family == PredicateFamily.TAOSC_SPECIALIZED:
         # No predicates: taosc generated a specialized (CWE-369/476/617)
         # patch.  Reuse the prebuilt binary when present.
+        binradar_env["PATCH_TYPE"] = family.value
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
         if brpatched_binary.exists():
             metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
             patch_addr = int(binradar_env["PATCH_LOC"], 0)
@@ -1115,6 +1121,8 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         # No prebuilt binary and no predicates: build the artifacts with
         # zero candidates (TOTAL_PATCHES=0); binradar.py handles the
         # no-patch case.
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "0"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "0"
         print(f"Warning: no {predicates_file.name} and no prebuilt "
               f"brpatched binary in {workdir}; building with zero "
               f"candidate patches")
@@ -1135,6 +1143,14 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         # (TOTAL_PATCHES=0); binradar.py handles the no-patch case.
         print(f"Warning: {predicates_file.name} is empty in {workdir}; "
               f"building with zero candidate patches")
+
+    # PATCH_TYPE and the patch counters describe the pipeline inputs:
+    # TAOSC_TOTAL_PATCHES counts the predicates Taosc generated, and
+    # PREFILTER_TOTAL_PATCHES the ones that survive the offline prefilter
+    # (or all of them when no prefilter ran or it failed open).
+    binradar_env["PATCH_TYPE"] = family.value
+    binradar_env["TAOSC_TOTAL_PATCHES"] = str(len(predicate_records))
+    binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(predicate_records))
 
     patch_records = [
         PredicateRecord(patch_id, record.source_line, record.source_text,
@@ -1171,6 +1187,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                         record.parsed))
             print(f"[prefilter] loaded {len(predicate_records)} predicates, "
                   f"{len(survived)} survived")
+            binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(survived))
             patch_records = survived
 
     # Get patch destination
