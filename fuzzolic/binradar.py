@@ -289,7 +289,10 @@ class TracerExecutor:
                 with open(analyze_result_file, "rb") as f:
                     analyze_result = f.read()
                 logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start_time, 3)}] [saved {analyze_result_file}]")
-            logger.debug(f"[TRACER] [{self.mode}] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
+            if self.mode != "binradar":
+                # In binradar mode the caller logs one line per iteration;
+                # logging it here too would duplicate every iteration.
+                logger.debug(f"[TRACER] [{self.mode}] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
         except Exception as e:
             is_timeout = True
             logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
@@ -977,12 +980,10 @@ class BinRadarExecutor:
                 f"[FILTER] [patch {patch_id}] Still crashes at the original "
                 f"fault address {result.fault_addr:#x}. Filtered out.")
         else:
+            # Surviving patches are not logged individually: with many
+            # candidates this floods the log; the [patch] rows in filter.sbsv
+            # and the [FILTER] [survived ...] summary cover them.
             passed = True
-            logger.info(
-                f"[FILTER] [patch {patch_id}] Does not crash at the original "
-                f"fault address {self.probe_result.fault_addr:#x} "
-                f"(exit {result.exit_info}, fault-addr {result.fault_addr:#x}). "
-                f"Survived.")
         f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
         return passed
 
@@ -1071,17 +1072,23 @@ class BinRadarExecutor:
                             branches = None
                         if branches is not None and branches == observed:
                             equivalent.append(patch)
+                    reused = equivalent[1:]
+                    for patch in reused:
+                        remaining.remove(patch)
+                    if reused:
+                        logger.info(
+                            f"[FILTER] [cache-reuse] [representative "
+                            f"{representative}] [patches {reused}]")
                     for patch in equivalent:
-                        if patch != representative:
-                            remaining.remove(patch)
-                            logger.info(
-                                f"[FILTER] [cache-hit] [patch {patch}] "
-                                f"[representative {representative}]")
                         if self._filter_decision(
                                 patch, result,
                                 binradar_verifier.BinRadarPatchResult(
                                     patch, observed), f):
                             survived_patches.append(patch)
+        logger.info(
+            f"[FILTER] [summary] [total {self.total_patches}] "
+            f"[survived {len(survived_patches)}] "
+            f"[filtered {self.total_patches - len(survived_patches)}]")
         logger.info(f"[FILTER] [survived {survived_patches}]")
         self.save_progress(f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] [survived {survived_patches}]")
         self.filter_result = survived_patches
@@ -1292,7 +1299,12 @@ class BinRadarExecutor:
                     logger.info(f"[BINRADAR] [id {self.run_id}] Timeout reached. Stopping binradar execution.")
                     break
                 tracer_time, tracer_success, remaining = tracer.run()
-                logger.debug(f"[binradar] [tracer] [id {self.run_id}] [iter {tracer.iter}] [tracer-time {tracer_time}] [tracer-success {tracer_success}] [remaining {remaining}]")
+                message = (f"[binradar] [tracer] [iter {tracer.iter}] "
+                           f"[time {tracer_time}] [remaining {remaining}]")
+                if tracer_success:
+                    logger.debug(message)
+                else:
+                    logger.warning(message + " [failed true]")
             # TODO: currently, we don't utilize collected constraints
             tracer.stop()
             solver.stop()

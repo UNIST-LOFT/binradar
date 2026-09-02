@@ -53,10 +53,13 @@ import re
 import sbsv
 import sys
 import enum
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
+from itertools import repeat
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -1157,6 +1160,52 @@ def load_experiment_list(exp_file: str) -> Tuple[str, List[str], List[str]]:
     return exp_file_dir, resolved_dirs, display_dirs
 
 
+def _auto_workers(count: int) -> int:
+    """Default worker count: one per CPU, capped by the number of tasks."""
+    cpus = os.cpu_count() or 1
+    return max(1, min(cpus, count))
+
+
+def _collect_task(collect: Callable[[str], object], exp_dir: str) -> object:
+    """Collect one experiment; convert unexpected errors to a placeholder.
+
+    A broken experiment (e.g. unreadable file) must not abort the whole
+    run, so failures become a placeholder result with an error message.
+    """
+    try:
+        return collect(exp_dir)
+    except Exception as e:
+        message = f"collection failed: {type(e).__name__}: {e}"
+        func = getattr(collect, "func", None)
+        if func is collect_experiment_result:
+            return ExperimentResult(exp_dir=exp_dir,
+                                    overall_status="no_data",
+                                    error_message=message)
+        if func is collect_sdfuzz_experiment:
+            return SdfuzzResult(exp_dir=exp_dir, status="no_data",
+                                error_message=message)
+        return TaoscResult(exp_dir=exp_dir, status="no_data",
+                           error_message=message)
+
+
+def collect_all(collect: Callable[[str], object], resolved_dirs: List[str],
+                jobs: int) -> List[object]:
+    """Collect results for all experiments, in parallel when requested.
+
+    Results are returned in the same order as ``resolved_dirs`` regardless
+    of worker scheduling.  ``jobs`` is the worker count; 0 means auto
+    (one worker per CPU, capped by the number of experiments), 1 forces
+    sequential collection in-process.
+    """
+    workers = jobs if jobs > 0 else _auto_workers(len(resolved_dirs))
+    if workers <= 1 or len(resolved_dirs) <= 1:
+        return [_collect_task(collect, d) for d in resolved_dirs]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        # map() preserves input order; chunksize=1 since each task is heavy.
+        return list(pool.map(_collect_task, repeat(collect), resolved_dirs,
+                             chunksize=1))
+
+
 def write_output(output_path: str, output_format: str, header: List[str],
                  csv_rows: List[Dict[str, str]], log_lines: List[str],
                  counts: Dict[str, int]):
@@ -1197,13 +1246,13 @@ def cmd_binradar(args):
     logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
     os.makedirs(logs_dir, exist_ok=True)
 
-    # Collect all results
-    all_results: List[ExperimentResult] = []
-    for exp_dir, display in zip(resolved_dirs, display_dirs):
-        result = collect_experiment_result(exp_dir, workdir_name, run_prefix)
-        if output_format in ("csv", "tsv"):
+    # Collect all results (in parallel; see --jobs)
+    collect = partial(collect_experiment_result, workdir_name=workdir_name,
+                      run_prefix=run_prefix)
+    all_results = collect_all(collect, resolved_dirs, args.jobs)
+    if output_format in ("csv", "tsv"):
+        for result, display in zip(all_results, display_dirs):
             result.exp_dir = display
-        all_results.append(result)
 
     # Output file
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1262,13 +1311,14 @@ def cmd_sdfuzz(args):
     logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
     os.makedirs(logs_dir, exist_ok=True)
 
-    # Collect all results
-    all_results: List[SdfuzzResult] = []
-    for exp_dir, display in zip(resolved_dirs, display_dirs):
-        result = collect_sdfuzz_experiment(exp_dir, workdir_name, fuzzer_name)
-        if output_format in ("csv", "tsv"):
+    # Collect all results (in parallel; see --jobs)
+    collect = partial(collect_sdfuzz_experiment, workdir_name=workdir_name,
+                      fuzzer_name=fuzzer_name)
+    all_results: List[SdfuzzResult] = collect_all(collect, resolved_dirs,
+                                                  args.jobs)
+    if output_format in ("csv", "tsv"):
+        for result, display in zip(all_results, display_dirs):
             result.exp_dir = display
-        all_results.append(result)
 
     # Output file
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1326,12 +1376,12 @@ def cmd_taosc(args):
     logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
     os.makedirs(logs_dir, exist_ok=True)
 
-    all_results: List[TaoscResult] = []
-    for exp_dir, display in zip(resolved_dirs, display_dirs):
-        result = collect_taosc_experiment(exp_dir, workdir_name)
-        if output_format in ("csv", "tsv"):
+    collect = partial(collect_taosc_experiment, workdir_name=workdir_name)
+    all_results: List[TaoscResult] = collect_all(collect, resolved_dirs,
+                                                 args.jobs)
+    if output_format in ("csv", "tsv"):
+        for result, display in zip(all_results, display_dirs):
             result.exp_dir = display
-        all_results.append(result)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     ext = output_format if output_format in ("csv", "tsv") else "log"
@@ -1388,6 +1438,8 @@ def main():
     shared.add_argument("--fuzzer", default="sdfuzz",
                         help="Fuzzer output directory name under workdir "
                              "(sdfuzz only, default: sdfuzz)")
+    shared.add_argument("--jobs", type=int, default=0,
+                        help="number of parallel collection workers (0 = auto: one per CPU; 1 = sequential)")
     shared.add_argument(
         "-n", "--no-subject-id", action="store_true",
         help="omit the experiment subject id column in csv/tsv output")
