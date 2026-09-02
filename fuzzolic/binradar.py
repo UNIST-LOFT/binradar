@@ -1565,6 +1565,7 @@ def main():
         help="prioritize directed candidates from the end of the forward trace (Z3 only)")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
+    parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
     # The following argument is for experiments and debugging
     phases = ["probe", "filter", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
@@ -1588,6 +1589,20 @@ def main():
     env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if args.disable_binradar else "0"
+    if args.target_patches == "all":
+        # Run every predicate that survived the offline prefilter instead of
+        # the top-30 subset.  Candidates past the top-30 cap are only
+        # compiled into the binaries when setup ran with
+        # `binradar-setup.py setup --target-patches all`.
+        pref_total = int(env.get("PREFILTER_TOTAL_PATCHES",
+                                 env["TOTAL_PATCHES"]))
+        if pref_total > int(env["TOTAL_PATCHES"]):
+            logger.warning(
+                f"--target-patches all: workdir was set up with the top-30 "
+                f"cap (TOTAL_PATCHES={env['TOTAL_PATCHES']}, "
+                f"PREFILTER_TOTAL_PATCHES={pref_total}); re-run setup with "
+                f"--target-patches all to compile every survivor")
+        env["TOTAL_PATCHES"] = str(pref_total)
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

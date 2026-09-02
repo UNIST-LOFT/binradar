@@ -15,6 +15,8 @@ assert _spec is not None and _spec.loader is not None
 binradar_setup = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar_setup)
 
+import binradar_taosc_predicates
+
 
 def _fake_run(calls):
     def fake_run(cmd, cwd=None, **kwargs):
@@ -80,6 +82,66 @@ def test_generic_env_counters_with_prefilter(tmp_path, monkeypatch):
     assert env["TAOSC_TOTAL_PATCHES"] == "2"
     assert env["PREFILTER_TOTAL_PATCHES"] == "1"
     assert env["TOTAL_PATCHES"] == "1"
+
+
+def test_brpatches_json_exports_all_prefilter_survivors(tmp_path, monkeypatch):
+    """brpatches.json keeps every prefilter survivor past the top-30 cap."""
+    predicates = "\n".join("max1 - rax == ~max1" for _ in range(32)) + "\n"
+    workdir, env = _prepare_workdir(tmp_path, predicates)
+    sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
+    lines = [f"[prefilter] [meta] [version 1] [kind generic-erm] "
+             f"[sha256 {sha256}]"]
+    for i in range(1, 33):
+        lines.append(f"[prefilter] [res] [id {i}] [pass true] "
+                     f"[new-id {i}] x")
+    lines.append("[prefilter] [done] [total 32] [survived 32] [time 0.00]")
+    (workdir / "prefilter.sbsv").write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    # The binaries and TOTAL_PATCHES stay capped at the top 30...
+    assert env["PREFILTER_TOTAL_PATCHES"] == "32"
+    assert env["TOTAL_PATCHES"] == "30"
+    # ...but the manifest exports all 32 prefilter survivors, consecutively
+    # from id 1 so load_runtime_predicates still accepts it.
+    import json
+    manifest = json.loads((workdir / "brpatches.json").read_text())
+    assert [row["id"] for row in manifest["predicates"]] == \
+        list(range(1, 33))
+    family, predicates = binradar_taosc_predicates.load_runtime_predicates(
+        workdir / "brpatches.json")
+    assert family is binradar_setup.PredicateFamily.GENERIC_ERM
+    assert set(predicates) == set(range(1, 33))
+
+
+def test_target_patches_all_compiles_every_survivor(tmp_path, monkeypatch):
+    """--target-patches all compiles every prefilter survivor (no cap)."""
+    predicates = "\n".join("max1 - rax == ~max1" for _ in range(32)) + "\n"
+    workdir, env = _prepare_workdir(tmp_path, predicates)
+    sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
+    lines = [f"[prefilter] [meta] [version 1] [kind generic-erm] "
+             f"[sha256 {sha256}]"]
+    for i in range(1, 33):
+        lines.append(f"[prefilter] [res] [id {i}] [pass true] "
+                     f"[new-id {i}] x")
+    lines.append("[prefilter] [done] [total 32] [survived 32] [time 0.00]")
+    (workdir / "prefilter.sbsv").write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(
+        tmp_path, workdir, env, target_patches="all")
+    assert env["TOTAL_PATCHES"] == "32"
+    assert env["PREFILTER_TOTAL_PATCHES"] == "32"
+    # brpatches.inc compiles every survivor, not just the top 30.
+    inc = (workdir / "brpatches.inc").read_text()
+    assert "case 32:" in inc
+    # brpatches.json exports all 32 as well.
+    import json
+    manifest = json.loads((workdir / "brpatches.json").read_text())
+    assert [row["id"] for row in manifest["predicates"]] == \
+        list(range(1, 33))
 
 
 def test_cwe805_direct_env_counters(tmp_path, monkeypatch):

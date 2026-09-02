@@ -89,8 +89,13 @@ Subcommands:
                 (previously fuzzolic/binradar-prefilter.py)
 
 Usage:
-  uv run fuzzolic/binradar-setup.py setup -w <workdir>
+  uv run fuzzolic/binradar-setup.py setup -w <workdir> [--target-patches top-30|all]
   uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
+
+--target-patches selects how many prefilter survivors are compiled into the
+binaries: top-30 (default, same as before) or all (use
+PREFILTER_TOTAL_PATCHES).  Run binradar.py with the matching --target-patches
+value.
 """
 
 
@@ -333,8 +338,17 @@ def build_cached_artifact(
     family: PredicateFamily,
     allocator: Optional[AllocatorTrace],
     selected: List[PredicateRecord],
+    survived: Optional[List[PredicateRecord]] = None,
 ) -> None:
-    """Build .brcached only when branch-equivalence can skip executions."""
+    """Build .brcached only when branch-equivalence can skip executions.
+
+    The runtime-id manifest (brpatches.json) exports ``survived`` — every
+    predicate that survived the offline prefilter — not just the top-30
+    ``selected`` subset compiled into the binaries.  The manifest consumers
+    (FILTER cache and concrete verifier) only look up candidate ids up to
+    TOTAL_PATCHES, so the extra ids are harmless and keep the prefilter
+    survivors fully auditable.
+    """
     _remove_cached_artifact(workdir, binradar_env)
     if family not in (PredicateFamily.GENERIC_ERM,
                       PredicateFamily.CWE805_ERM) or len(selected) <= 1:
@@ -355,8 +369,9 @@ def build_cached_artifact(
     else:
         binradar_env["BRCACHE_STACK_SIZE"] = "0"
 
+    manifest_records = survived if survived is not None else selected
     write_runtime_predicates(
-        workdir / "brpatches.json", family, selected)
+        workdir / "brpatches.json", family, manifest_records)
     try:
         metadata = build_cached_binary(
             workdir, configdir, binradar_env, family, allocator)
@@ -994,7 +1009,8 @@ def extract_e9_runtime_metadata(
     return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 
-def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
+def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str],
+                  target_patches: str = "top-30"):
     print(f"Preparing patch in {workdir}")
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
@@ -1211,10 +1227,19 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: no destination found in {destinations_file}")
         exit(1)
     # Generate brpatches.inc
-    # Currently, we only select top 30 patches.
     # Runtime patch IDs are compact and start at 1.  Each selected record
     # retains the original predicate source line for traceability.
-    selected_patch_records = patch_records[:30]
+    # --target-patches top-30 (default) caps the compiled candidates at 30;
+    # --target-patches all compiles every prefilter survivor.
+    if target_patches == "all":
+        selected_patch_records = patch_records
+        print(f"Targeting all {len(selected_patch_records)} prefilter "
+              f"survivor(s) (--target-patches all)")
+    else:
+        selected_patch_records = patch_records[:30]
+        print(f"Targeting top {len(selected_patch_records)} of "
+              f"{len(patch_records)} prefilter survivor(s) "
+              f"(default --target-patches top-30)")
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
@@ -1283,7 +1308,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
     build_cached_artifact(
         workdir, configdir, binradar_env, family, allocator,
-        selected_patch_records)
+        selected_patch_records, survived=patch_records)
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
@@ -1317,7 +1342,8 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
     return env
 
 
-def cmd_setup(configdir: Path, workdir: Path):
+def cmd_setup(configdir: Path, workdir: Path,
+              target_patches: str = "top-30"):
     config_path = configdir / "config.env"
     if not config_path.exists():
         print(f"Error: config.env not found in {configdir}")
@@ -1331,7 +1357,7 @@ def cmd_setup(configdir: Path, workdir: Path):
 
     workdir = workdir.resolve()
     binradar_env = create_binradar_env(configdir, config_path, workdir)
-    prepare_patch(configdir, workdir, binradar_env)
+    prepare_patch(configdir, workdir, binradar_env, target_patches)
     binradar_env_path = workdir / "binradar.env"
     save_env(binradar_env, binradar_env_path)
     print(f"binradar environment variables saved to {binradar_env_path}")
@@ -1494,6 +1520,11 @@ def main():
     setup_parser.add_argument("-w", "--workdir", type=Path, required=False,
                               default=Path.cwd() / "workdir",
                               help="Working directory (default: ./workdir)")
+    setup_parser.add_argument(
+        "--target-patches", choices=["top-30", "all"], default="top-30",
+        help="how many prefilter survivors to compile into the binaries: "
+             "top-30 (default, same as before) or all "
+             "(use PREFILTER_TOTAL_PATCHES)")
 
     prefilter_parser = subparsers.add_parser(
         "prefilter", help="evaluate predicates offline against the POC and "
@@ -1508,7 +1539,7 @@ def main():
 
     args = parser.parse_args()
     if args.command == "setup":
-        cmd_setup(args.configdir, args.workdir)
+        cmd_setup(args.configdir, args.workdir, args.target_patches)
     else:
         cmd_prefilter(args.configdir, args.workdir)
 
