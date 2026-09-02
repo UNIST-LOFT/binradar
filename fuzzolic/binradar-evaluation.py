@@ -312,10 +312,13 @@ def main():
 
         # 3. Concrete verifier (on the filtered patches only) runs concurrently
         runner = binradar_verifier.BinRadarQemuRunner.from_env(workdir, env)
+        cached_binary = os.path.join(workdir, f"{binary}.brcached")
+        verifier_binary = cached_binary \
+            if len(survived) > 1 and os.path.exists(cached_binary) \
+            else os.path.join(workdir, f"{binary}.brpatched")
         verifier = binradar_verifier.BinRadarConcreteVerifier(
             workdir, minimizer_dir, runner, probe_result,
-            os.path.join(workdir, f"{binary}.brpatched"),
-            survived)
+            verifier_binary, survived)
         minimizer_result_file = os.path.join(minimizer_dir, "minimizer.sbsv")
         binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file)

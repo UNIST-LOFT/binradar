@@ -19,6 +19,7 @@ import io
 import time
 import enum
 import fcntl
+from pathlib import Path
 from types import TracebackType
 from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
@@ -741,6 +742,23 @@ class BinRadarExecutor:
     def patched_binary(self) -> str:
         return os.path.join(self.workdir, f"{self.binary}.brpatched")
 
+    def cached_binary(self) -> str:
+        return os.path.join(self.workdir, f"{self.binary}.brcached")
+
+    def verifier_binary(self) -> str:
+        """Binary the concrete verifier runs candidates on.
+
+        With more than one surviving patch, the verifier executes one
+        representative per distinct branch vector on the cached capture
+        artifact (<binary>.brcached) and reuses the result for equivalent
+        predicates; individual fallback runs still use .brpatched.  Without
+        the cached artifact (or with a single patch) the verifier runs
+        .brpatched directly.
+        """
+        if len(self.filter_result) > 1 and os.path.exists(self.cached_binary()):
+            return self.cached_binary()
+        return self.patched_binary()
+
     def resolved_poc_input(self) -> str:
         if os.path.isabs(self.poc_input):
             return self.poc_input
@@ -900,6 +918,81 @@ class BinRadarExecutor:
                 survived_patches.append(row["id"])
         return survived_patches
 
+    def _load_cached_predicates(self, runner) -> Optional[Dict[int, binradar_verifier.ParsedPredicate]]:
+        """Load the runtime predicate manifest for cached filter execution.
+
+        Returns None when the cache is unavailable (single patch, missing
+        manifest or .brcached, family mismatch, or missing CWE-805 stack
+        size), so the filter falls back to individual executions.
+        """
+        if self.total_patches <= 1:
+            return None
+        manifest = os.path.join(self.workdir, "brpatches.json")
+        if not os.path.exists(manifest) \
+                or not os.path.exists(runner.cached_binary()):
+            return None
+        try:
+            family, predicates = binradar_verifier.load_runtime_predicates(
+                Path(manifest))
+        except ValueError as e:
+            logger.warning(f"[FILTER] Predicate cache disabled: {e}")
+            return None
+        if runner.patch_kind and runner.patch_kind != family.value:
+            logger.warning(
+                f"[FILTER] Predicate cache disabled: manifest family "
+                f"{family.value} != configured family {runner.patch_kind}")
+            return None
+        missing = [patch for patch in range(1, self.total_patches + 1)
+                   if patch not in predicates]
+        if missing:
+            logger.warning(
+                f"[FILTER] Predicate cache disabled: missing runtime "
+                f"patch ids {missing}")
+            return None
+        if family == binradar_verifier.PredicateFamily.CWE805_ERM \
+                and runner.brcache_stack_size <= 0:
+            logger.warning(
+                "[FILTER] Predicate cache disabled: missing CWE-805 "
+                "cache stack size")
+            return None
+        return predicates
+
+    def _filter_decision(self, patch_id: int, result,
+                         patch_result: Optional[binradar_verifier.BinRadarPatchResult],
+                         f: TextIO) -> bool:
+        """Evaluate one filter observation and write its [patch] row."""
+        if result is None:
+            logger.warning(
+                f"[FILTER] [patch {patch_id}] Failed to run patched binary "
+                f"with the poc input. Keeping the patch.")
+            passed = True
+        elif patch_result is not None and patch_result.crashed():
+            passed = False
+            logger.info(
+                f"[FILTER] [patch {patch_id}] Patch itself crashed "
+                f"(division/modulo by zero). Filtered out.")
+        elif result.is_crash() and result.fault_addr == self.probe_result.fault_addr:
+            passed = False
+            logger.info(
+                f"[FILTER] [patch {patch_id}] Still crashes at the original "
+                f"fault address {result.fault_addr:#x}. Filtered out.")
+        else:
+            passed = True
+            logger.info(
+                f"[FILTER] [patch {patch_id}] Does not crash at the original "
+                f"fault address {self.probe_result.fault_addr:#x} "
+                f"(exit {result.exit_info}, fault-addr {result.fault_addr:#x}). "
+                f"Survived.")
+        f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
+        return passed
+
+    def _filter_patch(self, patch_id: int, runner,
+                      testcase: str, f: TextIO) -> bool:
+        """Run one candidate individually on .brpatched and evaluate it."""
+        result, patch_result = runner.test_with_patched(
+            str(patch_id), testcase)
+        return self._filter_decision(patch_id, result, patch_result, f)
+
     def run_filter(self) -> List[int]:
         self.check_requirements()
         if self.probe_result is None:
@@ -922,23 +1015,73 @@ class BinRadarExecutor:
         testcase = self.resolved_poc_input()
         survived_patches: List[int] = list()
         with open(filter_result_file, "w", encoding="utf-8") as f:
-            for patch_id in range(1, self.total_patches + 1):
-                result, patch_result = runner.test_with_patched(str(patch_id), testcase)
-                if result is None:
-                    logger.warning(f"[FILTER] [patch {patch_id}] Failed to run patched binary with the poc input. Keeping the patch.")
-                    passed = True
-                elif patch_result is not None and patch_result.crashed():
-                    passed = False
-                    logger.info(f"[FILTER] [patch {patch_id}] Patch itself crashed (division/modulo by zero). Filtered out.")
-                elif result.is_crash() and result.fault_addr == self.probe_result.fault_addr:
-                    passed = False
-                    logger.info(f"[FILTER] [patch {patch_id}] Still crashes at the original fault address {result.fault_addr:#x}. Filtered out.")
-                else:
-                    passed = True
-                    logger.info(f"[FILTER] [patch {patch_id}] Does not crash at the original fault address {self.probe_result.fault_addr:#x} (exit {result.exit_info}, fault-addr {result.fault_addr:#x}). Survived.")
-                f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
-                if passed:
-                    survived_patches.append(patch_id)
+            cached_predicates = self._load_cached_predicates(runner)
+            if cached_predicates is None:
+                for patch_id in range(1, self.total_patches + 1):
+                    if self._filter_patch(patch_id, runner, testcase, f):
+                        survived_patches.append(patch_id)
+            else:
+                # Cached execution: run one representative per distinct
+                # complete branch vector on .brcached and reuse its process
+                # result for every predicate with the same vector.
+                remaining = list(range(1, self.total_patches + 1))
+                while remaining:
+                    representative = remaining.pop(0)
+                    logger.info(
+                        f"[FILTER] [cache-run] [patch {representative}]")
+                    result, cached = runner.test_with_cached(
+                        representative, cached_predicates[representative],
+                        testcase)
+                    if result is None or cached is None:
+                        logger.warning(
+                            f"[FILTER] [patch {representative}] Cached run "
+                            f"failed; falling back to individual execution.")
+                        if self._filter_patch(
+                                representative, runner, testcase, f):
+                            survived_patches.append(representative)
+                        continue
+                    observed = cached.br_selection
+                    try:
+                        evaluated = binradar_verifier.evaluate_cached_predicate(
+                            cached_predicates[representative],
+                            cached.snapshots)
+                    except (IndexError, ValueError) as e:
+                        logger.warning(
+                            f"[FILTER] [patch {representative}] Predicate "
+                            f"evaluation failed ({e}); falling back to "
+                            f"individual execution.")
+                        evaluated = None
+                    if evaluated is None or evaluated != observed:
+                        logger.warning(
+                            f"[FILTER] [patch {representative}] Cached "
+                            f"branch vector mismatch; falling back to "
+                            f"individual execution.")
+                        if self._filter_patch(
+                                representative, runner, testcase, f):
+                            survived_patches.append(representative)
+                        continue
+                    # Reuse the representative's result for every predicate
+                    # with the same complete branch vector.
+                    equivalent = [representative]
+                    for patch in remaining:
+                        try:
+                            branches = binradar_verifier.evaluate_cached_predicate(
+                                cached_predicates[patch], cached.snapshots)
+                        except (IndexError, ValueError):
+                            branches = None
+                        if branches is not None and branches == observed:
+                            equivalent.append(patch)
+                    for patch in equivalent:
+                        if patch != representative:
+                            remaining.remove(patch)
+                            logger.info(
+                                f"[FILTER] [cache-hit] [patch {patch}] "
+                                f"[representative {representative}]")
+                        if self._filter_decision(
+                                patch, result,
+                                binradar_verifier.BinRadarPatchResult(
+                                    patch, observed), f):
+                            survived_patches.append(patch)
         logger.info(f"[FILTER] [survived {survived_patches}]")
         self.save_progress(f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] [survived {survived_patches}]")
         self.filter_result = survived_patches
@@ -1083,7 +1226,7 @@ class BinRadarExecutor:
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), self.filter_result)
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
         verifier.run_verification_streaming(minimizer_result_file)
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
@@ -1103,7 +1246,7 @@ class BinRadarExecutor:
         minimizer.load_testcases()
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.patched_binary(), self.filter_result)
+        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
         binradar_minimizer.run_minimizer_and_verifier(minimizer, verifier, minimizer_result_file)
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
