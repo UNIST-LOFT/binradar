@@ -559,17 +559,43 @@ class Testcase:
 
 class BinRadarConcreteVerifierResult:
     patch_verified: Dict[int, bool]
+    patch_confidence: Dict[int, float]
+    accept_evidences: Dict[int, int]
+    total_evidences: Dict[int, int]
     def __init__(self, results: dict):
         self.patch_verified = dict()
+        self.patch_confidence = dict()
+        self.accept_evidences = dict()
+        self.total_evidences = dict()
         for res in results["verifier-result"]:
             patch_id = res["patch"]
             verified = res["res"] == "verified"
             self.patch_verified[patch_id] = verified
+        for evidence in results.get("verifier-confidence", []):
+            patch_id = evidence["patch"]
+            accepted = evidence["accept-evidences"]
+            total = evidence["total-evidences"]
+            self.accept_evidences[patch_id] = accepted
+            self.total_evidences[patch_id] = total
+            # Recompute instead of trusting the serialized score so the
+            # in-memory value always follows the metric definition.
+            self.patch_confidence[patch_id] = (
+                accepted / total if total > 0 else 0.0)
+        # Legacy verifier files have verdict rows but no confidence rows.
+        # Represent their unknown evidence as the documented 0/0 score.
+        for patch_id in self.patch_verified:
+            self.accept_evidences.setdefault(patch_id, 0)
+            self.total_evidences.setdefault(patch_id, 0)
+            self.patch_confidence.setdefault(patch_id, 0.0)
     
     @classmethod
     def from_sbsv(cls, sbsv_file: str) -> Optional["BinRadarConcreteVerifierResult"]:
         parser = sbsv.parser()
-        parser.add_schema("[verifier-result] [res: str] [patch: int] [testcase?: str]")
+        parser.add_schema(
+            "[verifier-result] [res: str] [patch: int] [testcase?: str]")
+        parser.add_schema(
+            "[verifier-confidence] [patch: int] [score: float] "
+            "[accept-evidences: int] [total-evidences: int]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
             result = parser.load(f)
         if "verifier-result" not in result:
@@ -591,6 +617,8 @@ class BinRadarConcreteVerifier:
     minimized_dir: str
     cached_predicates: Dict[int, ParsedPredicate]
     cache_family: Optional[PredicateFamily]
+    accept_evidences: Dict[int, int]
+    total_evidences: Dict[int, int]
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
@@ -600,6 +628,8 @@ class BinRadarConcreteVerifier:
         self.patched_binary = patched_binary
         self.patches = patches
         self.testcases = list()
+        self.accept_evidences = {patch: 0 for patch in patches}
+        self.total_evidences = {patch: 0 for patch in patches}
         self.start_time = time.time()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
@@ -652,12 +682,40 @@ class BinRadarConcreteVerifier:
             br=row["br"]
         )
 
+    def _record_evidence(self, patch: int, accepted: bool) -> None:
+        self.total_evidences[patch] = self.total_evidences.get(patch, 0) + 1
+        if accepted:
+            self.accept_evidences[patch] = self.accept_evidences.get(patch, 0) + 1
+
+    def confidence(self, patch: int) -> float:
+        total = self.total_evidences.get(patch, 0)
+        if total == 0:
+            return 0.0
+        return self.accept_evidences.get(patch, 0) / total
+
+    def _log_result(self, patch: int, result: str, testcase: str) -> None:
+        self.logger.info(
+            f"[verifier-result] [res {result}] [patch {patch}] "
+            f"[testcase {testcase}]")
+        self.logger.info(
+            f"[verifier-confidence] [patch {patch}] "
+            f"[score {self.confidence(patch):.6f}] "
+            f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
+            f"[total-evidences {self.total_evidences.get(patch, 0)}]")
+
     def _test_result(
         self, patch: int, testcase: Testcase, result: BinRadarProbeResult,
         patch_result: Optional[BinRadarPatchResult],
     ) -> bool:
-        """Return whether one observed execution rejects the candidate."""
+        """Return whether one observed execution rejects the candidate.
+
+        Conclusive pass/fail observations count as evidence. Observations at
+        unrelated fault addresses and timeouts are ignored. A normal-to-normal
+        branch-vector difference is negative evidence, but is not a hard
+        rejection.
+        """
         if patch_result is not None and patch_result.crashed():
+            self._record_evidence(patch, False)
             self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
             return True
         if testcase.exit == "crash":
@@ -665,9 +723,11 @@ class BinRadarConcreteVerifier:
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
                     return False
+                self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
             if result.is_normal_exit():
+                self._record_evidence(patch, True)
                 self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
             if result.is_timeout():
@@ -675,6 +735,10 @@ class BinRadarConcreteVerifier:
                 return False
         else:
             if result.is_crash():
+                if result.fault_addr != self.probe_result.fault_addr:
+                    self.logger.info(f"[verifier] [no-crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    return False
+                self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
             if result.is_normal_exit():
@@ -682,10 +746,12 @@ class BinRadarConcreteVerifier:
                     self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
                     return False
                 if testcase.br == patch_result.br_selection:
+                    self._record_evidence(patch, True)
                     self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     return False
-                self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                return True
+                self._record_evidence(patch, False)
+                self.logger.info(f"[verifier] [no-crash-confidence-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return False
             if result.is_timeout():
                 self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
@@ -846,7 +912,8 @@ class BinRadarConcreteVerifier:
                         for patch in list(pending_patches):
                             if patch not in rejected:
                                 continue
-                            self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {testcase.filename}]")
+                            self._log_result(
+                                patch, "rejected", testcase.filename)
                             pending_patches.remove(patch)
                         if not pending_patches and minimizer_thread is not None:
                             return
@@ -878,4 +945,4 @@ class BinRadarConcreteVerifier:
             if tail and not tail.endswith("\n"):
                 raise RuntimeError("minimizer.sbsv contains an unterminated line")
         for patch in pending_patches:
-            self.logger.info(f"[verifier-result] [res verified] [patch {patch}] [testcase ]")
+            self._log_result(patch, "verified", "")

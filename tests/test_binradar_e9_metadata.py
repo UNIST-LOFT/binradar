@@ -598,14 +598,17 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
         SimpleNamespace(fault_addr=0xDEAD),
         str(workdir / "imginfo.brpatched"), [1, 2, 3])
     # The cached run (representative patch 1) took branch 0; the minimizer
-    # observed the same branch vector [0] for the original run, so patches
-    # with that vector pass and differing vectors are rejected.
+    # observed the same branch vector [0] for the original run. Matching
+    # vectors are accept evidence; differing vectors lower confidence without
+    # rejecting the patch.
     testcase = binradar.binradar_verifier.Testcase(
         0, "input", "ok", 0, [0])
     verifier.testcases.append(testcase)
 
     rejected = verifier._test_testcase_batch([1, 2, 3], testcase)
-    assert rejected == {2, 3}
+    assert rejected == set()
+    assert verifier.accept_evidences == {1: 1, 2: 0, 3: 0}
+    assert verifier.total_evidences == {1: 1, 2: 1, 3: 1}
     # One representative run per distinct branch vector. Both representatives
     # reuse the cached artifact; only the third predicate's vector differs
     # from the representative's, and it is judged offline from the snapshot.

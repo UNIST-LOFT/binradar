@@ -61,6 +61,161 @@ def test_disabled_binradar_final_uses_concrete_result_without_trace(tmp_path):
     assert any(row.startswith("[final] [done]") for row in progress)
 
 
+def test_concrete_verifier_result_parses_confidence_evidence(tmp_path):
+    result_file = tmp_path / "verifier.sbsv"
+    result_file.write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-confidence] [patch 1] [score 0.123] "
+        "[accept-evidences 2] [total-evidences 3]\n"
+    )
+
+    result = binradar.binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(
+        str(result_file))
+
+    assert result is not None
+    assert result.patch_verified == {1: True}
+    # The parser recomputes the score from evidence rather than trusting the
+    # rounded/incorrect serialized value.
+    assert result.patch_confidence == {1: 2 / 3}
+    assert result.accept_evidences == {1: 2}
+    assert result.total_evidences == {1: 3}
+
+
+def test_concrete_verifier_branch_difference_lowers_confidence_without_rejecting(
+        tmp_path):
+    class FakeRunner:
+        patch_kind = ""
+        brcache_stack_size = 0
+
+        def cached_binary(self):
+            return str(tmp_path / "missing.brcached")
+
+    verifier = binradar.binradar_verifier.BinRadarConcreteVerifier(
+        str(tmp_path), str(tmp_path), FakeRunner(),
+        SimpleNamespace(fault_addr=0xDEAD),
+        str(tmp_path / "binary.brpatched"), [1])
+    testcase = binradar.binradar_verifier.Testcase(
+        0, "input", "ok", 0, [0])
+
+    def execution(exit_kind, fault_addr=0):
+        return SimpleNamespace(
+            fault_addr=fault_addr,
+            is_crash=lambda: exit_kind == "crash",
+            is_normal_exit=lambda: exit_kind == "ok",
+            is_timeout=lambda: exit_kind == "timeout",
+        )
+
+    # A behavioral difference is negative evidence, not a rejection.
+    assert not verifier._test_result(
+        1, testcase, execution("ok"),
+        binradar.binradar_verifier.BinRadarPatchResult(1, [1]))
+    assert verifier.confidence(1) == 0.0
+
+    # A matching behavior adds accept evidence.
+    assert not verifier._test_result(
+        1, testcase, execution("ok"),
+        binradar.binradar_verifier.BinRadarPatchResult(1, [0]))
+    assert verifier.confidence(1) == 0.5
+
+    # A new crash at an unrelated address is ignored. A crash at the POC's
+    # fault address remains a hard rejection and negative evidence.
+    assert not verifier._test_result(
+        1, testcase, execution("crash", 0xBEEF),
+        binradar.binradar_verifier.BinRadarPatchResult(1, [0]))
+    assert verifier.total_evidences[1] == 2
+    assert verifier._test_result(
+        1, testcase, execution("crash", 0xDEAD),
+        binradar.binradar_verifier.BinRadarPatchResult(1, [0]))
+    assert verifier.accept_evidences[1] == 1
+    assert verifier.total_evidences[1] == 3
+
+
+def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
+        tmp_path):
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-confidence] [patch 1] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+        "[verifier-confidence] [patch 2] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n"
+    )
+    (tmp_path / "binradar-tracer-msg.log").write_text(
+        # Iteration 1: patch 1 differs; patch 2 matches.
+        "[binradar] [normal] [iter 1] [patch 0]\n"
+        "[binradar] [commit] [iter 1] [patch 0] [br 0]\n"
+        "[binradar] [normal] [iter 1] [patch 1]\n"
+        "[binradar] [commit] [iter 1] [patch 1] [br 1]\n"
+        "[binradar] [normal] [iter 1] [patch 2]\n"
+        "[binradar] [commit] [iter 1] [patch 2] [br 0]\n"
+        # Iteration 2: patch 1 fixes the crash; patch 2 retains it.
+        "[binradar] [crash] [iter 2] [patch 0] [guest_pc 0] "
+        "[guest_cs_base 0] [fault_addr dead] [host_fault_addr 0]\n"
+        "[binradar] [commit] [iter 2] [patch 0] [br 0]\n"
+        "[binradar] [normal] [iter 2] [patch 1]\n"
+        "[binradar] [commit] [iter 2] [patch 1] [br 1]\n"
+        "[binradar] [crash] [iter 2] [patch 2] [guest_pc 0] "
+        "[guest_cs_base 0] [fault_addr dead] [host_fault_addr 0]\n"
+        "[binradar] [commit] [iter 2] [patch 2] [br 0]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    executor.disable_binradar = False
+    executor.probe_result = SimpleNamespace(tracer_fault_addr=0xDEAD)
+    executor.save_progress = lambda row: None
+
+    executor.run_final()
+
+    final_text = (tmp_path / "final.sbsv").read_text()
+    assert ("[final] [binradar] [patch 1] [res verified] "
+            "[reason none] [iter -1]") in final_text
+    assert ("[final] [binradar] [patch 2] [res rejected] "
+            "[reason same-crash] [iter 2]") in final_text
+    assert ("[final] [confidence] [patch 1] [score 0.666667] "
+            "[accept-evidences 2] [total-evidences 3]") in final_text
+    assert ("[final] [confidence] [patch 2] [score 0.666667] "
+            "[accept-evidences 2] [total-evidences 3]") in final_text
+    assert "[binradar_remaining_patches [1]]" in final_text
+
+
+def test_final_confidence_rows_sorted_and_only_accepted_patches(tmp_path):
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-confidence] [patch 1] [score 0.5] "
+        "[accept-evidences 1] [total-evidences 2]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+        "[verifier-confidence] [patch 2] [score 1.0] "
+        "[accept-evidences 2] [total-evidences 2]\n"
+        "[verifier-result] [res rejected] [patch 3] [testcase t]\n"
+        "[verifier-confidence] [patch 3] [score 0.0] "
+        "[accept-evidences 0] [total-evidences 1]\n"
+        "[verifier-result] [res verified] [patch 4] [testcase ]\n"
+        "[verifier-confidence] [patch 4] [score 0.75] "
+        "[accept-evidences 3] [total-evidences 4]\n"
+        "[verifier-result] [res verified] [patch 5] [testcase ]\n"
+        "[verifier-confidence] [patch 5] [score 0.75] "
+        "[accept-evidences 3] [total-evidences 4]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    executor.filter_result = [1, 2, 3, 4, 5]
+    executor.save_progress = lambda row: None
+
+    executor.run_final()
+
+    final_text = (tmp_path / "final.sbsv").read_text()
+    confidence_rows = [
+        line for line in final_text.splitlines()
+        if "[final] [confidence]" in line
+    ]
+    # Rejected patch 3 is not listed; the rest are ranked by score (highest
+    # first) with ties keeping the original patch-id order.
+    assert len(confidence_rows) == 4
+    assert "[patch 2]" in confidence_rows[0]
+    assert "[patch 4]" in confidence_rows[1]
+    assert "[patch 5]" in confidence_rows[2]
+    assert "[patch 1]" in confidence_rows[3]
+    assert all("[patch 3]" not in row for row in confidence_rows)
+
+
 def test_verifier_binary_uses_cached_artifact_for_multiple_patches(tmp_path):
     executor = _stub_executor(tmp_path)
     executor.workdir = str(tmp_path)

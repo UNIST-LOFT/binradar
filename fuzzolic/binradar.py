@@ -1335,6 +1335,23 @@ class BinRadarExecutor:
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
+        # FINAL combines concrete-verifier and BinRadar observations into one
+        # confidence score per patch. Older verifier files have no evidence
+        # rows and therefore start at 0/0 (score 0.0).
+        accept_evidences = {
+            patch: concrete_verifier_result.accept_evidences.get(patch, 0)
+            for patch in self.filter_result
+        }
+        total_evidences = {
+            patch: concrete_verifier_result.total_evidences.get(patch, 0)
+            for patch in self.filter_result
+        }
+
+        def record_evidence(patch: int, accepted: bool) -> None:
+            total_evidences[patch] = total_evidences.get(patch, 0) + 1
+            if accepted:
+                accept_evidences[patch] = accept_evidences.get(patch, 0) + 1
+
         if self.disable_binradar:
             logger.info("[FINAL] BinRadar phase disabled; skipping trace analysis.")
             trace_file = io.StringIO()
@@ -1396,22 +1413,25 @@ class BinRadarExecutor:
                         continue
                     if original["result"] == "crash" and patch_result["result"] == "crash":
                         if original["fault_addr"] == poc_fault_loc and patch_result["fault_addr"] == poc_fault_loc:
+                            record_evidence(patch, False)
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] still causes the same crash - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
                             binradar_reject_reasons[patch] = ("same-crash", iter)
+                    elif original["result"] == "crash" and patch_result["result"] == "normal":
+                        record_evidence(patch, True)
                     elif original["result"] == "normal" and patch_result["result"] == "crash":
                         if patch_result["fault_addr"] == poc_fault_loc:
+                            record_evidence(patch, False)
                             if patch in binradar_remaining_patches:
                                 logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] introduces a crash - likely not fixed.")
                             binradar_remaining_patches.discard(patch)
                             binradar_reject_reasons[patch] = ("introduced-crash", iter)
                     elif original["result"] == "normal" and patch_result["result"] == "normal":
-                        if original["br"] != patch_result["br"]:
-                            if patch in binradar_remaining_patches:
-                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}) - likely not fixed.")
-                            binradar_remaining_patches.discard(patch)
-                            binradar_reject_reasons[patch] = ("different-br", iter)
+                        same_behavior = original["br"] == patch_result["br"]
+                        record_evidence(patch, same_behavior)
+                        if not same_behavior:
+                            logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}); reducing confidence without rejecting the patch.")
         self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
 
         # Write a self-contained final.sbsv with per-patch verdicts from the
@@ -1428,6 +1448,23 @@ class BinRadarExecutor:
                 verified = concrete_verifier_result.patch_verified.get(patch_id, True)
                 res = "verified" if verified else "rejected"
                 f.write(f"[final] [verifier] [patch {patch_id}] [res {res}]\n")
+            # Confidence rows cover only patches accepted by the concrete
+            # verifier, ranked by score (highest first). Ties keep the
+            # original patch-id order (stable sort).
+            confidence_rows = []
+            for patch_id in sorted(self.filter_result):
+                if not concrete_verifier_result.patch_verified.get(patch_id, True):
+                    continue
+                accepted = accept_evidences.get(patch_id, 0)
+                total = total_evidences.get(patch_id, 0)
+                confidence = accepted / total if total > 0 else 0.0
+                confidence_rows.append((patch_id, confidence, accepted, total))
+            confidence_rows.sort(key=lambda row: row[1], reverse=True)
+            for patch_id, confidence, accepted, total in confidence_rows:
+                f.write(f"[final] [confidence] [patch {patch_id}] "
+                        f"[score {confidence:.6f}] "
+                        f"[accept-evidences {accepted}] "
+                        f"[total-evidences {total}]\n")
             if not self.disable_binradar:
                 for patch_id in sorted(remaining_patches):
                     if patch_id in binradar_remaining_patches:
