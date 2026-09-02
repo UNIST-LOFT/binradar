@@ -1204,6 +1204,12 @@ class BinRadarExecutor:
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
         testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        benign_inputs = os.path.join(self.workdir, "input", "benign")
+        malicious_inputs = os.path.join(self.workdir, "input", "malicious")
+        if os.path.exists(benign_inputs):
+            testcase_dirs.append(benign_inputs)
+        if os.path.exists(malicious_inputs):
+            testcase_dirs.append(malicious_inputs)            
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()
@@ -1241,6 +1247,12 @@ class BinRadarExecutor:
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
         testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        benign_inputs = os.path.join(self.workdir, "input", "benign")
+        malicious_inputs = os.path.join(self.workdir, "input", "malicious")
+        if os.path.exists(benign_inputs):
+            testcase_dirs.append(benign_inputs)
+        if os.path.exists(malicious_inputs):
+            testcase_dirs.append(malicious_inputs)   
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()

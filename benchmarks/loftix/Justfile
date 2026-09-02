@@ -75,6 +75,9 @@ build-all:
 backup-all workdir_old="workdir" workdir_bak="workdir-bak":
     just _run-all backup "mv {{workdir_old}} {{workdir_bak}}" 30
 
+copy-all workdir_old="workdir" workdir_bak="workdir-bak":
+    just _run-all copy "cp -r {{workdir_old}} {{workdir_bak}}" 30
+
 clean-all workdir="workdir":
     just _run-all clean "rm -rf {{workdir}}" 30
 
