@@ -19,7 +19,9 @@ Subcommands:
           3. Looks for errors in binradar.log (and binradar-tracer-msg.log) for each run
           4. Shows the [filter] result (survived patches) and the [final]
              result (remaining_patches), plus per-patch verifier/binradar
-             verdicts from final.sbsv
+             verdicts from final.sbsv. Per-patch output is limited to the
+             top --top patches ranked by confidence (default 10); the
+             remaining patches are summarized as counts.
           5. Shows the patch prefilter context from <workdir>/prefilter.sbsv
              (predicates evaluated/survived) when present
 
@@ -134,6 +136,9 @@ def _build_sbsv_parser() -> sbsv.parser:
     parser.add_schema("[patch] [id: int] [pass: bool]")
     parser.add_schema("[final] [verifier] [patch: str] [res: str]")
     parser.add_schema(
+        "[final] [confidence] [patch: str] [score: str] "
+        "[accept-evidences: str] [total-evidences: str]")
+    parser.add_schema(
         "[final] [binradar] [patch: str] [res: str] [reason: str] [iter: int]")
     return parser
 
@@ -173,7 +178,11 @@ class RunResult:
     verifier_data: Dict[int, List[str]] = field(default_factory=dict)  # raw verifier results
     binradar_verified: str = ""  # e.g. "1,3,5" or "" if none verified by binradar
     binradar_rejected: str = ""  # e.g. "2,4,6"
+    binradar_reject_reasons: str = ""  # e.g. "2:different-br; 4:introduced-crash"
     binradar_data: Dict[int, Dict[str, str]] = field(default_factory=dict)  # patch -> {res, reason, iter}
+    confidence_data: Dict[int, Dict[str, str]] = field(default_factory=dict)  # patch -> {score, accept-evidences, total-evidences}
+    top_patches: List[int] = field(default_factory=list)  # top-N patch ids by confidence
+    top_patches_total: int = 0  # total patches ranked by confidence
     filter_done: bool = False
     filter_survived: str = ""  # e.g. "[1, 2]" or "[]"
     filter_rejected: str = ""  # e.g. "3" or "" if none
@@ -336,17 +345,20 @@ def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
     return results
 
 
-def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str, str]]]:
+def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str, str]], Dict[int, Dict[str, str]]]:
     """Parse per-patch verdicts from a final.sbsv file.
 
-    Returns (verifier_verdicts, binradar_verdicts):
+    Returns (verifier_verdicts, binradar_verdicts, confidence_data):
       verifier_verdicts: patch id -> "verified" / "rejected"
       binradar_verdicts:  patch id -> {"res": ..., "reason": ..., "iter": ...}
+      confidence_data:    patch id -> {"score": ..., "accept-evidences": ...,
+                                       "total-evidences": ...}
     """
     verifier_verdicts: Dict[int, str] = {}
     binradar_verdicts: Dict[int, Dict[str, str]] = {}
+    confidence_data: Dict[int, Dict[str, str]] = {}
     if not os.path.isfile(sbsv_path):
-        return verifier_verdicts, binradar_verdicts
+        return verifier_verdicts, binradar_verdicts, confidence_data
 
     with open(sbsv_path, "r") as f:
         for line in f:
@@ -369,7 +381,13 @@ def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str
                     "reason": entry.get("reason", ""),
                     "iter": entry.get("iter", ""),
                 }
-    return verifier_verdicts, binradar_verdicts
+            elif action == "confidence":
+                confidence_data[pid] = {
+                    "score": entry.get("score", ""),
+                    "accept-evidences": entry.get("accept-evidences", ""),
+                    "total-evidences": entry.get("total-evidences", ""),
+                }
+    return verifier_verdicts, binradar_verdicts, confidence_data
 
 
 def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
@@ -430,17 +448,102 @@ def prefilter_done_status(workdir: str,
     return DoneStatus.INCOMPLETE
 
 
-def verifier_summary(verifier_results: Dict[int, List[str]]) -> Tuple[str, str]:
-    """Return (verified_patches_csv, rejected_patches_csv) from verifier data."""
-    verified: List[str] = []
+def safe_float(s: str) -> float:
+    """Safely convert a string to float, returns 0.0 on failure."""
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def top_patches_by_confidence(confidence_data: Dict[int, Dict[str, str]],
+                              top: int) -> Tuple[List[int], int]:
+    """Return the top-N patch ids ranked by confidence score.
+
+    Ranking is by score (highest first); ties keep the original patch-id
+    order. Returns (top_ids, total_count).
+    """
+    ranked = sorted(
+        confidence_data.items(),
+        key=lambda item: (-safe_float(item[1].get("score", "")), item[0]))
+    return [pid for pid, _ in ranked[:top]], len(ranked)
+
+
+def _parse_patch_list(value: str) -> List[int]:
+    """Parse a patch-id list like "[1, 2, 3]" or "1,2,3" into ints."""
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    if not value:
+        return []
+    ids: List[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+
+def _truncate_patch_list(value: str, top_patches: List[int]) -> str:
+    """Truncate a patch-id list to the top-ranked patches.
+
+    Accepts bracket lists ("[1, 2, 3]") and comma lists ("1,2,3") and
+    preserves the input format. Returns the original value when it is not a
+    list or when every id is already in the top set; otherwise returns the
+    top ids with a "+N more" suffix. When none of the list's ids are
+    top-ranked (e.g. a rejected list), the first ids of the list are shown
+    instead so the line is never empty.
+    """
+    if not top_patches:
+        return value
+    ids = _parse_patch_list(value)
+    if not ids:
+        return value
+    top_set = set(top_patches)
+    shown = [pid for pid in ids if pid in top_set]
+    if len(shown) == len(ids):
+        return value
+    if not shown:
+        shown = ids[:len(top_patches)]
+    text = ", ".join(str(p) for p in shown)
+    if value.strip().startswith("["):
+        text = "[" + text + "]"
+    return text + f" (+{len(ids) - len(shown)} more)"
+
+
+def _verifier_summary_top(verifier_data: Dict[int, List[str]],
+                          top_patches: List[int]) -> Tuple[str, str]:
+    """Return (accepted_csv, rejected_csv) limited to the top patches."""
+    accepted: List[str] = []
     rejected: List[str] = []
-    for pid in sorted(verifier_results.keys()):
-        res_list = verifier_results[pid]
+    for pid in top_patches:
+        res_list = verifier_data.get(pid)
+        if res_list is None:
+            continue
         if "verified" in res_list:
-            verified.append(str(pid))
+            accepted.append(str(pid))
         if "rejected" in res_list:
             rejected.append(str(pid))
-    return (",".join(verified), ",".join(rejected))
+    return ",".join(accepted), ",".join(rejected)
+
+
+def _binradar_summary_top(binradar_data: Dict[int, Dict[str, str]],
+                          top_patches: List[int]) -> Tuple[str, str, str]:
+    """Return (verified_csv, rejected_csv, reject_reasons) limited to the
+    top patches."""
+    verified: List[str] = []
+    rejected: List[str] = []
+    reasons: List[str] = []
+    for pid in top_patches:
+        d = binradar_data.get(pid)
+        if d is None:
+            continue
+        if d.get("res") == "verified":
+            verified.append(str(pid))
+        elif d.get("res") == "rejected":
+            rejected.append(str(pid))
+            reasons.append(f"{pid}:{d.get('reason', '')}")
+    return ",".join(verified), ",".join(rejected), "; ".join(reasons)
 
 
 def safe_int(s: str) -> int:
@@ -463,9 +566,13 @@ def _fix_bracket_value(value: str) -> str:
 
 
 def collect_experiment_result(exp_dir: str, workdir_name: str,
-                               run_prefix: str) -> ExperimentResult:
+                               run_prefix: str,
+                               top_patches: int = 10) -> ExperimentResult:
     """
     Collect results for a single experiment.
+
+    Per-patch output is limited to the top ``top_patches`` patches ranked
+    by confidence (from final.sbsv); the rest is summarized as counts.
 
     Returns an ExperimentResult with structured data.
     """
@@ -612,22 +719,38 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             verifier_path = os.path.join(run_dir, "verifier.sbsv")
             verifier_results = parse_verifier_sbsv(verifier_path)
             if verifier_results:
-                accepted, rejected = verifier_summary(verifier_results)
-                run_res.verifier_accepted = accepted
-                run_res.verifier_rejected = rejected
                 run_res.verifier_data = verifier_results
 
-        # Per-patch binradar verdicts from final.sbsv (written by the FINAL phase)
+        # Per-patch binradar verdicts and confidence from final.sbsv (written
+        # by the FINAL phase). The confidence rows rank the accepted patches;
+        # only the top-N of them are shown in the per-patch output.
         final_path = os.path.join(run_dir, "final.sbsv")
-        _, binradar_verdicts = parse_final_sbsv(final_path)
+        _, binradar_verdicts, confidence_data = parse_final_sbsv(final_path)
         if binradar_verdicts:
-            verified = [pid for pid, d in sorted(binradar_verdicts.items())
-                        if d.get("res") == "verified"]
-            rejected = [pid for pid, d in sorted(binradar_verdicts.items())
-                        if d.get("res") == "rejected"]
-            run_res.binradar_verified = ",".join(str(p) for p in verified)
-            run_res.binradar_rejected = ",".join(str(p) for p in rejected)
             run_res.binradar_data = binradar_verdicts
+        if confidence_data:
+            run_res.confidence_data = confidence_data
+            run_res.top_patches, run_res.top_patches_total = \
+                top_patches_by_confidence(confidence_data, top_patches)
+        else:
+            # Legacy final.sbsv without confidence rows: keep every patch
+            # with a verdict (old behavior).
+            run_res.top_patches = sorted(
+                set(run_res.verifier_data) | set(run_res.binradar_data))
+            run_res.top_patches_total = len(run_res.top_patches)
+
+        # Per-patch summaries limited to the top-ranked patches.
+        if run_res.verifier_data:
+            accepted, rejected = _verifier_summary_top(
+                run_res.verifier_data, run_res.top_patches)
+            run_res.verifier_accepted = accepted
+            run_res.verifier_rejected = rejected
+        if run_res.binradar_data:
+            verified, rejected, reasons = _binradar_summary_top(
+                run_res.binradar_data, run_res.top_patches)
+            run_res.binradar_verified = verified
+            run_res.binradar_rejected = rejected
+            run_res.binradar_reject_reasons = reasons
 
         result.runs.append(run_res)
 
@@ -798,25 +921,40 @@ def format_result_log(result: ExperimentResult) -> str:
 
         if run_res.has_final:
             lines.append(
-                f"    [final] remaining_patches: {run_res.remaining_patches}")
+                f"    [final] remaining_patches: "
+                f"{_truncate_patch_list(run_res.remaining_patches, run_res.top_patches)}")
             lines.append(
                 f"    [final] binradar_remaining_patches: "
-                f"{run_res.binradar_remaining_patches}")
+                f"{_truncate_patch_list(run_res.binradar_remaining_patches, run_res.top_patches)}")
 
             if run_res.verifier_accepted or run_res.verifier_rejected:
-                lines.append("    [verifier] summary:")
-                for pid in sorted(run_res.verifier_data.keys()):
-                    res_list = run_res.verifier_data[pid]
+                header = "    [verifier] summary:"
+                if run_res.top_patches_total > len(run_res.top_patches):
+                    header = (f"    [verifier] summary (top "
+                              f"{len(run_res.top_patches)} of "
+                              f"{run_res.top_patches_total} by confidence):")
+                lines.append(header)
+                for pid in run_res.top_patches:
+                    res_list = run_res.verifier_data.get(pid)
+                    if res_list is None:
+                        continue
                     verified = res_list.count("verified")
                     rejected = res_list.count("rejected")
                     lines.append(
                         f"      patch {pid}: {verified} verified, "
                         f"{rejected} rejected")
 
-            if run_res.binradar_data:
-                lines.append("    [binradar] summary:")
-                for pid in sorted(run_res.binradar_data.keys()):
-                    d = run_res.binradar_data[pid]
+            if run_res.binradar_data and run_res.top_patches:
+                header = "    [binradar] summary:"
+                if run_res.top_patches_total > len(run_res.top_patches):
+                    header = (f"    [binradar] summary (top "
+                              f"{len(run_res.top_patches)} of "
+                              f"{run_res.top_patches_total} by confidence):")
+                lines.append(header)
+                for pid in run_res.top_patches:
+                    d = run_res.binradar_data.get(pid)
+                    if d is None:
+                        continue
                     if d.get("res") == "rejected":
                         detail = f" ({d.get('reason')}"
                         if d.get("iter"):
@@ -828,8 +966,10 @@ def format_result_log(result: ExperimentResult) -> str:
 
         if run_res.filter_done:
             lines.append(
-                f"    [filter] survived: {run_res.filter_survived or '[]'}  "
-                f"rejected: {run_res.filter_rejected or 'none'}")
+                f"    [filter] survived: "
+                f"{_truncate_patch_list(run_res.filter_survived or '[]', run_res.top_patches)}  "
+                f"rejected: "
+                f"{_truncate_patch_list(run_res.filter_rejected or 'none', run_res.top_patches)}")
 
         if run_res.prefilter_total >= 0:
             pct = ""
@@ -934,10 +1074,14 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "run": run_res.run_name,
                 "status": run_res.status,
                 "has_final": str(run_res.has_final),
-                "remaining_patches": run_res.remaining_patches,
-                "binradar_remaining_patches": run_res.binradar_remaining_patches,
-                "filter_survived_patches": run_res.filter_survived,
-                "filter_rejected_patches": run_res.filter_rejected,
+                "remaining_patches": _truncate_patch_list(
+                    run_res.remaining_patches, run_res.top_patches),
+                "binradar_remaining_patches": _truncate_patch_list(
+                    run_res.binradar_remaining_patches, run_res.top_patches),
+                "filter_survived_patches": _truncate_patch_list(
+                    run_res.filter_survived, run_res.top_patches),
+                "filter_rejected_patches": _truncate_patch_list(
+                    run_res.filter_rejected, run_res.top_patches),
                 "prefilter_total": str(run_res.prefilter_total)
                 if run_res.prefilter_total >= 0 else "",
                 "prefilter_survived": str(run_res.prefilter_survived)
@@ -947,10 +1091,7 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "verifier_rejected_patches": run_res.verifier_rejected,
                 "binradar_verified_patches": run_res.binradar_verified,
                 "binradar_rejected_patches": run_res.binradar_rejected,
-                "binradar_reject_reasons": "; ".join(
-                    f"{pid}:{d.get('reason', '')}"
-                    for pid, d in sorted(run_res.binradar_data.items())
-                    if d.get("res") == "rejected"),
+                "binradar_reject_reasons": run_res.binradar_reject_reasons,
                 "log_errors_count": str(len(run_res.log_errors)),
                 "tracer_errors_count": str(len(run_res.tracer_errors)),
                 "error_preview": error_preview,
@@ -1248,7 +1389,7 @@ def cmd_binradar(args):
 
     # Collect all results (in parallel; see --jobs)
     collect = partial(collect_experiment_result, workdir_name=workdir_name,
-                      run_prefix=run_prefix)
+                      run_prefix=run_prefix, top_patches=args.top)
     all_results = collect_all(collect, resolved_dirs, args.jobs)
     if output_format in ("csv", "tsv"):
         for result, display in zip(all_results, display_dirs):
@@ -1283,6 +1424,8 @@ def cmd_binradar(args):
         output_lines.append(f"Experiment list: {exp_file}")
         output_lines.append(f"Workdir: {workdir_name}")
         output_lines.append(f"Run prefix: {run_prefix}")
+        output_lines.append(
+            f"Per-patch output: top {args.top} patches by confidence")
         output_lines.append(f"Total experiments: {len(resolved_dirs)}")
         output_lines.append("=" * 60)
         output_lines.append("")
@@ -1440,6 +1583,10 @@ def main():
                              "(sdfuzz only, default: sdfuzz)")
     shared.add_argument("--jobs", type=int, default=0,
                         help="number of parallel collection workers (0 = auto: one per CPU; 1 = sequential)")
+    shared.add_argument(
+        "--top", type=int, default=10,
+        help="show only the top N patches by confidence (binradar only, "
+             "default: 10)")
     shared.add_argument(
         "-n", "--no-subject-id", action="store_true",
         help="omit the experiment subject id column in csv/tsv output")

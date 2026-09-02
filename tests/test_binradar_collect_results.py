@@ -91,15 +91,95 @@ def test_parse_final_sbsv(tmp_path):
         "[final] [binradar] [patch 1] [res verified] [reason none] [iter -1]\n"
         "[final] [binradar] [patch 2] [res rejected] "
         "[reason different-br] [iter 3]\n"
+        "[final] [confidence] [patch 1] [score 0.5] "
+        "[accept-evidences 1] [total-evidences 2]\n"
         "[final] [done] [prefix run] [id 0] "
         "[remaining_patches [1]] [binradar_remaining_patches []]\n"
     )
-    verifier, binradar = collector.parse_final_sbsv(str(path))
+    verifier, binradar, confidence = collector.parse_final_sbsv(str(path))
     assert verifier == {1: "verified", 2: "rejected"}
     assert binradar == {
         1: {"res": "verified", "reason": "none", "iter": "-1"},
         2: {"res": "rejected", "reason": "different-br", "iter": "3"},
     }
+    assert confidence == {
+        1: {"score": "0.5", "accept-evidences": "1",
+            "total-evidences": "2"},
+    }
+
+
+def test_top_patches_by_confidence_ranking_and_ties():
+    confidence = {
+        1: {"score": "0.5"},
+        2: {"score": "1.0"},
+        3: {"score": "0.75"},
+        4: {"score": "0.75"},
+        5: {"score": "0.0"},
+    }
+    top, total = collector.top_patches_by_confidence(confidence, 3)
+    assert top == [2, 3, 4]
+    assert total == 5
+
+
+def test_collect_cutoff_top_patches_by_confidence(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[filter] [done] [prefix run] [id 0] [survived [1, 2, 3, 4, 5]]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1, 2, 3, 4, 5]] "
+        "[binradar_remaining_patches [1, 2, 3, 4, 5]]\n"
+    )
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+        "[verifier-result] [res verified] [patch 3] [testcase ]\n"
+        "[verifier-result] [res verified] [patch 4] [testcase ]\n"
+        "[verifier-result] [res verified] [patch 5] [testcase ]\n"
+    )
+    (run_dir / "final.sbsv").write_text(
+        "[final] [verifier] [patch 1] [res verified]\n"
+        "[final] [verifier] [patch 2] [res verified]\n"
+        "[final] [verifier] [patch 3] [res verified]\n"
+        "[final] [verifier] [patch 4] [res verified]\n"
+        "[final] [verifier] [patch 5] [res verified]\n"
+        "[final] [confidence] [patch 1] [score 0.5] "
+        "[accept-evidences 1] [total-evidences 2]\n"
+        "[final] [confidence] [patch 2] [score 1.0] "
+        "[accept-evidences 2] [total-evidences 2]\n"
+        "[final] [confidence] [patch 3] [score 0.75] "
+        "[accept-evidences 3] [total-evidences 4]\n"
+        "[final] [confidence] [patch 4] [score 0.75] "
+        "[accept-evidences 3] [total-evidences 4]\n"
+        "[final] [confidence] [patch 5] [score 0.25] "
+        "[accept-evidences 1] [total-evidences 4]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1, 2, 3, 4, 5]] "
+        "[binradar_remaining_patches [1, 2, 3, 4, 5]]\n"
+    )
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run", top_patches=3)
+
+    run_res = result.runs[0]
+    assert run_res.top_patches == [2, 3, 4]
+    assert run_res.top_patches_total == 5
+    assert run_res.verifier_accepted == "2,3,4"
+    log = collector.format_result_log(result)
+    assert "top 3 of 5 by confidence" in log
+    assert "patch 2:" in log
+    assert "patch 3:" in log
+    assert "patch 4:" in log
+    assert "patch 1:" not in log
+    assert "patch 5:" not in log
+    assert "(+2 more)" in log
+    csv_row = collector.format_results_csv([result])[0]
+    assert csv_row["verifier_accepted_patches"] == "2,3,4"
+    assert csv_row["verifier_rejected_patches"] == ""
+    assert "(+2 more)" in csv_row["remaining_patches"]
 
 
 def test_collect_taosc_counts_original_and_prefiltered_predicates(tmp_path):
