@@ -83,6 +83,39 @@ class PredicateFamily(enum.Enum):
     TAOSC_SPECIALIZED = "taosc-specialized"
 
 
+# The exact strings Taosc writes to workdir/patch-format (utils/taosc/*/synth.in)
+# and the BinRadar predicate family each one denotes.
+PATCH_FORMAT_TO_FAMILY: Dict[str, PredicateFamily] = {
+    "Single CWE-369": PredicateFamily.TAOSC_SPECIALIZED,
+    "Single CWE-617": PredicateFamily.TAOSC_SPECIALIZED,
+    "Single CWE-823": PredicateFamily.TAOSC_SPECIALIZED,
+    "Single CWE-805": PredicateFamily.CWE805_DIRECT,
+    "ERM CWE-805": PredicateFamily.CWE805_ERM,
+    "ERM generic": PredicateFamily.GENERIC_ERM,
+}
+
+
+def read_patch_format(workdir: Path) -> Optional[str]:
+    """Return the raw workdir/patch-format string, or None when absent."""
+    patch_format_file = workdir / "patch-format"
+    if not patch_format_file.exists():
+        return None
+    value = patch_format_file.read_text().strip()
+    return value or None
+
+
+def parse_patch_format(workdir: Path) -> Optional[PredicateFamily]:
+    """Read workdir/patch-format and map it to a predicate family.
+
+    Returns None when the file is absent or holds an unrecognized value, so
+    callers can fall back to artifact-based classification.
+    """
+    value = read_patch_format(workdir)
+    if value is None:
+        return None
+    return PATCH_FORMAT_TO_FAMILY.get(value)
+
+
 @dataclass(frozen=True)
 class RegisterCell:
     register_index: int
@@ -522,15 +555,66 @@ def parse_allocator_trace(trace_dir: Path) -> Optional[AllocatorTrace]:
     return AllocatorTrace(kind, calls, returns)
 
 
+def _family_from_patch_format(
+    family: PredicateFamily,
+    predicates_file: Path,
+    allocator: Optional[AllocatorTrace],
+) -> Tuple[PredicateFamily, Optional[AllocatorTrace]]:
+    """Validate a patch-format-derived family against the workdir artifacts.
+
+    Taosc's patch-format is the authoritative classifier, but the artifacts
+    must still be consistent so a stale or mismatched patch-format is caught
+    rather than silently mis-classified.
+    """
+    if family in (PredicateFamily.CWE805_DIRECT,
+                  PredicateFamily.CWE805_ERM):
+        if allocator is None:
+            raise ValueError(
+                f"patch-format says {family.value} but no allocator trace "
+                "found in trace/")
+        return family, allocator
+    if family == PredicateFamily.GENERIC_ERM:
+        if not predicates_file.exists():
+            raise ValueError(
+                "patch-format says ERM generic but no predicates file found")
+        records = load_predicates(predicates_file)
+        if not records:
+            raise ValueError(
+                "patch-format says ERM generic but predicates is empty")
+        for source_line, predicate in records:
+            if classify_predicate_line(predicate) \
+                    != PredicateFamily.GENERIC_ERM.value:
+                raise ValueError(
+                    f"predicates:{source_line}: not a generic predicate: "
+                    f"{predicate!r}")
+            try:
+                predicate_to_branch_patch_str(predicate)
+            except ValueError as e:
+                raise ValueError(
+                    f"predicates:{source_line}: {e}") from e
+        return PredicateFamily.GENERIC_ERM, None
+    # TAOSC_SPECIALIZED (Single CWE-369/617/823): no predicates, no
+    # allocator trace.
+    return PredicateFamily.TAOSC_SPECIALIZED, None
+
+
 def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[AllocatorTrace]]:
     """Classify the workdir's patch family (plan §6.1).
 
-    Returns (family, allocator_trace).  Raises ValueError with a
-    predicates:<line>: <reason> diagnostic on malformed predicate files.
+    The Taosc ``patch-format`` file is the primary classifier when present;
+    otherwise the workdir artifacts (allocator trace, crash/patch addresses,
+    predicates grammar) are used.  Returns (family, allocator_trace).  Raises
+    ValueError with a predicates:<line>: <reason> diagnostic on malformed
+    predicate files.
     """
     predicates_file = workdir / "predicates"
     trace_dir = workdir / "trace"
     allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
+
+    patch_format_family = parse_patch_format(workdir)
+    if patch_format_family is not None:
+        return _family_from_patch_format(
+            patch_format_family, predicates_file, allocator)
 
     if allocator is not None:
         crash_address = (trace_dir / "crash.address").read_text().strip() \

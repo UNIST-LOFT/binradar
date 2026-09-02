@@ -55,6 +55,7 @@ from binradar_taosc_predicates import (
     parse_state_lines,
     predicate_to_branch_patch_str,
     predicates_sha256,
+    read_patch_format,
     tokenize_generic,
     write_prefilter,
     write_runtime_predicates,
@@ -1010,6 +1011,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: {e}")
         exit(1)
     binradar_env["BINRADAR_PATCH_KIND"] = family.value
+    patch_format = read_patch_format(workdir)
+    if patch_format is not None:
+        print(f"Taosc patch-format: {patch_format} -> {family.value}")
 
     if family == PredicateFamily.CWE805_DIRECT:
         assert allocator is not None

@@ -138,3 +138,56 @@ def test_collect_taosc_skips_prefilter_without_predicates(tmp_path):
     assert result.original_predicates == 0
     assert result.prefiltered_predicates == 0
     assert result.prefilter_done is collector.DoneStatus.SKIPPED
+
+
+def test_collect_taosc_skips_prefilter_with_single_patch_format(tmp_path):
+    """A Single CWE-* patch-format skips the prefilter even with a brpatched."""
+    workdir = tmp_path / "workdir-013"
+    workdir.mkdir()
+    (workdir / "patch-format").write_text("Single CWE-617\n")
+    (workdir / "sample.brpatched").touch()
+
+    result = collector.collect_taosc_experiment(str(tmp_path), "workdir-013")
+
+    assert result.status == "ok"
+    assert result.patch_format == "Single CWE-617"
+    assert result.original_predicates == 0
+    assert result.prefiltered_predicates == 0
+    assert result.prefilter_done is collector.DoneStatus.SKIPPED
+    assert "patch-format: Single CWE-617" in collector.format_taosc_result_log(result)
+    row = collector.format_taosc_results_csv([result])[0]
+    assert row["patch_format"] == "Single CWE-617"
+
+
+def test_collect_taosc_erm_patch_format_without_prefilter_is_incomplete(tmp_path):
+    """An ERM patch-format with no prefilter.sbsv is INCOMPLETE, not skipped."""
+    workdir = tmp_path / "workdir-013"
+    workdir.mkdir()
+    (workdir / "patch-format").write_text("ERM generic\n")
+    (workdir / "predicates").write_text("max1 - rax == ~max1\n")
+
+    result = collector.collect_taosc_experiment(str(tmp_path), "workdir-013")
+
+    assert result.patch_format == "ERM generic"
+    assert result.original_predicates == 1
+    assert result.prefilter_done is collector.DoneStatus.INCOMPLETE
+    assert result.status == "issues"
+
+
+def test_prefilter_skipped_for_single_patch_format(tmp_path):
+    """A Single CWE-* patch-format marks the binradar prefilter as skipped."""
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    out_dir.mkdir(parents=True)
+    (workdir / "patch-format").write_text("Single CWE-805\n")
+    (workdir / "sample.brpatched").touch()
+    (out_dir / "progress.sbsv").write_text(
+        "[filter] [start] [prefix run] [id 0]\n"
+        "[filter] [done] [prefix run] [id 0] [survived []]\n"
+    )
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    assert result.runs[0].prefilter_done is collector.DoneStatus.SKIPPED
+    assert "status: SKIPPED" in collector.format_result_log(result)

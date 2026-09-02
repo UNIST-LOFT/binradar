@@ -137,3 +137,77 @@ def test_setup_persists_new_env_keys(tmp_path, monkeypatch):
     assert saved["TAOSC_TOTAL_PATCHES"] == "2"
     assert saved["PREFILTER_TOTAL_PATCHES"] == "2"
     assert saved["TOTAL_PATCHES"] == "2"
+
+
+def test_patch_format_erm_generic_classifies_generic(tmp_path, monkeypatch):
+    """patch-format 'ERM generic' drives the generic-erm family."""
+    workdir, env = _prepare_workdir(
+        tmp_path, "max1 - rax == ~max1\nmax1 / rax < +max1\n")
+    (workdir / "patch-format").write_text("ERM generic\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    assert env["PATCH_TYPE"] == "generic-erm"
+    assert env["TAOSC_TOTAL_PATCHES"] == "2"
+
+
+def test_patch_format_single_cwe805_classifies_direct(tmp_path, monkeypatch):
+    """patch-format 'Single CWE-805' drives the CWE805-direct family."""
+    workdir = tmp_path / "workdir"
+    trace = workdir / "trace"
+    trace.mkdir(parents=True)
+    (trace / "malloc.calls").write_text("0 4066e4\n")
+    (trace / "malloc.returns").write_text("4066f0\n")
+    (trace / "crash.address").write_text("410735")
+    workdir, env = _prepare_workdir(tmp_path, None)
+    (workdir / "patch-format").write_text("Single CWE-805\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    assert env["PATCH_TYPE"] == "CWE805-direct"
+    assert env["TAOSC_TOTAL_PATCHES"] == "1"
+
+
+def test_patch_format_single_cwe617_classifies_specialized(tmp_path, monkeypatch):
+    """patch-format 'Single CWE-617' drives the taosc-specialized family."""
+    workdir, env = _prepare_workdir(tmp_path, None)
+    (workdir / "patch-format").write_text("Single CWE-617\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    assert env["PATCH_TYPE"] == "taosc-specialized"
+    assert env["TAOSC_TOTAL_PATCHES"] == "0"
+
+
+def test_patch_format_erm_cwe805_classifies_erm(tmp_path, monkeypatch):
+    """patch-format 'ERM CWE-805' drives the CWE805-erm family."""
+    workdir = tmp_path / "workdir"
+    trace = workdir / "trace"
+    trace.mkdir(parents=True)
+    (trace / "realloc.calls").write_text("0 486b4f\n")
+    (trace / "realloc.returns").write_text("486b55\n")
+    (trace / "crash.address").write_text("4d56d6")
+    workdir, env = _prepare_workdir(
+        tmp_path, "s->rax >= i->begin && s->rax < i->end\n")
+    (workdir / "patch-format").write_text("ERM CWE-805\n")
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
+    _patch_extract(monkeypatch)
+
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    assert env["PATCH_TYPE"] == "CWE805-erm"
+    assert env["TAOSC_TOTAL_PATCHES"] == "1"
+
+
+def test_patch_format_mismatch_rejected(tmp_path):
+    """patch-format 'Single CWE-805' without an allocator trace fails."""
+    workdir, _ = _prepare_workdir(tmp_path, None)
+    (workdir / "patch-format").write_text("Single CWE-805\n")
+    try:
+        binradar_setup.detect_predicate_family(workdir)
+    except ValueError as e:
+        assert "no allocator trace" in str(e)
+    else:
+        raise AssertionError("mismatched patch-format must be rejected")

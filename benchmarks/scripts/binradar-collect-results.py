@@ -35,8 +35,11 @@ Subcommands:
     taosc
         Collect predicate counts from <workdir>/predicates and
         <workdir>/prefilter.sbsv.  The latter contains the predicates that
-        survived BinRadar's prefilter.  Workdirs with no predicates are
-        reported with zero counts and a skipped prefilter status.
+        survived BinRadar's prefilter.  The Taosc family is read from
+        <workdir>/patch-format: Single CWE-* workdirs have no predicate list
+        and are reported with zero counts and a skipped prefilter status.
+        Workdirs with no predicates are reported with zero counts and a
+        skipped prefilter status.
 
 Output is saved to logs/binradar-<datetime>.log / logs/sdfuzz-<datetime>.log /
 logs/taosc-<datetime>.log
@@ -80,6 +83,26 @@ class DoneStatus(enum.Enum):
     OK = "OK"
     INCOMPLETE = "INCOMPLETE"
     SKIPPED = "SKIPPED"
+
+
+# Taosc patch-format families that carry no predicate list and therefore do
+# not run BinRadar's predicate prefilter (Single CWE-* synth paths).
+PATCH_FORMAT_SINGLE = frozenset({
+    "Single CWE-369", "Single CWE-617", "Single CWE-823", "Single CWE-805",
+})
+
+
+def read_patch_format(workdir: str) -> Optional[str]:
+    """Return the Taosc patch-format string from workdir/patch-format.
+
+    Returns None when the file is absent or empty.
+    """
+    path = os.path.join(workdir, "patch-format")
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r") as f:
+        value = f.read().strip()
+    return value or None
 
 def _build_sbsv_parser() -> sbsv.parser:
     """Build a parser for the structured rows consumed by this collector."""
@@ -193,6 +216,7 @@ class TaoscResult:
     exp_dir: str
     status: str  # "ok", "issues", "no_data"
     error_message: str = ""  # for workdir-not-found, etc.
+    patch_format: str = ""  # Taosc workdir/patch-format, when present
     original_predicates: int = -1
     prefiltered_predicates: int = -1
     prefilter_total: int = -1
@@ -386,11 +410,15 @@ def prefilter_done_status(workdir: str,
                           prefilter: Dict[str, int]) -> DoneStatus:
     """Return the prefilter state represented by a workdir.
 
-    A setup workdir with an existing patched binary but no ``predicates``
-    file uses the prebuilt patch path, so there is no prefilter to run.
+    A Single CWE-* taosc workdir (per workdir/patch-format) has no predicate
+    list and no prefilter to run.  A setup workdir with an existing patched
+    binary but no ``predicates`` file uses the prebuilt patch path, so there
+    is no prefilter to run either.
     """
     if prefilter["done"]:
         return DoneStatus.OK
+    if read_patch_format(workdir) in PATCH_FORMAT_SINGLE:
+        return DoneStatus.SKIPPED
     if (prefilter["total"] < 0
             and not os.path.isfile(os.path.join(workdir, "predicates"))
             and any(path.is_file()
@@ -719,6 +747,9 @@ def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
         result.error_message = "workdir not found"
         return result
 
+    patch_format = read_patch_format(workdir)
+    result.patch_format = patch_format or ""
+
     original = count_predicates(os.path.join(workdir, "predicates"))
     result.original_predicates = max(original, 0)
 
@@ -730,6 +761,11 @@ def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
 
     if prefilter["done"]:
         result.prefilter_done = DoneStatus.OK
+    elif patch_format in PATCH_FORMAT_SINGLE:
+        # Single CWE-* taosc patches have no predicate file and do not run
+        # BinRadar's predicate prefilter.
+        result.prefiltered_predicates = 0
+        result.prefilter_done = DoneStatus.SKIPPED
     elif not os.path.isfile(prefilter_path) and result.original_predicates == 0:
         # Direct-call and specialized taosc patches have no predicate file and
         # do not run BinRadar's predicate prefilter.
@@ -989,6 +1025,7 @@ def format_taosc_result_log(result: TaoscResult) -> str:
                 if result.original_predicates >= 0 else "N/A")
     prefiltered = (str(result.prefiltered_predicates)
                    if result.prefiltered_predicates >= 0 else "N/A")
+    lines.append(f"  [taosc] patch-format: {result.patch_format or 'N/A'}")
     lines.append(f"  [taosc] original predicates: {original}")
     lines.append(f"  [taosc] prefiltered predicates: {prefiltered}")
 
@@ -1061,6 +1098,7 @@ def format_sdfuzz_results_csv(all_results: List[SdfuzzResult],
 TAOSC_CSV_COLUMNS = [
     "experiment",
     "status",
+    "patch_format",
     "original_predicates",
     "prefiltered_predicates",
     "prefilter_total",
@@ -1077,6 +1115,8 @@ def format_taosc_results_csv(all_results: List[TaoscResult],
         row = {
             "status": (f"ERROR: {result.error_message}"
                         if result.error_message else result.status),
+            "patch_format": (result.patch_format
+                             if not result.error_message else ""),
             "original_predicates": (str(result.original_predicates)
                                      if not result.error_message else ""),
             "prefiltered_predicates": (str(result.prefiltered_predicates)
