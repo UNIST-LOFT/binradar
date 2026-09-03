@@ -21,7 +21,9 @@ Subcommands:
              result (remaining_patches), plus per-patch verifier/binradar
              verdicts from final.sbsv. Per-patch output is limited to the
              top --top patches ranked by confidence (default 10); the
-             remaining patches are summarized as counts.
+             remaining patches are summarized as counts, and the shown
+             remaining patches are annotated with their confidence score
+             (e.g. "142(0.731)").
           5. Shows the patch prefilter context from <workdir>/prefilter.sbsv
              (predicates evaluated/survived) when present
 
@@ -324,6 +326,13 @@ def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
 
     with open(sbsv_path, "r") as f:
         for line in f:
+            # Cheap prefilter: verifier.sbsv can be tens of GB of per-testcase
+            # rows ([verifier] [crash-pass], [verifier-cache] [hit], ...), and
+            # the sbsv tokenizer is ~85x slower than this substring check.
+            # Any line parsing to schema "verifier-result" must contain the
+            # token, so skipping the rest cannot drop a kept row.
+            if "verifier-result" not in line:
+                continue
             row = _parse_row_with_fallback(line, SBSV_PARSER)
             if row is not None and row.schema_name == "verifier-result":
                 patch_id = safe_int(str(row["patch"]))
@@ -484,7 +493,16 @@ def _parse_patch_list(value: str) -> List[int]:
     return ids
 
 
-def _truncate_patch_list(value: str, top_patches: List[int]) -> str:
+def _format_confidence_score(score: str) -> str:
+    """Format a confidence score for display (e.g. 0.192036 -> "0.192")."""
+    try:
+        return f"{float(score):.3f}"
+    except (ValueError, TypeError):
+        return score
+
+
+def _truncate_patch_list(value: str, top_patches: List[int],
+                         confidence_data: Optional[Dict[int, Dict[str, str]]] = None) -> str:
     """Truncate a patch-id list to the top-ranked patches.
 
     Accepts bracket lists ("[1, 2, 3]") and comma lists ("1,2,3") and
@@ -493,6 +511,11 @@ def _truncate_patch_list(value: str, top_patches: List[int]) -> str:
     top ids with a "+N more" suffix. When none of the list's ids are
     top-ranked (e.g. a rejected list), the first ids of the list are shown
     instead so the line is never empty.
+
+    When ``confidence_data`` (the [final] [confidence] rows keyed by patch
+    id) is given, shown ids are ordered by score descending (ties keep the
+    patch-id order) and annotated with their score: "142(0.731)". Ids
+    without a confidence row keep the plain form.
     """
     if not top_patches:
         return value
@@ -501,14 +524,32 @@ def _truncate_patch_list(value: str, top_patches: List[int]) -> str:
         return value
     top_set = set(top_patches)
     shown = [pid for pid in ids if pid in top_set]
-    if len(shown) == len(ids):
-        return value
+    if not confidence_data:
+        # No confidence context (filter lists, legacy runs): keep the
+        # historical behavior byte-for-byte.
+        if len(shown) == len(ids):
+            return value
+        if not shown:
+            shown = ids[:len(top_patches)]
+        text = ", ".join(str(p) for p in shown)
+        if value.strip().startswith("["):
+            text = "[" + text + "]"
+        return text + f" (+{len(ids) - len(shown)} more)"
     if not shown:
         shown = ids[:len(top_patches)]
-    text = ", ".join(str(p) for p in shown)
+    shown = sorted(
+        shown,
+        key=lambda pid: (-safe_float(
+            confidence_data.get(pid, {}).get("score", "")), pid))
+    text = ", ".join(
+        f"{pid}({_format_confidence_score(confidence_data[pid]['score'])})"
+        if pid in confidence_data else str(pid)
+        for pid in shown)
     if value.strip().startswith("["):
         text = "[" + text + "]"
-    return text + f" (+{len(ids) - len(shown)} more)"
+    if len(shown) < len(ids):
+        return text + f" (+{len(ids) - len(shown)} more)"
+    return text
 
 
 def _verifier_summary_top(verifier_data: Dict[int, List[str]],
@@ -922,10 +963,10 @@ def format_result_log(result: ExperimentResult) -> str:
         if run_res.has_final:
             lines.append(
                 f"    [final] remaining_patches: "
-                f"{_truncate_patch_list(run_res.remaining_patches, run_res.top_patches)}")
+                f"{_truncate_patch_list(run_res.remaining_patches, run_res.top_patches, run_res.confidence_data)}")
             lines.append(
                 f"    [final] binradar_remaining_patches: "
-                f"{_truncate_patch_list(run_res.binradar_remaining_patches, run_res.top_patches)}")
+                f"{_truncate_patch_list(run_res.binradar_remaining_patches, run_res.top_patches, run_res.confidence_data)}")
 
             if run_res.verifier_accepted or run_res.verifier_rejected:
                 header = "    [verifier] summary:"
@@ -1075,9 +1116,11 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "status": run_res.status,
                 "has_final": str(run_res.has_final),
                 "remaining_patches": _truncate_patch_list(
-                    run_res.remaining_patches, run_res.top_patches),
+                    run_res.remaining_patches, run_res.top_patches,
+                    run_res.confidence_data),
                 "binradar_remaining_patches": _truncate_patch_list(
-                    run_res.binradar_remaining_patches, run_res.top_patches),
+                    run_res.binradar_remaining_patches, run_res.top_patches,
+                    run_res.confidence_data),
                 "filter_survived_patches": _truncate_patch_list(
                     run_res.filter_survived, run_res.top_patches),
                 "filter_rejected_patches": _truncate_patch_list(
