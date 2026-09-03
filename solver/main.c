@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <execinfo.h>
 #include <string.h>
+#include <errno.h>
+#include <stdlib.h>
 
 #include "debug-config.h"
 #include "solver.h"
@@ -946,6 +948,61 @@ Z3_ast smt_new_const(uint64_t value, size_t n_bits)
 
 uintptr_t sub_idx_offset = 0;
 
+#define BINRADAR_PART_SUFFIX ".binradar-part"
+
+static void atomic_output_error(const char* action, const char* path)
+{
+    int saved_errno = errno;
+    fprintf(stderr, "Failed to %s testcase output %s: %s\n",
+            action, path, strerror(saved_errno));
+    exit(EXIT_FAILURE);
+}
+
+static FILE* atomic_output_open(const char* final_path,
+                                char* partial_path,
+                                size_t partial_path_size)
+{
+    int n = snprintf(partial_path, partial_path_size, "%s%s",
+                     final_path, BINRADAR_PART_SUFFIX);
+    if (n < 0 || (size_t)n >= partial_path_size) {
+        errno = ENAMETOOLONG;
+        atomic_output_error("name", final_path);
+    }
+    if (remove(partial_path) != 0 && errno != ENOENT) {
+        atomic_output_error("remove stale partial", partial_path);
+    }
+    FILE* fp = fopen(partial_path, "wb");
+    if (fp == NULL) {
+        atomic_output_error("open partial", partial_path);
+    }
+    return fp;
+}
+
+static void atomic_output_publish(FILE* fp,
+                                  const char* partial_path,
+                                  const char* final_path)
+{
+    if (fflush(fp) != 0 || ferror(fp)) {
+        int saved_errno = errno;
+        fclose(fp);
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("write", partial_path);
+    }
+    if (fclose(fp) != 0) {
+        int saved_errno = errno;
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("close", partial_path);
+    }
+    if (rename(partial_path, final_path) != 0) {
+        int saved_errno = errno;
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("publish", final_path);
+    }
+}
+
 static void perform_mutations(size_t idx,
                               size_t sub_idx,
                               const char* data,
@@ -961,7 +1018,9 @@ static void perform_mutations(size_t idx,
 #if 0
         printf("Running mutation: %s\n", testcase_name);
 #endif
-        FILE* fp = fopen(testcase_name, "w");
+        char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+        FILE* fp = atomic_output_open(
+            testcase_name, partial_name, sizeof(partial_name));
         switch (mutations[mutation_count].type) {
             case TRIM: {
                 for (size_t i = 0; i < size * stride; i += stride) {
@@ -1049,7 +1108,7 @@ static void perform_mutations(size_t idx,
             }
         }
 
-        fclose(fp);
+        atomic_output_publish(fp, partial_name, testcase_name);
         mutation_count += 1;
     }
 }
@@ -1089,7 +1148,9 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
 
     char    var_name[128];
     Z3_sort bv_sort = Z3_mk_bv_sort(ctx, 8);
-    FILE*   fp      = fopen(testcase_name, "w");
+    char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+    FILE* fp = atomic_output_open(
+        testcase_name, partial_name, sizeof(partial_name));
     for (long i = 0; i < input_size; i++) {
 #if 0
         int n = snprintf(var_name, sizeof(var_name), "k!%lu", i);
@@ -1126,7 +1187,7 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
         }
         fwrite(&solution_byte, sizeof(char), 1, fp);
     }
-    fclose(fp);
+    atomic_output_publish(fp, partial_name, testcase_name);
     //
     perform_mutations(idx, sub_idx, last_testcase.data, testcase.size, 1);
 }
@@ -1143,7 +1204,9 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
     SAYF("Dumping solution into %s\n", testcase_name);
 #endif
     fprintf(stderr, "[dump] [byte] [name %s]\n", testcase_name);
-    FILE* fp = fopen(testcase_name, "w");
+    char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+    FILE* fp = atomic_output_open(
+        testcase_name, partial_name, sizeof(partial_name));
     for (size_t i = 0; i < size * stride; i += stride) {
         uint8_t byte = data[i];
 #if 0
@@ -1153,7 +1216,7 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
 #endif
         fwrite(&byte, sizeof(char), 1, fp);
     }
-    fclose(fp);
+    atomic_output_publish(fp, partial_name, testcase_name);
     //
     perform_mutations(idx, sub_idx, data, size, stride);
 }
