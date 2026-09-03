@@ -5,6 +5,7 @@ out
 logs
 
 *.list
+!exp.list
 
 potrace/CVE-2013-7437/.eps
 libtiff/CVE-2016-9273/*.tif
