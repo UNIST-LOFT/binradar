@@ -42,17 +42,24 @@ Usage:
 Subcommands:
     qasan
         Run the probe-style QASAN execution (afl-qemu-trace --asan host)
-        against both <binary>.orig and <binary>.brpatched (PATCH_ID=0,
-        i.e. original behavior) for every subject in exp.list and check
-        that QASAN detects the same crash (same fault address) on the
-        patched binary as on the original one.
+        against <binary>.orig and <binary>.brpatched (PATCH_ID=0, i.e.
+        original behavior) for every subject in exp.list and check that
+        QASAN detects the same crash (same fault address) on the patched
+        binary as on the original one.  When the workdir also contains a
+        <binary>.brcached artifact (built by binradar-setup.py when more
+        than one predicate survived the prefilter), the same PATCH_ID=0
+        probe is run against it too and its crash must match .orig as
+        well (with TAOSC_PRED unset the cached plugin takes the no-branch
+        fallback, so .brcached must behave like the original binary).
 
         Verdicts:
           PASS          - qasan detects the same crash (same fault address)
-                          on both .orig and .brpatched.
+                          on .orig and every checked artifact (.brpatched,
+                          plus .brcached when present).
           FAIL          - the patched binary does not crash, crashes at a
-                          different fault address, or the probe on
-                          .brpatched fails (timeout / no crash detected).
+                          different fault address, the probe on .brpatched
+                          fails (timeout / no crash detected), or the
+                          .brcached artifact fails the same check.
           BASELINE-FAIL - the probe on .orig does not reproduce the crash;
                           the subject cannot be tested.
           SKIP          - workdir / binary / poc input files missing.
@@ -160,8 +167,11 @@ class QasanSubjectResult:
     orig_fault_addr: str = ""
     patched_exit: str = ""
     patched_fault_addr: str = ""
+    cached_exit: str = ""
+    cached_fault_addr: str = ""
     orig_cmd: str = ""
     patched_cmd: str = ""
+    cached_cmd: str = ""
 
 
 @dataclass
@@ -409,11 +419,26 @@ def extract_tracer_crash_reason(log: str) -> str:
 
 
 def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
-                    testcase: str, timeout: float):
-    """Run the probe-style qasan execution and parse the probe result."""
+                    testcase: str, timeout: float,
+                    binary_path: Optional[str] = None):
+    """Run the probe-style qasan execution and parse the probe result.
+
+    When binary_path is given it is probed directly (e.g. <binary>.brcached);
+    otherwise use_patched selects .orig vs .brpatched."""
     runner = BinRadarQemuRunner.from_env(workdir, env)
-    command = runner.get_qemu_stacktrace_command(use_patched, testcase)
+    if binary_path is not None:
+        command = runner.get_qemu_stacktrace_command_for_binary(
+            binary_path, testcase)
+    else:
+        command = runner.get_qemu_stacktrace_command(use_patched, testcase)
     proc_env = runner.get_env_for_exec(patch_id="0")
+    if binary_path is not None and binary_path.endswith(".brcached"):
+        # The cached artifact's dest() takes the no-branch fallback only
+        # when TAOSC_PRED is unset; make sure a stale value from the
+        # surrounding shell cannot turn the probe into a patched run.
+        proc_env.pop("TAOSC_PRED", None)
+        if runner.brcache_stack_size:
+            proc_env["BRCACHE_STACK_SIZE"] = str(runner.brcache_stack_size)
     result = binradar_utils.execute(
         command, cwd=workdir, env=proc_env, timeout=timeout, verbose=False)
     probe = None
@@ -620,6 +645,7 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
     binary = env.get("BINARY", "")
     orig_bin = os.path.join(workdir, f"{binary}.orig")
     patched_bin = os.path.join(workdir, f"{binary}.brpatched")
+    cached_bin = os.path.join(workdir, f"{binary}.brcached")
     poc_input = env.get("POC_INPUT", "")
     testcase = (poc_input if os.path.isabs(poc_input)
                 else os.path.join(workdir, poc_input))
@@ -671,13 +697,49 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
     if patched_probe.exit_info != "crash":
         result.status = Status.FAIL
         result.detail = f"no crash detected on .brpatched (exit: {patched_probe.exit_info})"
-        return result
-    if patched_probe.fault_addr != orig_probe.fault_addr:
+    elif patched_probe.fault_addr != orig_probe.fault_addr:
         result.status = Status.FAIL
         result.detail = "fault address differs"
+
+    # Also check the .brcached artifact when setup built one: with
+    # TAOSC_PRED unset its dest() must take the no-branch fallback, so the
+    # POC must reproduce the same crash as on .orig.
+    if os.path.isfile(cached_bin):
+        try:
+            cached_probe, cached_hint, cached_res, cached_repro = run_qasan_probe(
+                workdir, env, False, testcase, timeout,
+                binary_path=cached_bin)
+        except Exception as e:
+            cached_probe, cached_hint, cached_res, cached_repro = \
+                None, f"execution error: {e}", None, ""
+        result.cached_cmd = cached_repro
+        if cached_probe is None:
+            reason = "timeout" if (cached_res is not None and not cached_res.success) \
+                else (cached_hint or "no crash detected")
+            result.cached_exit = "failed"
+            result.status = Status.FAIL
+            reason_txt = f"probe on .brcached failed ({reason})"
+            result.detail = (f"{result.detail}; {reason_txt}"
+                             if result.detail else reason_txt)
+            return result
+        result.cached_exit = cached_probe.exit_info
+        result.cached_fault_addr = hex(cached_probe.fault_addr)
+        if cached_probe.exit_info != "crash":
+            result.status = Status.FAIL
+            detail = (f"no crash detected on .brcached "
+                      f"(exit: {cached_probe.exit_info})")
+            result.detail = f"{result.detail}; {detail}" if result.detail else detail
+            return result
+        if cached_probe.fault_addr != orig_probe.fault_addr:
+            result.status = Status.FAIL
+            detail = "fault address differs on .brcached"
+            result.detail = f"{result.detail}; {detail}" if result.detail else detail
+            return result
+
+    if result.status == Status.FAIL:
         return result
     result.status = Status.PASS
-    result.detail = "same crash detected on both binaries"
+    result.detail = "same crash detected on all checked binaries"
     return result
 
 
@@ -1000,11 +1062,16 @@ def format_log_result(result: QasanSubjectResult, verbose: bool = False) -> str:
     if result.status != Status.BASELINE:
         lines.append(f"  [patched] exit: {result.patched_exit or 'n/a'}  "
                      f"fault-addr: {result.patched_fault_addr or 'n/a'}")
+    if result.cached_exit:
+        lines.append(f"  [cached]  exit: {result.cached_exit or 'n/a'}  "
+                     f"fault-addr: {result.cached_fault_addr or 'n/a'}")
     if verbose:
         if result.orig_cmd:
             lines.append(f"  [cmd orig] {result.orig_cmd}")
         if result.patched_cmd:
             lines.append(f"  [cmd patched] {result.patched_cmd}")
+        if result.cached_cmd:
+            lines.append(f"  [cmd cached] {result.cached_cmd}")
     lines.append(f"  [VERDICT] {result.status} ({result.detail})")
     return "\n".join(lines)
 
@@ -1070,6 +1137,8 @@ CSV_COLUMNS = [
     "orig_fault_addr",
     "patched_exit",
     "patched_fault_addr",
+    "cached_exit",
+    "cached_fault_addr",
 ]
 
 
@@ -1089,6 +1158,8 @@ def write_delimited(output_path: str, results: List[QasanSubjectResult],
                 "orig_fault_addr": r.orig_fault_addr,
                 "patched_exit": r.patched_exit,
                 "patched_fault_addr": r.patched_fault_addr,
+                "cached_exit": r.cached_exit,
+                "cached_fault_addr": r.cached_fault_addr,
             }
             if include_subject_id:
                 row["experiment"] = r.exp_dir
