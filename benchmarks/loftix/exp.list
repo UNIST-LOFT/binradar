@@ -5,15 +5,11 @@ binutils/CVE-2017-15020
 binutils/CVE-2017-15025
 binutils/CVE-2017-6965
 binutils/CVE-2017-6966
-binutils/CVE-2018-10372
 binutils/CVE-2019-9077
 jasper/CVE-2016-8691
 jasper/CVE-2016-9387
-jasper/CVE-2016-9557
 jq/CVE-2023-50246
-jq/CVE-2024-23337
 libjpeg/CVE-2012-2806
-libjpeg/CVE-2017-15232
 libjpeg/CVE-2018-14498
 libjpeg/CVE-2018-19664
 libming/CVE-2016-9265
@@ -38,11 +34,8 @@ libtiff/CVE-2017-7595
 libtiff/bugzilla-2633
 libxml2/CVE-2012-5134
 libxml2/CVE-2016-1839
-libxml2/CVE-2017-5969
 potrace/CVE-2013-7437
 zziplib/CVE-2017-5974
-zziplib/CVE-2017-5975
-zziplib/CVE-2017-5978
 zziplib/CVE-2017-5979
 zziplib/CVE-2017-5980
 zziplib/CVE-2017-5981

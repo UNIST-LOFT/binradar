@@ -356,6 +356,39 @@ def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
     return fault_addr, exit_info
 
 
+def _in_e9_exclude_ranges(addr: int, exclude_ranges: str) -> bool:
+    """True if addr lies inside one of the canonical half-open
+    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve pages)."""
+    for part in exclude_ranges.split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        start_s, end_s = part.split("-", 1)
+        try:
+            if int(start_s, 16) <= addr < int(end_s, 16):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
+                                 binary_path: str) -> Tuple[int, bool]:
+    """Map a fault pc inside the E9 trampoline/reserve pages back to the
+    patch site.
+
+    With PATCH_ID=0 the patch stub takes the no-patch path and re-executes
+    the relocated copy of the original patch-site instruction inside the E9
+    trampoline pages, so a crash caused by that instruction reports the
+    trampoline address instead of the in-binary site.  A crash with the pc
+    inside the artifact's E9 exclude ranges can only come from patch-stub
+    code, so attribute it to PATCH_LOC."""
+    exclude_ranges, _ = runner.e9_metadata_for_binary(binary_path)
+    if fault_addr is not None and _in_e9_exclude_ranges(fault_addr, exclude_ranges):
+        return int(runner.patch_loc, 0), True
+    return fault_addr, False
+
+
 _TRACER_PARSER = sbsv.parser()
 _TRACER_PARSER.add_custom_type("hex", lambda x: int(x, 16))
 _TRACER_PARSER.add_schema(
@@ -420,18 +453,28 @@ def extract_tracer_crash_reason(log: str) -> str:
 
 def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
                     testcase: str, timeout: float,
-                    binary_path: Optional[str] = None):
+                    binary_path: Optional[str] = None,
+                    runner: Optional[BinRadarQemuRunner] = None):
     """Run the probe-style qasan execution and parse the probe result.
 
     When binary_path is given it is probed directly (e.g. <binary>.brcached);
-    otherwise use_patched selects .orig vs .brpatched."""
-    runner = BinRadarQemuRunner.from_env(workdir, env)
+    otherwise use_patched selects .orig vs .brpatched.
+
+    A pipe is created for PATCH_FD so the guest patch runtime can consult
+    PATCH_ID: the Taosc 0.1.13 runtime (binradar_wrap) ignores PATCH_ID
+    entirely when PATCH_FD is unset, which would silently apply the patch
+    during a PATCH_ID=0 probe.  The runtime's [patch] log rows are drained
+    from the pipe on a reader thread (they can exceed the pipe capacity, in
+    which case an undrained pipe would deadlock the guest)."""
+    if runner is None:
+        runner = BinRadarQemuRunner.from_env(workdir, env)
     if binary_path is not None:
         command = runner.get_qemu_stacktrace_command_for_binary(
             binary_path, testcase)
     else:
         command = runner.get_qemu_stacktrace_command(use_patched, testcase)
-    proc_env = runner.get_env_for_exec(patch_id="0")
+    rfd, wfd = os.pipe()
+    proc_env = runner.get_env_for_exec(patch_id="0", patch_fd=wfd)
     if binary_path is not None and binary_path.endswith(".brcached"):
         # The cached artifact's dest() takes the no-branch fallback only
         # when TAOSC_PRED is unset; make sure a stale value from the
@@ -439,8 +482,22 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
         proc_env.pop("TAOSC_PRED", None)
         if runner.brcache_stack_size:
             proc_env["BRCACHE_STACK_SIZE"] = str(runner.brcache_stack_size)
-    result = binradar_utils.execute(
-        command, cwd=workdir, env=proc_env, timeout=timeout, verbose=False)
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=workdir, env=proc_env, start_new_session=True,
+            pass_fds=(wfd,))
+    except Exception:
+        os.close(rfd)
+        os.close(wfd)
+        raise
+    os.close(wfd)
+    reader, patch_chunks = binradar_utils.create_pipe_reader_thread(rfd)
+    try:
+        result = binradar_utils.execute_await(process, timeout=timeout,
+                                              verbose=False)
+    finally:
+        reader.join(timeout=5)
     probe = None
     exit_hint = ""
     if result.success:
@@ -659,10 +716,11 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
         return result
 
     try:
+        runner = BinRadarQemuRunner.from_env(workdir, env)
         orig_probe, orig_hint, orig_res, orig_repro = run_qasan_probe(
-            workdir, env, False, testcase, timeout)
+            workdir, env, False, testcase, timeout, runner=runner)
         patched_probe, patched_hint, patched_res, patched_repro = run_qasan_probe(
-            workdir, env, True, testcase, timeout)
+            workdir, env, True, testcase, timeout, runner=runner)
     except Exception as e:
         result.detail = f"execution error: {e}"
         return result
@@ -694,10 +752,16 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
     result.patched_exit = patched_probe.exit_info
     result.patched_fault_addr = hex(patched_probe.fault_addr)
 
+    patched_addr = patched_probe.fault_addr
+    # A PATCH_ID=0 crash inside the E9 trampoline pages is the re-executed
+    # copy of the patch-site instruction: attribute it to the patch site.
+    patched_addr, _e9_norm = normalize_patched_fault_addr(
+        patched_addr, runner, patched_bin)
+
     if patched_probe.exit_info != "crash":
         result.status = Status.FAIL
         result.detail = f"no crash detected on .brpatched (exit: {patched_probe.exit_info})"
-    elif patched_probe.fault_addr != orig_probe.fault_addr:
+    elif patched_addr != orig_probe.fault_addr:
         result.status = Status.FAIL
         result.detail = "fault address differs"
 
@@ -708,7 +772,7 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
         try:
             cached_probe, cached_hint, cached_res, cached_repro = run_qasan_probe(
                 workdir, env, False, testcase, timeout,
-                binary_path=cached_bin)
+                binary_path=cached_bin, runner=runner)
         except Exception as e:
             cached_probe, cached_hint, cached_res, cached_repro = \
                 None, f"execution error: {e}", None, ""
@@ -724,13 +788,15 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
             return result
         result.cached_exit = cached_probe.exit_info
         result.cached_fault_addr = hex(cached_probe.fault_addr)
+        cached_addr, _ = normalize_patched_fault_addr(
+            cached_probe.fault_addr, runner, cached_bin)
         if cached_probe.exit_info != "crash":
             result.status = Status.FAIL
             detail = (f"no crash detected on .brcached "
                       f"(exit: {cached_probe.exit_info})")
             result.detail = f"{result.detail}; {detail}" if result.detail else detail
             return result
-        if cached_probe.fault_addr != orig_probe.fault_addr:
+        if cached_addr != orig_probe.fault_addr:
             result.status = Status.FAIL
             detail = "fault address differs on .brcached"
             result.detail = f"{result.detail}; {detail}" if result.detail else detail
