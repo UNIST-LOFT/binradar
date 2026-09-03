@@ -39,7 +39,7 @@ run-all cmd:
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
-    parallel --resume --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
+    parallel --resume-failed --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
       'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 

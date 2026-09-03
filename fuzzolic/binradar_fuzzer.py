@@ -49,12 +49,11 @@ class BinRadarFuzzer:
     def start(self) -> subprocess.Popen:
         raise NotImplementedError("start() method must be implemented in subclasses")
 
-    def wait(self, timeout: float = 1800.0):
-        if self.process:
-            result = binradar_utils.execute_await(self.process, timeout=timeout, verbose=True)
-            if result is None:
-                logger.info("Fuzzer execution timed out.")
-                return
+    def wait(self, timeout: float = 1800.0) -> Optional[binradar_utils.ExecutionResult]:
+        if self.process is None:
+            return None
+        return binradar_utils.execute_await(
+            self.process, timeout=timeout, verbose=True)
     
     def get_testcase_dirs(self) -> List[str]:
         raise NotImplementedError("get_testcase_dirs() method must be implemented")
@@ -110,9 +109,13 @@ class AFLppFuzzer(BinRadarFuzzer):
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
         return self.process
 
-    def get_testcase_dirs(self) -> List[str]:
-        outdirs = [
-            os.path.join(self.outdir, "default", "queue"),
-            os.path.join(self.outdir, "default", "crashes")
+    @staticmethod
+    def testcase_dirs_for_outdir(outdir: str) -> List[str]:
+        """Return AFL++ testcase paths without creating or mutating outdir."""
+        return [
+            os.path.join(outdir, "default", "queue"),
+            os.path.join(outdir, "default", "crashes"),
         ]
-        return outdirs
+
+    def get_testcase_dirs(self) -> List[str]:
+        return self.testcase_dirs_for_outdir(self.outdir)

@@ -474,7 +474,8 @@ class SolverExecutor:
             except subprocess.TimeoutExpired:
                 logger.info(f"[SOLVER] [{self.mode}] Solver will be killed.")
                 binradar_utils.execute_await(self.process, timeout=1)
-        return int((time.time() - start_time) * 1000), (not is_timeout)
+        succeeded = (not is_timeout and self.process.returncode == 0)
+        return int((time.time() - start_time) * 1000), succeeded
 
     def stop(self):
         if self.process:
@@ -1129,9 +1130,15 @@ class BinRadarExecutor:
             tracer.start()
             tracer_time, tracer_success, _ = tracer.run()
             self.save_progress(f"[fuzzolic] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            if not tracer_success:
+                raise RuntimeError("Fuzzolic tracer timed out or failed")
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
             self.save_progress(f"[fuzzolic] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            if not solver_success:
+                raise RuntimeError(
+                    f"Fuzzolic solver timed out or exited with status "
+                    f"{solver.process.returncode if solver.process else 'unknown'}")
             tracer.stop()
             solver.stop()
         except Exception as e:
@@ -1163,9 +1170,15 @@ class BinRadarExecutor:
             tracer.start()
             tracer_time, tracer_success, _ = tracer.run()
             self.save_progress(f"[directed] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
+            if not tracer_success:
+                raise RuntimeError("Directed tracer timed out or failed")
             solver.create_inputs()
             solver_time, solver_success = solver.wait()
             self.save_progress(f"[directed] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
+            if not solver_success:
+                raise RuntimeError(
+                    f"Directed solver timed out or exited with status "
+                    f"{solver.process.returncode if solver.process else 'unknown'}")
             tracer.stop()
             solver.stop()
         except Exception as e:
@@ -1178,26 +1191,51 @@ class BinRadarExecutor:
 
         self.save_progress(f"[directed] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
+    def fuzzer_outdir(self) -> str:
+        return os.path.join(self.run_dir, "fuzzer-out")
+
+    def prepare_fuzzer_output(self) -> None:
+        """Reset fuzzer output before producer/minimizer concurrency starts."""
+        fuzzer_outdir = self.fuzzer_outdir()
+        if os.path.exists(fuzzer_outdir):
+            logger.info(
+                f"Fuzzer output directory already exists: {fuzzer_outdir}. "
+                f"It will be overwritten.")
+            shutil.rmtree(fuzzer_outdir)
+        os.makedirs(fuzzer_outdir, exist_ok=True)
+        self._fuzzer_output_prepared = True
+
     def run_fuzzer(self):
         self.check_requirements()
         exec_mode = "fuzzer"
         self.save_progress(f"[fuzzer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
-        fuzzer_outdir = os.path.join(self.run_dir, "fuzzer-out")
-        if os.path.exists(fuzzer_outdir):
-            logger.info(f"Fuzzer output directory already exists: {fuzzer_outdir}. It will be overwritten.")
-            shutil.rmtree(fuzzer_outdir)
-        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, fuzzer_outdir, config)
+        fuzzer_outdir = self.fuzzer_outdir()
+        if not getattr(self, "_fuzzer_output_prepared", False):
+            self.prepare_fuzzer_output()
+        self._fuzzer_output_prepared = False
+        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(
+            self.workdir, fuzzer_outdir, config)
         fuzzer.start()
         if fuzzer.process is None:
-            logger.error("Failed to start fuzzer process.")
-            sys.exit(1)
+            raise RuntimeError("Failed to start fuzzer process")
         with RUNNING_PROCESSES_LOCK:
             RUNNING_PROCESSES.append(fuzzer.process)
-        fuzzer.wait(timeout=self.timeout)
-        with RUNNING_PROCESSES_LOCK:
-            if fuzzer.process in RUNNING_PROCESSES:
-                RUNNING_PROCESSES.remove(fuzzer.process)
+        try:
+            result = fuzzer.wait(timeout=self.timeout)
+        finally:
+            with RUNNING_PROCESSES_LOCK:
+                if fuzzer.process in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES.remove(fuzzer.process)
+        if result is None:
+            raise RuntimeError("Fuzzer process was not started")
+        if result.timed_out:
+            # AFL++ intentionally runs until the phase deadline. execute_await
+            # terminates the process group and waits for it to exit.
+            logger.info("Fuzzer reached its configured phase timeout.")
+        elif not result.success or result.exit_code != 0:
+            raise RuntimeError(
+                f"Fuzzer exited unexpectedly with status {result.exit_code}")
         self.save_progress(f"[fuzzer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_minimizer(self):
@@ -1209,8 +1247,9 @@ class BinRadarExecutor:
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
-        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
-        testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        testcase_dirs.extend(
+            binradar_fuzzer.AFLppFuzzer.testcase_dirs_for_outdir(
+                self.fuzzer_outdir()))
         benign_inputs = os.path.join(self.workdir, "input", "benign")
         malicious_inputs = os.path.join(self.workdir, "input", "malicious")
         if os.path.exists(benign_inputs):
@@ -1243,7 +1282,18 @@ class BinRadarExecutor:
         verifier.run_verification_streaming(minimizer_result_file)
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
-    def run_minimizer_and_verifier(self):
+    def run_minimizer_and_verifier(self,
+                                   producer_threads: Optional[List[threading.Thread]] = None,
+                                   producer_exc_queue: Optional["queue.Queue[BaseException]"] = None):
+        """Run the minimizer and the concrete verifier together.
+
+        With ``producer_threads`` (the fuzzolic/directed/fuzzer threads), the
+        minimizer discovers testcase files incrementally while those phases
+        still run and finishes only after all of them have ended; the verifier
+        consumes the [testcase] rows as they appear. Without them (e.g.
+        --seq), it behaves like a standalone snapshot run over the already
+        complete testcase dirs.
+        """
         self.check_requirements()
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run minimizer and verifier.")
@@ -1252,8 +1302,9 @@ class BinRadarExecutor:
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
-        fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(self.workdir, os.path.join(self.run_dir, "fuzzer-out"), config)
-        testcase_dirs.extend(fuzzer.get_testcase_dirs())
+        testcase_dirs.extend(
+            binradar_fuzzer.AFLppFuzzer.testcase_dirs_for_outdir(
+                self.fuzzer_outdir()))
         benign_inputs = os.path.join(self.workdir, "input", "benign")
         malicious_inputs = os.path.join(self.workdir, "input", "malicious")
         if os.path.exists(benign_inputs):
@@ -1262,12 +1313,14 @@ class BinRadarExecutor:
             testcase_dirs.append(malicious_inputs)   
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
-        minimizer.load_testcases()
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
-        binradar_minimizer.run_minimizer_and_verifier(minimizer, verifier, minimizer_result_file)
+        binradar_minimizer.run_minimizer_and_verifier(
+            minimizer, verifier, minimizer_result_file,
+            producer_threads=producer_threads,
+            producer_exc_queue=producer_exc_queue)
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
@@ -1550,13 +1603,30 @@ class BinRadarExecutor:
             self.done()
             return
 
+        # Reset output before either the fuzzer or the minimizer can touch it.
+        # Queue paths are derived without constructing another fuzzer object.
+        self.prepare_fuzzer_output()
+
         thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
+        producer_exc_queue: "queue.Queue[BaseException]" = queue.Queue()
         binradar_thread: Optional[threading.Thread] = None
         
         def run_captured(name: str, target):
             try:
                 target()
             except BaseException as exc:
+                thread_errors.put((name, exc, exc.__traceback__))
+                logger.error(f"[{name}] failed: {exc}")
+
+        # The concrete testcase producers additionally re-raise into
+        # producer_exc_queue so the minimizer, which now runs concurrently
+        # with them, can abort as soon as any producer fails instead of
+        # silently verifying a truncated testcase set.
+        def run_producer_captured(name: str, target):
+            try:
+                target()
+            except BaseException as exc:
+                producer_exc_queue.put(exc)
                 thread_errors.put((name, exc, exc.__traceback__))
                 logger.error(f"[{name}] failed: {exc}")
 
@@ -1577,18 +1647,34 @@ class BinRadarExecutor:
         else:
             logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
 
-        fuzzolic_thread = threading.Thread(target=run_captured, args=("fuzzolic", self.run_fuzzolic))
-        directed_thread = threading.Thread(target=run_captured, args=("directed", self.run_directed))
-        fuzzer_thread = threading.Thread(target=run_captured, args=("fuzzer", self.run_fuzzer))
+        fuzzolic_thread = threading.Thread(target=run_producer_captured, args=("fuzzolic", self.run_fuzzolic))
+        directed_thread = threading.Thread(target=run_producer_captured, args=("directed", self.run_directed))
+        fuzzer_thread = threading.Thread(target=run_producer_captured, args=("fuzzer", self.run_fuzzer))
         threads_concrete = [fuzzolic_thread, directed_thread, fuzzer_thread]
         for thread in threads_concrete:
             thread.start()
+
+        # The minimizer+verifier no longer wait for the producers: the
+        # minimizer discovers testcase files incrementally while
+        # fuzzolic/directed/fuzzer are still running and logs its done marker
+        # only after all three have ended, and the verifier consumes the
+        # [testcase] rows as they appear.
+        try:
+            self.run_minimizer_and_verifier(
+                producer_threads=threads_concrete,
+                producer_exc_queue=producer_exc_queue)
+        except BaseException:
+            # A producer, the minimizer, or the verifier failed: stop the
+            # remaining phases before surfacing the error.
+            stop_running_processes()
+            for thread in threads_concrete:
+                thread.join(timeout=60)
+            if binradar_thread is not None:
+                binradar_thread.join(timeout=10)
+            raise
         for thread in threads_concrete:
             thread.join()
 
-        raise_thread_error_if_any()
-
-        self.run_minimizer_and_verifier()
         raise_thread_error_if_any(wait_for_binradar=True)
 
         if binradar_thread is not None:

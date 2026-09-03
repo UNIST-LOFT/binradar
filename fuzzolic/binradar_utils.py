@@ -42,11 +42,13 @@ def get_e9_metadata(env: Dict[str, str], prefix: str) -> Tuple[str, str]:
     return env.get(ranges_key, ""), env.get(calls_key, "")
 
 class ExecutionResult:
-    def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str):
+    def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str,
+                 timed_out: bool = False):
         self.success = success
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+        self.timed_out = timed_out
     
     def decode_status(self) -> int:
         if os.WIFEXITED(self.exit_code):
@@ -122,7 +124,8 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
             success=False,
             exit_code=process.returncode,
             stdout=decode_output(stdout),
-            stderr=decode_output(stderr))
+            stderr=decode_output(stderr),
+            timed_out=True)
     
     except Exception as e:
         try:

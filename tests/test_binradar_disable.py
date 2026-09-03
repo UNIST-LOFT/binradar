@@ -393,7 +393,11 @@ def test_disabled_binradar_is_not_started_by_multithreaded_orchestration(
     executor.run_fuzzolic = lambda: events.append(("fuzzolic",))
     executor.run_directed = lambda: events.append(("directed",))
     executor.run_fuzzer = lambda: events.append(("fuzzer",))
-    executor.run_minimizer_and_verifier = lambda: events.append(("min-ver",))
+    def _run_minimizer_and_verifier(producer_threads=None,
+                                    producer_exc_queue=None):
+        events.append(("min-ver",))
+
+    executor.run_minimizer_and_verifier = _run_minimizer_and_verifier
     executor.run_final = lambda: events.append(("final",))
     executor.done = lambda: events.append(("done",))
 
