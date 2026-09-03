@@ -29,6 +29,23 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "utils", "binradar-aflplusplus", "afl-qemu-trace")
 
 
+def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
+    """True if addr lies inside one of the canonical half-open
+    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve/loader pages).
+    Shared by the verifier and binradar-test.py's qasan probes."""
+    for part in exclude_ranges.split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        start_s, end_s = part.split("-", 1)
+        try:
+            if int(start_s, 16) <= addr < int(end_s, 16):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_custom_type("hex", lambda x: int(x, 16))
@@ -420,14 +437,50 @@ class BinRadarQemuRunner:
                 return self.e9_metadata.get(artifact, ("", []))
         return "", []
     
-    def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
+    def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None,
+                         binary: Optional[str] = None) -> Dict[str, str]:
         env = os.environ.copy()
         # env["LC_ALL"] = "C"
         env["AFL_USE_QASAN"] = "1"
         env["PATCH_ID"] = patch_id
         if patch_fd is not None:
             env["PATCH_FD"] = str(patch_fd)
+        # QASAN load/store checks are only generated for instrumented blocks
+        # (afl_must_instrument), and the E9 trampoline/reserve pages are
+        # outside the main image.  With the no-patch path (PATCH_ID=0, or a
+        # predicate taking branch 0) the patch stub re-executes the relocated
+        # copy of the patch-site instruction there, which would go unchecked:
+        # the crash disappears or shifts to a later site.  Re-include the
+        # artifact's E9 pages via QEMU's partial-instrumentation ranges (the
+        # E9_EXCLUDE_RANGES hex-interval syntax is exactly what the
+        # AFL_QEMU_INST_RANGES parser expects).  The original binary has no
+        # E9 metadata and is left untouched.  See
+        # agent-docs/problem/QASAN_E9_TRAMPOLINE_UNINSTRUMENTED.md.
+        ranges, _ = self.e9_metadata_for_binary(
+            binary if binary is not None else self.patched_binary())
+        if ranges:
+            env["AFL_QEMU_INST_RANGES"] = ranges
         return env
+
+    def normalize_fault_addr(self, fault_addr: int,
+                             binary: Optional[str] = None) -> int:
+        """Attribute a crash pc inside the artifact's E9 trampoline/reserve
+        pages to the patch site.
+
+        With the no-patch path the only relevant code running in the E9
+        pages is the re-executed relocated copy of the patch-site
+        instruction, so a crash whose fault pc lands there was caused by
+        the site instruction and must be compared against PATCH_LOC (same
+        rule as binradar-test.py's qasan probes).  Without this, a
+        non-fixing patch's crash would be classified as "crash elsewhere"
+        (ignored) instead of "crash at the original fault address".
+        Original binaries have no E9 metadata, so they are unchanged."""
+        ranges, _ = self.e9_metadata_for_binary(
+            binary if binary is not None else self.patched_binary())
+        if fault_addr is not None and ranges \
+                and addr_in_e9_ranges(fault_addr, ranges):
+            return int(self.patch_loc, 0)
+        return fault_addr
     
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
@@ -463,7 +516,7 @@ class BinRadarQemuRunner:
 
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(False, testcase)
-        env = self.get_env_for_exec(patch_id="0")
+        env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
             logger.error("Failed to execute the command.")
@@ -472,7 +525,7 @@ class BinRadarQemuRunner:
     
     def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
         command = self.get_qemu_stacktrace_command(False, testcase, patch_func_entry=patch_func_entry)
-        env = self.get_env_for_exec(patch_id="0")
+        env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
             logger.error("Failed to execute the command.")
@@ -489,7 +542,8 @@ class BinRadarQemuRunner:
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes]]:
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         rfd, wfd = os.pipe()
-        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd)
+        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd,
+                                    binary=binary)
         if extra_env is not None:
             env.update(extra_env)
         proc = subprocess.Popen(
@@ -504,7 +558,15 @@ class BinRadarQemuRunner:
         if not result.success:
             logger.error("Failed to execute the command")
             return None, None
-        return BinRadarProbeResult.from_log(result.stderr), b"".join(chunks)
+        probe = BinRadarProbeResult.from_log(result.stderr)
+        if probe is not None:
+            # A crash with the fault pc inside the artifact's E9 trampoline/
+            # reserve pages is the re-executed relocated copy of the patch-
+            # site instruction: attribute it to the patch site so the filter
+            # and verifier comparisons against the .orig fault address work.
+            probe.fault_addr = self.normalize_fault_addr(probe.fault_addr,
+                                                         binary)
+        return probe, b"".join(chunks)
 
     def test_with_patched(
         self, patch_id: str, testcase: str, verbose: bool = False,

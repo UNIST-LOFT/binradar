@@ -26,6 +26,7 @@ from binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
     QEMU_STACKTRACE_RELEASE,
+    addr_in_e9_ranges,
 )
 
 LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
@@ -51,6 +52,15 @@ Subcommands:
         probe is run against it too and its crash must match .orig as
         well (with TAOSC_PRED unset the cached plugin takes the no-branch
         fallback, so .brcached must behave like the original binary).
+        Patched-artifact probes set AFL_QEMU_INST_RANGES to the artifact's
+        E9_EXCLUDE_RANGES so QASAN also checks the E9 trampoline/reserve
+        pages (with PATCH_ID=0 the stub re-executes the relocated copy of
+        the patch-site instruction there; without instrumentation that
+        access is unchecked and the crash would disappear or shift).
+        Crashes with a pc inside those ranges are attributed to PATCH_LOC
+        (normalize_patched_fault_addr); the csv/tsv columns report the
+        attributed address, the raw trampoline pc only appears in the log
+        format.
 
         Verdicts:
           PASS          - qasan detects the same crash (same fault address)
@@ -169,6 +179,11 @@ class QasanSubjectResult:
     patched_fault_addr: str = ""
     cached_exit: str = ""
     cached_fault_addr: str = ""
+    # Raw reported crash pcs before E9 trampoline attribution (log output
+    # only; the csv/tsv columns carry the attributed addresses that the
+    # verdict compares).
+    patched_fault_addr_raw: str = ""
+    cached_fault_addr_raw: str = ""
     orig_cmd: str = ""
     patched_cmd: str = ""
     cached_cmd: str = ""
@@ -358,18 +373,9 @@ def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
 
 def _in_e9_exclude_ranges(addr: int, exclude_ranges: str) -> bool:
     """True if addr lies inside one of the canonical half-open
-    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve pages)."""
-    for part in exclude_ranges.split(","):
-        part = part.strip()
-        if not part or "-" not in part:
-            continue
-        start_s, end_s = part.split("-", 1)
-        try:
-            if int(start_s, 16) <= addr < int(end_s, 16):
-                return True
-        except ValueError:
-            continue
-    return False
+    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve pages).
+    Delegates to the shared verifier helper."""
+    return addr_in_e9_ranges(addr, exclude_ranges)
 
 
 def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
@@ -474,7 +480,10 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
     else:
         command = runner.get_qemu_stacktrace_command(use_patched, testcase)
     rfd, wfd = os.pipe()
-    proc_env = runner.get_env_for_exec(patch_id="0", patch_fd=wfd)
+    probe_binary = binary_path if binary_path is not None \
+        else runner.patched_binary()
+    proc_env = runner.get_env_for_exec(patch_id="0", patch_fd=wfd,
+                                       binary=probe_binary)
     if binary_path is not None and binary_path.endswith(".brcached"):
         # The cached artifact's dest() takes the no-branch fallback only
         # when TAOSC_PRED is unset; make sure a stale value from the
@@ -750,13 +759,19 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
         return result
 
     result.patched_exit = patched_probe.exit_info
-    result.patched_fault_addr = hex(patched_probe.fault_addr)
+    result.patched_fault_addr_raw = hex(patched_probe.fault_addr)
 
     patched_addr = patched_probe.fault_addr
     # A PATCH_ID=0 crash inside the E9 trampoline pages is the re-executed
     # copy of the patch-site instruction: attribute it to the patch site.
-    patched_addr, _e9_norm = normalize_patched_fault_addr(
+    # The csv/tsv columns report the attributed address (what the verdict
+    # compares), not the raw trampoline pc.
+    patched_addr, e9_norm = normalize_patched_fault_addr(
         patched_addr, runner, patched_bin)
+    result.patched_fault_addr = hex(patched_addr)
+    if e9_norm:
+        result.patched_fault_addr_raw = (f"{result.patched_fault_addr_raw} "
+                                         f"(E9 trampoline)")
 
     if patched_probe.exit_info != "crash":
         result.status = Status.FAIL
@@ -787,9 +802,13 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
                              if result.detail else reason_txt)
             return result
         result.cached_exit = cached_probe.exit_info
-        result.cached_fault_addr = hex(cached_probe.fault_addr)
-        cached_addr, _ = normalize_patched_fault_addr(
+        result.cached_fault_addr_raw = hex(cached_probe.fault_addr)
+        cached_addr, cached_e9_norm = normalize_patched_fault_addr(
             cached_probe.fault_addr, runner, cached_bin)
+        result.cached_fault_addr = hex(cached_addr)
+        if cached_e9_norm:
+            result.cached_fault_addr_raw = (f"{result.cached_fault_addr_raw} "
+                                            f"(E9 trampoline)")
         if cached_probe.exit_info != "crash":
             result.status = Status.FAIL
             detail = (f"no crash detected on .brcached "
@@ -1128,9 +1147,15 @@ def format_log_result(result: QasanSubjectResult, verbose: bool = False) -> str:
     if result.status != Status.BASELINE:
         lines.append(f"  [patched] exit: {result.patched_exit or 'n/a'}  "
                      f"fault-addr: {result.patched_fault_addr or 'n/a'}")
+        if result.patched_fault_addr_raw and \
+                result.patched_fault_addr_raw != result.patched_fault_addr:
+            lines.append(f"            (raw pc: {result.patched_fault_addr_raw})")
     if result.cached_exit:
         lines.append(f"  [cached]  exit: {result.cached_exit or 'n/a'}  "
                      f"fault-addr: {result.cached_fault_addr or 'n/a'}")
+        if result.cached_fault_addr_raw and \
+                result.cached_fault_addr_raw != result.cached_fault_addr:
+            lines.append(f"            (raw pc: {result.cached_fault_addr_raw})")
     if verbose:
         if result.orig_cmd:
             lines.append(f"  [cmd orig] {result.orig_cmd}")
