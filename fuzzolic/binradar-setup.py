@@ -69,33 +69,31 @@ BRPATCH_CACHED_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-cached.c"
 QEMU_STACKTRACE_RELEASE = ROOT_DIR / "utils" / "binradar-aflplusplus" / "afl-qemu-trace"
 
 
-"""BinRadar workdir setup and patch prefilter (one entry point).
+"""BinRadar workdir setup (includes the patch prefilter, one entry point).
 
-Subcommands:
-  setup       - generate <BINARY>.brpatched and binradar.env from
-                config.env (previously benchmarks/scripts/binradar_setup.py)
-  prefilter   - run the POC once against a capture-instrumented binary
-                (<BINARY>.brprefilter, built from
-                benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
-                configuration used by the FILTER phase, collect the
-                patch-site STATE vectors, evaluate every candidate
-                predicate offline (mirroring taosc's i64 semantics and its
-                false-means-jump branch polarity), and write
-                workdir/prefilter.sbsv listing which predicates branch on
-                the POC.  `setup` then
-                keeps only the surviving predicates before applying the
-                top-30 cap, so the expensive binradar pipeline never runs
-                on predicates that the FILTER phase would reject anyway.
-                (previously fuzzolic/binradar-prefilter.py)
+`setup` does everything in one step:
+  1. offline prefilter: run the POC once against a capture-instrumented
+     binary (<BINARY>.brprefilter, built from
+     benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
+     configuration used by the FILTER phase, collect the patch-site STATE
+     vectors, evaluate every candidate predicate offline (mirroring
+     taosc's i64 semantics and its false-means-jump branch polarity), and
+     write workdir/prefilter.sbsv listing which predicates branch on the
+     POC.  Fail-open: any capture/parse problem keeps all predicates.
+     A valid existing prefilter.sbsv (matching family + predicates-file
+     SHA-256) is reused; delete it to force a re-run.
+  2. patch preparation: generate <BINARY>.brpatched and binradar.env from
+     config.env (previously benchmarks/scripts/binradar_setup.py), keeping
+     only the surviving predicates before applying the top-30 cap, so the
+     expensive binradar pipeline never runs on predicates that the FILTER
+     phase would reject anyway.
 
 Usage:
-  uv run fuzzolic/binradar-setup.py setup -w <workdir> [--target-patches top-30|all]
-  uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
+  uv run fuzzolic/binradar-setup.py setup -w <workdir>
 
---target-patches selects how many prefilter survivors are compiled into the
-binaries: top-30 (default, same as before) or all (use
-PREFILTER_TOTAL_PATCHES).  Run binradar.py with the matching --target-patches
-value.
+The compiled binaries always contain at most the top-30 prefilter
+survivors; brpatches.json (the verifier-cache manifest) exports every
+survivor so the full candidate set stays loadable and auditable.
 """
 
 
@@ -1009,8 +1007,7 @@ def extract_e9_runtime_metadata(
     return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 
-def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str],
-                  target_patches: str = "top-30"):
+def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
@@ -1229,17 +1226,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str],
     # Generate brpatches.inc
     # Runtime patch IDs are compact and start at 1.  Each selected record
     # retains the original predicate source line for traceability.
-    # --target-patches top-30 (default) caps the compiled candidates at 30;
-    # --target-patches all compiles every prefilter survivor.
-    if target_patches == "all":
-        selected_patch_records = patch_records
-        print(f"Targeting all {len(selected_patch_records)} prefilter "
-              f"survivor(s) (--target-patches all)")
-    else:
-        selected_patch_records = patch_records[:30]
-        print(f"Targeting top {len(selected_patch_records)} of "
-              f"{len(patch_records)} prefilter survivor(s) "
-              f"(default --target-patches top-30)")
+    # The compiled candidates are capped at the top 30 prefilter survivors
+    # (keeps the binaries small); brpatches.json still exports every
+    # survivor past the cap.
+    selected_patch_records = patch_records[:30]
+    print(f"Targeting top {len(selected_patch_records)} of "
+          f"{len(patch_records)} prefilter survivor(s)")
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
@@ -1342,8 +1334,8 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
     return env
 
 
-def cmd_setup(configdir: Path, workdir: Path,
-              target_patches: str = "top-30"):
+def cmd_setup(configdir: Path, workdir: Path):
+    configdir = configdir.resolve()
     config_path = configdir / "config.env"
     if not config_path.exists():
         print(f"Error: config.env not found in {configdir}")
@@ -1357,29 +1349,41 @@ def cmd_setup(configdir: Path, workdir: Path,
 
     workdir = workdir.resolve()
     binradar_env = create_binradar_env(configdir, config_path, workdir)
-    prepare_patch(configdir, workdir, binradar_env, target_patches)
+    # Offline prefilter first: it writes workdir/prefilter.sbsv, which
+    # prepare_patch applies before the top-30 cap.  Fail-open: on any
+    # prefilter problem prepare_patch keeps all predicates.
+    run_prefilter(configdir, workdir)
+    prepare_patch(configdir, workdir, binradar_env)
     binradar_env_path = workdir / "binradar.env"
     save_env(binradar_env, binradar_env_path)
     print(f"binradar environment variables saved to {binradar_env_path}")
 
 
-def cmd_prefilter(configdir: Path, workdir: Path):
-    configdir = configdir.resolve()
-    workdir = workdir.resolve()
+def run_prefilter(configdir: Path, workdir: Path):
+    """Offline prefilter run inside `setup` (fail-open, never exits).
+
+    Runs the POC once against the capture-instrumented binary and writes
+    workdir/prefilter.sbsv.  Any problem (missing files, family-detection
+    failure, capture failure) skips the prefilter or fails open so
+    prepare_patch continues with all predicates.  A prefilter.sbsv whose
+    metadata (family + predicates-file SHA-256) still matches is reused
+    instead of re-running the capture.
+    """
     prefilter_file = workdir / "prefilter.sbsv"
     start = time.time()
 
     config_path = configdir / "config.env"
     if not config_path.exists():
-        print(f"Error: config.env not found in {configdir}")
-        sys.exit(1)
+        print(f"Warning: config.env not found in {configdir}; "
+              "skipping prefilter")
+        return
     config = load_env(config_path)
 
     predicates_file = workdir / "predicates"
     if not predicates_file.exists():
         # No predicates (CWE synth path); nothing to prefilter.
         print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
-        sys.exit(0)
+        return
 
     # Classify the workdir first (plan §6.1): the CWE-805 direct family
     # has no predicate list to compact, so the prefilter is a no-op and
@@ -1387,12 +1391,27 @@ def cmd_prefilter(configdir: Path, workdir: Path):
     try:
         family, allocator = detect_predicate_family(workdir)
     except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        print(f"Warning: prefilter family detection failed ({e}); "
+              "skipping prefilter")
+        return
     if family == PredicateFamily.CWE805_DIRECT:
         print(f"Workdir is {family.value}; prefilter is a no-op "
               "(FILTER is the behavioral gate).")
-        sys.exit(0)
+        return
+
+    # Reuse a prefilter.sbsv that still matches this family and the exact
+    # predicates-file bytes (load_prefilter_passed_ids returns None on any
+    # metadata mismatch, so a stale prefilter is never reused).
+    if prefilter_file.exists():
+        passed_ids = load_prefilter_passed_ids(
+            prefilter_file,
+            expected_kind=family.value,
+            expected_sha256=predicates_sha256(predicates_file),
+        )
+        if passed_ids is not None:
+            print(f"[prefilter] reusing {prefilter_file.name} "
+                  f"({len(passed_ids)} survivors); delete it to re-run")
+            return
 
     predicate_records = load_predicates(predicates_file)
     if not predicate_records:
@@ -1400,16 +1419,18 @@ def cmd_prefilter(configdir: Path, workdir: Path):
                         kind=family.value,
                         sha256=predicates_sha256(predicates_file))
         print("No predicates; prefilter is a no-op.")
-        sys.exit(0)
+        return
 
     for key in ("BINARY", "POC_INPUT", "TEST_CMD"):
         if key not in config:
-            print(f"Error: {key} not found in config.env")
-            sys.exit(1)
+            print(f"Warning: {key} not found in config.env; "
+                  "skipping prefilter")
+            return
     patch_location_file = workdir / "patch-location"
     if not patch_location_file.exists():
-        print(f"Error: {patch_location_file.name} file not found in {workdir}")
-        sys.exit(1)
+        print(f"Warning: {patch_location_file.name} file not found in "
+              f"{workdir}; skipping prefilter")
+        return
     patch_loc = f"0x{patch_location_file.read_text().strip()}"
 
     if family == PredicateFamily.CWE805_ERM:
@@ -1421,9 +1442,10 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         assert allocator is not None
         stack_size_file = workdir / "stack-size"
         if not stack_size_file.exists():
-            print(f"Error: {stack_size_file.name} file not found in "
-                  f"{workdir} (CWE-805 prefilter needs the stack size)")
-            sys.exit(1)
+            print(f"Warning: {stack_size_file.name} file not found in "
+                  f"{workdir} (CWE-805 prefilter needs the stack size); "
+                  "keeping all predicates (fail-open)")
+            return
         stack_size = int(stack_size_file.read_text().strip())
         snapshots = capture_states(workdir, configdir, config, patch_loc,
                                    allocator, stack_size)
@@ -1436,7 +1458,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
             write_prefilter(prefilter_file, results, time.time() - start,
                             kind=family.value,
                             sha256=predicates_sha256(predicates_file))
-            sys.exit(0)
+            return
         if not snapshots:
             print("Warning: patch site never hit on the POC; discarding "
                   "all predicates")
@@ -1446,7 +1468,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
             write_prefilter(prefilter_file, results, time.time() - start,
                             kind=family.value,
                             sha256=predicates_sha256(predicates_file))
-            sys.exit(0)
+            return
 
         print(f"Captured {len(snapshots)} CWE-805 snapshot(s)")
         results = []
@@ -1461,7 +1483,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         write_prefilter(prefilter_file, results, time.time() - start,
                         kind=family.value,
                         sha256=predicates_sha256(predicates_file))
-        sys.exit(0)
+        return
 
     states = capture_states(workdir, configdir, config, patch_loc)
     if states is None:
@@ -1473,7 +1495,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         write_prefilter(prefilter_file, results, time.time() - start,
                         kind=family.value,
                         sha256=predicates_sha256(predicates_file))
-        sys.exit(0)
+        return
     if not states:
         # The patch site is never hit on the POC, so every predicate would
         # be filtered out by the FILTER phase anyway (the patch never
@@ -1485,7 +1507,7 @@ def cmd_prefilter(configdir: Path, workdir: Path):
         write_prefilter(prefilter_file, results, time.time() - start,
                         kind=family.value,
                         sha256=predicates_sha256(predicates_file))
-        sys.exit(0)
+        return
 
     print(f"Captured {len(states)} patch-site state vector(s)")
     results = []
@@ -1507,41 +1529,24 @@ def cmd_prefilter(configdir: Path, workdir: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="binradar-setup: setup the binradar workdir and "
-                    "prefilter candidate patches")
+        description="binradar-setup: setup the binradar workdir "
+                    "(runs the patch prefilter and prepares the patched "
+                    "binaries)")
     subparsers = parser.add_subparsers(
-        dest="command", required=True, metavar="setup|prefilter")
+        dest="command", required=True, metavar="setup")
 
     setup_parser = subparsers.add_parser(
-        "setup", help="generate <BINARY>.brpatched and binradar.env")
+        "setup", help="prefilter candidate predicates and generate "
+                      "<BINARY>.brpatched and binradar.env")
     setup_parser.add_argument("-c", "--configdir", type=Path, required=False,
                               default=Path.cwd(),
                               help="Config directory (default: current directory)")
     setup_parser.add_argument("-w", "--workdir", type=Path, required=False,
                               default=Path.cwd() / "workdir",
                               help="Working directory (default: ./workdir)")
-    setup_parser.add_argument(
-        "--target-patches", choices=["top-30", "all"], default="top-30",
-        help="how many prefilter survivors to compile into the binaries: "
-             "top-30 (default, same as before) or all "
-             "(use PREFILTER_TOTAL_PATCHES)")
-
-    prefilter_parser = subparsers.add_parser(
-        "prefilter", help="evaluate predicates offline against the POC and "
-                          "write prefilter.sbsv")
-    prefilter_parser.add_argument("-c", "--configdir", type=Path, required=False,
-                                  default=Path.cwd(),
-                                  help="Directory containing config.env "
-                                       "(default: current directory)")
-    prefilter_parser.add_argument("-w", "--workdir", type=Path,
-                                  default=Path.cwd() / "workdir",
-                                  help="Working directory (default: ./workdir)")
 
     args = parser.parse_args()
-    if args.command == "setup":
-        cmd_setup(args.configdir, args.workdir, args.target_patches)
-    else:
-        cmd_prefilter(args.configdir, args.workdir)
+    cmd_setup(args.configdir, args.workdir)
 
 
 if __name__ == "__main__":

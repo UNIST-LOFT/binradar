@@ -1738,18 +1738,20 @@ def main():
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if args.disable_binradar else "0"
     if args.target_patches == "all":
         # Run every predicate that survived the offline prefilter instead of
-        # the top-30 subset.  Candidates past the top-30 cap are only
-        # compiled into the binaries when setup ran with
-        # `binradar-setup.py setup --target-patches all`.
+        # the top-30 subset.  Setup caps the compiled candidates at the
+        # top 30, so candidates past the cap are never compiled into the
+        # binaries and cannot be run; clamp to the compiled set.
         pref_total = int(env.get("PREFILTER_TOTAL_PATCHES",
                                  env["TOTAL_PATCHES"]))
         if pref_total > int(env["TOTAL_PATCHES"]):
             logger.warning(
-                f"--target-patches all: workdir was set up with the top-30 "
-                f"cap (TOTAL_PATCHES={env['TOTAL_PATCHES']}, "
-                f"PREFILTER_TOTAL_PATCHES={pref_total}); re-run setup with "
-                f"--target-patches all to compile every survivor")
-        env["TOTAL_PATCHES"] = str(pref_total)
+                f"--target-patches all: only the top "
+                f"{env['TOTAL_PATCHES']} prefilter survivors are compiled "
+                f"into the binaries (PREFILTER_TOTAL_PATCHES="
+                f"{pref_total}); candidates past the compiled cap cannot "
+                f"be run")
+        else:
+            env["TOTAL_PATCHES"] = str(pref_total)
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

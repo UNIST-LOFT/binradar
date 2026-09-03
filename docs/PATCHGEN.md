@@ -110,19 +110,15 @@ hooks.
 just setup
 # uv run /path/to/binradar/fuzzolic/binradar-setup.py setup -w workdir
 ```
-This setup script classifies the workdir, generates `workdir/binradar.env` with
-the necessary configuration (including `BINRADAR_PATCH_KIND`), and generates
-`workdir/brpatches.inc` with the typed predicate table.
+This setup script runs the offline prefilter, classifies the workdir, generates
+`workdir/binradar.env` with the necessary configuration (including
+`BINRADAR_PATCH_KIND`), and generates `workdir/brpatches.inc` with the typed
+predicate table.
 
-Before `setup`, run the patch prefilter to evaluate all candidate predicates
-offline against the POC:
-```shell
-just prefilter <workdir>
-# uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
-```
-The prefilter keeps only predicates that branch on the POC, so the expensive
+The prefilter is part of `setup`: it evaluates all candidate predicates offline
+against the POC and keeps only the ones that branch on it, so the expensive
 pipeline never runs on patches the FILTER phase would reject.  For CWE-805
 ERM it captures full-context snapshots (clamps + registers + stack) and
 evaluates descriptors offline; for CWE-805 direct it is a no-op (FILTER is the
-behavioral gate).  `just binradar` runs the prefilter automatically on fresh
-workdirs.
+behavioral gate).  A `prefilter.sbsv` whose metadata (family + predicates-file
+SHA-256) still matches is reused on re-setup; delete it to force a re-run.

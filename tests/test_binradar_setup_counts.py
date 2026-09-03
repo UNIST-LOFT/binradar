@@ -115,8 +115,9 @@ def test_brpatches_json_exports_all_prefilter_survivors(tmp_path, monkeypatch):
     assert set(predicates) == set(range(1, 33))
 
 
-def test_target_patches_all_compiles_every_survivor(tmp_path, monkeypatch):
-    """--target-patches all compiles every prefilter survivor (no cap)."""
+def test_target_patches_always_caps_at_top_30(tmp_path, monkeypatch):
+    """The compiled binaries stay capped at the top-30 survivors even when
+    more survive the prefilter; brpatches.json exports them all."""
     predicates = "\n".join("max1 - rax == ~max1" for _ in range(32)) + "\n"
     workdir, env = _prepare_workdir(tmp_path, predicates)
     sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
@@ -130,13 +131,13 @@ def test_target_patches_all_compiles_every_survivor(tmp_path, monkeypatch):
     monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
     _patch_extract(monkeypatch)
 
-    binradar_setup.prepare_patch(
-        tmp_path, workdir, env, target_patches="all")
-    assert env["TOTAL_PATCHES"] == "32"
+    binradar_setup.prepare_patch(tmp_path, workdir, env)
+    assert env["TOTAL_PATCHES"] == "30"
     assert env["PREFILTER_TOTAL_PATCHES"] == "32"
-    # brpatches.inc compiles every survivor, not just the top 30.
+    # brpatches.inc stays capped at the top 30 (keeps the binaries small).
     inc = (workdir / "brpatches.inc").read_text()
-    assert "case 32:" in inc
+    assert "case 32:" not in inc
+    assert "case 30:" in inc
     # brpatches.json exports all 32 as well.
     import json
     manifest = json.loads((workdir / "brpatches.json").read_text())
