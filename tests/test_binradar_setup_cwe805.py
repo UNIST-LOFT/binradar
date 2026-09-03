@@ -338,6 +338,29 @@ def test_detect_family_generic():
     assert allocator is None
 
 
+def test_detect_family_generic_ignores_empty_allocator_trace(tmp_path):
+    """patch-format=ERM generic must not fail on a leftover empty trace.
+
+    Regression test for zziplib/CVE-2017-5979: the POC crashed inside the
+    very first realloc (QASAN SEGV in __libqasan_realloc), so taosc left
+    0-byte trace/realloc.calls and trace/realloc.returns files behind.
+    The generic family does not use the allocator trace, so the empty
+    files must be ignored instead of raising "realloc.calls is empty".
+    """
+    workdir = tmp_path / "workdir"
+    trace = workdir / "trace"
+    trace.mkdir(parents=True)
+    (trace / "realloc.calls").write_text("")
+    (trace / "realloc.returns").write_text("")
+    (trace / "crash.address").write_text("")
+    (workdir / "patch-format").write_text("ERM generic\n")
+    (workdir / "predicates").write_text("max1 - rdx == ~max1\n")
+
+    family, allocator = binradar_setup.detect_predicate_family(workdir)
+    assert family is binradar_setup.PredicateFamily.GENERIC_ERM
+    assert allocator is None
+
+
 def test_detect_family_CWE805_erm():
     family, allocator = binradar_setup.detect_predicate_family(
         FIXTURES / "cwe805-erm")

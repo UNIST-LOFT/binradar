@@ -609,13 +609,25 @@ def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[Al
     """
     predicates_file = workdir / "predicates"
     trace_dir = workdir / "trace"
-    allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
 
     patch_format_family = parse_patch_format(workdir)
     if patch_format_family is not None:
+        # Only the CWE-805 families use the allocator trace.  Generic ERM
+        # and taosc-specialized patches ignore it: taosc may leave an empty
+        # or malformed trace/ artifact behind (e.g. a POC that crashes
+        # inside the very first allocator call, so no call/return pair is
+        # recorded), and that must not abort a generic classification
+        # (zziplib/CVE-2017-5979).
+        if patch_format_family in (PredicateFamily.CWE805_DIRECT,
+                                   PredicateFamily.CWE805_ERM):
+            allocator = parse_allocator_trace(trace_dir) \
+                if trace_dir.is_dir() else None
+        else:
+            allocator = None
         return _family_from_patch_format(
             patch_format_family, predicates_file, allocator)
 
+    allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
     if allocator is not None:
         crash_address = (trace_dir / "crash.address").read_text().strip() \
             if (trace_dir / "crash.address").exists() else ""
