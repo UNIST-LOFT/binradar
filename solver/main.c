@@ -562,6 +562,10 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
                                                  size_t      query_idx,
                                                  Z3_solver solver, Z3_ast* deps)
 {
+    if (query_idx >= EXPR_QUERY_CAPACITY || !z3_ast_exprs[query_idx]) {
+        ABORT("Cannot register query %lu without a Z3 constraint.", query_idx);
+    }
+
     GHashTableIter iter, iter2;
     gpointer       key, value;
     gboolean       res;
@@ -7073,8 +7077,8 @@ static void smt_binradar_heap_bound_check(Query* q)
     smt_bv_resize(&offset_expr, &size_expr, 0);
     Z3_ast check = Z3_mk_bvult(smt_solver.ctx, offset_expr, size_expr);
     inputs = merge_inputs(inputs, size_inputs);
+    z3_ast_exprs[GET_QUERY_IDX(q)] = check;
     if (reverse_directed_lowering) {
-        z3_ast_exprs[GET_QUERY_IDX(q)] = check;
         if (inputs) {
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
         }
