@@ -23,7 +23,10 @@ Subcommands:
              top --top patches ranked by confidence (default 10); the
              remaining patches are summarized as counts, and the shown
              remaining patches are annotated with their confidence score
-             (e.g. "142(0.731)").
+             (e.g. "142(0.731)"). Runs that never reached FINAL (no
+             confidence rows) have no ranking to order by: their filter
+             survivors are capped at the top --top patches in patch-id
+             order instead of being printed in full.
           5. Shows the patch prefilter context from <workdir>/prefilter.sbsv
              (predicates evaluated/survived) when present
 
@@ -618,6 +621,9 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
 
     Per-patch output is limited to the top ``top_patches`` patches ranked
     by confidence (from final.sbsv); the rest is summarized as counts.
+    A run that never reached FINAL has no confidence rows, so its patch
+    lists are capped at the top ``top_patches`` patches in patch-id order
+    (falling back to the filter survivors when no verdicts exist).
 
     Returns an ExperimentResult with structured data.
     """
@@ -792,11 +798,25 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             run_res.top_patches, run_res.top_patches_total = \
                 top_patches_by_confidence(confidence_data, top_patches)
         else:
-            # Legacy final.sbsv without confidence rows: keep every patch
-            # with a verdict (old behavior).
-            run_res.top_patches = sorted(
+            # No confidence rows: legacy final.sbsv from old workdirs, or an
+            # incomplete run whose FINAL phase never wrote them.  Legacy
+            # complete runs keep every patch with a verdict (old behavior);
+            # an incomplete run has no confidence ranking to order by, so its
+            # patch lists (e.g. [filter] survived) are capped at the top-N
+            # patches in patch-id order like a completed run, instead of
+            # printing e.g. the whole prefilter survivor list.
+            all_patches = sorted(
                 set(run_res.verifier_data) | set(run_res.binradar_data))
-            run_res.top_patches_total = len(run_res.top_patches)
+            if final_entry is None and not all_patches:
+                # Incomplete run: verifier/binradar verdicts are only
+                # collected for runs that reached FINAL, so fall back to the
+                # filter survivors as the patch universe to truncate.
+                all_patches = _parse_patch_list(run_res.filter_survived)
+            if final_entry is None:
+                run_res.top_patches = all_patches[:top_patches]
+            else:
+                run_res.top_patches = all_patches
+            run_res.top_patches_total = len(all_patches)
 
         # Per-patch summaries limited to the top-ranked patches.
         if run_res.verifier_data:
