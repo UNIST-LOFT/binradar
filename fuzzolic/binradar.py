@@ -1996,8 +1996,7 @@ def main():
                 f"into the binaries (PREFILTER_TOTAL_PATCHES="
                 f"{pref_total}); candidates past the compiled cap cannot "
                 f"be run")
-        else:
-            env["TOTAL_PATCHES"] = str(pref_total)
+        env["TOTAL_PATCHES"] = str(pref_total)
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)
