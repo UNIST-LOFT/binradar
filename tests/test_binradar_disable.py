@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 _spec = importlib.util.spec_from_file_location(
@@ -59,6 +61,35 @@ def test_disabled_binradar_final_uses_concrete_result_without_trace(tmp_path):
     assert "[binradar_remaining_patches [1]]" in final_text
     assert "binradar-tracer-msg.log" not in final_text
     assert any(row.startswith("[final] [done]") for row in progress)
+
+
+def test_final_rejects_incomplete_verifier_patch_coverage(tmp_path):
+    """A missing verdict must not silently default to patch acceptance."""
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier-result] [res rejected] [patch 1] [testcase crash]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    executor.save_progress = lambda row: None
+
+    with pytest.raises(ValueError, match=r"missing patches \[2\]"):
+        executor.run_final()
+
+    assert not (tmp_path / "final.sbsv").exists()
+
+
+def test_final_rejects_duplicate_verifier_verdicts(tmp_path):
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier-result] [res rejected] [patch 1] [testcase crash]\n"
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    executor.save_progress = lambda row: None
+
+    with pytest.raises(ValueError, match=r"duplicate patches \[1\]"):
+        executor.run_final()
+
+    assert not (tmp_path / "final.sbsv").exists()
 
 
 def test_concrete_verifier_result_parses_confidence_evidence(tmp_path):

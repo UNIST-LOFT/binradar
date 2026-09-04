@@ -361,6 +361,64 @@ def test_streaming_minimizer_and_verifier(tmp_path, stub_runner_env):
     assert "[verifier-result] [res verified] [patch 1]" in verifier_log
 
 
+def test_streaming_verifier_rejects_patch_while_producer_is_running(
+        tmp_path, monkeypatch):
+    """A hard failure must be serialized before the sole fuzzer producer
+    exits; streaming must not turn a rejected patch into a default verify."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fuzzer_queue = tmp_path / "fuzzer-out" / "default" / "queue"
+    fuzzer_queue.mkdir(parents=True)
+
+    class OriginalCrashRunner:
+        def test_with_patched(self, patch_id, testcase, verbose=False):
+            return (_probe(exit_info="crash", fault_addr=0x1234),
+                    binradar_verifier.BinRadarPatchResult(0, [0]))
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda dir, env: OriginalCrashRunner()))
+    minimizer = binradar_minimizer.BinRadarMinimizer(
+        str(tmp_path), str(run_dir), _probe(exit_info="crash"),
+        [str(fuzzer_queue)], {}, min_file_age=0.0)
+
+    patch_executed = threading.Event()
+
+    class RejectingPatchRunner:
+        patch_kind = ""
+        brcache_stack_size = 0
+
+        def cached_binary(self):
+            return str(tmp_path / "missing.brcached")
+
+        def test_with_patched(self, patch_id, testcase, verbose=False):
+            patch_executed.set()
+            return (_probe(exit_info="crash", fault_addr=0x1234),
+                    binradar_verifier.BinRadarPatchResult(
+                        int(patch_id), [0]))
+
+    verifier = binradar_verifier.BinRadarConcreteVerifier(
+        str(tmp_path), str(run_dir), RejectingPatchRunner(),
+        _probe(exit_info="crash"), "nm.brpatched", [1])
+
+    def fuzzer_producer():
+        _publish(fuzzer_queue / "id:000000", b"crashing-input")
+        # Keep the producer alive until the verifier has consumed this case.
+        assert patch_executed.wait(timeout=2)
+
+    producer_thread = threading.Thread(
+        target=fuzzer_producer, name="fuzzer-test-producer")
+    producer_thread.start()
+    binradar_minimizer.run_minimizer_and_verifier(
+        minimizer, verifier, str(run_dir / "minimizer.sbsv"),
+        poll_interval=0.01, producer_threads=[producer_thread])
+    producer_thread.join()
+
+    verifier_log = (run_dir / "verifier.sbsv").read_text()
+    assert "[verifier-result] [res rejected] [patch 1]" in verifier_log
+    assert "[verifier-result] [res verified] [patch 1]" not in verifier_log
+
+
 def test_queued_producer_failure_aborts(tmp_path, stub_runner_env):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

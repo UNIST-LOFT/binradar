@@ -21,7 +21,7 @@ import enum
 import fcntl
 from pathlib import Path
 from types import TracebackType
-from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
+from typing import Callable, Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
 import analyze_type
 import binradar_verifier
@@ -1489,6 +1489,14 @@ class BinRadarExecutor:
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
+        try:
+            concrete_verifier_result.require_complete_verdicts(
+                self.filter_result)
+        except ValueError as exc:
+            # Missing verdicts previously defaulted to verified here, which
+            # could silently retain patches after an incomplete verifier run.
+            logger.error(f"Incomplete verifier result: {exc}")
+            raise
         # FINAL combines concrete-verifier and BinRadar observations into one
         # confidence score per patch. Older verifier files have no evidence
         # rows and therefore start at 0/0 (score 0.0).
@@ -1522,10 +1530,9 @@ class BinRadarExecutor:
                 logger.error("Trace message log file not found. BinRadar results might be incomplete.")
                 raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
             trace_file = open(trace_msg_log_file, "r", encoding="utf-8")
-        for result in concrete_verifier_result.patch_verified:
-            verified = concrete_verifier_result.patch_verified[result]
-            if not verified:
-                remaining_patches.discard(result)
+        for patch_id in self.filter_result:
+            if not concrete_verifier_result.patch_verified[patch_id]:
+                remaining_patches.discard(patch_id)
         binradar_remaining_patches = remaining_patches.copy()
         binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
         with trace_file as f:
@@ -1623,7 +1630,7 @@ class BinRadarExecutor:
                         f"[id {self.run_id}] "
                         f"[failed-phases {','.join(failed_phases)}]\n")
             for patch_id in sorted(self.filter_result):
-                verified = concrete_verifier_result.patch_verified.get(patch_id, True)
+                verified = concrete_verifier_result.patch_verified[patch_id]
                 res = "verified" if verified else "rejected"
                 f.write(f"[final] [verifier] [patch {patch_id}] [res {res}]\n")
             # Confidence rows cover only patches accepted by the concrete
@@ -1631,7 +1638,7 @@ class BinRadarExecutor:
             # original patch-id order (stable sort).
             confidence_rows = []
             for patch_id in sorted(self.filter_result):
-                if not concrete_verifier_result.patch_verified.get(patch_id, True):
+                if not concrete_verifier_result.patch_verified[patch_id]:
                     continue
                 accepted = accept_evidences.get(patch_id, 0)
                 total = total_evidences.get(patch_id, 0)
@@ -1661,13 +1668,71 @@ class BinRadarExecutor:
     def done(self):
         self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")
     
+    def _run_streaming_concrete_producers(
+            self,
+            producers: List[Tuple[str, Callable[[], None]]]) -> None:
+        """Run concrete producers with the streaming minimizer/verifier.
+
+        Every producer is an optional evidence phase. In strict mode, a
+        producer exception is sent to the minimizer so an incomplete testcase
+        stream cannot produce a verdict. Under --less-strict, the failure is
+        recorded and the minimizer drains the outputs from the producers that
+        remain.
+        """
+        thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
+        producer_exc_queue: "queue.Queue[BaseException]" = queue.Queue()
+
+        def run_producer_captured(
+                name: str, target: Callable[[], None]) -> None:
+            try:
+                target()
+            except BaseException as exc:
+                if (name in OPTIONAL_EVIDENCE_PHASES
+                        and getattr(self, "less_strict", False)
+                        and isinstance(exc, Exception)):
+                    self._record_tolerated_phase_failure(name, exc)
+                    return
+                producer_exc_queue.put(exc)
+                thread_errors.put((name, exc, exc.__traceback__))
+                logger.error(f"[{name}] failed: {exc}")
+
+        producer_threads = [
+            threading.Thread(
+                target=run_producer_captured, args=(name, target), name=name)
+            for name, target in producers
+        ]
+        for thread in producer_threads:
+            thread.start()
+
+        try:
+            self.run_minimizer_and_verifier(
+                producer_threads=producer_threads,
+                producer_exc_queue=producer_exc_queue)
+        except BaseException:
+            # A producer, the minimizer, or the verifier failed. Stop external
+            # processes and wait for every producer wrapper before surfacing
+            # the authoritative exception.
+            stop_running_processes()
+            for thread in producer_threads:
+                thread.join(timeout=60)
+            raise
+
+        for thread in producer_threads:
+            thread.join()
+        if not thread_errors.empty():
+            _, exc, tb = thread_errors.get()
+            stop_running_processes()
+            if tb is not None:
+                raise exc.with_traceback(tb)
+            raise exc
+
     def run_fuzzer_only(self, run_prefix: str = "run"):
         """Run the AFL++ producer and concrete verification pipeline only.
 
         PROBE and FILTER remain mandatory prerequisites. FUZZOLIC, DIRECTED,
         and BINRADAR are skipped; FINAL therefore uses concrete-verifier
-        evidence only. The fuzzer completes before snapshot minimization and
-        verification begin.
+        evidence only. AFL++, the streaming minimizer, and the verifier run
+        concurrently.
         """
         self.disable_binradar = True
         self.set_run_dir(run_prefix=run_prefix)
@@ -1679,8 +1744,14 @@ class BinRadarExecutor:
             self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
             self.done()
             return
-        self._run_optional_phase("fuzzer", self.run_fuzzer)
-        self.run_minimizer_and_verifier()
+
+        # Reset the AFL++ directory before either its writer or the streaming
+        # minimizer can observe it. run_fuzzer consumes this prepared marker
+        # instead of deleting the directory after discovery has started.
+        self.prepare_fuzzer_output()
+        self._run_streaming_concrete_producers([
+            ("fuzzer", self.run_fuzzer),
+        ])
         self.run_final()
         self.done()
 

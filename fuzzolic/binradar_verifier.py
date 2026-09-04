@@ -621,11 +621,13 @@ class Testcase:
 
 class BinRadarConcreteVerifierResult:
     patch_verified: Dict[int, bool]
+    patch_verdict_counts: Dict[int, int]
     patch_confidence: Dict[int, float]
     accept_evidences: Dict[int, int]
     total_evidences: Dict[int, int]
     def __init__(self, results: dict):
         self.patch_verified = dict()
+        self.patch_verdict_counts = dict()
         self.patch_confidence = dict()
         self.accept_evidences = dict()
         self.total_evidences = dict()
@@ -633,6 +635,8 @@ class BinRadarConcreteVerifierResult:
             patch_id = res["patch"]
             verified = res["res"] == "verified"
             self.patch_verified[patch_id] = verified
+            self.patch_verdict_counts[patch_id] = (
+                self.patch_verdict_counts.get(patch_id, 0) + 1)
         for evidence in results.get("verifier-confidence", []):
             patch_id = evidence["patch"]
             accepted = evidence["accept-evidences"]
@@ -649,7 +653,28 @@ class BinRadarConcreteVerifierResult:
             self.accept_evidences.setdefault(patch_id, 0)
             self.total_evidences.setdefault(patch_id, 0)
             self.patch_confidence.setdefault(patch_id, 0.0)
-    
+
+    def require_complete_verdicts(self, patches: List[int]) -> None:
+        """Require exactly one verifier verdict for every candidate patch.
+
+        FINAL must never interpret an absent verdict as acceptance. Missing,
+        unexpected, or duplicate rows indicate an incomplete/corrupt verifier
+        stream and make finalization fail closed.
+        """
+        expected = set(patches)
+        actual = set(self.patch_verified)
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        duplicates = sorted(
+            patch for patch, count in self.patch_verdict_counts.items()
+            if count != 1)
+        if missing or unexpected or duplicates:
+            raise ValueError(
+                "Verifier result coverage mismatch: "
+                f"missing patches {missing}; "
+                f"unexpected patches {unexpected}; "
+                f"duplicate patches {duplicates}")
+
     @classmethod
     def from_sbsv(cls, sbsv_file: str) -> Optional["BinRadarConcreteVerifierResult"]:
         parser = sbsv.parser()

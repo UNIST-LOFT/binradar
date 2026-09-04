@@ -67,10 +67,13 @@ def test_optional_phase_failure_is_recorded_in_less_strict_mode(tmp_path):
         "[fuzzer] [failed] [prefix run] [id 0] [less-strict true]"]
 
 
-def test_fuzzer_only_runs_fuzzer_then_concrete_pipeline(tmp_path, monkeypatch):
+def test_fuzzer_only_streams_fuzzer_into_concrete_pipeline(
+        tmp_path, monkeypatch):
     executor = _policy_executor(tmp_path, less_strict=False)
     executor.disable_binradar = False
     events = []
+    fuzzer_started = threading.Event()
+    finish_fuzzer = threading.Event()
     monkeypatch.setattr(binradar.logger, "set_file", lambda _: None)
 
     def set_run_dir(run_prefix="run"):
@@ -80,12 +83,29 @@ def test_fuzzer_only_runs_fuzzer_then_concrete_pipeline(tmp_path, monkeypatch):
         Path(executor.run_dir).mkdir()
         events.append("set-run-dir")
 
+    def run_fuzzer():
+        events.append("fuzzer-start")
+        fuzzer_started.set()
+        assert finish_fuzzer.wait(timeout=2)
+        events.append("fuzzer-done")
+
+    def run_minimizer_and_verifier(producer_threads=None,
+                                   producer_exc_queue=None):
+        assert fuzzer_started.wait(timeout=2)
+        assert producer_threads is not None
+        assert len(producer_threads) == 1
+        assert producer_threads[0].is_alive()
+        assert producer_exc_queue is not None
+        assert producer_exc_queue.empty()
+        events.append("minimizer-verifier-concurrent")
+        finish_fuzzer.set()
+
     executor.set_run_dir = set_run_dir
     executor.run_probe = lambda: events.append("probe")
     executor.run_filter = lambda: (events.append("filter") or [1])
-    executor.run_fuzzer = lambda: events.append("fuzzer")
-    executor.run_minimizer_and_verifier = lambda: events.append(
-        "minimizer-verifier")
+    executor.prepare_fuzzer_output = lambda: events.append("prepare-fuzzer")
+    executor.run_fuzzer = run_fuzzer
+    executor.run_minimizer_and_verifier = run_minimizer_and_verifier
     executor.run_final = lambda: events.append("final")
     executor.done = lambda: events.append("done")
     executor.run_fuzzolic = lambda: (_ for _ in ()).throw(
@@ -99,8 +119,49 @@ def test_fuzzer_only_runs_fuzzer_then_concrete_pipeline(tmp_path, monkeypatch):
 
     assert executor.disable_binradar is True
     assert events == [
-        "set-run-dir", "probe", "filter", "fuzzer",
-        "minimizer-verifier", "final", "done"]
+        "set-run-dir", "probe", "filter", "prepare-fuzzer",
+        "fuzzer-start", "minimizer-verifier-concurrent", "fuzzer-done",
+        "final", "done"]
+
+
+def test_fuzzer_only_less_strict_failure_finishes_concrete_pipeline(
+        tmp_path, monkeypatch):
+    executor = _policy_executor(tmp_path, less_strict=True)
+    executor.disable_binradar = False
+    events = []
+    monkeypatch.setattr(binradar.logger, "set_file", lambda _: None)
+
+    def set_run_dir(run_prefix="run"):
+        executor.run_prefix = run_prefix
+        executor.run_id = 0
+        executor.run_dir = str(tmp_path / "fuzzer-00000")
+        Path(executor.run_dir).mkdir()
+
+    def fail_fuzzer():
+        raise RuntimeError("AFL dry run failed")
+
+    def run_minimizer_and_verifier(producer_threads=None,
+                                   producer_exc_queue=None):
+        assert producer_threads is not None
+        for thread in producer_threads:
+            thread.join()
+        assert producer_exc_queue is not None
+        assert producer_exc_queue.empty()
+        events.append("minimizer-verifier")
+
+    executor.set_run_dir = set_run_dir
+    executor.run_probe = lambda: None
+    executor.run_filter = lambda: [1]
+    executor.prepare_fuzzer_output = lambda: None
+    executor.run_fuzzer = fail_fuzzer
+    executor.run_minimizer_and_verifier = run_minimizer_and_verifier
+    executor.run_final = lambda: events.append("final")
+    executor.done = lambda: events.append("done")
+
+    executor.run_fuzzer_only("fuzzer")
+
+    assert executor.failed_phase_names() == ["fuzzer"]
+    assert events == ["minimizer-verifier", "final", "done"]
 
 
 def test_multithreaded_less_strict_fuzzer_failure_reaches_final(

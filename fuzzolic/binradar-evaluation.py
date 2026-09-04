@@ -176,16 +176,17 @@ def write_final(final_file: str, verified_file: str, survived: List[int],
                 fuzzer: str) -> List[int]:
     """Parse the verifier output and write the final remaining-patches analysis.
 
-    Mirrors binradar.run_final for the concrete-verifier part: a patch stays in
-    the remaining set unless the verifier explicitly rejected it. Only patches
-    that survived the filter phase are considered.
+    Mirrors binradar.run_final for the concrete-verifier part. The verifier
+    file must contain exactly one verdict for every filter survivor; an absent
+    verdict is incomplete evidence, never implicit acceptance.
     """
     verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verified_file)
     if verifier_result is None:
         sys.exit(f"ERROR: failed to parse verifier result: {verified_file}")
+    verifier_result.require_complete_verdicts(survived)
     remaining = set(survived)
-    for patch_id, verified in verifier_result.patch_verified.items():
-        if not verified:
+    for patch_id in survived:
+        if not verifier_result.patch_verified[patch_id]:
             remaining.discard(patch_id)
     with open(final_file, "w", encoding="utf-8") as f:
         f.write(f"[final] [start] [fuzzer {fuzzer}] [verified {os.path.basename(verified_file)}]\n")
