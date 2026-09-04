@@ -189,6 +189,55 @@ def test_standalone_processes_all_without_age_guard(tmp_path, stub_runner_env):
     assert "[minimizer] [done]" in (tmp_path / "run" / "minimizer.sbsv").read_text()
 
 
+def test_standalone_minimizer_enforces_phase_timeout(tmp_path, monkeypatch):
+    testcases = tmp_path / "tests"
+    testcases.mkdir()
+    (testcases / "a.dat").write_bytes(b"aaa")
+    minimizer = _make_minimizer(tmp_path, [str(testcases)], min_file_age=0.0)
+    minimizer.load_testcases()
+
+    class SlowRunner(StubQemuRunner):
+        def test_with_patched(self, patch_id, testcase, verbose=False):
+            time.sleep(0.05)
+            return super().test_with_patched(patch_id, testcase, verbose)
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda dir, env: SlowRunner()))
+
+    with pytest.raises(TimeoutError, match="Minimizer phase timed out"):
+        minimizer.run_testcases(timeout=0.01)
+
+    assert "[minimizer] [done]" not in \
+        (tmp_path / "run" / "minimizer.sbsv").read_text()
+
+
+def test_standalone_verifier_enforces_phase_timeout(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    minimized = run_dir / "minimized"
+    minimized.mkdir()
+    (minimized / "0_case.dat").write_bytes(b"aaa")
+    minimizer_log = run_dir / "minimizer.sbsv"
+    minimizer_log.write_text(
+        "[testcase] [result] [id 0] [file 0_case.dat] [exit ok] "
+        "[fault-addr 1234] [pid 0] [br [0]]\n"
+        "[minimizer] [done] [time 0]\n")
+
+    verifier = _make_verifier(tmp_path)
+
+    def slow_test(patch_id, testcase, verbose=False):
+        time.sleep(0.05)
+        return _probe(), _patch_result()
+
+    verifier.runner.test_with_patched = slow_test
+    with pytest.raises(TimeoutError, match="Verifier phase timed out"):
+        verifier.run_verification_streaming(
+            str(minimizer_log), timeout=0.01)
+
+    assert "[verifier-result]" not in (run_dir / "verifier.sbsv").read_text()
+
+
 def test_dedup_across_dirs(tmp_path, stub_runner_env):
     d1 = tmp_path / "d1"
     d2 = tmp_path / "d2"

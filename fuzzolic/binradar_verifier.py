@@ -755,6 +755,11 @@ class BinRadarConcreteVerifier:
             return 0.0
         return self.accept_evidences.get(patch, 0) / total
 
+    @staticmethod
+    def _raise_if_timed_out(deadline: Optional[float]) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Verifier phase timed out")
+
     def _log_result(self, patch: int, result: str, testcase: str) -> None:
         self.logger.info(
             f"[verifier-result] [res {result}] [patch {patch}] "
@@ -819,10 +824,13 @@ class BinRadarConcreteVerifier:
                 return False
         return False
 
-    def _test_testcase(self, patch: int, testcase: Testcase) -> bool:
+    def _test_testcase(self, patch: int, testcase: Testcase,
+                       deadline: Optional[float] = None) -> bool:
         """Run one candidate normally and return whether it is rejected."""
+        self._raise_if_timed_out(deadline)
         self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
         result, patch_result = self.run_testcase_patched(patch, testcase)
+        self._raise_if_timed_out(deadline)
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
             return False
@@ -844,18 +852,23 @@ class BinRadarConcreteVerifier:
 
     def _test_testcase_batch(
         self, patches: List[int], testcase: Testcase,
+        deadline: Optional[float] = None,
     ) -> Set[int]:
         """Run one representative per distinct complete branch vector."""
         if self.cache_family is None or len(patches) <= 1:
-            return {patch for patch in patches
-                    if self._test_testcase(patch, testcase)}
+            rejected: Set[int] = set()
+            for patch in patches:
+                if self._test_testcase(patch, testcase, deadline):
+                    rejected.add(patch)
+            return rejected
 
-        rejected: Set[int] = set()
+        rejected = set()
         remaining = list(patches)
         while remaining:
+            self._raise_if_timed_out(deadline)
             if len(remaining) == 1:
                 patch = remaining.pop()
-                if self._test_testcase(patch, testcase):
+                if self._test_testcase(patch, testcase, deadline):
                     rejected.add(patch)
                 continue
 
@@ -865,11 +878,12 @@ class BinRadarConcreteVerifier:
                 f"[id {testcase.id}] [file {testcase.filename}]")
             result, cached = self.run_testcase_cached(
                 representative, testcase)
+            self._raise_if_timed_out(deadline)
             if result is None or cached is None:
                 self.logger.warning(
                     f"[verifier-cache] [fallback] [patch {representative}] "
                     f"[id {testcase.id}]")
-                if self._test_testcase(representative, testcase):
+                if self._test_testcase(representative, testcase, deadline):
                     rejected.add(representative)
                 continue
 
@@ -880,7 +894,7 @@ class BinRadarConcreteVerifier:
                 self.logger.warning(
                     f"[verifier-cache] [runtime-mismatch] "
                     f"[patch {representative}] [id {testcase.id}]")
-                if self._test_testcase(representative, testcase):
+                if self._test_testcase(representative, testcase, deadline):
                     rejected.add(representative)
                 continue
 
@@ -926,12 +940,17 @@ class BinRadarConcreteVerifier:
     def run_verification_streaming(self, minimizer_result_file: str,
                                    poll_interval: float = 0.2,
                                    minimizer_thread: Optional[threading.Thread] = None,
-                                   minimizer_exc_queue: Optional[Any] = None) -> None:
+                                   minimizer_exc_queue: Optional[Any] = None,
+                                   timeout: Optional[float] = None) -> None:
         """Stream [testcase] [result] rows from minimizer.sbsv and verify the
         patches against each testcase as it appears. A standalone replay
         requires the done marker; a live stream may stop consuming rows once
         every patch is rejected while the minimizer continues to completion.
+        ``timeout`` is the total wall-clock budget for this verifier run;
+        non-positive values disable the deadline.
         """
+        deadline = (time.monotonic() + timeout
+                    if timeout is not None and timeout > 0 else None)
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
@@ -941,6 +960,7 @@ class BinRadarConcreteVerifier:
                 raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
             waited = 0.0
             while not os.path.exists(minimizer_result_file):
+                self._raise_if_timed_out(deadline)
                 if minimizer_thread is not None and not minimizer_thread.is_alive():
                     if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
                         raise minimizer_exc_queue.get_nowait()
@@ -955,6 +975,7 @@ class BinRadarConcreteVerifier:
         with open(minimizer_result_file, "r", encoding="utf-8") as f:
             offset = f.tell()
             while True:
+                self._raise_if_timed_out(deadline)
                 f.seek(offset)
                 fcntl.flock(f, fcntl.LOCK_EX)
                 data = f.read()
@@ -970,7 +991,7 @@ class BinRadarConcreteVerifier:
                             continue
                         self.testcases.append(testcase)
                         rejected = self._test_testcase_batch(
-                            list(pending_patches), testcase)
+                            list(pending_patches), testcase, deadline)
                         for patch in list(pending_patches):
                             if patch not in rejected:
                                 continue
@@ -984,7 +1005,12 @@ class BinRadarConcreteVerifier:
                 if minimizer_thread is None:
                     if done_seen:
                         break
-                    raise RuntimeError("minimizer.sbsv does not contain a completed minimizer run ([minimizer] [done] missing). Run the minimizer phase first.")
+                    raise RuntimeError(
+                        "minimizer.sbsv does not contain a completed "
+                        "minimizer run ([minimizer] [done] missing). Run the "
+                        "minimizer phase first, or --run-single-phase "
+                        "minimizer-verifier to run the minimizer and the "
+                        "verifier concurrently.")
                 if not minimizer_thread.is_alive():
                     if done_seen:
                         break
@@ -1006,5 +1032,6 @@ class BinRadarConcreteVerifier:
             fcntl.flock(f, fcntl.LOCK_UN)
             if tail and not tail.endswith("\n"):
                 raise RuntimeError("minimizer.sbsv contains an unterminated line")
+        self._raise_if_timed_out(deadline)
         for patch in pending_patches:
             self._log_result(patch, "verified", "")

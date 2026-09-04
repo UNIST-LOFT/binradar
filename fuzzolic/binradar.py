@@ -39,6 +39,7 @@ FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
 SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
 SOLVER_TIMEOUT = 10 # s
+MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 
 RUNNING_PROCESSES: List[subprocess.Popen] = []
 RUNNING_PROCESSES_LOCK = threading.Lock()
@@ -60,6 +61,26 @@ class BinRadarPhase(enum.IntEnum):
     VERIFIER = 7
     BINRADAR = 8
     FINAL = 9
+    # Combined single phase: minimizer + concrete verifier running
+    # concurrently over already-produced testcases (same as their part of
+    # --seq). CLI name: "minimizer-verifier".
+    MINIMIZER_VERIFIER = 10
+
+
+def phase_from_name(name: str) -> BinRadarPhase:
+    """Map a --run-single-phase name to its phase value.
+
+    Dashes map to the underscore in the enum member name, so the CLI can
+    use "minimizer-verifier" while the enum member is MINIMIZER_VERIFIER.
+    """
+    return BinRadarPhase[name.upper().replace("-", "_")]
+
+
+# Valid --run-single-phase names; each must map through phase_from_name.
+SINGLE_PHASE_NAMES = ["probe", "filter", "fuzzolic", "directed", "fuzzer",
+                      "minimizer", "verifier", "minimizer-verifier",
+                      "binradar", "final"]
+
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -721,6 +742,18 @@ class BinRadarExecutor:
     def elapsed_time_ms(self) -> int:
         return int((time.time() - self.start_time) * 1000)
 
+    def minimizer_verifier_timeout(self) -> Optional[float]:
+        """Wall-clock budget for each minimizer/verifier phase.
+
+        These concrete phases may need to drain testcases produced during the
+        configured producer budget, so they receive 50% additional time.
+        As elsewhere in the pipeline, a non-positive configured timeout means
+        no phase deadline.
+        """
+        if self.timeout <= 0:
+            return None
+        return self.timeout * MINIMIZER_VERIFIER_TIMEOUT_FACTOR
+
     def save_progress(self, data: str):
         time = self.elapsed_time_ms()
         logger.info(f"[PROGRESS] {data} [time {time}]")
@@ -1259,7 +1292,7 @@ class BinRadarExecutor:
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()
-        minimizer.run_testcases()
+        minimizer.run_testcases(timeout=self.minimizer_verifier_timeout())
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_verifier(self):
@@ -1279,7 +1312,9 @@ class BinRadarExecutor:
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
-        verifier.run_verification_streaming(minimizer_result_file)
+        verifier.run_verification_streaming(
+            minimizer_result_file,
+            timeout=self.minimizer_verifier_timeout())
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_minimizer_and_verifier(self,
@@ -1320,7 +1355,8 @@ class BinRadarExecutor:
         binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file,
             producer_threads=producer_threads,
-            producer_exc_queue=producer_exc_queue)
+            producer_exc_queue=producer_exc_queue,
+            timeout=self.minimizer_verifier_timeout())
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
@@ -1583,6 +1619,8 @@ class BinRadarExecutor:
             self.run_minimizer()
         elif phase == BinRadarPhase.VERIFIER:
             self.run_verifier()
+        elif phase == BinRadarPhase.MINIMIZER_VERIFIER:
+            self.run_minimizer_and_verifier()
         elif phase == BinRadarPhase.BINRADAR:
             self.run_binradar()
         elif phase == BinRadarPhase.FINAL:
@@ -1700,7 +1738,7 @@ def main():
         help="set the working directory for binradar")
     parser.add_argument(
         "-t", "--timeout", type=int, default=-1,
-        help="set timeout for each test case (s)")
+        help="set the base timeout in seconds (minimizer/verifier use 1.5x)")
     parser.add_argument(
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
@@ -1714,9 +1752,8 @@ def main():
         help="disable the binradar phase")
     parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
     # The following argument is for experiments and debugging
-    phases = ["probe", "filter", "fuzzolic", "directed", "fuzzer", "minimizer", "verifier", "binradar", "final"]
     parser.add_argument("--run-single-phase", default="", 
-        choices=phases, help="run a specific phase")
+        choices=SINGLE_PHASE_NAMES, help="run a specific phase")
     parser.add_argument("--run-prefix", default="run", help="set the prefix for run directories (default: run)")
     parser.add_argument("--run-id", default="n", help="n=new run (default), l=last run, or a numeric run id (only valid when --run-single-phase is set)")
     parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
@@ -1761,7 +1798,7 @@ def main():
 
     executor = BinRadarExecutor.from_env(workdir, env)
     if args.run_single_phase:
-        executor.run_single_phase(args.run_prefix, args.run_id, BinRadarPhase[args.run_single_phase.upper()])
+        executor.run_single_phase(args.run_prefix, args.run_id, phase_from_name(args.run_single_phase))
     elif args.seq:
         executor.run_sequential(args.run_prefix)
     else:

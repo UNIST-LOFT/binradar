@@ -186,7 +186,8 @@ class BinRadarMinimizer:
                       producer_exc_queue: Optional["queue.Queue[BaseException]"] = None,
                       poll_interval: float = 0.2,
                       scan_interval: float = 1.0,
-                      cancel_event: Optional[threading.Event] = None) -> None:
+                      cancel_event: Optional[threading.Event] = None,
+                      timeout: Optional[float] = None) -> None:
         """Run the discovered testcases and log one [testcase] row per kept
         testcase, then the done marker.
 
@@ -198,14 +199,19 @@ class BinRadarMinimizer:
         ``producer_exc_queue`` is re-raised so the minimizer aborts instead
         of silently verifying a truncated testcase set. Without producers,
         all queued testcases are processed once (previous behavior).
+        ``timeout`` is the total wall-clock budget for this minimizer run;
+        non-positive values disable the deadline.
         """
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.work_dir, self.config)
+        deadline = (time.monotonic() + timeout
+                    if timeout is not None and timeout > 0 else None)
         id = 0
         last_scan = 0.0
         with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
             current_testcase = os.path.join(tmpdir, ".cur_input")
             while True:
                 self._raise_if_cancelled(cancel_event)
+                self._raise_if_timed_out(deadline)
                 self._raise_producer_failure(producer_exc_queue)
                 producers_alive = (producer_threads is not None
                                    and any(t.is_alive() for t in producer_threads))
@@ -215,7 +221,7 @@ class BinRadarMinimizer:
                     last_scan = now
                 id = self._process_pending(
                     runner, id, current_testcase, producer_exc_queue,
-                    cancel_event)
+                    cancel_event, deadline)
                 if not producers_alive:
                     self._raise_producer_failure(producer_exc_queue)
                     break
@@ -227,6 +233,11 @@ class BinRadarMinimizer:
             cancel_event: Optional[threading.Event]) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise _MinimizerCancelled()
+
+    @staticmethod
+    def _raise_if_timed_out(deadline: Optional[float]) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Minimizer phase timed out")
 
     @staticmethod
     def _raise_producer_failure(
@@ -242,10 +253,12 @@ class BinRadarMinimizer:
     def _process_pending(
             self, runner, id: int, current_testcase: str,
             producer_exc_queue: Optional["queue.Queue[BaseException]"] = None,
-            cancel_event: Optional[threading.Event] = None) -> int:
+            cancel_event: Optional[threading.Event] = None,
+            deadline: Optional[float] = None) -> int:
         """Run queued immutable testcase snapshots and return the next id."""
         for testcase in sorted(self.pending):
             self._raise_if_cancelled(cancel_event)
+            self._raise_if_timed_out(deadline)
             self._raise_producer_failure(producer_exc_queue)
             self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
             with open(current_testcase, "wb") as f:
@@ -253,6 +266,7 @@ class BinRadarMinimizer:
             # TODO: better minimization
             run_res, patch_res = runner.test_with_patched("0", current_testcase, verbose=False)
             # run_result = runner.test_with_original(current_testcase, verbose=False)
+            self._raise_if_timed_out(deadline)
             if run_res is None:
                 self.log(f"Failed {testcase.filename} with error.")
                 continue
@@ -278,7 +292,8 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
                                minimizer_result_file: str,
                                poll_interval: float = 0.2,
                                producer_threads: Optional[List[threading.Thread]] = None,
-                               producer_exc_queue: Optional["queue.Queue[BaseException]"] = None) -> None:
+                               producer_exc_queue: Optional["queue.Queue[BaseException]"] = None,
+                               timeout: Optional[float] = None) -> None:
     """Run the minimizer and the concrete verifier concurrently: the verifier
     streams [testcase] [result] rows from minimizer.sbsv while the minimizer
     appends them, and finishes when the minimizer ends (or earlier, when every
@@ -288,10 +303,14 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
     minimizer itself streams too: it discovers testcase files while those
     phases still run and finishes only after all of them have ended. A
     producer failure raised through ``producer_exc_queue`` aborts the
-    minimizer and therefore the verifier.
+    minimizer and therefore the verifier. ``timeout`` is one shared
+    wall-clock budget for the concurrent pair; non-positive values disable
+    the deadline.
     """
     exc_queue: "queue.Queue[BaseException]" = queue.Queue()
     cancel_event = threading.Event()
+    deadline = (time.monotonic() + timeout
+                if timeout is not None and timeout > 0 else None)
 
     def _run_minimizer():
         try:
@@ -299,7 +318,8 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
                 producer_threads=producer_threads,
                 producer_exc_queue=producer_exc_queue,
                 poll_interval=poll_interval,
-                cancel_event=cancel_event)
+                cancel_event=cancel_event,
+                timeout=timeout)
         except _MinimizerCancelled:
             # The verifier failed. Leave the stream incomplete and let the
             # verifier's original exception remain authoritative.
@@ -315,8 +335,14 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
             poll_interval=poll_interval,
             minimizer_thread=thread,
             minimizer_exc_queue=exc_queue,
+            timeout=timeout,
         )
-        thread.join()
+        if deadline is None:
+            thread.join()
+        else:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                raise TimeoutError("Minimizer/verifier phases timed out")
     except BaseException:
         # Cooperatively stop discovery/processing. A currently running QEMU
         # check has a bounded timeout; join fully so no minimizer can keep
