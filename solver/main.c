@@ -183,7 +183,13 @@ typedef struct {
 } TestcaseMutation;
 
 static Testcase testcase;
-static TestcaseMutation mutations[32];
+/* 32 mutation slots + 1 terminator slot: the MODEL_STRLEN handler in
+ * smt_model_expr emits up to 2 mutations per iteration over 16 iterations
+ * (s1_len >= 16), and the NO_MUTATION sentinel is written at index
+ * mutation_count afterwards. With a 32-element array the sentinel landed on
+ * &mutations[32] == &testcase, truncating testcase.data -> SIGSEGV in
+ * perform_mutations (see problem/SOLVER_MODEL_STRLEN_MUTATIONS_OOB_WRITE.md). */
+static TestcaseMutation mutations[33];
 
 static int debug_translation = 0;
 

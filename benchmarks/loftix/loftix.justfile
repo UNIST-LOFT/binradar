@@ -50,7 +50,7 @@ br-all workdir="workdir":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-all --target-patches all
 
 br-fo-all workdir="workdir":
-    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-fo-all --target-patches all --disable-binradar
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-fo-all --target-patches all --fuzzer-only --less-strict
 
 eval workdir="workdir" fuzzer="sdfuzz" fuzz_out="/workspace/binradar/benchmarks/sdfuzz":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-evaluation.py -w {{workdir}} --fuzzer {{fuzzer}} --fuzz-out {{fuzz_out}}

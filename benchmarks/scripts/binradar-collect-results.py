@@ -134,6 +134,8 @@ def _build_sbsv_parser() -> sbsv.parser:
     parser.add_schema(
         "[final] [done] [prefix: str] [id: str] "
         "[remaining_patches?: str] [binradar_remaining_patches?: str]")
+    parser.add_schema(
+        "[final] [degraded] [prefix: str] [id: str] [failed-phases: str]")
     parser.add_schema("[verifier-result] [res: str] [patch: str]")
     parser.add_schema("[patch] [id: int] [pass: bool]")
     parser.add_schema("[final] [verifier] [patch: str] [res: str]")
@@ -188,6 +190,8 @@ class RunResult:
     filter_done: bool = False
     filter_survived: str = ""  # e.g. "[1, 2]" or "[]"
     filter_rejected: str = ""  # e.g. "3" or "" if none
+    degraded: bool = False
+    failed_phases: str = ""
     prefilter_total: int = -1  # predicates evaluated by the prefilter
     prefilter_survived: int = -1  # predicates kept (pass=true)
     prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
@@ -673,6 +677,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         started: set = set()
         done_phases: set = set()
         final_entry: Optional[Dict[str, str]] = None
+        degraded_entry: Optional[Dict[str, str]] = None
         filter_entry: Optional[Dict[str, str]] = None
 
         for entry in entries:
@@ -687,6 +692,8 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                     final_entry = entry
                 elif phase == "filter":
                     filter_entry = entry
+            elif phase == "final" and action == "degraded":
+                degraded_entry = entry
 
         incomplete_phases = started - done_phases
 
@@ -704,8 +711,17 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         if incomplete_phases or log_errors:
             tracer_errors = find_errors_in_tracer_msg(tracer_msg_log)
 
-        # Determine status
-        if final_entry is not None:
+        # Determine status. A --less-strict run deliberately reaches FINAL
+        # after optional evidence phases fail, but must not be reported as a
+        # complete security-verification result.
+        degraded = final_entry is not None and degraded_entry is not None
+        failed_phases = (degraded_entry.get("failed-phases", "")
+                         if degraded_entry is not None else "")
+        if final_entry is not None and degraded:
+            status = f"DEGRADED: failed phases: {failed_phases or 'unknown'}"
+            has_any_final = True
+            overall_ok = False
+        elif final_entry is not None:
             status = "OK"
             has_any_final = True
         elif not incomplete_phases:
@@ -744,6 +760,8 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             filter_done=("filter" in done_phases or bool(filter_results)),
             filter_survived=filter_survived,
             filter_rejected=filter_rejected,
+            degraded=degraded,
+            failed_phases=failed_phases,
             prefilter_total=prefilter["total"],
             prefilter_survived=prefilter["survived"],
             prefilter_done=prefilter_done_status(workdir, prefilter),

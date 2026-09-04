@@ -40,6 +40,12 @@ FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
 SOLVER_TIMEOUT = 10 # s
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
+# Security boundary for --less-strict: only independent evidence producers
+# may fail open. Phases needed to establish or serialize a verdict are never
+# members of this set.
+OPTIONAL_EVIDENCE_PHASES = frozenset({
+    "fuzzolic", "directed", "fuzzer", "binradar",
+})
 
 RUNNING_PROCESSES: List[subprocess.Popen] = []
 RUNNING_PROCESSES_LOCK = threading.Lock()
@@ -634,6 +640,10 @@ class BinRadarExecutor:
     fuzzy: bool
     reverse_directed: bool
     disable_binradar: bool
+    less_strict: bool
+    binradar_failed: bool
+    phase_failures: Dict[str, str]
+    phase_failure_lock: threading.Lock
     # Data
     config: Dict[str, str]
     progress_filename: str
@@ -644,7 +654,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -654,6 +664,10 @@ class BinRadarExecutor:
         self.fuzzy = fuzzy
         self.reverse_directed = reverse_directed
         self.disable_binradar = disable_binradar
+        self.less_strict = less_strict
+        self.binradar_failed = False
+        self.phase_failures = {}
+        self.phase_failure_lock = threading.Lock()
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
         self.e9_metadata_prefix = e9_metadata_prefix
@@ -707,7 +721,8 @@ class BinRadarExecutor:
             total_patches=int(env["TOTAL_PATCHES"]),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1",
-            disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1")
+            disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1",
+            less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1")
         # Retain every artifact's prefixed E9 metadata so extract_config
         # passes all of it to BinRadarQemuRunner.from_env, which selects
         # by the executed binary path.
@@ -717,7 +732,8 @@ class BinRadarExecutor:
                 binradar.config[ranges_key] = env[ranges_key]
             if calls_key in env:
                 binradar.config[calls_key] = env[calls_key]
-        for key in ("BINRADAR_PATCH_KIND", "BRCACHE_STACK_SIZE"):
+        for key in ("BINRADAR_PATCH_KIND", "BRCACHE_STACK_SIZE",
+                    "BINRADAR_AFL_EXEC_TIMEOUT"):
             if key in env:
                 binradar.config[key] = env[key]
         return binradar
@@ -741,6 +757,55 @@ class BinRadarExecutor:
 
     def elapsed_time_ms(self) -> int:
         return int((time.time() - self.start_time) * 1000)
+
+    def _record_tolerated_phase_failure(
+            self, phase: str, exc: BaseException) -> None:
+        """Record an optional evidence phase that failed under --less-strict.
+
+        Required phases (probe, filter, minimizer, verifier, and final) never
+        call this helper. Keeping the failure separate from a successful
+        ``[phase] [done]`` marker prevents a degraded run from masquerading as
+        a complete run in progress logs.
+        """
+        if phase not in OPTIONAL_EVIDENCE_PHASES:
+            raise ValueError(
+                f"Required phase {phase!r} cannot be tolerated")
+        if not hasattr(self, "phase_failure_lock"):
+            # Some unit tests construct executors with __new__. Production
+            # executors initialize these fields in __init__.
+            self.phase_failure_lock = threading.Lock()
+            self.phase_failures = {}
+        detail = f"{type(exc).__name__}: {exc}"
+        with self.phase_failure_lock:
+            self.phase_failures[phase] = detail
+            if phase == "binradar":
+                self.binradar_failed = True
+        logger.warning(
+            f"[LESS-STRICT] [{phase}] failed ({detail}); continuing with "
+            f"the evidence produced by the remaining phases.")
+        self.save_progress(
+            f"[{phase}] [failed] [prefix {self.run_prefix}] "
+            f"[id {self.run_id}] [less-strict true]")
+
+    def _run_optional_phase(self, phase: str, target) -> bool:
+        """Run an evidence-producing phase, optionally tolerating failure."""
+        if phase not in OPTIONAL_EVIDENCE_PHASES:
+            raise ValueError(f"Phase {phase!r} is not optional")
+        try:
+            target()
+            return True
+        except Exception as exc:
+            if not getattr(self, "less_strict", False):
+                raise
+            self._record_tolerated_phase_failure(phase, exc)
+            return False
+
+    def failed_phase_names(self) -> List[str]:
+        lock = getattr(self, "phase_failure_lock", None)
+        if lock is None:
+            return []
+        with lock:
+            return sorted(self.phase_failures)
 
     def minimizer_verifier_timeout(self) -> Optional[float]:
         """Wall-clock budget for each minimizer/verifier phase.
@@ -1441,8 +1506,16 @@ class BinRadarExecutor:
             if accepted:
                 accept_evidences[patch] = accept_evidences.get(patch, 0) + 1
 
+        binradar_failed = getattr(self, "binradar_failed", False)
+        skip_binradar_analysis = self.disable_binradar or binradar_failed
         if self.disable_binradar:
             logger.info("[FINAL] BinRadar phase disabled; skipping trace analysis.")
+            trace_file = io.StringIO()
+        elif binradar_failed:
+            logger.warning(
+                "[FINAL] BinRadar phase failed under --less-strict; ignoring "
+                "its potentially incomplete trace and using concrete "
+                "verifier evidence only.")
             trace_file = io.StringIO()
         else:
             if not os.path.exists(trace_msg_log_file):
@@ -1481,9 +1554,9 @@ class BinRadarExecutor:
                 elif result.schema_name == "binradar$commit":
                     current["br"] = result["br"]
             
-            poc_fault_loc = (0 if self.disable_binradar
+            poc_fault_loc = (0 if skip_binradar_analysis
                              else self.probe_result.tracer_fault_addr)
-            if not self.disable_binradar and poc_fault_loc == 0:
+            if not skip_binradar_analysis and poc_fault_loc == 0:
                 logger.warning("[FINAL] tracer_fault_addr is 0; binradar crash comparison will not match any fault address.")
 
             for iter in iter_map:
@@ -1521,18 +1594,34 @@ class BinRadarExecutor:
                         record_evidence(patch, same_behavior)
                         if not same_behavior:
                             logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}); reducing confidence without rejecting the patch.")
-        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]")
+        failed_phases = self.failed_phase_names()
+        degraded_suffix = (
+            f" [degraded true] [failed-phases {','.join(failed_phases)}]"
+            if failed_phases else " [degraded false] [failed-phases none]")
+        if failed_phases:
+            self.save_progress(
+                f"[final] [degraded] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}] "
+                f"[failed-phases {','.join(failed_phases)}]")
+        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]{degraded_suffix}")
 
         # Write a self-contained final.sbsv with per-patch verdicts from the
         # concrete verifier and, when enabled, the binradar analysis.
         final_result_file = os.path.join(self.run_dir, "final.sbsv")
-        trace_metadata = (f"[trace {os.path.basename(trace_msg_log_file)}]"
-                          if not self.disable_binradar
-                          else "[binradar disabled]")
+        if self.disable_binradar:
+            trace_metadata = "[binradar disabled]"
+        elif binradar_failed:
+            trace_metadata = "[binradar failed]"
+        else:
+            trace_metadata = f"[trace {os.path.basename(trace_msg_log_file)}]"
         with open(final_result_file, "w", encoding="utf-8") as f:
             f.write(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}] "
                     f"[verifier {os.path.basename(verifier_result_file)}] "
                     f"{trace_metadata}\n")
+            if failed_phases:
+                f.write(f"[final] [degraded] [prefix {self.run_prefix}] "
+                        f"[id {self.run_id}] "
+                        f"[failed-phases {','.join(failed_phases)}]\n")
             for patch_id in sorted(self.filter_result):
                 verified = concrete_verifier_result.patch_verified.get(patch_id, True)
                 res = "verified" if verified else "rejected"
@@ -1554,7 +1643,7 @@ class BinRadarExecutor:
                         f"[score {confidence:.6f}] "
                         f"[accept-evidences {accepted}] "
                         f"[total-evidences {total}]\n")
-            if not self.disable_binradar:
+            if not skip_binradar_analysis:
                 for patch_id in sorted(remaining_patches):
                     if patch_id in binradar_remaining_patches:
                         f.write(f"[final] [binradar] [patch {patch_id}] [res verified] "
@@ -1565,12 +1654,36 @@ class BinRadarExecutor:
                                 f"[reason {reason}] [iter {reject_iter}]\n")
             f.write(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
                     f"[remaining_patches {sorted(remaining_patches)}] "
-                    f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]\n")
+                    f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]"
+                    f"{degraded_suffix}\n")
         logger.info(f"[FINAL] Saved final result: {final_result_file}")
 
     def done(self):
         self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")
     
+    def run_fuzzer_only(self, run_prefix: str = "run"):
+        """Run the AFL++ producer and concrete verification pipeline only.
+
+        PROBE and FILTER remain mandatory prerequisites. FUZZOLIC, DIRECTED,
+        and BINRADAR are skipped; FINAL therefore uses concrete-verifier
+        evidence only. The fuzzer completes before snapshot minimization and
+        verification begin.
+        """
+        self.disable_binradar = True
+        self.set_run_dir(run_prefix=run_prefix)
+        logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.run_probe()
+        survived_patches = self.run_filter()
+        if len(survived_patches) == 0:
+            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+            self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
+            self.done()
+            return
+        self._run_optional_phase("fuzzer", self.run_fuzzer)
+        self.run_minimizer_and_verifier()
+        self.run_final()
+        self.done()
+
     def run_sequential(self, run_prefix: str = "run"):
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
@@ -1581,12 +1694,12 @@ class BinRadarExecutor:
             self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
             self.done()
             return
-        self.run_fuzzolic()
-        self.run_directed()
-        self.run_fuzzer()
+        self._run_optional_phase("fuzzolic", self.run_fuzzolic)
+        self._run_optional_phase("directed", self.run_directed)
+        self._run_optional_phase("fuzzer", self.run_fuzzer)
         self.run_minimizer_and_verifier()
         if not self.disable_binradar:
-            self.run_binradar()
+            self._run_optional_phase("binradar", self.run_binradar)
         else:
             logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
         self.run_final()
@@ -1610,11 +1723,11 @@ class BinRadarExecutor:
         if phase == BinRadarPhase.FILTER:
             return
         if phase == BinRadarPhase.FUZZOLIC:
-            self.run_fuzzolic()
+            self._run_optional_phase("fuzzolic", self.run_fuzzolic)
         elif phase == BinRadarPhase.DIRECTED:
-            self.run_directed()
+            self._run_optional_phase("directed", self.run_directed)
         elif phase == BinRadarPhase.FUZZER:
-            self.run_fuzzer()
+            self._run_optional_phase("fuzzer", self.run_fuzzer)
         elif phase == BinRadarPhase.MINIMIZER:
             self.run_minimizer()
         elif phase == BinRadarPhase.VERIFIER:
@@ -1622,7 +1735,7 @@ class BinRadarExecutor:
         elif phase == BinRadarPhase.MINIMIZER_VERIFIER:
             self.run_minimizer_and_verifier()
         elif phase == BinRadarPhase.BINRADAR:
-            self.run_binradar()
+            self._run_optional_phase("binradar", self.run_binradar)
         elif phase == BinRadarPhase.FINAL:
             self.run_final()
         else:
@@ -1649,21 +1762,36 @@ class BinRadarExecutor:
         producer_exc_queue: "queue.Queue[BaseException]" = queue.Queue()
         binradar_thread: Optional[threading.Thread] = None
         
+        def tolerate_thread_failure(name: str, exc: BaseException) -> bool:
+            # Do not swallow process-control exceptions such as SystemExit or
+            # KeyboardInterrupt. Ordinary optional-phase failures are the only
+            # failures relaxed by --less-strict.
+            if (name not in OPTIONAL_EVIDENCE_PHASES
+                    or not getattr(self, "less_strict", False)
+                    or not isinstance(exc, Exception)):
+                return False
+            self._record_tolerated_phase_failure(name, exc)
+            return True
+
         def run_captured(name: str, target):
             try:
                 target()
             except BaseException as exc:
+                if tolerate_thread_failure(name, exc):
+                    return
                 thread_errors.put((name, exc, exc.__traceback__))
                 logger.error(f"[{name}] failed: {exc}")
 
-        # The concrete testcase producers additionally re-raise into
-        # producer_exc_queue so the minimizer, which now runs concurrently
-        # with them, can abort as soon as any producer fails instead of
-        # silently verifying a truncated testcase set.
+        # In strict mode, concrete testcase producers additionally re-raise
+        # into producer_exc_queue so the concurrently running minimizer aborts
+        # instead of silently verifying a truncated testcase set. Less-strict
+        # failures are recorded above and deliberately do not enter the queue.
         def run_producer_captured(name: str, target):
             try:
                 target()
             except BaseException as exc:
+                if tolerate_thread_failure(name, exc):
+                    return
                 producer_exc_queue.put(exc)
                 thread_errors.put((name, exc, exc.__traceback__))
                 logger.error(f"[{name}] failed: {exc}")
@@ -1750,6 +1878,12 @@ def main():
         help="prioritize directed candidates from the end of the forward trace (Z3 only)")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
+    parser.add_argument("--less-strict", action="store_true",
+        help=("continue when optional evidence phases (fuzzolic, directed, "
+              "fuzzer, or binradar) fail; final output is marked degraded"))
+    parser.add_argument("--fuzzer-only", action="store_true",
+        help=("run probe/filter, AFL++ fuzzer, minimizer/verifier, and final; "
+              "skip fuzzolic, directed, and binradar"))
     parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
     # The following argument is for experiments and debugging
     parser.add_argument("--run-single-phase", default="", 
@@ -1758,6 +1892,9 @@ def main():
     parser.add_argument("--run-id", default="n", help="n=new run (default), l=last run, or a numeric run id (only valid when --run-single-phase is set)")
     parser.add_argument("--seq", action="store_true", help="run all phases sequentially (for debugging)")
     args = parser.parse_args()
+    if args.fuzzer_only and (args.run_single_phase or args.seq):
+        parser.error(
+            "--fuzzer-only cannot be combined with --run-single-phase or --seq")
 
     workdir = os.path.abspath(args.workdir)
     if not os.path.exists(workdir):
@@ -1772,7 +1909,8 @@ def main():
     env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
     env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
-    env["BINRADAR_DISABLE_BINRADAR"] = "1" if args.disable_binradar else "0"
+    env["BINRADAR_DISABLE_BINRADAR"] = "1" if (args.disable_binradar or args.fuzzer_only) else "0"
+    env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
     if args.target_patches == "all":
         # Run every predicate that survived the offline prefilter instead of
         # the top-30 subset.  Setup caps the compiled candidates at the
@@ -1799,6 +1937,8 @@ def main():
     executor = BinRadarExecutor.from_env(workdir, env)
     if args.run_single_phase:
         executor.run_single_phase(args.run_prefix, args.run_id, phase_from_name(args.run_single_phase))
+    elif args.fuzzer_only:
+        executor.run_fuzzer_only(args.run_prefix)
     elif args.seq:
         executor.run_sequential(args.run_prefix)
     else:

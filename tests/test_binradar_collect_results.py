@@ -81,6 +81,33 @@ def test_parse_timestamped_progress_with_sbsv(tmp_path):
     assert rows[2]["remaining_patches"] == "[1]"
 
 
+def test_collect_marks_less_strict_final_as_degraded(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[fuzzer] [start] [prefix run] [id 0]\n"
+        "[fuzzer] [failed] [prefix run] [id 0] [less-strict true]\n"
+        "[final] [degraded] [prefix run] [id 0] "
+        "[failed-phases fuzzer]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[degraded true] [failed-phases fuzzer]\n")
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.degraded is True
+    assert run.failed_phases == "fuzzer"
+    assert run.status == "DEGRADED: failed phases: fuzzer"
+    assert result.overall_status == "issues"
+
+
 def test_parse_final_sbsv(tmp_path):
     path = tmp_path / "final.sbsv"
     path.write_text(

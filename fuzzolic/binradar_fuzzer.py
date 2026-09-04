@@ -17,7 +17,7 @@ QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "bina
 AFL_PATH = os.path.join(ROOT_DIR, "utils", "AFLplusplus")
 
 class BinRadarFuzzer:
-    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str):
+    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -25,6 +25,10 @@ class BinRadarFuzzer:
         self.poc_input = poc_input
         self.patch_loc = patch_loc
         self.test_cmd = test_cmd
+        # AFL's '+' form uses this value as a dry-run ceiling and then
+        # auto-scales where possible. The previous fixed 3000 ms limit caused
+        # valid slow seeds to abort under high parallel benchmark load.
+        self.afl_exec_timeout = afl_exec_timeout
         self.process: Optional[subprocess.Popen] = None
     
     @classmethod
@@ -41,6 +45,7 @@ class BinRadarFuzzer:
             poc_input=env["POC_INPUT"],
             patch_loc=env["PATCH_LOC"],
             test_cmd=env["TEST_CMD"],
+            afl_exec_timeout=env.get("BINRADAR_AFL_EXEC_TIMEOUT", "10000+"),
         )
     
     def get_patched_binary_path(self) -> str:
@@ -87,7 +92,7 @@ class AFLppFuzzer(BinRadarFuzzer):
         cmd = [
             os.path.join(AFL_PATH, "afl-fuzz"),
             "-Q",
-            "-t", "3000",
+            "-t", self.afl_exec_timeout,
             "-i", input_path,
             "-o", self.outdir,
         ]
