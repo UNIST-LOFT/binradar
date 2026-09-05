@@ -642,6 +642,7 @@ class BinRadarExecutor:
     disable_binradar: bool
     less_strict: bool
     binradar_failed: bool
+    concrete_evidence_timed_out: bool
     phase_failures: Dict[str, str]
     phase_failure_lock: threading.Lock
     # Data
@@ -666,6 +667,7 @@ class BinRadarExecutor:
         self.disable_binradar = disable_binradar
         self.less_strict = less_strict
         self.binradar_failed = False
+        self.concrete_evidence_timed_out = False
         self.phase_failures = {}
         self.phase_failure_lock = threading.Lock()
         self.test_cmd = test_cmd
@@ -806,6 +808,24 @@ class BinRadarExecutor:
             return []
         with lock:
             return sorted(self.phase_failures)
+
+    def _record_concrete_evidence_timeout(self, phases: List[str]) -> None:
+        """Mark a planned concrete-evidence cutoff as degraded, not fatal."""
+        if not hasattr(self, "phase_failure_lock"):
+            # Some unit tests construct executors with __new__.
+            self.phase_failure_lock = threading.Lock()
+            self.phase_failures = {}
+        self.concrete_evidence_timed_out = True
+        with self.phase_failure_lock:
+            self.phase_failures["minimizer-verifier"] = (
+                "wall-clock evidence budget reached")
+        logger.warning(
+            "[MINIMIZER/VERIFIER] Wall-clock budget reached; finalizing "
+            "verdicts and confidence from the evidence collected so far.")
+        for phase in phases:
+            self.save_progress(
+                f"[{phase}] [timeout] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}]")
 
     def minimizer_verifier_timeout(self) -> Optional[float]:
         """Wall-clock budget for each minimizer/verifier phase.
@@ -1357,7 +1377,10 @@ class BinRadarExecutor:
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()
-        minimizer.run_testcases(timeout=self.minimizer_verifier_timeout())
+        timed_out = minimizer.run_testcases(
+            timeout=self.minimizer_verifier_timeout())
+        if timed_out:
+            self._record_concrete_evidence_timeout(["minimizer"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_verifier(self):
@@ -1377,14 +1400,16 @@ class BinRadarExecutor:
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
-        verifier.run_verification_streaming(
+        timed_out = verifier.run_verification_streaming(
             minimizer_result_file,
             timeout=self.minimizer_verifier_timeout())
+        if timed_out:
+            self._record_concrete_evidence_timeout(["verifier"])
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_minimizer_and_verifier(self,
                                    producer_threads: Optional[List[threading.Thread]] = None,
-                                   producer_exc_queue: Optional["queue.Queue[BaseException]"] = None):
+                                   producer_exc_queue: Optional["queue.Queue[BaseException]"] = None) -> bool:
         """Run the minimizer and the concrete verifier together.
 
         With ``producer_threads`` (the fuzzolic/directed/fuzzer threads), the
@@ -1417,13 +1442,17 @@ class BinRadarExecutor:
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
-        binradar_minimizer.run_minimizer_and_verifier(
+        timed_out = binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file,
             producer_threads=producer_threads,
             producer_exc_queue=producer_exc_queue,
             timeout=self.minimizer_verifier_timeout())
+        if timed_out:
+            self._record_concrete_evidence_timeout(
+                ["minimizer", "verifier"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+        return timed_out
 
     def run_binradar(self):
         if self.disable_binradar:
@@ -1489,6 +1518,12 @@ class BinRadarExecutor:
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
+        if (concrete_verifier_result.stop_reason == "timeout"
+                and not getattr(self, "concrete_evidence_timed_out", False)):
+            # Preserve the degraded marker when FINAL is resumed in a fresh
+            # process after graceful timeout finalization already produced a
+            # complete verifier result file.
+            self._record_concrete_evidence_timeout([])
         try:
             concrete_verifier_result.require_complete_verdicts(
                 self.filter_result)

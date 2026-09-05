@@ -7,7 +7,7 @@ import time
 import threading
 import fcntl
 from pathlib import Path
-from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
+from typing import List, Set, Tuple, Dict, Optional, Any, TextIO, Callable
 
 import sbsv
 
@@ -625,12 +625,16 @@ class BinRadarConcreteVerifierResult:
     patch_confidence: Dict[int, float]
     accept_evidences: Dict[int, int]
     total_evidences: Dict[int, int]
+    stop_reason: Optional[str]
     def __init__(self, results: dict):
         self.patch_verified = dict()
         self.patch_verdict_counts = dict()
         self.patch_confidence = dict()
         self.accept_evidences = dict()
         self.total_evidences = dict()
+        stopped_rows = results.get("verifier", {}).get("stopped", [])
+        self.stop_reason = (stopped_rows[-1]["reason"]
+                            if stopped_rows else None)
         for res in results["verifier-result"]:
             patch_id = res["patch"]
             verified = res["res"] == "verified"
@@ -683,12 +687,17 @@ class BinRadarConcreteVerifierResult:
         parser.add_schema(
             "[verifier-confidence] [patch: int] [score: float] "
             "[accept-evidences: int] [total-evidences: int]")
+        parser.add_schema("[verifier] [stopped] [reason: str]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
             result = parser.load(f)
         if "verifier-result" not in result:
             logger.error("Verifier result not found in the sbsv file.")
             return None
         return cls(result)
+
+
+class _VerifierTimeout(TimeoutError):
+    """The verifier's own wall-clock evidence budget was exhausted."""
 
 
 class BinRadarConcreteVerifier:
@@ -706,6 +715,7 @@ class BinRadarConcreteVerifier:
     cache_family: Optional[PredicateFamily]
     accept_evidences: Dict[int, int]
     total_evidences: Dict[int, int]
+    timeout_cutoff_logged: bool
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
@@ -717,6 +727,7 @@ class BinRadarConcreteVerifier:
         self.testcases = list()
         self.accept_evidences = {patch: 0 for patch in patches}
         self.total_evidences = {patch: 0 for patch in patches}
+        self.timeout_cutoff_logged = False
         self.start_time = time.time()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
@@ -783,7 +794,14 @@ class BinRadarConcreteVerifier:
     @staticmethod
     def _raise_if_timed_out(deadline: Optional[float]) -> None:
         if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError("Verifier phase timed out")
+            raise _VerifierTimeout("Verifier phase timed out")
+
+    def mark_timeout_cutoff(self) -> None:
+        """Serialize the partial-evidence marker exactly once."""
+        if self.timeout_cutoff_logged:
+            return
+        self.logger.info("[verifier] [stopped] [reason timeout]")
+        self.timeout_cutoff_logged = True
 
     def _log_result(self, patch: int, result: str, testcase: str) -> None:
         self.logger.info(
@@ -878,23 +896,34 @@ class BinRadarConcreteVerifier:
     def _test_testcase_batch(
         self, patches: List[int], testcase: Testcase,
         deadline: Optional[float] = None,
+        on_rejected: Optional[Callable[[int], None]] = None,
     ) -> Set[int]:
-        """Run one representative per distinct complete branch vector."""
+        """Run one representative per distinct complete branch vector.
+
+        ``on_rejected`` serializes conclusive failures immediately. This is
+        important at a graceful deadline: a later timeout in the same batch
+        must not discard a rejection that has already been observed.
+        """
+        rejected: Set[int] = set()
+
+        def record_rejection(patch: int) -> None:
+            rejected.add(patch)
+            if on_rejected is not None:
+                on_rejected(patch)
+
         if self.cache_family is None or len(patches) <= 1:
-            rejected: Set[int] = set()
             for patch in patches:
                 if self._test_testcase(patch, testcase, deadline):
-                    rejected.add(patch)
+                    record_rejection(patch)
             return rejected
 
-        rejected = set()
         remaining = list(patches)
         while remaining:
             self._raise_if_timed_out(deadline)
             if len(remaining) == 1:
                 patch = remaining.pop()
                 if self._test_testcase(patch, testcase, deadline):
-                    rejected.add(patch)
+                    record_rejection(patch)
                 continue
 
             representative = remaining.pop(0)
@@ -909,7 +938,7 @@ class BinRadarConcreteVerifier:
                     f"[verifier-cache] [fallback] [patch {representative}] "
                     f"[id {testcase.id}]")
                 if self._test_testcase(representative, testcase, deadline):
-                    rejected.add(representative)
+                    record_rejection(representative)
                 continue
 
             observed = cached.br_selection
@@ -920,7 +949,7 @@ class BinRadarConcreteVerifier:
                     f"[verifier-cache] [runtime-mismatch] "
                     f"[patch {representative}] [id {testcase.id}]")
                 if self._test_testcase(representative, testcase, deadline):
-                    rejected.add(representative)
+                    record_rejection(representative)
                 continue
 
             representative_result = BinRadarPatchResult(
@@ -928,7 +957,7 @@ class BinRadarConcreteVerifier:
             if self._test_result(
                     representative, testcase, result,
                     representative_result):
-                rejected.add(representative)
+                record_rejection(representative)
 
             equivalent: List[Tuple[int, List[int]]] = []
             for patch in remaining:
@@ -944,7 +973,7 @@ class BinRadarConcreteVerifier:
                 if self._test_result(
                         patch, testcase, result,
                         BinRadarPatchResult(patch, branches)):
-                    rejected.add(patch)
+                    record_rejection(patch)
         return rejected
 
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
@@ -966,13 +995,17 @@ class BinRadarConcreteVerifier:
                                    poll_interval: float = 0.2,
                                    minimizer_thread: Optional[threading.Thread] = None,
                                    minimizer_exc_queue: Optional[Any] = None,
-                                   timeout: Optional[float] = None) -> None:
-        """Stream [testcase] [result] rows from minimizer.sbsv and verify the
-        patches against each testcase as it appears. A standalone replay
-        requires the done marker; a live stream may stop consuming rows once
+                                   timeout: Optional[float] = None) -> bool:
+        """Stream minimizer evidence and serialize one verdict per patch.
+
+        A standalone replay requires either the complete ``done`` marker or a
+        timeout ``stopped`` marker. A live stream may stop consuming rows once
         every patch is rejected while the minimizer continues to completion.
         ``timeout`` is the total wall-clock budget for this verifier run;
-        non-positive values disable the deadline.
+        non-positive values disable the deadline. Reaching the deadline is a
+        graceful cutoff: already-observed hard failures remain rejected and
+        every other patch is verified with confidence computed from the
+        evidence consumed so far. The return value reports that cutoff.
         """
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
@@ -980,83 +1013,123 @@ class BinRadarConcreteVerifier:
         parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
         parser.add_schema("[minimizer] [done] [time: int]")
-        if not os.path.exists(minimizer_result_file):
-            if minimizer_thread is None:
-                raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
-            waited = 0.0
-            while not os.path.exists(minimizer_result_file):
-                self._raise_if_timed_out(deadline)
-                if minimizer_thread is not None and not minimizer_thread.is_alive():
-                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
-                        raise minimizer_exc_queue.get_nowait()
-                    raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
-                time.sleep(poll_interval)
-                waited += poll_interval
-                if waited >= 60:
-                    raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+        parser.add_schema(
+            "[minimizer] [stopped] [reason: str] [time: int]")
         pending_patches = list(self.patches)
         done_seen = False
+        stop_reason: Optional[str] = None
         dead_without_marker = False
-        with open(minimizer_result_file, "r", encoding="utf-8") as f:
-            offset = f.tell()
-            while True:
-                self._raise_if_timed_out(deadline)
+        timed_out = False
+
+        def record_rejection(patch: int, testcase: Testcase) -> None:
+            if patch not in pending_patches:
+                return
+            self._log_result(patch, "rejected", testcase.filename)
+            pending_patches.remove(patch)
+
+        try:
+            if not os.path.exists(minimizer_result_file):
+                if minimizer_thread is None:
+                    raise RuntimeError(
+                        f"Minimizer results not found: {minimizer_result_file}")
+                waited = 0.0
+                while not os.path.exists(minimizer_result_file):
+                    self._raise_if_timed_out(deadline)
+                    if not minimizer_thread.is_alive():
+                        if (minimizer_exc_queue is not None
+                                and not minimizer_exc_queue.empty()):
+                            raise minimizer_exc_queue.get_nowait()
+                        raise RuntimeError(
+                            "Minimizer ended without writing a terminal "
+                            "marker. Its results are incomplete.")
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+                    if waited >= 60:
+                        raise RuntimeError(
+                            f"Minimizer results not found: "
+                            f"{minimizer_result_file}")
+            with open(minimizer_result_file, "r", encoding="utf-8") as f:
+                offset = f.tell()
+                while True:
+                    self._raise_if_timed_out(deadline)
+                    f.seek(offset)
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    data = f.read()
+                    offset = f.tell()
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    for line in data.split("\n"):
+                        row = parser.parse_line_detached(line)
+                        if row is None:
+                            continue
+                        if row.schema_name == "testcase$result":
+                            testcase = self._testcase_from_result_row(row.data)
+                            if testcase is None:
+                                continue
+                            self.testcases.append(testcase)
+                            rejected = self._test_testcase_batch(
+                                list(pending_patches), testcase, deadline,
+                                on_rejected=lambda patch, testcase=testcase:
+                                    record_rejection(patch, testcase))
+                            # Keep compatibility with batch implementations
+                            # that return rejections without using the callback.
+                            for patch in rejected:
+                                record_rejection(patch, testcase)
+                            if (not pending_patches
+                                    and minimizer_thread is not None):
+                                return False
+                        elif row.schema_name == "minimizer$done":
+                            done_seen = True
+                        elif row.schema_name == "minimizer$stopped":
+                            stop_reason = row["reason"]
+                    if stop_reason is not None:
+                        if stop_reason != "timeout":
+                            raise RuntimeError(
+                                f"Minimizer stopped for unsupported reason: "
+                                f"{stop_reason}")
+                        timed_out = True
+                        break
+                    if minimizer_thread is None:
+                        if done_seen:
+                            break
+                        raise RuntimeError(
+                            "minimizer.sbsv does not contain a terminal "
+                            "minimizer marker ([minimizer] [done] or "
+                            "[minimizer] [stopped] missing). Run the "
+                            "minimizer phase first, or --run-single-phase "
+                            "minimizer-verifier to run the minimizer and the "
+                            "verifier concurrently.")
+                    if not minimizer_thread.is_alive():
+                        if done_seen:
+                            break
+                        if (minimizer_exc_queue is not None
+                                and not minimizer_exc_queue.empty()):
+                            raise minimizer_exc_queue.get_nowait()
+                        # The terminal marker may have been written between
+                        # the last read and thread exit. One more read round is
+                        # conclusive once the writer is dead.
+                        if dead_without_marker:
+                            raise RuntimeError(
+                                "Minimizer ended without writing a terminal "
+                                "marker. Its results are incomplete.")
+                        dead_without_marker = True
+                    time.sleep(poll_interval)
+                # The writer holds the lock across write+flush. A
+                # non-newline-terminated tail indicates a torn row from an
+                # external writer.
                 f.seek(offset)
                 fcntl.flock(f, fcntl.LOCK_EX)
-                data = f.read()
-                offset = f.tell()
+                tail = f.read()
                 fcntl.flock(f, fcntl.LOCK_UN)
-                for line in data.split("\n"):
-                    row = parser.parse_line_detached(line)
-                    if row is None:
-                        continue
-                    if row.schema_name == "testcase$result":
-                        testcase = self._testcase_from_result_row(row.data)
-                        if testcase is None:
-                            continue
-                        self.testcases.append(testcase)
-                        rejected = self._test_testcase_batch(
-                            list(pending_patches), testcase, deadline)
-                        for patch in list(pending_patches):
-                            if patch not in rejected:
-                                continue
-                            self._log_result(
-                                patch, "rejected", testcase.filename)
-                            pending_patches.remove(patch)
-                        if not pending_patches and minimizer_thread is not None:
-                            return
-                    elif row.schema_name == "minimizer$done":
-                        done_seen = True
-                if minimizer_thread is None:
-                    if done_seen:
-                        break
+                if tail and not tail.endswith("\n"):
                     raise RuntimeError(
-                        "minimizer.sbsv does not contain a completed "
-                        "minimizer run ([minimizer] [done] missing). Run the "
-                        "minimizer phase first, or --run-single-phase "
-                        "minimizer-verifier to run the minimizer and the "
-                        "verifier concurrently.")
-                if not minimizer_thread.is_alive():
-                    if done_seen:
-                        break
-                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
-                        raise minimizer_exc_queue.get_nowait()
-                    # The marker may have been written between our last read
-                    # and the thread's exit; the file is final once the thread
-                    # is dead, so one more read round is conclusive before
-                    # declaring the run incomplete.
-                    if dead_without_marker:
-                        raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
-                    dead_without_marker = True
-                time.sleep(poll_interval)
-            # Final drain guard: the writer holds the lock across write+flush, so
-            # a non-newline-terminated tail means a torn row from a non-locking writer.
-            f.seek(offset)
-            fcntl.flock(f, fcntl.LOCK_EX)
-            tail = f.read()
-            fcntl.flock(f, fcntl.LOCK_UN)
-            if tail and not tail.endswith("\n"):
-                raise RuntimeError("minimizer.sbsv contains an unterminated line")
-        self._raise_if_timed_out(deadline)
+                        "minimizer.sbsv contains an unterminated line")
+            if not timed_out:
+                self._raise_if_timed_out(deadline)
+        except _VerifierTimeout:
+            timed_out = True
+
+        if timed_out:
+            self.mark_timeout_cutoff()
         for patch in pending_patches:
             self._log_result(patch, "verified", "")
+        return timed_out

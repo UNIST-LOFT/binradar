@@ -3,7 +3,8 @@
 
 The minimizer discovers atomically published testcase files while producer
 phases run, executes immutable byte snapshots, propagates producer failures,
-cancels on verifier errors, and keeps standalone snapshot behavior.
+gracefully finalizes evidence at its deadline, cancels on verifier errors,
+and keeps standalone snapshot behavior.
 """
 
 import importlib.util
@@ -189,7 +190,7 @@ def test_standalone_processes_all_without_age_guard(tmp_path, stub_runner_env):
     assert "[minimizer] [done]" in (tmp_path / "run" / "minimizer.sbsv").read_text()
 
 
-def test_standalone_minimizer_enforces_phase_timeout(tmp_path, monkeypatch):
+def test_standalone_minimizer_timeout_is_graceful_cutoff(tmp_path, monkeypatch):
     testcases = tmp_path / "tests"
     testcases.mkdir()
     (testcases / "a.dat").write_bytes(b"aaa")
@@ -205,14 +206,14 @@ def test_standalone_minimizer_enforces_phase_timeout(tmp_path, monkeypatch):
         binradar_verifier.BinRadarQemuRunner, "from_env",
         staticmethod(lambda dir, env: SlowRunner()))
 
-    with pytest.raises(TimeoutError, match="Minimizer phase timed out"):
-        minimizer.run_testcases(timeout=0.01)
+    assert minimizer.run_testcases(timeout=0.01) is True
 
-    assert "[minimizer] [done]" not in \
-        (tmp_path / "run" / "minimizer.sbsv").read_text()
+    minimizer_log = (tmp_path / "run" / "minimizer.sbsv").read_text()
+    assert "[minimizer] [stopped] [reason timeout]" in minimizer_log
+    assert "[minimizer] [done]" not in minimizer_log
 
 
-def test_standalone_verifier_enforces_phase_timeout(tmp_path):
+def test_standalone_verifier_timeout_finalizes_partial_evidence(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     minimized = run_dir / "minimized"
@@ -231,11 +232,72 @@ def test_standalone_verifier_enforces_phase_timeout(tmp_path):
         return _probe(), _patch_result()
 
     verifier.runner.test_with_patched = slow_test
-    with pytest.raises(TimeoutError, match="Verifier phase timed out"):
-        verifier.run_verification_streaming(
-            str(minimizer_log), timeout=0.01)
+    assert verifier.run_verification_streaming(
+        str(minimizer_log), timeout=0.01) is True
 
-    assert "[verifier-result]" not in (run_dir / "verifier.sbsv").read_text()
+    verifier_log = (run_dir / "verifier.sbsv").read_text()
+    assert "[verifier] [stopped] [reason timeout]" in verifier_log
+    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
+    assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
+    parsed = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(
+        str(run_dir / "verifier.sbsv"))
+    assert parsed is not None
+    assert parsed.stop_reason == "timeout"
+
+
+def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "minimized").mkdir()
+    minimizer_log = run_dir / "minimizer.sbsv"
+    minimizer_log.write_text(
+        "[minimizer] [stopped] [reason timeout] [time 10]\n")
+
+    verifier = _make_verifier(tmp_path)
+    assert verifier.run_verification_streaming(str(minimizer_log)) is True
+
+    verifier_log = (run_dir / "verifier.sbsv").read_text()
+    assert "[verifier] [stopped] [reason timeout]" in verifier_log
+    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
+    assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
+
+
+def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    minimized = run_dir / "minimized"
+    minimized.mkdir()
+    (minimized / "0_case.dat").write_bytes(b"aaa")
+    minimizer_log = run_dir / "minimizer.sbsv"
+    minimizer_log.write_text(
+        "[testcase] [result] [id 0] [file 0_case.dat] [exit ok] "
+        "[fault-addr 1234] [pid 0] [br [0]]\n"
+        "[minimizer] [done] [time 0]\n")
+
+    runner = binradar_verifier.BinRadarQemuRunner(
+        dir=str(tmp_path), binary="nm", test_cmd="-l @@",
+        patch_loc="0x1000")
+
+    def timed_test(patch_id, testcase, verbose=False):
+        if int(patch_id) == 1:
+            return (_probe(exit_info="crash", fault_addr=0x1234),
+                    binradar_verifier.BinRadarPatchResult(1, [0]))
+        time.sleep(0.05)
+        return _probe(), binradar_verifier.BinRadarPatchResult(2, [0])
+
+    runner.test_with_patched = timed_test
+    verifier = binradar_verifier.BinRadarConcreteVerifier(
+        str(tmp_path), str(run_dir), runner, _probe(),
+        "nm.brpatched", [1, 2])
+
+    assert verifier.run_verification_streaming(
+        str(minimizer_log), timeout=0.01) is True
+
+    verifier_log = (run_dir / "verifier.sbsv").read_text()
+    assert "[verifier-result] [res rejected] [patch 1]" in verifier_log
+    assert "[accept-evidences 0] [total-evidences 1]" in verifier_log
+    assert "[verifier-result] [res verified] [patch 2]" in verifier_log
+    assert "[verifier-result] [res verified] [patch 1]" not in verifier_log
 
 
 def test_dedup_across_dirs(tmp_path, stub_runner_env):
@@ -436,6 +498,26 @@ def test_queued_producer_failure_aborts(tmp_path, stub_runner_env):
             poll_interval=0.05, producer_threads=[],
             producer_exc_queue=exc_queue)
     assert "[minimizer] [done]" not in (run_dir / "minimizer.sbsv").read_text()
+
+
+def test_producer_timeout_exception_remains_fatal(tmp_path, stub_runner_env):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    testcases = tmp_path / "tests"
+    testcases.mkdir()
+    minimizer = _make_minimizer(tmp_path, [str(testcases)], min_file_age=0.0)
+    verifier = _make_verifier(tmp_path)
+    exc_queue = queue.Queue()
+    exc_queue.put(TimeoutError("producer timed out"))
+
+    with pytest.raises(TimeoutError, match="producer timed out"):
+        binradar_minimizer.run_minimizer_and_verifier(
+            minimizer, verifier, str(run_dir / "minimizer.sbsv"),
+            poll_interval=0.01, producer_threads=[],
+            producer_exc_queue=exc_queue, timeout=1.0)
+
+    verifier_log = (run_dir / "verifier.sbsv").read_text()
+    assert "[verifier-result]" not in verifier_log
 
 
 def test_producer_thread_failure_propagates(tmp_path, stub_runner_env):

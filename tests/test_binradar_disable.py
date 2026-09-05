@@ -63,6 +63,32 @@ def test_disabled_binradar_final_uses_concrete_result_without_trace(tmp_path):
     assert any(row.startswith("[final] [done]") for row in progress)
 
 
+def test_final_marks_graceful_verifier_timeout_as_degraded(tmp_path):
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier] [stopped] [reason timeout]\n"
+        "[verifier-result] [res rejected] [patch 1] [testcase crash]\n"
+        "[verifier-confidence] [patch 1] [score 0.0] "
+        "[accept-evidences 0] [total-evidences 1]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+        "[verifier-confidence] [patch 2] [score 0.5] "
+        "[accept-evidences 1] [total-evidences 2]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    progress = []
+    executor.save_progress = progress.append
+
+    executor.run_final()
+
+    final_text = (tmp_path / "final.sbsv").read_text()
+    assert "[final] [verifier] [patch 1] [res rejected]" in final_text
+    assert "[final] [verifier] [patch 2] [res verified]" in final_text
+    assert "[final] [confidence] [patch 2] [score 0.500000]" in final_text
+    assert "[final] [degraded]" in final_text
+    assert "[failed-phases minimizer-verifier]" in final_text
+    assert any("[degraded true]" in row for row in progress
+               if row.startswith("[final] [done]"))
+
+
 def test_final_rejects_incomplete_verifier_patch_coverage(tmp_path):
     """A missing verdict must not silently default to patch acceptance."""
     (tmp_path / "verifier.sbsv").write_text(

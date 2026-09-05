@@ -73,6 +73,10 @@ class _MinimizerCancelled(Exception):
     """Internal cooperative-cancellation signal for verifier failures."""
 
 
+class _MinimizerTimeout(TimeoutError):
+    """The minimizer's own wall-clock evidence budget was exhausted."""
+
+
 class BinRadarMinimizer:
     work_dir: str
     run_dir: str
@@ -187,9 +191,8 @@ class BinRadarMinimizer:
                       poll_interval: float = 0.2,
                       scan_interval: float = 1.0,
                       cancel_event: Optional[threading.Event] = None,
-                      timeout: Optional[float] = None) -> None:
-        """Run the discovered testcases and log one [testcase] row per kept
-        testcase, then the done marker.
+                      timeout: Optional[float] = None) -> bool:
+        """Run the discovered testcases and log one row per kept testcase.
 
         With ``producer_threads`` (streaming mode), testcases are discovered
         while the producers still run: each round rescans the testcase dirs,
@@ -200,33 +203,41 @@ class BinRadarMinimizer:
         of silently verifying a truncated testcase set. Without producers,
         all queued testcases are processed once (previous behavior).
         ``timeout`` is the total wall-clock budget for this minimizer run;
-        non-positive values disable the deadline.
+        non-positive values disable the deadline. Reaching the deadline is a
+        graceful evidence cutoff: a ``[minimizer] [stopped]`` marker replaces
+        the complete-run ``[minimizer] [done]`` marker and ``True`` is
+        returned.
         """
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.work_dir, self.config)
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         id = 0
         last_scan = 0.0
-        with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
-            current_testcase = os.path.join(tmpdir, ".cur_input")
-            while True:
-                self._raise_if_cancelled(cancel_event)
-                self._raise_if_timed_out(deadline)
-                self._raise_producer_failure(producer_exc_queue)
-                producers_alive = (producer_threads is not None
-                                   and any(t.is_alive() for t in producer_threads))
-                now = time.time()
-                if (now - last_scan) >= scan_interval or not producers_alive:
-                    self.scan_testcases(producers_alive=producers_alive)
-                    last_scan = now
-                id = self._process_pending(
-                    runner, id, current_testcase, producer_exc_queue,
-                    cancel_event, deadline)
-                if not producers_alive:
+        try:
+            with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
+                current_testcase = os.path.join(tmpdir, ".cur_input")
+                while True:
+                    self._raise_if_cancelled(cancel_event)
+                    self._raise_if_timed_out(deadline)
                     self._raise_producer_failure(producer_exc_queue)
-                    break
-                time.sleep(poll_interval)
+                    producers_alive = (producer_threads is not None
+                                       and any(t.is_alive() for t in producer_threads))
+                    now = time.time()
+                    if (now - last_scan) >= scan_interval or not producers_alive:
+                        self.scan_testcases(producers_alive=producers_alive)
+                        last_scan = now
+                    id = self._process_pending(
+                        runner, id, current_testcase, producer_exc_queue,
+                        cancel_event, deadline)
+                    if not producers_alive:
+                        self._raise_producer_failure(producer_exc_queue)
+                        break
+                    time.sleep(poll_interval)
+        except _MinimizerTimeout:
+            self.log("[minimizer] [stopped] [reason timeout]")
+            return True
         self.log("[minimizer] [done]")
+        return False
 
     @staticmethod
     def _raise_if_cancelled(
@@ -237,7 +248,7 @@ class BinRadarMinimizer:
     @staticmethod
     def _raise_if_timed_out(deadline: Optional[float]) -> None:
         if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError("Minimizer phase timed out")
+            raise _MinimizerTimeout("Minimizer phase timed out")
 
     @staticmethod
     def _raise_producer_failure(
@@ -293,7 +304,7 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
                                poll_interval: float = 0.2,
                                producer_threads: Optional[List[threading.Thread]] = None,
                                producer_exc_queue: Optional["queue.Queue[BaseException]"] = None,
-                               timeout: Optional[float] = None) -> None:
+                               timeout: Optional[float] = None) -> bool:
     """Run the minimizer and the concrete verifier concurrently: the verifier
     streams [testcase] [result] rows from minimizer.sbsv while the minimizer
     appends them, and finishes when the minimizer ends (or earlier, when every
@@ -305,44 +316,52 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
     producer failure raised through ``producer_exc_queue`` aborts the
     minimizer and therefore the verifier. ``timeout`` is one shared
     wall-clock budget for the concurrent pair; non-positive values disable
-    the deadline.
+    the deadline. Reaching it is a graceful evidence cutoff and returns
+    ``True`` after both workers have stopped; other failures still propagate.
     """
     exc_queue: "queue.Queue[BaseException]" = queue.Queue()
+    minimizer_status: "queue.Queue[bool]" = queue.Queue()
     cancel_event = threading.Event()
     deadline = (time.monotonic() + timeout
                 if timeout is not None and timeout > 0 else None)
 
     def _run_minimizer():
         try:
-            minimizer.run_testcases(
+            minimizer_status.put(minimizer.run_testcases(
                 producer_threads=producer_threads,
                 producer_exc_queue=producer_exc_queue,
                 poll_interval=poll_interval,
                 cancel_event=cancel_event,
-                timeout=timeout)
+                timeout=timeout))
         except _MinimizerCancelled:
-            # The verifier failed. Leave the stream incomplete and let the
-            # verifier's original exception remain authoritative.
+            # The verifier failed or reached the shared cutoff. The caller
+            # records a timeout marker after the worker has fully stopped.
             return
         except BaseException as exc:
             exc_queue.put(exc)
 
     thread = threading.Thread(target=_run_minimizer, name="minimizer", daemon=True)
     thread.start()
+    timed_out = False
     try:
-        verifier.run_verification_streaming(
+        timed_out = verifier.run_verification_streaming(
             minimizer_result_file,
             poll_interval=poll_interval,
             minimizer_thread=thread,
             minimizer_exc_queue=exc_queue,
             timeout=timeout,
         )
-        if deadline is None:
+        if timed_out:
+            cancel_event.set()
+            thread.join()
+        elif deadline is None:
             thread.join()
         else:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
-                raise TimeoutError("Minimizer/verifier phases timed out")
+                timed_out = True
+                cancel_event.set()
+                thread.join()
     except BaseException:
         # Cooperatively stop discovery/processing. A currently running QEMU
         # check has a bounded timeout; join fully so no minimizer can keep
@@ -352,3 +371,15 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
         raise
     if not exc_queue.empty():
         raise exc_queue.get()
+    if not minimizer_status.empty():
+        timed_out = minimizer_status.get_nowait() or timed_out
+    elif timed_out:
+        # The verifier or join deadline cancelled the minimizer before its own
+        # deadline handler could serialize the terminal cutoff marker.
+        minimizer.log("[minimizer] [stopped] [reason timeout]")
+    if timed_out and hasattr(verifier, "mark_timeout_cutoff"):
+        # The verifier can finish early after rejecting every patch while the
+        # minimizer continues. If the shared pair then reaches its deadline,
+        # retain the cutoff metadata in verifier.sbsv for resumed FINAL runs.
+        verifier.mark_timeout_cutoff()
+    return timed_out
