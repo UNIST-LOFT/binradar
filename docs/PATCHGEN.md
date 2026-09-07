@@ -1,5 +1,7 @@
 # Patch Generation with TAOSC
 This document describes how to use TAOSC to generate patches for the vulnerable program, and how to check the generated patches.
+Source code of taosc: `https://github.com/UNIST-LOFT/taosc`
+
 
 ## Patch generation
 ```sh
@@ -13,13 +15,15 @@ cp ./utils/channels.scm ~/.config/guix/channels.scm
 guix pull
 # Install taosc
 guix build taosc
-# Build buggy binary
-guix build binutils@2.29
+
 cd benchmarks/loftix/binutils/CVE-2017-14940
 # Use just (https://github.com/casey/just)
+# Build buggy binary
+just build
+# guix build binutils@2.29
 just taosc
 # Or run directly
-guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
+guix shell taosc -- taosc-fix 10 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
 ```
 
 ## Patch families
