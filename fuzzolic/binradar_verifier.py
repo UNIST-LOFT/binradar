@@ -70,10 +70,14 @@ class BinRadarProbeResult:
         parser.add_schema("[patch-info] [set: bool] [location: hex]")
         parser.add_schema("[exit] [result: str]")
         parser.add_schema("[qemu-exit] [kind: str] [detail: str]")
-        parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol: str]")
+        # symbol is nullable: the stacktrace probe emits an empty [symbol ]
+        # token for unsymbolizable addresses (e.g. E9 trampoline PCs), which
+        # sbsv rejects for a non-nullable str key (crashed CVE-2014-8128 run
+        # br-fo-all-timeout during MINIMIZER).
+        parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol?: str]")
         parser.add_schema("[patch-cov] [location: hex] [covered: bool] [hits: int]")
         parser.add_schema("[patch-func] [location: hex] [entry: hex] [hits: int]")
-        parser.add_schema("[fault-addr] [idx: int] [addr: hex] [symbol: str]")
+        parser.add_schema("[fault-addr] [idx: int] [addr: hex] [symbol?: str]")
         return parser
     
     @staticmethod
@@ -112,7 +116,7 @@ class BinRadarProbeResult:
         
         stacktrace = []
         if len(result["stacktrace"]) > 0:
-            stacktrace = [(entry["addr"], entry["symbol"]) for entry in result["stacktrace"]]
+            stacktrace = [(entry["addr"], entry["symbol"] or "") for entry in result["stacktrace"]]
         patch_hit_cnt = 0
         if len(result["patch-cov"]) != 0:
             patch_cov_info = result["patch-cov"][-1]
@@ -265,7 +269,7 @@ class BinRadarProbeResult:
                     return cls(
                         patch_loc=res["patch-loc"],
                         patch_func_entry=res["func-entry"],
-                        stacktrace=[(entry["addr"], entry["symbol"]) for entry in res["stacktrace"]],
+                        stacktrace=[(entry["addr"], entry["symbol"] or "") for entry in res["stacktrace"]],
                         exit_info=res["exit"],
                         patch_hit_cnt=res["patch-hit"],
                         patch_func_hit_cnt=res["func-hit"],
@@ -519,7 +523,9 @@ class BinRadarQemuRunner:
         env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
-            logger.error("Failed to execute the command.")
+            logger.error(f"Failed to run test_with_original on testcase {testcase}: "
+                         f"exit status {result.decode_status()}; "
+                         f"command: {shlex.join(command)}")
             return None
         return BinRadarProbeResult.from_log(result.stderr)
     
@@ -528,7 +534,9 @@ class BinRadarQemuRunner:
         env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
-            logger.error("Failed to execute the command.")
+            logger.error(f"Failed to run test_with_file_trace on testcase {testcase}: "
+                         f"exit status {result.decode_status()}; "
+                         f"command: {shlex.join(command)}")
             return None
         probe_result = BinRadarProbeResult.from_log(result.stderr)
         if probe_result is None:
@@ -556,7 +564,11 @@ class BinRadarQemuRunner:
             proc, timeout=60.0, verbose=verbose)
         thread.join()
         if not result.success:
-            logger.error("Failed to execute the command")
+            reason = (f"timed out after 60s" if result.timed_out
+                      else f"exit status {result.decode_status()}")
+            logger.error(f"Failed to run probe on {binary} (patch_id={patch_id}, "
+                         f"testcase={testcase}): {reason}; "
+                         f"command: {shlex.join(command)}")
             return None, None
         probe = BinRadarProbeResult.from_log(result.stderr)
         if probe is not None:
