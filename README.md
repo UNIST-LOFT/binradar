@@ -9,6 +9,10 @@ docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t fuzzolic:2204 
 ## Prerequisites
 First, install guix and add the necessary channels. (Check [guix installation guide](https://guix.gnu.org/manual/en/html_node/Installation.html) for more details.)
 Necessary channels are provided in `utils/channels.scm`. You can copy it to `~/.config/guix/channels.scm` or specify it with `--channels-file` option when you run `guix pull`.
+```shell
+guix pull
+guix build taosc@0.1.17
+```
 
 Then, install [just](https://github.com/casey/just).
 
@@ -22,13 +26,13 @@ Now you can run `just taosc` in the target benchmark directory to generate patch
 cd benchmarks/loftix/binutils/CVE-2017-14940
 # Run `just --list` for available commands
 just build
-# guix build binutils@2.29
+# guix build binutils@2.29 # build buggy program
 just taosc
 # guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
 just setup
 # uv run /path/to/binradar/fuzzolic/binradar-setup.py setup -w workdir
-just binradar
-# ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir
+just binradar-fo
+# ABS_WORKDIR=$(cd "workdir" && pwd); docker run -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm fuzzolic:2204 uv run /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir --run-prefix br-fo --less-strict --target-patches all --fuzzer-only
 ```
 
 For batch execution, you can run these commands in `benchmarks/loftix` directory:
