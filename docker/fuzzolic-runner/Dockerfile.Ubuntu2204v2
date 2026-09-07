@@ -32,7 +32,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt install -y \
 	linux-libc-dev gcc-multilib \
 	apt-transport-https libtool libtool-bin autoconf \
     git gdb dumb-init valgrind ninja-build \
-	time xxd openssh-server && \
+	time xxd openssh-server bear && \
 	apt clean && \
 	rm -rf /var/lib/apt/lists/*
 
@@ -51,6 +51,7 @@ ENV HOME=/home/binradar
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/binradar/.local/bin:/home/binradar/.cargo/bin:$PATH"
+RUN cargo install just
 
 # Cache deps for fuzzolic
 WORKDIR /workspace/fuzzolic
@@ -62,28 +63,31 @@ RUN uv venv && uv sync
 COPY --chown=binradar:binradar . .
 
 # Build QEMU tracer
-RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && make -j 32 
+RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && bear -- make -j 32 
 
 # Build custom Z3
-RUN cd solver && mkdir build && cd build && cmake .. && make -j 32
+RUN cd solver && mkdir build && cd build && cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .. && make -j 32
 
 # Build LibAFL
-ENV LC_ALL=C
 
 # qemu_stacktrace: build.rs auto-builds libafl_qemu_asan_guest.so into its target dir
-RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/Cargo.toml
+# RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/Cargo.toml
 # qemu_targeted_simple: reuse the same DSO
-RUN mkdir -p /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release && \
-    cp /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/target/release/libafl_qemu_asan_guest.so /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release/
-RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/Cargo.toml
+# RUN mkdir -p /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release && \
+#     cp /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_stacktrace/target/release/libafl_qemu_asan_guest.so /workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/target/release/
+# RUN cargo build --release --manifest-path=/workspace/fuzzolic/LibAFL/fuzzers/binary_only/qemu_targeted_simple/Cargo.toml
 
 # Build AFL++
-RUN cd utils && rm -rf AFLplusplus && git clone https://github.com/AFLplusplus/AFLplusplus.git && \
-	cd AFLplusplus && git checkout 2dac4e7 && \
-	git apply ../afl-showmap.c.patch && \
-	make -j `nproc` all 
-RUN cd utils/AFLplusplus/qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
+# AFLplusplus: just old version for now, apply afl-showmap.c.patch
+# RUN cd utils && rm -rf AFLplusplus && git clone -b targeted https://github.com/hsh814/AFLplusplus.git AFLplusplus
+RUN cd utils/AFLplusplus && git switch targeted && make -j `nproc` all && \ 
+    cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
     pip install "meson==0.56.2" && ./build_qemu_support.sh
+# RUN cd utils && rm -rf binradar-aflplusplus && git clone -b binradar https://github.com/hsh814/AFLplusplus.git binradar-aflplusplus
+# cp ../../binradar-trace.c qemuafl/linux-user/binradar-trace.c && cp ../../binradar-trace.h qemuafl/qemuafl/binradar-trace.h && git apply ../../qemuafl.patch
+RUN cd utils/binradar-aflplusplus && git switch binradar && make -j `nproc` all && \
+    cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
+	pip install "meson==0.56.2" && ./build_qemu_support.sh
 ENV AFL_PATH=/workspace/fuzzolic/utils/AFLplusplus
 
 # Build fuzzolic tests
