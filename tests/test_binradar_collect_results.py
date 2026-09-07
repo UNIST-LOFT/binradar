@@ -148,6 +148,48 @@ def test_top_patches_by_confidence_ranking_and_ties():
     assert total == 5
 
 
+def _make_run(tmp_path, name, progress_lines):
+    """Create an experiment dir with one workdir/out/progress.sbsv."""
+    exp_dir = tmp_path / name
+    (exp_dir / "workdir" / "out").mkdir(parents=True)
+    (exp_dir / "workdir" / "out" / "progress.sbsv").write_text(progress_lines)
+    return str(exp_dir)
+
+
+def test_collect_at_least_one_remaining_patches(tmp_path):
+    """at_least_one_remaining_patches is True only for a FINAL run with a
+    non-empty remaining_patches list; csv/tsv places it next to has_final."""
+    final_one = _make_run(
+        tmp_path, "exp-one",
+        # FINAL with one remaining patch -> True
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]]\n")
+    final_none = _make_run(
+        tmp_path, "exp-none",
+        # FINAL with no remaining patches -> False
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches []] [binradar_remaining_patches []]\n")
+    no_final = _make_run(
+        tmp_path, "exp-no-final",
+        # never reached FINAL -> False
+        "[filter] [done] [prefix run] [id 0] [survived [1, 2]]\n")
+
+    results = [
+        collector.collect_experiment_result(d, "workdir", "run")
+        for d in (final_one, final_none, no_final)
+    ]
+
+    assert [r.runs[0].at_least_one_remaining_patches for r in results] == \
+        [True, False, False]
+
+    rows = collector.format_results_csv(results)
+    assert [row["at_least_one_remaining_patches"] for row in rows] == \
+        ["True", "False", "False"]
+    columns = collector.CSV_COLUMNS
+    assert columns.index("at_least_one_remaining_patches") == \
+        columns.index("has_final") + 1
+
+
 def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"
@@ -194,7 +236,7 @@ def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     run_res = result.runs[0]
     assert run_res.top_patches == [2, 3, 4]
     assert run_res.top_patches_total == 5
-    assert run_res.verifier_accepted == "2,3,4"
+    assert run_res.verifier_rejected == ""
     log = collector.format_result_log(result)
     assert "top 3 of 5 by confidence" in log
     assert "patch 2:" in log
@@ -204,8 +246,10 @@ def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     assert "patch 5:" not in log
     assert "(+2 more)" in log
     csv_row = collector.format_results_csv([result])[0]
-    assert csv_row["verifier_accepted_patches"] == "2,3,4"
+    assert "verifier_accepted_patches" not in csv_row
+    assert "binradar_verified_patches" not in csv_row
     assert csv_row["verifier_rejected_patches"] == ""
+    assert "binradar_rejected_patches" in csv_row
     assert "(+2 more)" in csv_row["remaining_patches"]
 
 

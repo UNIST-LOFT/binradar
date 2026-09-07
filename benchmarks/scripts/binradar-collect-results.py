@@ -178,12 +178,13 @@ class RunResult:
     run_name: str
     status: str  # "OK", "OK (rundir done, no final)", "INCOMPLETE: ...", etc.
     has_final: bool = False
+    # True when the run reached FINAL with a non-empty remaining_patches
+    # list (at least one remaining patch).
+    at_least_one_remaining_patches: bool = False
     remaining_patches: str = ""  # e.g. "[1, 2, 3]" or "[]"
     binradar_remaining_patches: str = ""
-    verifier_accepted: str = ""  # e.g. "1,3,5" or "" if none accepted
     verifier_rejected: str = ""  # e.g. "2,4,6"
     verifier_data: Dict[int, List[str]] = field(default_factory=dict)  # raw verifier results
-    binradar_verified: str = ""  # e.g. "1,3,5" or "" if none verified by binradar
     binradar_rejected: str = ""  # e.g. "2,4,6"
     binradar_reject_reasons: str = ""  # e.g. "2:different-br; 4:introduced-crash"
     binradar_data: Dict[int, Dict[str, str]] = field(default_factory=dict)  # patch -> {res, reason, iter}
@@ -559,39 +560,39 @@ def _truncate_patch_list(value: str, top_patches: List[int],
     return text
 
 
-def _verifier_summary_top(verifier_data: Dict[int, List[str]],
-                          top_patches: List[int]) -> Tuple[str, str]:
-    """Return (accepted_csv, rejected_csv) limited to the top patches."""
-    accepted: List[str] = []
+def _verifier_rejected_top(verifier_data: Dict[int, List[str]],
+                           top_patches: List[int]) -> str:
+    """Return the rejected patch ids as csv, limited to the top patches.
+
+    Verified patches are not summarized separately: the remaining_patches
+    column already carries the verified set (FINAL computes remaining as
+    the concrete-verifier-verified filter survivors).
+    """
     rejected: List[str] = []
     for pid in top_patches:
         res_list = verifier_data.get(pid)
-        if res_list is None:
-            continue
-        if "verified" in res_list:
-            accepted.append(str(pid))
-        if "rejected" in res_list:
+        if res_list is not None and "rejected" in res_list:
             rejected.append(str(pid))
-    return ",".join(accepted), ",".join(rejected)
+    return ",".join(rejected)
 
 
-def _binradar_summary_top(binradar_data: Dict[int, Dict[str, str]],
-                          top_patches: List[int]) -> Tuple[str, str, str]:
-    """Return (verified_csv, rejected_csv, reject_reasons) limited to the
-    top patches."""
-    verified: List[str] = []
+def _binradar_reject_summary_top(binradar_data: Dict[int, Dict[str, str]],
+                                 top_patches: List[int]) -> Tuple[str, str]:
+    """Return (rejected_csv, reject_reasons) limited to the top patches.
+
+    Verified patches are not summarized separately: the
+    binradar_remaining_patches column already carries the verified set.
+    """
     rejected: List[str] = []
     reasons: List[str] = []
     for pid in top_patches:
         d = binradar_data.get(pid)
         if d is None:
             continue
-        if d.get("res") == "verified":
-            verified.append(str(pid))
-        elif d.get("res") == "rejected":
+        if d.get("res") == "rejected":
             rejected.append(str(pid))
             reasons.append(f"{pid}:{d.get('reason', '')}")
-    return ",".join(verified), ",".join(rejected), "; ".join(reasons)
+    return ",".join(rejected), "; ".join(reasons)
 
 
 def safe_int(s: str) -> int:
@@ -780,6 +781,8 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             br_remaining = final_entry.get("binradar_remaining_patches", "N/A")
             run_res.remaining_patches = _fix_bracket_value(remaining)
             run_res.binradar_remaining_patches = _fix_bracket_value(br_remaining)
+            run_res.at_least_one_remaining_patches = bool(
+                _parse_patch_list(run_res.remaining_patches))
 
             verifier_path = os.path.join(run_dir, "verifier.sbsv")
             verifier_results = parse_verifier_sbsv(verifier_path)
@@ -820,14 +823,11 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
 
         # Per-patch summaries limited to the top-ranked patches.
         if run_res.verifier_data:
-            accepted, rejected = _verifier_summary_top(
+            run_res.verifier_rejected = _verifier_rejected_top(
                 run_res.verifier_data, run_res.top_patches)
-            run_res.verifier_accepted = accepted
-            run_res.verifier_rejected = rejected
         if run_res.binradar_data:
-            verified, rejected, reasons = _binradar_summary_top(
+            rejected, reasons = _binradar_reject_summary_top(
                 run_res.binradar_data, run_res.top_patches)
-            run_res.binradar_verified = verified
             run_res.binradar_rejected = rejected
             run_res.binradar_reject_reasons = reasons
 
@@ -1006,7 +1006,7 @@ def format_result_log(result: ExperimentResult) -> str:
                 f"    [final] binradar_remaining_patches: "
                 f"{_truncate_patch_list(run_res.binradar_remaining_patches, run_res.top_patches, run_res.confidence_data)}")
 
-            if run_res.verifier_accepted or run_res.verifier_rejected:
+            if run_res.verifier_data and run_res.top_patches:
                 header = "    [verifier] summary:"
                 if run_res.top_patches_total > len(run_res.top_patches):
                     header = (f"    [verifier] summary (top "
@@ -1094,6 +1094,7 @@ CSV_COLUMNS = [
     "run",
     "status",
     "has_final",
+    "at_least_one_remaining_patches",
     "remaining_patches",
     "binradar_remaining_patches",
     "filter_survived_patches",
@@ -1101,9 +1102,7 @@ CSV_COLUMNS = [
     "prefilter_total",
     "prefilter_survived",
     "prefilter_done",
-    "verifier_accepted_patches",
     "verifier_rejected_patches",
-    "binradar_verified_patches",
     "binradar_rejected_patches",
     "binradar_reject_reasons",
     "log_errors_count",
@@ -1122,6 +1121,7 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "run": "",
                 "status": f"ERROR: {result.error_message}",
                 "has_final": "",
+                "at_least_one_remaining_patches": "",
                 "remaining_patches": "",
                 "binradar_remaining_patches": "",
                 "filter_survived_patches": "",
@@ -1129,9 +1129,7 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "prefilter_total": "",
                 "prefilter_survived": "",
                 "prefilter_done": "",
-                "verifier_accepted_patches": "",
                 "verifier_rejected_patches": "",
-                "binradar_verified_patches": "",
                 "binradar_rejected_patches": "",
                 "binradar_reject_reasons": "",
                 "log_errors_count": "",
@@ -1153,6 +1151,8 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "run": run_res.run_name,
                 "status": run_res.status,
                 "has_final": str(run_res.has_final),
+                "at_least_one_remaining_patches":
+                    str(run_res.at_least_one_remaining_patches),
                 "remaining_patches": _truncate_patch_list(
                     run_res.remaining_patches, run_res.top_patches,
                     run_res.confidence_data),
@@ -1168,9 +1168,7 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "prefilter_survived": str(run_res.prefilter_survived)
                 if run_res.prefilter_survived >= 0 else "",
                 "prefilter_done": run_res.prefilter_done.value,
-                "verifier_accepted_patches": run_res.verifier_accepted,
                 "verifier_rejected_patches": run_res.verifier_rejected,
-                "binradar_verified_patches": run_res.binradar_verified,
                 "binradar_rejected_patches": run_res.binradar_rejected,
                 "binradar_reject_reasons": run_res.binradar_reject_reasons,
                 "log_errors_count": str(len(run_res.log_errors)),
