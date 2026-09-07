@@ -2,6 +2,7 @@
 ```shell
 git clone https://github.com/UNIST-LOFT/binradar.git
 cd binradar
+git checkout fuzzer-only
 git submodule update --init --recursive
 docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t fuzzolic:2204 -f docker/fuzzolic-runner/Dockerfile.Ubuntu2204v2 .
 ```
@@ -11,7 +12,7 @@ First, install guix and add the necessary channels. (Check [guix installation gu
 Necessary channels are provided in `utils/channels.scm`. You can copy it to `~/.config/guix/channels.scm` or specify it with `--channels-file` option when you run `guix pull`.
 ```shell
 guix pull
-guix build taosc@0.1.17
+guix build taosc
 ```
 
 Then, install [just](https://github.com/casey/just).
