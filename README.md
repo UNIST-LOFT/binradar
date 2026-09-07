@@ -37,13 +37,11 @@ For batch execution, you can run these commands in `benchmarks/loftix` directory
 cd benchmarks/loftix
 just build-all
 just list exp.list # You can edit exp.list to select benchmarks to run.
-just run taosc exp.list 20
+just run taosc exp.list 1       # taosc consumes multiple CPU cores
 just run setup exp.list 20      # setup includes the offline patch prefilter
-just run binradar exp.list 20    # docker runner; use `just run br exp.list 20` to run without docker
-# Run `just failed taosc taosc_failed.list` to check failed runs.
-# You can rerun failed runs with `just resume taosc exp.list 20` based on the joblog or `just run taosc taosc_failed.list 20`.
-# Evaluate patches with external-fuzzer testcases (sdfuzz):
-just eval-all
+just run binradar-fo exp.list 20    # docker runner; use `just run br-fo exp.list 20` to run without docker
+uv run ../scripts/binradar-collect-results.py binradar --run-prefix br-fo --format tsv
+# Check the collected results in the `benchmarks/loftix/logs` directory.
 ```
 
 ### Configuration

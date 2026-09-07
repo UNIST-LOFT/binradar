@@ -32,7 +32,11 @@ setup workdir="workdir":
 
 binradar workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
-    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir
+    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir  --target-patches all
+
+binradar-fo workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
+    ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
+    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir --run-prefix br-fo --target-patches all --fuzzer-only --less-strict
 
 binradar-dev workdir="workdir" binradar_image="fuzzolic:2204":
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
@@ -49,8 +53,8 @@ br workdir="workdir":
 br-all workdir="workdir":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-all --target-patches all
 
-br-fo-all workdir="workdir":
-    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-fo-all --target-patches all --fuzzer-only --less-strict
+br-fo workdir="workdir":
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-fo --target-patches all --fuzzer-only --less-strict
 
 eval workdir="workdir" fuzzer="sdfuzz" fuzz_out="/workspace/binradar/benchmarks/sdfuzz":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-evaluation.py -w {{workdir}} --fuzzer {{fuzzer}} --fuzz-out {{fuzz_out}}
