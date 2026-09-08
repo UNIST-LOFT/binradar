@@ -17,7 +17,10 @@ build:
 taosc workdir="workdir":
     mkdir -p {{workdir}}
     BINARY_PATH=$(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) && \
-    guix shell taosc -- taosc-fix 1 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
+    guix shell taosc -- taosc-fix 10 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
+
+taosc-prebuilt workdir="workdir":
+    uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}}
 
 setup workdir="workdir":
     [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
