@@ -77,6 +77,9 @@ typedef struct ReverseCandidate {
 } ReverseCandidate;
 
 static GArray* reverse_candidates = NULL;
+static uint64_t reverse_lowering_raw     = 0;
+static uint64_t reverse_lowering_selected = 0;
+static uint64_t reverse_lowering_skipped  = 0;
 
 enum query_range_mode {
     QUERY_DEFAULT = 0,
@@ -5751,13 +5754,19 @@ static void smt_branch_query(Query* q)
     }
 
     if (reverse_directed_lowering) {
-        if (has_real_inputs) {
+        reverse_lowering_raw++;
+        if (has_real_inputs && is_interesting_branch(q->address,
+                                                     q->args8.arg0,
+                                                     q->args8.arg1)) {
             ReverseCandidate candidate = {
                 .query = q,
                 .alternate = z3_neg_query,
                 .inputs = inputs,
             };
             g_array_append_val(reverse_candidates, candidate);
+            reverse_lowering_selected++;
+        } else {
+            reverse_lowering_skipped++;
         }
         if (inputs) {
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
@@ -7864,6 +7873,10 @@ static void reverse_directed_solve(void)
     }
 
     reverse_directed_solving = 1;
+    printf("[reverse-directed] [raw %llu] [selected %u] [skipped %llu]\n",
+           (unsigned long long)reverse_lowering_raw,
+           reverse_candidates->len,
+           (unsigned long long)reverse_lowering_skipped);
     printf("[reverse-directed] solving %u candidates from termination to entry\n",
            reverse_candidates->len);
     for (ssize_t i = (ssize_t)reverse_candidates->len - 1; i >= 0; i--) {
