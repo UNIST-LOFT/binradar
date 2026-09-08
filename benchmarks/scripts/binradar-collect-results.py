@@ -48,8 +48,19 @@ Subcommands:
         Workdirs with no predicates are reported with zero counts and a
         skipped prefilter status.
 
+    binradar-stats
+        Collect per-patch verifier evidence-class statistics for the top
+        --top patches ranked by confidence (from final.sbsv). Counts the
+        [verifier] [...] observation rows that
+        BinRadarConcreteVerifier._test_result emits per (patch, testcase)
+        in <run>/verifier.sbsv: pc (patch-crashed), csda
+        (crash-skip-diff-addr), cf (crash-fail), cp (crash-pass), ct
+        (crash-timeout), ncsda (no-crash-skip-diff-addr), ncf
+        (no-crash-fail), ncpsb (no-crash-pass-same-br), nccdb
+        (no-crash-confidence-diff-br), and nct (no-crash-timeout).
+
 Output is saved to logs/binradar-<datetime>.log / logs/sdfuzz-<datetime>.log /
-logs/taosc-<datetime>.log
+logs/taosc-<datetime>.log / logs/binradar-stats-<datetime>.log
 (or .csv/.tsv with --format csv / tsv)
 """
 
@@ -245,6 +256,54 @@ class TaoscResult:
     prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
 
 
+# Observation classes of BinRadarConcreteVerifier._test_result
+# (fuzzolic/binradar_verifier.py), mapped to the short keys used by the
+# binradar-stats output. Each verifier.sbsv row name maps to exactly one
+# class; note that a naive substring match is unsafe (e.g. "crash-fail" is
+# a substring of "no-crash-fail"), so the row action is matched exactly.
+VERIFIER_RESULT_ROW_KEYS = {
+    "patch-crashed": "pc",
+    "crash-skip-diff-addr": "csda",
+    "crash-fail": "cf",
+    "crash-pass": "cp",
+    "crash-timeout": "ct",
+    "no-crash-skip-diff-addr": "ncsda",
+    "no-crash-fail": "ncf",
+    "no-crash-pass-same-br": "ncpsb",
+    "no-crash-confidence-diff-br": "nccdb",
+    "no-crash-timeout": "nct",
+}
+STATS_KEYS = ["pc", "csda", "cf", "cp", "ct", "ncsda", "ncf", "ncpsb", "nccdb", "nct"]
+
+
+@dataclass
+class PatchStats:
+    """Per-patch counts of the _test_result observation classes."""
+    patch: int
+    score: str = ""  # raw confidence score from final.sbsv; "" when absent
+    counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class StatsRunResult:
+    """Verifier stats for a single run within an experiment."""
+    run_name: str
+    status: str
+    has_final: bool = False
+    top_shown: int = 0  # patches shown
+    total_ranked: int = 0  # total patches in the ranking universe
+    patches: List[PatchStats] = field(default_factory=list)
+
+
+@dataclass
+class StatsExperimentResult:
+    """Structured result of one experiment for the binradar-stats command."""
+    exp_dir: str
+    overall_status: str  # "ok", "issues", "no_data"
+    error_message: str = ""
+    runs: List[StatsRunResult] = field(default_factory=list)
+
+
 def parse_sbsv_line(line: str) -> Optional[Dict[str, str]]:
     """Parse one timestamp-prefixed or plain SBSV row with ``sbsv``."""
     payload = _strip_log_prefix(line.strip())
@@ -346,6 +405,51 @@ def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
                 patch_id = safe_int(str(row["patch"]))
                 results.setdefault(patch_id, []).append(str(row["res"]))
     return results
+
+
+_VERIFIER_ROW_RE = re.compile(r"^\[verifier\] \[([a-z-]+)\]")
+_VERIFIER_PATCH_RE = re.compile(r"\[patch (\d+)\]")
+
+
+def parse_verifier_test_result_stats(sbsv_path: str) -> Dict[int, Dict[str, int]]:
+    """Count _test_result observation rows per patch from verifier.sbsv.
+
+    Every counted row is a ``[verifier] [<action>] [patch N] ...`` log row
+    emitted by BinRadarConcreteVerifier._test_result, one per
+    (patch, testcase) observation. The rows carry a logging timestamp
+    prefix, which _strip_log_prefix removes; the action and patch id are
+    then matched with anchored regexes instead of the sbsv tokenizer for
+    speed.
+
+    verifier.sbsv can be tens of GB of per-testcase rows, so each line is
+    first skipped by a cheap substring check: ``[verifier] [`` occurs in
+    every counted row and cannot occur in any other row schema
+    ([verifier-cache], [verifier-result], and [verifier] [stopped] do not
+    match it).
+
+    Returns patch id -> {short key -> count} with all keys present.
+    """
+    counts: Dict[int, Dict[str, int]] = {}
+    if not os.path.isfile(sbsv_path):
+        return counts
+    with open(sbsv_path, "r") as f:
+        for line in f:
+            if "[verifier] [" not in line:
+                continue
+            payload = _strip_log_prefix(line.strip())
+            row = _VERIFIER_ROW_RE.match(payload)
+            if row is None:
+                continue
+            key = VERIFIER_RESULT_ROW_KEYS.get(row.group(1))
+            if key is None:
+                continue
+            patch = _VERIFIER_PATCH_RE.search(payload)
+            if patch is None:
+                continue
+            entry = counts.setdefault(int(patch.group(1)),
+                                      dict.fromkeys(STATS_KEYS, 0))
+            entry[key] += 1
+    return counts
 
 
 def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
@@ -982,6 +1086,132 @@ def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
     return result
 
 
+def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
+                             top_patches: int = 10) -> StatsExperimentResult:
+    """Collect per-patch verifier _test_result case counts for one experiment.
+
+    Mirrors collect_experiment_result's run selection (latest run id for the
+    requested prefix) and ranks patches by the final.sbsv confidence rows;
+    a run without confidence rows falls back to patch-id order over the
+    verifier evidence and the filter survivors.
+    """
+    workdir = os.path.join(exp_dir, workdir_name)
+    out_dir = os.path.join(workdir, "out")
+    progress_path = os.path.join(out_dir, "progress.sbsv")
+
+    result = StatsExperimentResult(exp_dir=exp_dir, overall_status="no_data")
+
+    if not os.path.isdir(workdir):
+        result.error_message = "workdir not found"
+        return result
+
+    if not os.path.isfile(progress_path):
+        result.error_message = "progress.sbsv not found (no run data)"
+        return result
+
+    progress = parse_progress_sbsv(progress_path)
+    if not progress:
+        result.error_message = "progress.sbsv is empty"
+        return result
+
+    runs: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for entry in progress:
+        prefix = entry.get("prefix", "")
+        run_id = entry.get("id", "")
+        if prefix and run_id:
+            if prefix != run_prefix:
+                continue
+            runs.setdefault((prefix, run_id), []).append(entry)
+    if not runs:
+        result.error_message = f"No runs found with prefix '{run_prefix}'"
+        return result
+
+    latest_run_id = max(safe_int(run_id) for _, run_id in runs.keys())
+    runs = {
+        key: entries
+        for key, entries in runs.items()
+        if safe_int(key[1]) == latest_run_id
+    }
+
+    overall_ok = True
+    has_any_final = False
+
+    for (prefix, run_id), entries in runs.items():
+        started: set = set()
+        done_phases: set = set()
+        final_entry: Optional[Dict[str, str]] = None
+        degraded_entry: Optional[Dict[str, str]] = None
+        for entry in entries:
+            phase = entry.get("_phase", "")
+            action = entry.get("_action", "")
+            if action == "start" and phase in KNOWN_PHASES:
+                started.add(phase)
+            elif action == "done" and phase in KNOWN_PHASES:
+                done_phases.add(phase)
+                if phase == "final":
+                    final_entry = entry
+            elif phase == "final" and action == "degraded":
+                degraded_entry = entry
+
+        incomplete_phases = started - done_phases
+        degraded = final_entry is not None and degraded_entry is not None
+        if final_entry is not None and degraded:
+            status = (f"DEGRADED: failed phases: "
+                      f"{degraded_entry.get('failed-phases', '') or 'unknown'}")
+            has_any_final = True
+            overall_ok = False
+        elif final_entry is not None:
+            status = "OK"
+            has_any_final = True
+        elif not incomplete_phases:
+            status = "OK (rundir done, no final)"
+        else:
+            status = (f"INCOMPLETE: phases not done: "
+                      f"{', '.join(sorted(incomplete_phases))}")
+            overall_ok = False
+
+        run_id_int = safe_int(run_id)
+        run_name = f"{prefix}-{run_id_int:05d}"
+        run_dir = os.path.join(out_dir, run_name)
+
+        _, _, confidence_data = parse_final_sbsv(
+            os.path.join(run_dir, "final.sbsv"))
+        filter_results = parse_filter_sbsv(
+            os.path.join(run_dir, "filter.sbsv"))
+        stats = parse_verifier_test_result_stats(
+            os.path.join(run_dir, "verifier.sbsv"))
+
+        if confidence_data:
+            top, total = top_patches_by_confidence(confidence_data,
+                                                   top_patches)
+        else:
+            universe = sorted(
+                set(stats)
+                | {pid for pid, passed in filter_results.items() if passed})
+            top, total = universe[:top_patches], len(universe)
+
+        patches: List[PatchStats] = []
+        for pid in top:
+            conf = confidence_data.get(pid, {})
+            counts = stats.get(pid) or dict.fromkeys(STATS_KEYS, 0)
+            patches.append(PatchStats(patch=pid, score=conf.get("score", ""),
+                                      counts=dict(counts)))
+
+        result.runs.append(StatsRunResult(
+            run_name=run_name, status=status,
+            has_final=(final_entry is not None),
+            top_shown=len(top), total_ranked=total, patches=patches))
+
+    if not overall_ok:
+        result.overall_status = "issues"
+    elif has_any_final:
+        result.overall_status = "ok"
+    else:
+        result.overall_status = "issues"
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Log formatter (human-readable)
 # ---------------------------------------------------------------------------
@@ -1186,6 +1416,90 @@ def _truncate(s: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len - 3] + "..."
+
+
+# ---------------------------------------------------------------------------
+# Stats (binradar-stats) log/CSV formatters
+# ---------------------------------------------------------------------------
+
+def format_patch_stats(patch: PatchStats) -> str:
+    """Format one patch as ``1(c: 0.991, pc: 10, csda: 20, ...)``."""
+    score = _format_confidence_score(patch.score) if patch.score else "-"
+    counts = patch.counts or dict.fromkeys(STATS_KEYS, 0)
+    body = ", ".join(
+        [f"c: {score}"]
+        + [f"{key}: {counts.get(key, 0)}" for key in STATS_KEYS])
+    return f"{patch.patch}({body})"
+
+
+def format_stats_result_log(result: StatsExperimentResult) -> str:
+    """Format a StatsExperimentResult as a human-readable log block."""
+    lines: List[str] = []
+    lines.append(f"=== {result.exp_dir} ===")
+
+    if result.error_message:
+        lines.append(f"  [STATUS] ERROR: {result.error_message}")
+        return "\n".join(lines)
+
+    for run in result.runs:
+        lines.append(f"  [{run.run_name}] {run.status}")
+        if run.total_ranked > run.top_shown:
+            lines.append(f"    [stats] (top {run.top_shown} of "
+                         f"{run.total_ranked} patches by confidence)")
+        else:
+            noun = "patch" if run.top_shown == 1 else "patches"
+            lines.append(f"    [stats] ({run.top_shown} {noun})")
+        lines.append("    [" + ", ".join(
+            format_patch_stats(patch) for patch in run.patches) + "]")
+
+    if result.overall_status == "ok":
+        lines.append("  [OVERALL] OK")
+    elif result.overall_status == "issues":
+        if result.runs and any(run.has_final for run in result.runs):
+            lines.append("  [OVERALL] HAS ISSUES")
+        else:
+            lines.append("  [OVERALL] INCOMPLETE (no final result)")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+STATS_CSV_COLUMNS = [
+    "experiment",
+    "run",
+    "status",
+    "patch",
+    "score",
+] + STATS_KEYS
+
+
+def format_stats_results_csv(all_results: List[StatsExperimentResult],
+                             include_subject_id: bool = True) -> List[Dict[str, str]]:
+    """Convert a list of StatsExperimentResults into CSV rows (one per patch)."""
+    rows: List[Dict[str, str]] = []
+    for result in all_results:
+        if result.error_message:
+            row = {col: "" for col in STATS_CSV_COLUMNS}
+            row["status"] = f"ERROR: {result.error_message}"
+            if include_subject_id:
+                row["experiment"] = result.exp_dir
+            rows.append(row)
+            continue
+        for run in result.runs:
+            for patch in run.patches:
+                row = {
+                    "run": run.run_name,
+                    "status": run.status,
+                    "patch": str(patch.patch),
+                    "score": (_format_confidence_score(patch.score)
+                              if patch.score else ""),
+                }
+                for key in STATS_KEYS:
+                    row[key] = str(patch.counts.get(key, 0))
+                if include_subject_id:
+                    row["experiment"] = result.exp_dir
+                rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1404,6 +1718,10 @@ def _collect_task(collect: Callable[[str], object], exp_dir: str) -> object:
         if func is collect_sdfuzz_experiment:
             return SdfuzzResult(exp_dir=exp_dir, status="no_data",
                                 error_message=message)
+        if func is collect_stats_experiment:
+            return StatsExperimentResult(exp_dir=exp_dir,
+                                         overall_status="no_data",
+                                         error_message=message)
         return TaoscResult(exp_dir=exp_dir, status="no_data",
                            error_message=message)
 
@@ -1511,6 +1829,74 @@ def cmd_binradar(args):
 
         for result in all_results:
             output_lines.append(format_result_log(result))
+
+        output_lines.append("=" * 60)
+        output_lines.append(
+            f"SUMMARY: {ok_count} OK, {issues_count} with issues, "
+            f"{no_data_count} no data")
+        output_lines.append(f"Total: {len(resolved_dirs)} experiments")
+        write_output(output_path, output_format, [], [], output_lines,
+                     counts)
+
+
+def cmd_binradar_stats(args):
+    exp_file = args.exp
+    workdir_name = args.workdir
+    run_prefix = args.run_prefix
+    output_format = args.format
+
+    _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
+
+    # Create logs directory
+    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Collect all results (in parallel; see --jobs)
+    collect = partial(collect_stats_experiment, workdir_name=workdir_name,
+                      run_prefix=run_prefix, top_patches=args.top)
+    all_results: List[StatsExperimentResult] = collect_all(
+        collect, resolved_dirs, args.jobs)
+    if output_format in ("csv", "tsv"):
+        for result, display in zip(all_results, display_dirs):
+            result.exp_dir = display
+
+    # Output file
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ext = output_format if output_format in ("csv", "tsv") else "log"
+    output_path = (args.output if args.output
+                   else os.path.join(logs_dir,
+                                     f"binradar-stats-{timestamp}.{ext}"))
+
+    # Count
+    ok_count = sum(1 for r in all_results if r.overall_status == "ok")
+    issues_count = sum(1 for r in all_results if r.overall_status == "issues")
+    no_data_count = sum(1 for r in all_results if r.overall_status == "no_data")
+
+    counts = {"OK": ok_count, "issues": issues_count,
+              "no_data": no_data_count, "total": len(resolved_dirs)}
+
+    if output_format in ("csv", "tsv"):
+        columns = list(STATS_CSV_COLUMNS)
+        if args.no_subject_id:
+            columns.remove("experiment")
+        csv_rows = format_stats_results_csv(
+            all_results, include_subject_id=not args.no_subject_id)
+        write_output(output_path, output_format, columns, csv_rows, [], counts)
+    else:
+        output_lines: List[str] = []
+        output_lines.append("BinRadar Verifier Stats Collection")
+        output_lines.append(f"Generated: {datetime.now().isoformat()}")
+        output_lines.append(f"Experiment list: {exp_file}")
+        output_lines.append(f"Workdir: {workdir_name}")
+        output_lines.append(f"Run prefix: {run_prefix}")
+        output_lines.append(
+            f"Per-patch output: top {args.top} patches by confidence")
+        output_lines.append(f"Total experiments: {len(resolved_dirs)}")
+        output_lines.append("=" * 60)
+        output_lines.append("")
+
+        for result in all_results:
+            output_lines.append(format_stats_result_log(result))
 
         output_lines.append("=" * 60)
         output_lines.append(
@@ -1687,6 +2073,11 @@ def main():
         "taosc", parents=[shared],
         help="collect original and prefiltered taosc predicate counts")
 
+    sub.add_parser(
+        "binradar-stats", parents=[shared],
+        help="collect per-patch verifier _test_result case counts for the "
+             "top-N confidence patches")
+
     args = parser.parse_args()
 
     # Default to binradar when no subcommand is given (backward compatible)
@@ -1694,6 +2085,8 @@ def main():
         cmd_binradar(args)
     elif args.command == "sdfuzz":
         cmd_sdfuzz(args)
+    elif args.command == "binradar-stats":
+        cmd_binradar_stats(args)
     else:
         cmd_taosc(args)
 

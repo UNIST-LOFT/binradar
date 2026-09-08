@@ -80,17 +80,22 @@ RUN cd solver && mkdir build && cd build && cmake -DCMAKE_EXPORT_COMPILE_COMMAND
 # Build AFL++
 # AFLplusplus: just old version for now, apply afl-showmap.c.patch
 # RUN cd utils && rm -rf AFLplusplus && git clone -b targeted https://github.com/hsh814/AFLplusplus.git AFLplusplus
-RUN cd utils/AFLplusplus && make -j `nproc` all && \ 
-    cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
-    pip install "meson==0.56.2" && ./build_qemu_support.sh
+# NOTE: utils/AFLplusplus and its nested qemu_mode/qemuafl are git submodules; 
+# Use NO_CHECKOUT=1 to skip the failing 'git checkout $QEMUAFL_VERSION' (the tree is already pinned).
+RUN cd utils/AFLplusplus && make -j `nproc` all && \
+    cd qemu_mode && rm -f ../.git qemuafl/.git && \
+    uvx virtualenv venv && . venv/bin/activate && \
+    pip install "meson==0.56.2" && NO_CHECKOUT=1 ./build_qemu_support.sh
 # RUN cd utils && rm -rf binradar-aflplusplus && git clone -b binradar https://github.com/hsh814/AFLplusplus.git binradar-aflplusplus
 # cp ../../binradar-trace.c qemuafl/linux-user/binradar-trace.c && cp ../../binradar-trace.h qemuafl/qemuafl/binradar-trace.h && git apply ../../qemuafl.patch
+# Same dangling-submodule-.git fix as above
 RUN cd utils/binradar-aflplusplus && make -j `nproc` all && \
-    cd qemu_mode && uvx virtualenv venv && . venv/bin/activate && \
-	pip install "meson==0.56.2" && ./build_qemu_support.sh
+    cd qemu_mode && rm -f ../.git qemuafl/.git && \
+    uvx virtualenv venv && . venv/bin/activate && \
+	pip install "meson==0.56.2" && NO_CHECKOUT=1 ./build_qemu_support.sh
 ENV AFL_PATH=/workspace/fuzzolic/utils/AFLplusplus
 
 # Build fuzzolic tests
 RUN cd tests && make
 
-CMD bash
+CMD ["bash"]
