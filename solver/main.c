@@ -3939,6 +3939,19 @@ Z3_ast optimize_z3_query(Z3_ast e)
                         g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
                         return e;
                     }
+                } else if (value >= SIZE(op1)) {
+                    /* ashR by a constant >= operand width saturates to the
+                     * sign bit; the Z3_mk_extract calls in the else branch
+                     * below would be invalid (low > high) */
+                    if (value2 == 0) {
+                        e = smt_new_const(0, SIZE(e));
+                        g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
+                        return e;
+                    } else if (SIZE(e) <= 64) {
+                        e = smt_new_const(FF_MASK(SIZE(e)), SIZE(e));
+                        g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
+                        return e;
+                    }
                 } else {
                     if (value2 == 0) {
                         Z3_ast a = smt_new_const(0, value);
