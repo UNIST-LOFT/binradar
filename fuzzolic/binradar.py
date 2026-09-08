@@ -10,7 +10,6 @@ import shutil
 import signal
 import subprocess
 import threading
-import multiprocessing
 import queue
 import sys
 import select
@@ -22,7 +21,6 @@ import fcntl
 from types import TracebackType
 from typing import Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
 
-import analyze_type
 import binradar_verifier
 import binradar_fuzzer
 import binradar_minimizer
@@ -44,8 +42,8 @@ RUNNING_PROCESSES_LOCK = threading.Lock()
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
-# Tracer forkserver
-HANDSHAKE_EXPECTED = 0x41464C00
+# Tracer forkserver protocol v2
+HANDSHAKE_EXPECTED = 0x41464C01
 
 
 class BinRadarPhase(enum.IntEnum):
@@ -171,13 +169,11 @@ class PipeManager:
 class TracerExecutor:
     forkserver_init_timeout: float = 1800.0
     forkserver_timeout: float = 1800.0
-    analyzer_timeout: float = 1200.0
     command: List[str]
     mode: str
     env: Dict[str, str]
     workdir: str
     rundir: str
-    trace_file: str
     process: Optional[subprocess.Popen]
     timeout: float
     # Forkserver
@@ -191,9 +187,6 @@ class TracerExecutor:
         self.env = env
         self.workdir = workdir
         self.rundir = rundir
-        self.trace_file = ""
-        if "BINRADAR_TRACE_FILE" in env:
-            self.trace_file = env["BINRADAR_TRACE_FILE"]
         self.timeout = timeout
         self.process = None
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
@@ -257,38 +250,13 @@ class TracerExecutor:
             self.run_result = binradar_utils.execute_await(self.process, timeout=self.timeout)
             logger.info(f"[TRACER] [{self.mode}] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
-        self._write_u32(0)  # was_killed - send run command to forkserver
         is_timeout = False
         try:
+            self._write_u32(0)  # was_killed - send run command to forkserver
             exit_status, patch_id, iter = self._read_status(self.forkserver_timeout)
             self.iter = iter
-            analyze_result = b""
-            if self._need_type_analysis(patch_id, iter):
-                logger.info(f"[TRACER] Start type analysis for patch {patch_id}, iter {iter} in {self.mode} mode")
-                if not os.path.exists(self.trace_file):
-                    raise RuntimeError(f"Log file for type analysis not found: {self.trace_file}")
-                analyze_result_file = os.path.join(self.rundir, f"analyzed-type.{self.iter}.sbsv")
-                analyze_start_time = time.time()
-                analyze_process = multiprocessing.get_context("spawn").Process(target=analyze_type.osprey_analyze, args=(self.trace_file, analyze_result_file), daemon=False)
-                analyze_process.start()
-                analyze_process.join(timeout=self.analyzer_timeout)
-                if analyze_process.is_alive():
-                    is_timeout = True
-                    logger.error(f"Osprey analysis is taking too long. Let us stop it.")
-                    analyze_process.terminate()
-                    analyze_process.join(timeout=5)
-                    if analyze_process.is_alive():
-                        logger.error(f"Osprey analysis will be killed.")
-                        analyze_process.kill()
-                    raise TimeoutError(f"Osprey analysis timed out")
-                if analyze_process.exitcode != 0:
-                    raise RuntimeError(f"Osprey analysis failed with exit code {analyze_process.exitcode}")
-                if not os.path.exists(analyze_result_file):
-                    raise RuntimeError(f"Osprey analysis result file not found: {analyze_result_file}")
-                with open(analyze_result_file, "rb") as f:
-                    analyze_result = f.read()
-                logger.info(f"[osprey-analyzer] [it {self.iter}] [len {len(analyze_result)}] [time {round(time.time() - analyze_start_time, 3)}] [saved {analyze_result_file}]")
             logger.debug(f"[TRACER] [{self.mode}] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
+            remaining = self._read_u32(self.forkserver_timeout)
         except Exception as e:
             is_timeout = True
             logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
@@ -305,12 +273,6 @@ class TracerExecutor:
                 self.process.kill()
                 self.process.wait()
             raise e
-        analyze_result_size = len(analyze_result)
-        if analyze_result_size > 0xFFFFFFFF:
-            raise ValueError(f"[TRACER] [{self.mode}] Analyze result too large")
-        self._write_u32(len(analyze_result))
-        self._write(analyze_result)
-        remaining = self._read_u32(self.forkserver_timeout)
         return int((time.time() - start_time) * 1000), (not is_timeout), remaining
     
     def stop(self):
@@ -324,16 +286,6 @@ class TracerExecutor:
                     RUNNING_PROCESSES.remove(self.process)
             self.process = None
         
-    def _need_type_analysis(self, patch_id: int, iter: int) -> bool:
-        """
-        Determine if type analysis is needed:
-        - It has large overhead, so we only want to run it when necessary.
-        """
-        if self.mode == "binradar":
-            if patch_id == 0 and iter == 1:
-                return True
-        return False
-    
     def _write_u32(self, value: int):
         self._write(struct.pack("<I", value))
     
@@ -351,40 +303,39 @@ class TracerExecutor:
                 continue
     
     def _read_u32(self, timeout: float) -> int:
-        if self.pipe_manager is None:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
-        rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
-        if not rlist:
-            raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
-        data = self._read(4)
-        if len(data) < 4:
-            raise EOFError(f"[TRACER] [{self.mode}] Failed to read 4 bytes from forkserver")
+        data = self._read(4, timeout)
         return struct.unpack("<I", data)[0]
     
     def _read_status(self, timeout: float) -> Tuple[int, int, int]:
-        if self.pipe_manager is None:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
-        rlist, _, _ = select.select([self.pipe_manager.get_stat_r()], [], [], timeout)
-        if not rlist:
-            raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
-        data = self._read(12)
-        if len(data) < 12:
-            raise EOFError(f"[TRACER] [{self.mode}] Failed to read 12 bytes from forkserver")
+        data = self._read(12, timeout)
         return struct.unpack("<III", data)
     
-    def _read(self, size: int) -> bytes:
+    def _read(self, size: int, timeout: Optional[float] = None) -> bytes:
         if self.pipe_manager is None:
             raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
-        data = b''
+        fd = self.pipe_manager.get_stat_r()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        data = bytearray()
         while len(data) < size:
+            wait = None
+            if deadline is not None:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
             try:
-                chunk = os.read(self.pipe_manager.get_stat_r(), size - len(data))
-                if not chunk:
-                    raise EOFError(f"[TRACER] [{self.mode}] EOF while reading from forkserver")
-                data += chunk
-            except BlockingIOError:
+                rlist, _, _ = select.select([fd], [], [], wait)
+            except InterruptedError:
                 continue
-        return data
+            if not rlist:
+                raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
+            try:
+                chunk = os.read(fd, size - len(data))
+            except InterruptedError:
+                continue
+            if not chunk:
+                raise EOFError(f"[TRACER] [{self.mode}] EOF while reading from forkserver")
+            data.extend(chunk)
+        return bytes(data)
 
 class SolverExecutor:
     mode: str
@@ -759,7 +710,7 @@ class BinRadarExecutor:
         env.update(self.config)
         if self.probe_result is None:
             raise RuntimeError("Probe result is not available. Cannot set environment for tracer and solver.")
-        trace_file = os.path.join(run_dir, f"{mode}-tracer-trace.log")
+        env["BINRADAR_OSPREY_ENABLE"] = "1" if mode == "binradar" else "0"
         log_file = os.path.join(run_dir, f"{mode}-tracer-msg.log")
         if os.path.exists(log_file):
             open(log_file, "w").close()
@@ -783,8 +734,7 @@ class BinRadarExecutor:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
                 env["BINRADAR_TRACE_FILE"] = "none"
             else:
-                open(trace_file, "w").close()
-                env["BINRADAR_TRACE_FILE"] = trace_file
+                env["BINRADAR_TRACE_FILE"] = "none"
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
                 env["PATCH_ID"] = "123456"
                 env["BINRADAR_PATCH_CNT"] = str(len(self.filter_result))
@@ -830,6 +780,7 @@ class BinRadarExecutor:
             self.test_cmd.replace("@@", self.resolved_poc_input()))
         tracer_env = os.environ.copy()
         tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
+        tracer_env["BINRADAR_OSPREY_ENABLE"] = "0"
         tracer_env["BINRADAR_TRACE_FILE"] = "none"
         tracer_env["PATCH_RESERVE_RANGE"] = self.patch_addr_ranges[0]
         tracer_env["E9_TRAMPOLINE_RANGE"] = self.patch_addr_ranges[1]

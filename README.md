@@ -155,7 +155,7 @@ Verdicts:
 ### Orchestrator
 - `fuzzolic/binradar.py`: main entry point for the verification process
 - `fuzzolic/binradar_verifier.py`: implementation of the verification logic.
-- `fuzzolic/analyze_type.py`: type inference used for binradar.
+- `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c`: experimental in-process OSPREY path. Stages 0–8 are accepted and BinRadar enables it; ranking and evaluation remain Stage 9 work. See `agent-docs/info/OSPREY_IMPLEMENTATION_PLAN.md` §0.
 
 These are main phases:
 1. PROBE: run the test cases with original binary to confirm the crash and collect information about the crash (e.g., fault address, patch function entrypoint, patch function hit count, etc.)
@@ -183,13 +183,7 @@ Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QE
   * tracer/tcg/symbolic-i386.c
 - Forkserver: Implemented
 - Type Analyzer
-  * Logging memory accesses with region info: (trace_mem())
-    + Heap: hook into malloc()/free()
-    + Stack: hook for callq/ret
-    + Global: hook into program segments in elf load
-    + Other: ignored
-  * Post-processing analyzer: python script (fuzzolic/analyze_type.py)
-    + Recover base addresses of each memory chunk using heuristic
+  * Experimental in-process OSPREY path (`tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c`). Stages 0–8 are accepted; the orchestrator enables it only in BinRadar mode over forkserver protocol v2. Ranking/evaluation remains out of scope until Stage 9; see `agent-docs/info/OSPREY_IMPLEMENTATION_PLAN.md` §0.
 - Memory modification
   * Implemented in tracer/tcg
 

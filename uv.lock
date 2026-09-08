@@ -16,7 +16,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -30,14 +30,12 @@ source = { virtual = "." }
 dependencies = [
     { name = "pytest" },
     { name = "sbsv" },
-    { name = "sortedcontainers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "sbsv", specifier = ">=0.2.3,<0.3.0" },
-    { name = "sortedcontainers", specifier = ">=2.4.0" },
 ]
 
 [[package]]
@@ -101,15 +99,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a6/6b/8fef36c7dee495d324e6fa9a4dd79e4c2c605d168007f684c246f7882d31/sbsv-0.2.3.tar.gz", hash = "sha256:d74cfe8c21fcc74f2e1820c1ac2c2404d4c07ab4ca61047af2ed2ee283c810f8", size = 55223, upload-time = "2026-05-26T08:45:37.203Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0a/90/a1e61eef4a1d15fe2a608088e3dd08bb7667d4a259839aa746523218ca36/sbsv-0.2.3-py3-none-any.whl", hash = "sha256:337721de336f3dd5885f7d27e9dd216a737b6b6ef1340c07edca1f1b336845a2", size = 13083, upload-time = "2026-05-26T08:45:35.373Z" },
-]
-
-[[package]]
-name = "sortedcontainers"
-version = "2.4.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
 ]
 
 [[package]]
