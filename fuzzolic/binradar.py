@@ -49,12 +49,14 @@ OPTIONAL_EVIDENCE_PHASES = frozenset({
 
 RUNNING_PROCESSES: List[subprocess.Popen] = []
 RUNNING_PROCESSES_LOCK = threading.Lock()
+# pid -> process group id, captured at spawn.
+RUNNING_PROCESS_PGIDS: Dict[int, int] = {}
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
 # Tracer forkserver
 HANDSHAKE_EXPECTED = 0x41464C00
-
+FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 
 class BinRadarPhase(enum.IntEnum):
     ALL = 0
@@ -94,14 +96,31 @@ def setlimits():
         resource.RLIMIT_AS, (MAX_VIRTUAL_MEMORY, MAX_VIRTUAL_MEMORY))
 
 
+def register_running_process(process: subprocess.Popen) -> None:
+    """Track `process` (and its process group) for the global cleanup path."""
+    with RUNNING_PROCESSES_LOCK:
+        RUNNING_PROCESSES.append(process)
+        RUNNING_PROCESS_PGIDS[process.pid] = binradar_utils.process_group_id(process)
+
+def unregister_running_process(process: subprocess.Popen):
+    with RUNNING_PROCESSES_LOCK:
+        if process in RUNNING_PROCESSES:
+            RUNNING_PROCESSES.remove(process)
+        RUNNING_PROCESS_PGIDS.pop(process.pid, None)
+
 def stop_running_processes():
     with RUNNING_PROCESSES_LOCK:
         processes = list(RUNNING_PROCESSES)
     for proc in processes:
+        pgid = RUNNING_PROCESS_PGIDS.get(proc.pid)
+        if pgid is None:
+            pgid = binradar_utils.process_group_id(proc)
+        # execute_await gives the leader a graceful shutdown window; when
+        # the leader is already dead it returns instantly without ever
+        # signaling the group, so always sweep the recorded group after it.
         binradar_utils.execute_await(proc, timeout=1)
-        with RUNNING_PROCESSES_LOCK:
-            if proc in RUNNING_PROCESSES:
-                RUNNING_PROCESSES.remove(proc)
+        binradar_utils.kill_process_group(pgid, grace=1)
+        unregister_running_process(proc)
 
 def handler(signo, stackframe):
     del signo
@@ -200,6 +219,7 @@ class TracerExecutor:
     forkserver_init_timeout: float = 1800.0
     forkserver_timeout: float = 1800.0
     analyzer_timeout: float = 1200.0
+    forkserver_analyze_margin: float = 300.0
     command: List[str]
     mode: str
     env: Dict[str, str]
@@ -224,6 +244,7 @@ class TracerExecutor:
             self.trace_file = env["BINRADAR_TRACE_FILE"]
         self.timeout = timeout
         self.process = None
+        self.pgid = None
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
         self.iter = 0
         self.run_result = None
@@ -243,8 +264,7 @@ class TracerExecutor:
                 cwd=self.workdir,
                 env=self.env,
                 start_new_session=True)
-            with RUNNING_PROCESSES_LOCK:
-                RUNNING_PROCESSES.append(self.process)
+            register_running_process(self.process)
             logger.info(f"[TRACER] [{self.mode}] Started tracer without forkserver mode. {' '.join(self.command)}")
             return
 
@@ -262,8 +282,7 @@ class TracerExecutor:
             pass_fds=pass_fds,
             start_new_session=True)
         
-        with RUNNING_PROCESSES_LOCK:
-            RUNNING_PROCESSES.append(self.process)
+        register_running_process(self.process)
         self.pipe_manager.close_passed_fds()
         
         # Handshake with forkserver
@@ -327,12 +346,19 @@ class TracerExecutor:
             if self.process.poll() is not None:
                 logger.error(f"[TRACER] [{self.mode}] Tracer process exited with code {self.process.returncode}")
             else:
-                logger.error(f"[TRACER] [{self.mode}] Tracer process is still running - sending SIGINT to stop it")
-            self.process.send_signal(signal.SIGINT)
+                logger.error(f"[TRACER] [{self.mode}] Tracer process is still running - killing its process group to stop it and any in-flight forkserver child")
+            # Leader-only SIGINT/SIGKILL leaks the in-flight forkserver
+            # child as a PPID-1 orphan (br-test 2026-09-08 F2): the parent
+            # may be stuck in waitpid/read_exact while the child futex-waits
+            # forever. Signal the whole group, then SIGKILL any survivors.
+            if self.pgid is None:
+                self.pgid = binradar_utils.process_group_id(self.process)
+            binradar_utils.kill_process_group(self.pgid, grace=10,
+                                              first_signal=signal.SIGINT)
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.error(f"[TRACER] [{self.mode}] Tracer did not exit after SIGINT - sending SIGKILL")
+                logger.error(f"[TRACER] [{self.mode}] Tracer did not exit after the group kill - sending SIGKILL")
                 self.process.kill()
                 self.process.wait()
             raise e
@@ -350,9 +376,12 @@ class TracerExecutor:
         if self.process is not None:
             logger.info(f"[TRACER] [{self.mode}] Stopping tracer process...")
             self.run_result = binradar_utils.execute_await(self.process, timeout=5)
-            with RUNNING_PROCESSES_LOCK:
-                if self.process in RUNNING_PROCESSES:
-                    RUNNING_PROCESSES.remove(self.process)
+            # execute_await returns instantly when the leader is already
+            # dead; sweep the group so no forkserver child survives.
+            if self.pgid is None:
+                self.pgid = binradar_utils.process_group_id(self.process)
+            binradar_utils.kill_process_group(self.pgid, grace=1)
+            unregister_running_process(self.process)
             self.process = None
         
     def _need_type_analysis(self, patch_id: int, iter: int) -> bool:
@@ -454,6 +483,7 @@ class SolverExecutor:
         log_file = os.path.join(run_dir, f"{mode}-solver.log")
         self.log_fp = open(log_file, "wb")
         self.process = None
+        self.pgid = None
         self.run_result = None
     
     def start(self):
@@ -466,8 +496,7 @@ class SolverExecutor:
             cwd=self.rundir,
             env=self.env,
             start_new_session=True)
-        with RUNNING_PROCESSES_LOCK:
-            RUNNING_PROCESSES.append(self.process)
+        register_running_process(self.process)
         # Give the solver some time to start up and create shared memories
         time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
     
@@ -501,6 +530,9 @@ class SolverExecutor:
             except subprocess.TimeoutExpired:
                 logger.info(f"[SOLVER] [{self.mode}] Solver will be killed.")
                 binradar_utils.execute_await(self.process, timeout=1)
+                if self.pgid is None:
+                    self.pgid = binradar_utils.process_group_id(self.process)
+                binradar_utils.kill_process_group(self.pgid, grace=1)
         succeeded = (not is_timeout and self.process.returncode == 0)
         return int((time.time() - start_time) * 1000), succeeded
 
@@ -513,9 +545,10 @@ class SolverExecutor:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-            with RUNNING_PROCESSES_LOCK:
-                if self.process in RUNNING_PROCESSES:
-                    RUNNING_PROCESSES.remove(self.process)
+            if self.pgid is None:
+                self.pgid = binradar_utils.process_group_id(self.process)
+            binradar_utils.kill_process_group(self.pgid, grace=1)
+            unregister_running_process(self.process)
             self.process = None
         if not self.log_fp.closed:
             self.log_fp.close()
@@ -655,10 +688,11 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
+        self.forkserver_child_timeout = forkserver_child_timeout
         self.binary = binary
         self.poc_input = poc_input
         self.total_patches = total_patches
@@ -724,7 +758,10 @@ class BinRadarExecutor:
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1",
             disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1",
-            less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1")
+            less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
+            forkserver_child_timeout=int(env.get(
+                "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP",
+                str(FORKSERVER_CHILD_TIMEOUT_DEFAULT))))
         # Retain every artifact's prefixed E9 metadata so extract_config
         # passes all of it to BinRadarQemuRunner.from_env, which selects
         # by the executed binary path.
@@ -940,7 +977,22 @@ class BinRadarExecutor:
             env["BINRADAR_TRACE_FILE"] = "none"
         elif mode in ["directed", "binradar"]:
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-            env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(self.timeout))
+            # Cap a single forkserver child well below python's fixed 1800 s
+            # forkserver read timeout: a hung child must cost one bounded
+            # iteration (child cap + tracer-side analyze margin), not a
+            # python TimeoutError that fails the whole phase (br-test
+            # 2026-09-08: BINRADAR_FORKSERVER_CHILD_TIMEOUT was set to the
+            # whole-run budget, making the tracer's child-timeout salvage
+            # path unreachable).
+            child_timeout = min(self.forkserver_child_timeout, self.timeout)
+            if TracerExecutor.forkserver_timeout <= child_timeout + TracerExecutor.forkserver_analyze_margin:
+                raise RuntimeError(
+                    f"forkserver child timeout {child_timeout}s + analyze "
+                    f"margin {TracerExecutor.forkserver_analyze_margin:g}s must "
+                    f"stay below the forkserver read timeout "
+                    f"{TracerExecutor.forkserver_timeout:g}s; lower "
+                    f"--forkserver-child-timeout")
+            env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(child_timeout))
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             if mode == "directed":
                 env["BINRADAR_REVERSE_DIRECTED"] = "1" if self.reverse_directed else "0"
@@ -1337,14 +1389,11 @@ class BinRadarExecutor:
         fuzzer.start()
         if fuzzer.process is None:
             raise RuntimeError("Failed to start fuzzer process")
-        with RUNNING_PROCESSES_LOCK:
-            RUNNING_PROCESSES.append(fuzzer.process)
+        register_running_process(fuzzer.process)
         try:
             result = fuzzer.wait(timeout=self.timeout)
         finally:
-            with RUNNING_PROCESSES_LOCK:
-                if fuzzer.process in RUNNING_PROCESSES:
-                    RUNNING_PROCESSES.remove(fuzzer.process)
+            unregister_running_process(fuzzer.process)
         if result is None:
             raise RuntimeError("Fuzzer process was not started")
         if result.timed_out:
@@ -2004,6 +2053,13 @@ def main():
         help=("run probe/filter, AFL++ fuzzer, minimizer/verifier, and final; "
               "skip fuzzolic, directed, and binradar"))
     parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
+    parser.add_argument("--forkserver-child-timeout", type=int,
+                        default=FORKSERVER_CHILD_TIMEOUT_DEFAULT,
+                        help=("per-iteration cap in seconds for one forkserver "
+                              "child in the directed/binradar tracer phases "
+                              "(default: 900); must stay below the forkserver "
+                              "read timeout (1800s) minus the analyze margin "
+                              "(300s)"))
     # The following argument is for experiments and debugging
     parser.add_argument("--run-single-phase", default="", 
         choices=SINGLE_PHASE_NAMES, help="run a specific phase")
@@ -2030,6 +2086,7 @@ def main():
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if (args.disable_binradar or args.fuzzer_only) else "0"
     env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
+    env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     if args.target_patches == "all":
         # Run every predicate that survived the offline prefilter instead of
         # the top-30 subset.  Setup caps the compiled candidates at the

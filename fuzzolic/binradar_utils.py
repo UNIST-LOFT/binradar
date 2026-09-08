@@ -2,6 +2,7 @@ import subprocess
 import os
 import signal
 import threading
+import time
 from typing import List, Set, Tuple, Dict, Optional, Any
 
 import logger
@@ -92,6 +93,46 @@ def create_pipe_reader_thread(rfd: int, verbose: bool = False) -> Tuple[threadin
     thread.start()
     return thread, patch_chunks
 
+def process_group_id(process: subprocess.Popen) -> int:
+    """Return the process group id of `process`.
+    """
+    try:
+        return os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError):
+        return process.pid
+
+
+def kill_process_group(pgid: int, grace: float = 5.0,
+                       first_signal: int = signal.SIGTERM) -> None:
+    """Terminate a whole process group: `first_signal`, wait up to `grace`
+    seconds for the group to empty, then SIGKILL.
+    """
+    try:
+        os.killpg(pgid, first_signal)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)  # existence probe: raises once the group is empty
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _sweep_session_group(process: subprocess.Popen) -> None:
+    """Best-effort SIGKILL of `process`'s whole process group after reaping.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: bool = False) -> ExecutionResult:
 
     if verbose:
@@ -99,6 +140,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
     
     try:
         stdout, stderr = process.communicate(timeout=timeout)
+        _sweep_session_group(process)
         return ExecutionResult(
             success=True,
             exit_code=process.returncode,
@@ -120,6 +162,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()
+        _sweep_session_group(process)
         return ExecutionResult(
             success=False,
             exit_code=process.returncode,
@@ -133,6 +176,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
         except ProcessLookupError:
             pass
         stdout, stderr = process.communicate()
+        _sweep_session_group(process)
         logger.debug(f"Command failed: Error: {str(e)}")
         return ExecutionResult(
             success=False,

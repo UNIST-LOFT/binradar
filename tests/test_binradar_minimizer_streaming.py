@@ -641,7 +641,9 @@ def test_run_fuzzer_rejects_unexpected_exit(tmp_path, monkeypatch):
     executor.extract_config = lambda: {}
     progress = []
     executor.save_progress = progress.append
-    process = object()
+    # pid must exist for the process-group registry (2**30 is not a live pid;
+    # getpgid fails and the fallback records it unchanged).
+    process = SimpleNamespace(pid=2 ** 30)
     fake = SimpleNamespace(
         process=process,
         start=lambda: process,
@@ -666,7 +668,7 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
     executor.extract_config = lambda: {}
     progress = []
     executor.save_progress = progress.append
-    process = object()
+    process = SimpleNamespace(pid=2 ** 30)
     fake = SimpleNamespace(
         process=process,
         start=lambda: process,

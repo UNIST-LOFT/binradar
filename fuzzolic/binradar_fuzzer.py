@@ -30,6 +30,7 @@ class BinRadarFuzzer:
         # valid slow seeds to abort under high parallel benchmark load.
         self.afl_exec_timeout = afl_exec_timeout
         self.process: Optional[subprocess.Popen] = None
+        self.pgid: Optional[int] = None
     
     @classmethod
     def from_workdir(cls, dir: str, outdir: str) -> "BinRadarFuzzer":
@@ -57,8 +58,15 @@ class BinRadarFuzzer:
     def wait(self, timeout: float = 1800.0) -> Optional[binradar_utils.ExecutionResult]:
         if self.process is None:
             return None
-        return binradar_utils.execute_await(
+        result = binradar_utils.execute_await(
             self.process, timeout=timeout, verbose=True)
+        # execute_await group-kills on its own timeout path, but returns
+        # instantly when the leader is already dead; sweep the recorded
+        # group so afl-qemu-trace children never survive as orphans
+        # (br-test 2026-09-08 F2).
+        if self.pgid is not None:
+            binradar_utils.kill_process_group(self.pgid, grace=1)
+        return result
     
     def get_testcase_dirs(self) -> List[str]:
         raise NotImplementedError("get_testcase_dirs() method must be implemented")
@@ -82,6 +90,7 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
+        self.pgid = binradar_utils.process_group_id(self.process)
         return self.process
 
     def get_testcase_dirs(self) -> List[str]:
@@ -112,6 +121,7 @@ class AFLppFuzzer(BinRadarFuzzer):
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
+        self.pgid = binradar_utils.process_group_id(self.process)
         return self.process
 
     @staticmethod

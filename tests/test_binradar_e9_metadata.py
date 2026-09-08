@@ -719,6 +719,7 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     executor.workdir = str(tmp_path)
     executor.outdir = str(tmp_path / "out")
     executor.timeout = 60
+    executor.forkserver_child_timeout = binradar.FORKSERVER_CHILD_TIMEOUT_DEFAULT
     executor.binary = "nm"
     executor.poc_input = "poc/nullderef"
     executor.test_cmd = "-l @@"
