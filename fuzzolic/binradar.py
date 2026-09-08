@@ -1501,6 +1501,20 @@ class BinRadarExecutor:
 
         self.save_progress(f"[binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
+    def run_feedback(self):
+        # Generate feedback for taosc
+        if self.probe_result is None:
+            logger.error("Probe result not found. Cannot run feedback analysis.")
+            raise RuntimeError("Probe result not found.")
+        self.save_progress(f"[feedback] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        # Implement feedback analysis logic here.
+        # Make feedback directory, which contains:
+        # 1. Metadata about the feedback analysis. binradar.env file + binradar-feedback.json (including survived patch list)
+        # 2. Required files for the feedback analysis: poc dir, original binaries, brpatches.json
+        # 3. Generated concrete test cases from minimized/ -> concrete/benign, concrete/malicious
+        # 4. binradar produced snapshots (brcached -> expected value)
+        self.save_progress(f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+    
     def run_final(self):
         # Read verifier.sbsv and, when enabled, binradar-trace-msg.log to
         # get final results and save them to the progress file.
@@ -1976,9 +1990,8 @@ def main():
     parser.add_argument(
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
-    parser.add_argument(
-        "-f", "--fuzzy", action="store_true",
-        help="use the Fuzzy-SAT solver")
+    parser.add_argument("--fuzzy", action="store_true", help="use the Fuzzy-SAT solver")
+    parser.add_argument("--feedback", type=bool, default=True, help="Give feedback to taosc")
     parser.add_argument(
         "--reverse-directed", type=bool, default=True,
         help="prioritize directed candidates from the end of the forward trace (Z3 only)")
