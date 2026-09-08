@@ -69,6 +69,8 @@ static ssize_t query_end_idx = -1;
 static int reverse_directed_mode = 0;
 static int reverse_directed_lowering = 0;
 static int reverse_directed_solving = 0;
+/* Defined near reverse_directed_solve; called only from there. */
+static Z3_solver reverse_scratch_solver(void);
 
 typedef struct ReverseCandidate {
     Query*       query;
@@ -884,23 +886,6 @@ static inline Z3_ast get_deps_upto(GHashTable* inputs, ssize_t max_query_idx,
     }
 
     f_hash_table_destroy(added);
-    return result;
-}
-
-static inline Z3_ast get_forward_prefix_upto(ssize_t max_query_idx)
-{
-    Z3_ast result = Z3_mk_true(smt_solver.ctx);
-    if (max_query_idx < 0) {
-        return result;
-    }
-
-    for (ssize_t idx = 0; idx <= max_query_idx; idx++) {
-        if (!z3_ast_exprs[idx]) {
-            continue;
-        }
-        Z3_ast args[2] = {result, z3_ast_exprs[idx]};
-        result = Z3_mk_and(smt_solver.ctx, 2, args);
-    }
     return result;
 }
 
@@ -5601,10 +5586,7 @@ static inline void smt_notify_fuzzy_constraint(Z3_ast constraint)
 static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs, int mode)
 {
     Z3_solver solver = smt_new_solver();
-    if (reverse_directed_solving) {
-        Z3_ast prefix = get_forward_prefix_upto((ssize_t)GET_QUERY_IDX(q) - 1);
-        Z3_solver_assert(smt_solver.ctx, solver, prefix);
-    } else if (mode == 2) {
+    if (mode == 2) {
         add_deps_to_solver(inputs, solver, GET_QUERY_IDX(q));
     } else {
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), solver,  NULL);
@@ -5642,6 +5624,10 @@ static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs
     }
 #endif
     if (mode && !is_sat) {
+        /* Reverse-directed candidates never reach this function (their
+         * ordinary check and scratch-solver optimistic retry live in
+         * reverse_directed_solve), so the cached solver reset here is
+         * safe. */
         Z3_solver_reset(smt_solver.ctx, solver);
         Z3_solver_assert(smt_solver.ctx, solver, z3_neg_query);
         is_sat = smt_query_check(solver, GET_QUERY_IDX(q), 1);
@@ -7865,6 +7851,75 @@ static void smt_query(Query* q)
     }
 }
 
+/* Persistent prefix solver for reverse-directed solving (audit plan §C).
+ *
+ * Semantics per selected candidate at query index i (unchanged vs. the old
+ * per-candidate rebuild):
+ *   ordinary check = AND(z3_ast_exprs[j] for 0 <= j < i, non-NULL)
+ *                    AND alternate_i
+ *   optimistic retry = alternate_i alone (scratch solver, never a reset
+ *   of the prefix solver).
+ *
+ * Candidate indices are c0 < c1 < ... < c(S-1), visited S-1..0. The solver
+ * is built by asserting non-NULL exprs [0, c0) at the base level, then one
+ * nested scope per later candidate interval [c(j-1), cj). Total assertions
+ * are O(Q) instead of the old O(Q*C) nested Z3_mk_and chains
+ * (get_forward_prefix_upto); no giant n-ary conjunction is materialized.
+ */
+static Z3_solver reverse_prefix_solver       = NULL;
+static Z3_solver reverse_scratch_solver_inst = NULL;
+
+static Z3_solver reverse_scratch_solver(void)
+{
+    if (!reverse_scratch_solver_inst) {
+        reverse_scratch_solver_inst = Z3_mk_solver(smt_solver.ctx);
+        Z3_solver_inc_ref(smt_solver.ctx, reverse_scratch_solver_inst);
+        Z3_params params = Z3_mk_params(smt_solver.ctx);
+        Z3_symbol timeout = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
+        Z3_params_set_uint(smt_solver.ctx, params, timeout,
+                           SOLVER_TIMEOUT_Z3_MS);
+        Z3_solver_set_params(smt_solver.ctx, reverse_scratch_solver_inst,
+                             params);
+    } else {
+        Z3_solver_reset(smt_solver.ctx, reverse_scratch_solver_inst);
+    }
+    return reverse_scratch_solver_inst;
+}
+
+static void reverse_directed_prefix_init(ssize_t first_idx)
+{
+    reverse_prefix_solver = Z3_mk_solver(smt_solver.ctx);
+    Z3_solver_inc_ref(smt_solver.ctx, reverse_prefix_solver);
+    Z3_params params    = Z3_mk_params(smt_solver.ctx);
+    Z3_symbol timeout   = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
+    Z3_params_set_uint(smt_solver.ctx, params, timeout, SOLVER_TIMEOUT_Z3_MS);
+    Z3_solver_set_params(smt_solver.ctx, reverse_prefix_solver, params);
+
+    uint64_t asserted = 0;
+    for (ssize_t idx = 0; idx < first_idx; idx++) {
+        if (!z3_ast_exprs[idx]) {
+            continue;
+        }
+        Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                         z3_ast_exprs[idx]);
+        asserted++;
+    }
+    printf("[reverse-directed] [prefix-init] [first %ld] [asserted %llu]\n",
+           (long)first_idx, (unsigned long long)asserted);
+}
+
+static void reverse_directed_prefix_destroy(void)
+{
+    if (reverse_scratch_solver_inst) {
+        Z3_solver_dec_ref(smt_solver.ctx, reverse_scratch_solver_inst);
+        reverse_scratch_solver_inst = NULL;
+    }
+    if (reverse_prefix_solver) {
+        Z3_solver_dec_ref(smt_solver.ctx, reverse_prefix_solver);
+        reverse_prefix_solver = NULL;
+    }
+}
+
 static void reverse_directed_solve(void)
 {
     if (!reverse_candidates || reverse_candidates->len == 0) {
@@ -7872,25 +7927,90 @@ static void reverse_directed_solve(void)
         return;
     }
 
-    reverse_directed_solving = 1;
+    const unsigned int S = reverse_candidates->len;
     printf("[reverse-directed] [raw %llu] [selected %u] [skipped %llu]\n",
            (unsigned long long)reverse_lowering_raw,
-           reverse_candidates->len,
+           S,
            (unsigned long long)reverse_lowering_skipped);
+
+    /* Selected indices, ascending. Scope depth is bounded by S; if a
+     * pathological trace still selects too many candidates, that is a
+     * selection-policy problem (audit plan §C.6), not a solver fallback. */
+    ssize_t* indices = malloc(sizeof(ssize_t) * S);
+    if (!indices) {
+        PFATAL("reverse-directed: candidate index array allocation failed");
+    }
+    for (unsigned int i = 0; i < S; i++) {
+        indices[i] = (ssize_t)GET_QUERY_IDX(
+            g_array_index(reverse_candidates, ReverseCandidate, i).query);
+    }
+
+    /* Candidate j (0-based, ascending) needs the prefix strictly below
+     * indices[j], i.e. all non-NULL exprs in [0, indices[j]). */
+    reverse_directed_prefix_init(indices[0]);
+    reverse_directed_solving = 1;
     printf("[reverse-directed] solving %u candidates from termination to entry\n",
-           reverse_candidates->len);
-    for (ssize_t i = (ssize_t)reverse_candidates->len - 1; i >= 0; i--) {
+           S);
+
+    uint64_t sat_count = 0, unsat_count = 0;
+    for (ssize_t j = (ssize_t)S - 1; j >= 0; j--) {
         ReverseCandidate* candidate =
-            &g_array_index(reverse_candidates, ReverseCandidate, i);
+            &g_array_index(reverse_candidates, ReverseCandidate, j);
+        ssize_t idx = indices[j];
         if (!candidate->inputs || !candidate->alternate) {
+            /* Interval [c(j-1), cj) must still be asserted so the prefix
+             * for lower candidates stays exact. */
+            if (j > 0) {
+                Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
+                for (ssize_t i = indices[j - 1]; i < idx; i++) {
+                    if (z3_ast_exprs[i]) {
+                        Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                                         z3_ast_exprs[i]);
+                    }
+                }
+            }
             continue;
         }
         printf("[reverse-directed] candidate index=%lu address=%lx\n",
-               GET_QUERY_IDX(candidate->query), candidate->query->address);
-        smt_check_z3(candidate->query, candidate->alternate,
-                     candidate->inputs, 2);
+               (unsigned long)idx, candidate->query->address);
+        /* Ordinary check: current solver state == prefix [0, idx) plus the
+         * alternate asserted on top. */
+        Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
+        Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                         candidate->alternate);
+        int is_sat = smt_query_check(reverse_prefix_solver, (size_t)idx, 0);
+        if (is_sat) {
+            sat_count++;
+        } else {
+            /* Optimistic retry on the scratch solver: alternate alone. */
+            Z3_solver scratch = reverse_scratch_solver();
+            Z3_solver_assert(smt_solver.ctx, scratch, candidate->alternate);
+            is_sat = smt_query_check(scratch, (size_t)idx, 1);
+            if (is_sat) {
+                sat_count++;
+            } else {
+                unsat_count++;
+            }
+        }
+        Z3_solver_pop(smt_solver.ctx, reverse_prefix_solver, 1);
+        /* Expose exactly the prefix for the next (lower) candidate. */
+        if (j > 0) {
+            Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
+            for (ssize_t i = indices[j - 1]; i < idx; i++) {
+                if (z3_ast_exprs[i]) {
+                    Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                                     z3_ast_exprs[i]);
+                }
+            }
+        }
     }
+
+    printf("[reverse-directed] [solved] [sat %llu] [unsat %llu]\n",
+           (unsigned long long)sat_count,
+           (unsigned long long)unsat_count);
     reverse_directed_solving = 0;
+    reverse_directed_prefix_destroy();
+    free(indices);
 }
 
 static int is_reverse_directed_mode(void)
