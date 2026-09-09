@@ -1103,6 +1103,7 @@ class BinRadarExecutor:
         if probe_result is None:
             logger.info("[PROBE] Failed to get probe result. Check if patch location is set or qemu_stacktrace is available.")
             sys.exit(1)
+        assert probe_result is not None
         if not probe_result.patch_hit():
             logger.info(f"[PROBE] No patch hit found. The patch location might be incorrect - timeout {probe_result.is_timeout()} - crash {probe_result.is_crash()} - normal exit {probe_result.is_normal_exit()}.")
             sys.exit(1)
@@ -1211,6 +1212,7 @@ class BinRadarExecutor:
                          patch_result: Optional[binradar_verifier.BinRadarPatchResult],
                          f: TextIO) -> bool:
         """Evaluate one filter observation and write its [patch] row."""
+        assert self.probe_result is not None
         if result is None:
             logger.warning(
                 f"[FILTER] [patch {patch_id}] Failed to run patched binary "
