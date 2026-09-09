@@ -7869,6 +7869,33 @@ static void smt_query(Query* q)
 static Z3_solver reverse_prefix_solver       = NULL;
 static Z3_solver reverse_scratch_solver_inst = NULL;
 
+/* Wall-clock budget (step D): the main loops enforce config.timeout (ms)
+ * between queries; the reverse path must do the same across its lowering
+ * pass and per-candidate checks. Exceeding the budget stops cleanly
+ * before the orchestrator's hard kill so bitmaps and finished testcases
+ * flush; exit status stays nonzero/incomplete. */
+static struct timespec reverse_budget_start;
+static uint64_t reverse_budget_elapsed_ms(void)
+{
+    struct timespec now;
+    get_time(&now);
+    return get_diff_time_microsec(&reverse_budget_start, &now) / 1000;
+}
+static int reverse_budget_exceeded(void)
+{
+    if (config.timeout <= 0) {
+        return 0;
+    }
+    if (reverse_budget_elapsed_ms() <= (uint64_t)config.timeout) {
+        return 0;
+    }
+    SAYF("\n\n[reverse-directed] budget exceeded (%llu ms > %lu ms). "
+         "Stopping cleanly...\n",
+         (unsigned long long)reverse_budget_elapsed_ms(),
+         (unsigned long)config.timeout);
+    return 1;
+}
+
 static Z3_solver reverse_scratch_solver(void)
 {
     if (!reverse_scratch_solver_inst) {
@@ -7954,6 +7981,20 @@ static void reverse_directed_solve(void)
 
     uint64_t sat_count = 0, unsat_count = 0;
     for (ssize_t j = (ssize_t)S - 1; j >= 0; j--) {
+        if (reverse_budget_exceeded()) {
+            printf("[reverse-directed] [budget] [phase solving]"
+                   " [elapsed %llu] [attempted %llu of %u]\n",
+                   (unsigned long long)reverse_budget_elapsed_ms(),
+                   (unsigned long long)(S - 1 - j), S);
+            printf("[reverse-directed] [solved] [sat %llu] [unsat %llu]"
+                   " [incomplete 1]\n",
+                   (unsigned long long)sat_count,
+                   (unsigned long long)unsat_count);
+            reverse_directed_solving = 0;
+            reverse_directed_prefix_destroy();
+            free(indices);
+            exit(1);
+        }
         ReverseCandidate* candidate =
             &g_array_index(reverse_candidates, ReverseCandidate, j);
         ssize_t idx = indices[j];
@@ -8022,11 +8063,20 @@ static int is_reverse_directed_mode(void)
 static void handle_query_reverse_directed(void)
 {
     current_query_mode = QUERY_MODE_ORIGINAL;
+    get_time(&reverse_budget_start);
     reverse_candidates = g_array_new(FALSE, FALSE, sizeof(ReverseCandidate));
     reverse_directed_lowering = 1;
     for (Query* q = query_queue + 1; q->query != FINAL_QUERY; q++) {
         if (!q->query) {
             break;
+        }
+        if (reverse_budget_exceeded()) {
+            printf("[reverse-directed] [budget] [phase lowering]"
+                   " [elapsed %llu]\n",
+                   (unsigned long long)reverse_budget_elapsed_ms());
+            save_bitmaps();
+            reverse_directed_lowering = 0;
+            exit(1);
         }
         smt_query(q);
     }
