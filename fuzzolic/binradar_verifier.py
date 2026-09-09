@@ -6,17 +6,44 @@ import logging
 import time
 import threading
 import fcntl
-from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
+from pathlib import Path
+from typing import List, Set, Tuple, Dict, Optional, Any, TextIO, Callable
 
 import sbsv
 
 import logger
 
 import binradar_utils
+from binradar_taosc_predicates import (
+    CachedSnapshot,
+    ParsedPredicate,
+    PredicateFamily,
+    evaluate_cached_predicate,
+    load_runtime_predicates,
+    parse_cached_snapshots,
+    predicate_descriptor,
+)
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "utils", "binradar-aflplusplus", "afl-qemu-trace")
+
+
+def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
+    """True if addr lies inside one of the canonical half-open
+    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve/loader pages).
+    Shared by the verifier and binradar-test.py's qasan probes."""
+    for part in exclude_ranges.split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        start_s, end_s = part.split("-", 1)
+        try:
+            if int(start_s, 16) <= addr < int(end_s, 16):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 class BinRadarProbeResult:
@@ -43,10 +70,14 @@ class BinRadarProbeResult:
         parser.add_schema("[patch-info] [set: bool] [location: hex]")
         parser.add_schema("[exit] [result: str]")
         parser.add_schema("[qemu-exit] [kind: str] [detail: str]")
-        parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol: str]")
+        # symbol is nullable: the stacktrace probe emits an empty [symbol ]
+        # token for unsymbolizable addresses (e.g. E9 trampoline PCs), which
+        # sbsv rejects for a non-nullable str key (crashed CVE-2014-8128 run
+        # br-fo-all-timeout during MINIMIZER).
+        parser.add_schema("[stacktrace] [idx: int] [addr: hex] [symbol?: str]")
         parser.add_schema("[patch-cov] [location: hex] [covered: bool] [hits: int]")
         parser.add_schema("[patch-func] [location: hex] [entry: hex] [hits: int]")
-        parser.add_schema("[fault-addr] [idx: int] [addr: hex] [symbol: str]")
+        parser.add_schema("[fault-addr] [idx: int] [addr: hex] [symbol?: str]")
         return parser
     
     @staticmethod
@@ -85,7 +116,7 @@ class BinRadarProbeResult:
         
         stacktrace = []
         if len(result["stacktrace"]) > 0:
-            stacktrace = [(entry["addr"], entry["symbol"]) for entry in result["stacktrace"]]
+            stacktrace = [(entry["addr"], entry["symbol"] or "") for entry in result["stacktrace"]]
         patch_hit_cnt = 0
         if len(result["patch-cov"]) != 0:
             patch_cov_info = result["patch-cov"][-1]
@@ -238,7 +269,7 @@ class BinRadarProbeResult:
                     return cls(
                         patch_loc=res["patch-loc"],
                         patch_func_entry=res["func-entry"],
-                        stacktrace=[(entry["addr"], entry["symbol"]) for entry in res["stacktrace"]],
+                        stacktrace=[(entry["addr"], entry["symbol"] or "") for entry in res["stacktrace"]],
                         exit_info=res["exit"],
                         patch_hit_cnt=res["patch-hit"],
                         patch_func_hit_cnt=res["func-hit"],
@@ -334,21 +365,39 @@ class BinRadarPatchResult:
         e.g. a division/modulo by zero in the predicate."""
         return 2 in self.br_selection
 
+
+class BinRadarCachedRun:
+    def __init__(self, patch_id: int, snapshots: List[CachedSnapshot]):
+        self.patch_id = patch_id
+        self.snapshots = snapshots
+
+    @property
+    def br_selection(self) -> List[int]:
+        return [snapshot.branch for snapshot in self.snapshots]
+
+
 class BinRadarQemuRunner:
     dir: str
     binary: str
     test_cmd: str
     patch_loc: str
-    exclude_addrs: List[str]
-    e9_relocated_calls: List[str]
+    # E9 metadata per artifact ("brpatched", "prefilter", "brcached"):
+    # (exclude_ranges, [relocated-call records]).  All prefixed values are
+    # stored; the executed binary's path selects the proper one.
+    e9_metadata: Dict[str, Tuple[str, List[str]]]
+    patch_kind: str
+    brcache_stack_size: int
     run_results: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str, exclude_addrs: List[str] = [], e9_relocated_calls: List[str] = []):
+    def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str,
+                 e9_metadata: Optional[Dict[str, Tuple[str, List[str]]]] = None,
+                 patch_kind: str = "", brcache_stack_size: int = 0):
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
         self.patch_loc = patch_loc
-        self.exclude_addrs = exclude_addrs
-        self.e9_relocated_calls = e9_relocated_calls
+        self.e9_metadata = e9_metadata if e9_metadata is not None else {}
+        self.patch_kind = patch_kind
+        self.brcache_stack_size = brcache_stack_size
         self.run_results = None
     
     @staticmethod
@@ -358,30 +407,84 @@ class BinRadarQemuRunner:
     
     @staticmethod
     def from_env(dir: str, env: Dict[str, str]) -> "BinRadarQemuRunner":
-        exclude_addrs: List[str] = [env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
-        e9_relocated_calls: List[str] = []
-        for record in env.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
-            record = record.strip()
-            if record:
-                fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
-                e9_relocated_calls.append(":".join(fields))
+        e9_metadata: Dict[str, Tuple[str, List[str]]] = {}
+        for artifact in binradar_utils.E9_METADATA_PREFIXES:
+            exclude_ranges, relocated_calls_str = \
+                binradar_utils.get_e9_metadata(env, artifact)
+            records: List[str] = []
+            for record in relocated_calls_str.split(","):
+                record = record.strip()
+                if record:
+                    fields = [f"0x{int(field, 0):x}"
+                              for field in record.split(":")]
+                    records.append(":".join(fields))
+            e9_metadata[artifact] = (exclude_ranges, records)
         return BinRadarQemuRunner(
             dir=dir,
             binary=env["BINARY"],
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
-            exclude_addrs=exclude_addrs,
-            e9_relocated_calls=e9_relocated_calls
+            e9_metadata=e9_metadata,
+            patch_kind=env.get("BINRADAR_PATCH_KIND", ""),
+            brcache_stack_size=int(env.get("BRCACHE_STACK_SIZE", "0"), 0),
         )
+
+    def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
+        """(exclude_ranges, relocated-call records) of the artifact the
+        given binary path belongs to.  Original binaries have no E9
+        metadata; .brpatched/.brprefilter/.brcached each select their own
+        prefixed values."""
+        for artifact, suffix in (("brpatched", ".brpatched"),
+                                 ("prefilter", ".brprefilter"),
+                                 ("brcached", ".brcached")):
+            if binary_path.endswith(suffix):
+                return self.e9_metadata.get(artifact, ("", []))
+        return "", []
     
-    def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None) -> Dict[str, str]:
+    def get_env_for_exec(self, patch_id: str, patch_fd: Optional[int] = None,
+                         binary: Optional[str] = None) -> Dict[str, str]:
         env = os.environ.copy()
         # env["LC_ALL"] = "C"
         env["AFL_USE_QASAN"] = "1"
         env["PATCH_ID"] = patch_id
         if patch_fd is not None:
             env["PATCH_FD"] = str(patch_fd)
+        # QASAN load/store checks are only generated for instrumented blocks
+        # (afl_must_instrument), and the E9 trampoline/reserve pages are
+        # outside the main image.  With the no-patch path (PATCH_ID=0, or a
+        # predicate taking branch 0) the patch stub re-executes the relocated
+        # copy of the patch-site instruction there, which would go unchecked:
+        # the crash disappears or shifts to a later site.  Re-include the
+        # artifact's E9 pages via QEMU's partial-instrumentation ranges (the
+        # E9_EXCLUDE_RANGES hex-interval syntax is exactly what the
+        # AFL_QEMU_INST_RANGES parser expects).  The original binary has no
+        # E9 metadata and is left untouched.  See
+        # agent-docs/problem/QASAN_E9_TRAMPOLINE_UNINSTRUMENTED.md.
+        ranges, _ = self.e9_metadata_for_binary(
+            binary if binary is not None else self.patched_binary())
+        if ranges:
+            env["AFL_QEMU_INST_RANGES"] = ranges
         return env
+
+    def normalize_fault_addr(self, fault_addr: int,
+                             binary: Optional[str] = None) -> int:
+        """Attribute a crash pc inside the artifact's E9 trampoline/reserve
+        pages to the patch site.
+
+        With the no-patch path the only relevant code running in the E9
+        pages is the re-executed relocated copy of the patch-site
+        instruction, so a crash whose fault pc lands there was caused by
+        the site instruction and must be compared against PATCH_LOC (same
+        rule as binradar-test.py's qasan probes).  Without this, a
+        non-fixing patch's crash would be classified as "crash elsewhere"
+        (ignored) instead of "crash at the original fault address".
+        Original binaries have no E9 metadata, so they are unchanged."""
+        ranges, _ = self.e9_metadata_for_binary(
+            binary if binary is not None else self.patched_binary())
+        if fault_addr is not None and ranges \
+                and addr_in_e9_ranges(fault_addr, ranges):
+            return int(self.patch_loc, 0)
+        return fault_addr
     
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
@@ -389,36 +492,51 @@ class BinRadarQemuRunner:
     def patched_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.brpatched")
 
-    def get_qemu_stacktrace_command(self, use_patched_bin: bool, input_file: str, patch_func_entry: int = 0) -> List[str]:
-        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file, "--patch-loc", self.patch_loc, "--asan", "host"]
+    def cached_binary(self) -> str:
+        return os.path.join(self.dir, f"{self.binary}.brcached")
+
+    def get_qemu_stacktrace_command_for_binary(
+        self, binary: str, input_file: str, patch_func_entry: int = 0,
+    ) -> List[str]:
+        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file,
+               "--patch-loc", self.patch_loc, "--asan", "host"]
         if patch_func_entry != 0:
-            cmd += [ "--patch-func-entry", f"0x{patch_func_entry:x}"]
-        if use_patched_bin:
-            binary = self.patched_binary()
-            for addr_range in self.exclude_addrs:
-                cmd += ["--asan-exclude", addr_range]
-            for addr in self.e9_relocated_calls:
-                cmd += ["--e9-relocated-call", addr]
-        else:
-            binary = self.original_binary()
+            cmd += ["--patch-func-entry", f"0x{patch_func_entry:x}"]
+        _, relocated_calls = self.e9_metadata_for_binary(binary)
+        for addr in relocated_calls:
+            cmd += ["--e9-relocated-call", addr]
         cmd += [binary, "--"] + shlex.split(self.test_cmd)
         return cmd
 
+    def get_qemu_stacktrace_command(
+        self, use_patched_bin: bool, input_file: str,
+        patch_func_entry: int = 0,
+    ) -> List[str]:
+        binary = self.patched_binary() if use_patched_bin \
+            else self.original_binary()
+        return self.get_qemu_stacktrace_command_for_binary(
+            binary, input_file, patch_func_entry)
+
+
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(False, testcase)
-        env = self.get_env_for_exec(patch_id="0")
+        env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
-            logger.error("Failed to execute the command.")
+            logger.error(f"Failed to run test_with_original on testcase {testcase}: "
+                         f"exit status {result.decode_status()}; "
+                         f"command: {shlex.join(command)}")
             return None
         return BinRadarProbeResult.from_log(result.stderr)
     
     def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
         command = self.get_qemu_stacktrace_command(False, testcase, patch_func_entry=patch_func_entry)
-        env = self.get_env_for_exec(patch_id="0")
+        env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
         result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
         if not result.success:
-            logger.error("Failed to execute the command.")
+            logger.error(f"Failed to run test_with_file_trace on testcase {testcase}: "
+                         f"exit status {result.decode_status()}; "
+                         f"command: {shlex.join(command)}")
             return None
         probe_result = BinRadarProbeResult.from_log(result.stderr)
         if probe_result is None:
@@ -426,26 +544,77 @@ class BinRadarQemuRunner:
             return None
         return probe_result
 
-    def test_with_patched(self, patch_id: str, testcase: str, verbose: bool = False) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
-        command = self.get_qemu_stacktrace_command(True, testcase)
+    def _test_with_capture(
+        self, binary: str, patch_id: str, testcase: str,
+        verbose: bool = False, extra_env: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes]]:
+        command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         rfd, wfd = os.pipe()
-        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd)
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
+        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd,
+                                    binary=binary)
+        if extra_env is not None:
+            env.update(extra_env)
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
         os.close(wfd)
-        thread, patch_result_chunks = binradar_utils.create_pipe_reader_thread(rfd, verbose=verbose)
-        result = binradar_utils.execute_await(proc, timeout=60.0, verbose=verbose)
-        thread.join() # Read all patch results and close the pipe(rfd)
-        
-        patch_result_data = b"".join(patch_result_chunks).decode(errors="ignore")
+        thread, chunks = binradar_utils.create_pipe_reader_thread(
+            rfd, verbose=verbose)
+        result = binradar_utils.execute_await(
+            proc, timeout=60.0, verbose=verbose)
+        thread.join()
         if not result.success:
-            logger.error("Failed to execute the command")
+            reason = (f"timed out after 60s" if result.timed_out
+                      else f"exit status {result.decode_status()}")
+            logger.error(f"Failed to run probe on {binary} (patch_id={patch_id}, "
+                         f"testcase={testcase}): {reason}; "
+                         f"command: {shlex.join(command)}")
             return None, None
-        patch_result = BinRadarPatchResult.from_log(patch_result_data)
+        probe = BinRadarProbeResult.from_log(result.stderr)
+        if probe is not None:
+            # A crash with the fault pc inside the artifact's E9 trampoline/
+            # reserve pages is the re-executed relocated copy of the patch-
+            # site instruction: attribute it to the patch site so the filter
+            # and verifier comparisons against the .orig fault address work.
+            probe.fault_addr = self.normalize_fault_addr(probe.fault_addr,
+                                                         binary)
+        return probe, b"".join(chunks)
+
+    def test_with_patched(
+        self, patch_id: str, testcase: str, verbose: bool = False,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        probe, data = self._test_with_capture(
+            self.patched_binary(), patch_id, testcase, verbose)
+        if probe is None or data is None:
+            return None, None
+        patch_result = BinRadarPatchResult.from_log(
+            data.decode(errors="ignore"))
         if patch_result is None:
-            # logger.error("Failed to parse patch result from the log.")
-            # logger.debug(f"Failed to parse patch result with id {patch_id}, {testcase}")
             return None, None
-        return BinRadarProbeResult.from_log(result.stderr), patch_result
+        return probe, patch_result
+
+    def test_with_cached(
+        self, patch_id: int, predicate: ParsedPredicate, testcase: str,
+        verbose: bool = False,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        probe, data = self._test_with_capture(
+            self.cached_binary(), "0", testcase, verbose,
+            {
+                "TAOSC_PRED": predicate_descriptor(predicate),
+                "BRCACHE_STACK_SIZE": str(self.brcache_stack_size),
+            })
+        if probe is None or data is None:
+            return None, None
+        snapshots, error = parse_cached_snapshots(data)
+        if error is not None:
+            logger.warning(f"Cached capture rejected: {error}")
+            return probe, None
+        if probe.patch_hit_cnt != len(snapshots):
+            logger.warning(
+                f"Cached capture hit mismatch: probe={probe.patch_hit_cnt} "
+                f"snapshots={len(snapshots)}")
+            return probe, None
+        return probe, BinRadarCachedRun(patch_id, snapshots)
 
 
 class Testcase:
@@ -464,23 +633,83 @@ class Testcase:
 
 class BinRadarConcreteVerifierResult:
     patch_verified: Dict[int, bool]
+    patch_verdict_counts: Dict[int, int]
+    patch_confidence: Dict[int, float]
+    accept_evidences: Dict[int, int]
+    total_evidences: Dict[int, int]
+    stop_reason: Optional[str]
     def __init__(self, results: dict):
         self.patch_verified = dict()
+        self.patch_verdict_counts = dict()
+        self.patch_confidence = dict()
+        self.accept_evidences = dict()
+        self.total_evidences = dict()
+        stopped_rows = results.get("verifier", {}).get("stopped", [])
+        self.stop_reason = (stopped_rows[-1]["reason"]
+                            if stopped_rows else None)
         for res in results["verifier-result"]:
             patch_id = res["patch"]
             verified = res["res"] == "verified"
             self.patch_verified[patch_id] = verified
-    
+            self.patch_verdict_counts[patch_id] = (
+                self.patch_verdict_counts.get(patch_id, 0) + 1)
+        for evidence in results.get("verifier-confidence", []):
+            patch_id = evidence["patch"]
+            accepted = evidence["accept-evidences"]
+            total = evidence["total-evidences"]
+            self.accept_evidences[patch_id] = accepted
+            self.total_evidences[patch_id] = total
+            # Recompute instead of trusting the serialized score so the
+            # in-memory value always follows the metric definition.
+            self.patch_confidence[patch_id] = (
+                accepted / total if total > 0 else 0.0)
+        # Legacy verifier files have verdict rows but no confidence rows.
+        # Represent their unknown evidence as the documented 0/0 score.
+        for patch_id in self.patch_verified:
+            self.accept_evidences.setdefault(patch_id, 0)
+            self.total_evidences.setdefault(patch_id, 0)
+            self.patch_confidence.setdefault(patch_id, 0.0)
+
+    def require_complete_verdicts(self, patches: List[int]) -> None:
+        """Require exactly one verifier verdict for every candidate patch.
+
+        FINAL must never interpret an absent verdict as acceptance. Missing,
+        unexpected, or duplicate rows indicate an incomplete/corrupt verifier
+        stream and make finalization fail closed.
+        """
+        expected = set(patches)
+        actual = set(self.patch_verified)
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        duplicates = sorted(
+            patch for patch, count in self.patch_verdict_counts.items()
+            if count != 1)
+        if missing or unexpected or duplicates:
+            raise ValueError(
+                "Verifier result coverage mismatch: "
+                f"missing patches {missing}; "
+                f"unexpected patches {unexpected}; "
+                f"duplicate patches {duplicates}")
+
     @classmethod
     def from_sbsv(cls, sbsv_file: str) -> Optional["BinRadarConcreteVerifierResult"]:
         parser = sbsv.parser()
-        parser.add_schema("[verifier-result] [res: str] [patch: int] [testcase?: str]")
+        parser.add_schema(
+            "[verifier-result] [res: str] [patch: int] [testcase?: str]")
+        parser.add_schema(
+            "[verifier-confidence] [patch: int] [score: float] "
+            "[accept-evidences: int] [total-evidences: int]")
+        parser.add_schema("[verifier] [stopped] [reason: str]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
             result = parser.load(f)
         if "verifier-result" not in result:
             logger.error("Verifier result not found in the sbsv file.")
             return None
         return cls(result)
+
+
+class _VerifierTimeout(TimeoutError):
+    """The verifier's own wall-clock evidence budget was exhausted."""
 
 
 class BinRadarConcreteVerifier:
@@ -494,6 +723,11 @@ class BinRadarConcreteVerifier:
     start_time: float
     logger: logging.Logger
     minimized_dir: str
+    cached_predicates: Dict[int, ParsedPredicate]
+    cache_family: Optional[PredicateFamily]
+    accept_evidences: Dict[int, int]
+    total_evidences: Dict[int, int]
+    timeout_cutoff_logged: bool
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
         self.dir = dir
         self.run_dir = run_dir
@@ -503,6 +737,9 @@ class BinRadarConcreteVerifier:
         self.patched_binary = patched_binary
         self.patches = patches
         self.testcases = list()
+        self.accept_evidences = {patch: 0 for patch in patches}
+        self.total_evidences = {patch: 0 for patch in patches}
+        self.timeout_cutoff_logged = False
         self.start_time = time.time()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
@@ -514,6 +751,30 @@ class BinRadarConcreteVerifier:
         fmt = logging.Formatter("%(asctime)s - %(message)s")
         fh.setFormatter(fmt)
         self.logger.addHandler(fh)
+
+        self.cached_predicates = {}
+        self.cache_family = None
+        manifest = Path(dir) / "brpatches.json"
+        cached_binary = Path(runner.cached_binary())
+        if len(patches) > 1 and manifest.is_file() and cached_binary.is_file():
+            try:
+                family, predicates = load_runtime_predicates(manifest)
+                if runner.patch_kind and runner.patch_kind != family.value:
+                    raise ValueError(
+                        f"manifest family {family.value} != "
+                        f"configured family {runner.patch_kind}")
+                missing = [patch for patch in patches
+                           if patch not in predicates]
+                if missing:
+                    raise ValueError(f"missing runtime patch ids {missing}")
+                if family == PredicateFamily.CWE805_ERM \
+                        and runner.brcache_stack_size <= 0:
+                    raise ValueError("missing CWE-805 cache stack size")
+                self.cache_family = family
+                self.cached_predicates = predicates
+            except ValueError as e:
+                self.logger.warning(
+                    f"[verifier-cache] [disabled] [reason {e}]")
     
     def _testcase_from_result_row(self, row: Dict[str, Any]) -> Optional[Testcase]:
         id = row["id"]
@@ -531,58 +792,202 @@ class BinRadarConcreteVerifier:
             br=row["br"]
         )
 
-    def _test_testcase(self, patch: int, testcase: Testcase) -> bool:
-        """Run the patched binary for one (patch, testcase) pair. Returns True
-        iff the patch is rejected by this testcase, False otherwise."""
-        self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+    def _record_evidence(self, patch: int, accepted: bool) -> None:
+        self.total_evidences[patch] = self.total_evidences.get(patch, 0) + 1
+        if accepted:
+            self.accept_evidences[patch] = self.accept_evidences.get(patch, 0) + 1
+
+    def confidence(self, patch: int) -> float:
+        total = self.total_evidences.get(patch, 0)
+        if total == 0:
+            return 0.0
+        return self.accept_evidences.get(patch, 0) / total
+
+    @staticmethod
+    def _raise_if_timed_out(deadline: Optional[float]) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _VerifierTimeout("Verifier phase timed out")
+
+    def mark_timeout_cutoff(self) -> None:
+        """Serialize the partial-evidence marker exactly once."""
+        if self.timeout_cutoff_logged:
+            return
+        self.logger.info("[verifier] [stopped] [reason timeout]")
+        self.timeout_cutoff_logged = True
+
+    def _log_result(self, patch: int, result: str, testcase: str) -> None:
+        self.logger.info(
+            f"[verifier-result] [res {result}] [patch {patch}] "
+            f"[testcase {testcase}]")
+        self.logger.info(
+            f"[verifier-confidence] [patch {patch}] "
+            f"[score {self.confidence(patch):.6f}] "
+            f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
+            f"[total-evidences {self.total_evidences.get(patch, 0)}]")
+
+    def _test_result(
+        self, patch: int, testcase: Testcase, result: BinRadarProbeResult,
+        patch_result: Optional[BinRadarPatchResult],
+    ) -> bool:
+        """Return whether one observed execution rejects the candidate.
+
+        Conclusive pass/fail observations count as evidence. Observations at
+        unrelated fault addresses and timeouts are ignored. A normal-to-normal
+        branch-vector difference is negative evidence, but is not a hard
+        rejection.
+        """
+        if patch_result is not None and patch_result.crashed():
+            self._record_evidence(patch, False)
+            self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+            return True
         if testcase.exit == "crash":
-            result, patch_result = self.run_testcase_patched(patch, testcase)
-            if result is None:
-                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                return False
-            if patch_result is not None and patch_result.crashed():
-                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                return True
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
                     return False
+                self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
-            elif result.is_normal_exit():
+            if result.is_normal_exit():
+                self._record_evidence(patch, True)
                 self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
-            elif result.is_timeout():
+            if result.is_timeout():
                 self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         else:
-            result, patch_result = self.run_testcase_patched(patch, testcase)
-            if result is None:
-                self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-                return False
-            if patch_result is not None and patch_result.crashed():
-                self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                return True
             if result.is_crash():
+                if result.fault_addr != self.probe_result.fault_addr:
+                    self.logger.info(f"[verifier] [no-crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    return False
+                self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
-            elif result.is_normal_exit():
+            if result.is_normal_exit():
                 if patch_result is None:
                     self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
                     return False
-                # br is 0/1 here: a `2` (patch crashed) is rejected
-                # explicitly above, before this comparison.
                 if testcase.br == patch_result.br_selection:
+                    self._record_evidence(patch, True)
                     self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     return False
-                else:
-                    self.logger.info(f"[verifier] [no-crash-pass-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
-                    return True
-            elif result.is_timeout():
+                self._record_evidence(patch, False)
+                self.logger.info(f"[verifier] [no-crash-confidence-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                return False
+            if result.is_timeout():
                 self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         return False
-    
+
+    def _test_testcase(self, patch: int, testcase: Testcase,
+                       deadline: Optional[float] = None) -> bool:
+        """Run one candidate normally and return whether it is rejected."""
+        self._raise_if_timed_out(deadline)
+        self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+        result, patch_result = self.run_testcase_patched(patch, testcase)
+        self._raise_if_timed_out(deadline)
+        if result is None:
+            self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
+            return False
+        return self._test_result(patch, testcase, result, patch_result)
+
+    def _cached_branches(
+        self, patch: int, snapshots: List[CachedSnapshot],
+    ) -> Optional[List[int]]:
+        predicate = self.cached_predicates.get(patch)
+        if predicate is None:
+            return None
+        try:
+            return evaluate_cached_predicate(predicate, snapshots)
+        except (IndexError, ValueError) as e:
+            self.logger.warning(
+                f"[verifier-cache] [predicate-error] [patch {patch}] "
+                f"[reason {e}]")
+            return None
+
+    def _test_testcase_batch(
+        self, patches: List[int], testcase: Testcase,
+        deadline: Optional[float] = None,
+        on_rejected: Optional[Callable[[int], None]] = None,
+    ) -> Set[int]:
+        """Run one representative per distinct complete branch vector.
+
+        ``on_rejected`` serializes conclusive failures immediately. This is
+        important at a graceful deadline: a later timeout in the same batch
+        must not discard a rejection that has already been observed.
+        """
+        rejected: Set[int] = set()
+
+        def record_rejection(patch: int) -> None:
+            rejected.add(patch)
+            if on_rejected is not None:
+                on_rejected(patch)
+
+        if self.cache_family is None or len(patches) <= 1:
+            for patch in patches:
+                if self._test_testcase(patch, testcase, deadline):
+                    record_rejection(patch)
+            return rejected
+
+        remaining = list(patches)
+        while remaining:
+            self._raise_if_timed_out(deadline)
+            if len(remaining) == 1:
+                patch = remaining.pop()
+                if self._test_testcase(patch, testcase, deadline):
+                    record_rejection(patch)
+                continue
+
+            representative = remaining.pop(0)
+            self.logger.info(
+                f"[verifier-cache] [miss] [patch {representative}] "
+                f"[id {testcase.id}] [file {testcase.filename}]")
+            result, cached = self.run_testcase_cached(
+                representative, testcase)
+            self._raise_if_timed_out(deadline)
+            if result is None or cached is None:
+                self.logger.warning(
+                    f"[verifier-cache] [fallback] [patch {representative}] "
+                    f"[id {testcase.id}]")
+                if self._test_testcase(representative, testcase, deadline):
+                    record_rejection(representative)
+                continue
+
+            observed = cached.br_selection
+            evaluated = self._cached_branches(
+                representative, cached.snapshots)
+            if evaluated is None or evaluated != observed:
+                self.logger.warning(
+                    f"[verifier-cache] [runtime-mismatch] "
+                    f"[patch {representative}] [id {testcase.id}]")
+                if self._test_testcase(representative, testcase, deadline):
+                    record_rejection(representative)
+                continue
+
+            representative_result = BinRadarPatchResult(
+                representative, observed)
+            if self._test_result(
+                    representative, testcase, result,
+                    representative_result):
+                record_rejection(representative)
+
+            equivalent: List[Tuple[int, List[int]]] = []
+            for patch in remaining:
+                branches = self._cached_branches(patch, cached.snapshots)
+                if branches is not None and branches == observed:
+                    equivalent.append((patch, branches))
+            for patch, branches in equivalent:
+                remaining.remove(patch)
+                self.logger.info(
+                    f"[verifier-cache] [hit] [patch {patch}] "
+                    f"[representative {representative}] "
+                    f"[id {testcase.id}]")
+                if self._test_result(
+                        patch, testcase, result,
+                        BinRadarPatchResult(patch, branches)):
+                    record_rejection(patch)
+        return rejected
+
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename))
         if result is None:
@@ -590,84 +995,153 @@ class BinRadarConcreteVerifier:
             return None, None
         return result, patch_result
 
+    def run_testcase_cached(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        predicate = self.cached_predicates.get(patch_id)
+        if predicate is None:
+            return None, None
+        return self.runner.test_with_cached(
+            patch_id, predicate,
+            os.path.join(self.minimized_dir, testcase.filename))
+
     def run_verification_streaming(self, minimizer_result_file: str,
                                    poll_interval: float = 0.2,
                                    minimizer_thread: Optional[threading.Thread] = None,
-                                   minimizer_exc_queue: Optional[Any] = None) -> None:
-        """Stream [testcase] [result] rows from minimizer.sbsv and verify the
-        patches against each testcase as it appears. A standalone replay
-        requires the done marker; a live stream may stop consuming rows once
+                                   minimizer_exc_queue: Optional[Any] = None,
+                                   timeout: Optional[float] = None) -> bool:
+        """Stream minimizer evidence and serialize one verdict per patch.
+
+        A standalone replay requires either the complete ``done`` marker or a
+        timeout ``stopped`` marker. A live stream may stop consuming rows once
         every patch is rejected while the minimizer continues to completion.
+        ``timeout`` is the total wall-clock budget for this verifier run;
+        non-positive values disable the deadline. Reaching the deadline is a
+        graceful cutoff: already-observed hard failures remain rejected and
+        every other patch is verified with confidence computed from the
+        evidence consumed so far. The return value reports that cutoff.
         """
+        deadline = (time.monotonic() + timeout
+                    if timeout is not None and timeout > 0 else None)
         parser = sbsv.parser()
         parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
         parser.add_schema("[minimizer] [done] [time: int]")
-        if not os.path.exists(minimizer_result_file):
-            if minimizer_thread is None:
-                raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
-            waited = 0.0
-            while not os.path.exists(minimizer_result_file):
-                if minimizer_thread is not None and not minimizer_thread.is_alive():
-                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
-                        raise minimizer_exc_queue.get_nowait()
-                    raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
-                time.sleep(poll_interval)
-                waited += poll_interval
-                if waited >= 60:
-                    raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+        parser.add_schema(
+            "[minimizer] [stopped] [reason: str] [time: int]")
         pending_patches = list(self.patches)
         done_seen = False
+        stop_reason: Optional[str] = None
         dead_without_marker = False
-        with open(minimizer_result_file, "r", encoding="utf-8") as f:
-            offset = f.tell()
-            while True:
+        timed_out = False
+
+        def record_rejection(patch: int, testcase: Testcase) -> None:
+            if patch not in pending_patches:
+                return
+            self._log_result(patch, "rejected", testcase.filename)
+            pending_patches.remove(patch)
+
+        try:
+            if not os.path.exists(minimizer_result_file):
+                if minimizer_thread is None:
+                    raise RuntimeError(
+                        f"Minimizer results not found: {minimizer_result_file}")
+                waited = 0.0
+                while not os.path.exists(minimizer_result_file):
+                    self._raise_if_timed_out(deadline)
+                    if not minimizer_thread.is_alive():
+                        if (minimizer_exc_queue is not None
+                                and not minimizer_exc_queue.empty()):
+                            raise minimizer_exc_queue.get_nowait()
+                        raise RuntimeError(
+                            "Minimizer ended without writing a terminal "
+                            "marker. Its results are incomplete.")
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+                    if waited >= 60:
+                        raise RuntimeError(
+                            f"Minimizer results not found: "
+                            f"{minimizer_result_file}")
+            with open(minimizer_result_file, "r", encoding="utf-8") as f:
+                offset = f.tell()
+                while True:
+                    self._raise_if_timed_out(deadline)
+                    f.seek(offset)
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    data = f.read()
+                    offset = f.tell()
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    for line in data.split("\n"):
+                        row = parser.parse_line_detached(line)
+                        if row is None:
+                            continue
+                        if row.schema_name == "testcase$result":
+                            testcase = self._testcase_from_result_row(row.data)
+                            if testcase is None:
+                                continue
+                            self.testcases.append(testcase)
+                            rejected = self._test_testcase_batch(
+                                list(pending_patches), testcase, deadline,
+                                on_rejected=lambda patch, testcase=testcase:
+                                    record_rejection(patch, testcase))
+                            # Keep compatibility with batch implementations
+                            # that return rejections without using the callback.
+                            for patch in rejected:
+                                record_rejection(patch, testcase)
+                            if (not pending_patches
+                                    and minimizer_thread is not None):
+                                return False
+                        elif row.schema_name == "minimizer$done":
+                            done_seen = True
+                        elif row.schema_name == "minimizer$stopped":
+                            stop_reason = row["reason"]
+                    if stop_reason is not None:
+                        if stop_reason != "timeout":
+                            raise RuntimeError(
+                                f"Minimizer stopped for unsupported reason: "
+                                f"{stop_reason}")
+                        timed_out = True
+                        break
+                    if minimizer_thread is None:
+                        if done_seen:
+                            break
+                        raise RuntimeError(
+                            "minimizer.sbsv does not contain a terminal "
+                            "minimizer marker ([minimizer] [done] or "
+                            "[minimizer] [stopped] missing). Run the "
+                            "minimizer phase first, or --run-single-phase "
+                            "minimizer-verifier to run the minimizer and the "
+                            "verifier concurrently.")
+                    if not minimizer_thread.is_alive():
+                        if done_seen:
+                            break
+                        if (minimizer_exc_queue is not None
+                                and not minimizer_exc_queue.empty()):
+                            raise minimizer_exc_queue.get_nowait()
+                        # The terminal marker may have been written between
+                        # the last read and thread exit. One more read round is
+                        # conclusive once the writer is dead.
+                        if dead_without_marker:
+                            raise RuntimeError(
+                                "Minimizer ended without writing a terminal "
+                                "marker. Its results are incomplete.")
+                        dead_without_marker = True
+                    time.sleep(poll_interval)
+                # The writer holds the lock across write+flush. A
+                # non-newline-terminated tail indicates a torn row from an
+                # external writer.
                 f.seek(offset)
                 fcntl.flock(f, fcntl.LOCK_EX)
-                data = f.read()
-                offset = f.tell()
+                tail = f.read()
                 fcntl.flock(f, fcntl.LOCK_UN)
-                for line in data.split("\n"):
-                    row = parser.parse_line_detached(line)
-                    if row is None:
-                        continue
-                    if row.schema_name == "testcase$result":
-                        testcase = self._testcase_from_result_row(row.data)
-                        if testcase is None:
-                            continue
-                        self.testcases.append(testcase)
-                        for patch in list(pending_patches):
-                            if self._test_testcase(patch, testcase):
-                                self.logger.info(f"[verifier-result] [res rejected] [patch {patch}] [testcase {testcase.filename}]")
-                                pending_patches.remove(patch)
-                                if not pending_patches and minimizer_thread is not None:
-                                    return
-                    elif row.schema_name == "minimizer$done":
-                        done_seen = True
-                if minimizer_thread is None:
-                    if done_seen:
-                        break
-                    raise RuntimeError("minimizer.sbsv does not contain a completed minimizer run ([minimizer] [done] missing). Run the minimizer phase first.")
-                if not minimizer_thread.is_alive():
-                    if done_seen:
-                        break
-                    if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
-                        raise minimizer_exc_queue.get_nowait()
-                    # The marker may have been written between our last read
-                    # and the thread's exit; the file is final once the thread
-                    # is dead, so one more read round is conclusive before
-                    # declaring the run incomplete.
-                    if dead_without_marker:
-                        raise RuntimeError("Minimizer ended without writing the done marker. Its results are incomplete.")
-                    dead_without_marker = True
-                time.sleep(poll_interval)
-            # Final drain guard: the writer holds the lock across write+flush, so
-            # a non-newline-terminated tail means a torn row from a non-locking writer.
-            f.seek(offset)
-            fcntl.flock(f, fcntl.LOCK_EX)
-            tail = f.read()
-            fcntl.flock(f, fcntl.LOCK_UN)
-            if tail and not tail.endswith("\n"):
-                raise RuntimeError("minimizer.sbsv contains an unterminated line")
+                if tail and not tail.endswith("\n"):
+                    raise RuntimeError(
+                        "minimizer.sbsv contains an unterminated line")
+            if not timed_out:
+                self._raise_if_timed_out(deadline)
+        except _VerifierTimeout:
+            timed_out = True
+
+        if timed_out:
+            self.mark_timeout_cutoff()
         for patch in pending_patches:
-            self.logger.info(f"[verifier-result] [res verified] [patch {patch}] [testcase ]")
+            self._log_result(patch, "verified", "")
+        return timed_out

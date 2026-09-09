@@ -13,290 +13,92 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import Dict, List, Optional, Tuple, Union
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import binradar_taosc_predicates
+import binradar_utils
+from binradar_taosc_predicates import (
+    AllocatorTrace,
+    CWE805PointerPredicate,
+    CWE805SizePredicate,
+    CWE805Snapshot,
+    InstrumentationSpec,
+    INT64_MIN,
+    PREFILTER_SNAPSHOT_HEADER,
+    PREFILTER_SNAPSHOT_MAGIC,
+    PREFILTER_SNAPSHOT_VERSION,
+    PredicateFamily,
+    PredicateRecord,
+    PrefilterTrap,
+    RegisterCell,
+    StackCell,
+    _MASK64,
+    _emit_brpatches_inc,
+    _parse_predicate_records,
+    build_instrumentation_spec,
+    CWE805_branch_taken,
+    CWE805_snapshot_branch_taken,
+    detect_predicate_family,
+    e9tool_command,
+    evaluate_predicate,
+    load_prefilter_passed_ids,
+    load_predicates,
+    parse_allocator_trace,
+    parse_CWE805_predicate,
+    parse_CWE805_snapshots,
+    parse_state_lines,
+    predicate_to_branch_patch_str,
+    predicates_sha256,
+    read_patch_format,
+    tokenize_generic,
+    write_prefilter,
+    write_runtime_predicates,
+)
+
 ROOT_DIR = SCRIPT_DIR.parent
 BENCHMARK_SCRIPTS = ROOT_DIR / "benchmarks" / "scripts"
 BRPATCH_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch.c"
 BRPATCH_PREFILTER_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-prefilter.c"
+BRPATCH_CACHED_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-cached.c"
 QEMU_STACKTRACE_RELEASE = ROOT_DIR / "utils" / "binradar-aflplusplus" / "afl-qemu-trace"
 
 
-"""BinRadar workdir setup and patch prefilter (one entry point).
+"""BinRadar workdir setup (includes the patch prefilter, one entry point).
 
-Subcommands:
-  setup       - generate <BINARY>.brpatched and binradar.env from
-                config.env (previously benchmarks/scripts/binradar_setup.py)
-  prefilter   - run the POC once against a capture-instrumented binary
-                (<BINARY>.brprefilter, built from
-                benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
-                configuration used by the FILTER phase, collect the
-                patch-site STATE vectors, evaluate every candidate
-                predicate offline (mirroring taosc's i64 semantics and its
-                false-means-jump branch polarity), and write
-                workdir/prefilter.sbsv listing which predicates branch on
-                the POC.  `setup` then
-                keeps only the surviving predicates before applying the
-                top-10 cap, so the expensive binradar pipeline never runs
-                on predicates that the FILTER phase would reject anyway.
-                (previously fuzzolic/binradar-prefilter.py)
+`setup` does everything in one step:
+  1. offline prefilter: run the POC once against a capture-instrumented
+     binary (<BINARY>.brprefilter, built from
+     benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
+     configuration used by the FILTER phase, collect the patch-site STATE
+     vectors, evaluate every candidate predicate offline (mirroring
+     taosc's i64 semantics and its false-means-jump branch polarity), and
+     write workdir/prefilter.sbsv listing which predicates branch on the
+     POC.  Fail-open: any capture/parse problem keeps all predicates.
+     A valid existing prefilter.sbsv (matching family + predicates-file
+     SHA-256) is reused; delete it to force a re-run.
+  2. patch preparation: generate <BINARY>.brpatched and binradar.env from
+     config.env (previously benchmarks/scripts/binradar_setup.py), keeping
+     only the surviving predicates before applying the top-30 cap, so the
+     expensive binradar pipeline never runs on predicates that the FILTER
+     phase would reject anyway.
 
 Usage:
   uv run fuzzolic/binradar-setup.py setup -w <workdir>
-  uv run fuzzolic/binradar-setup.py prefilter -w <workdir>
+
+The compiled binaries always contain at most the top-30 prefilter
+survivors; brpatches.json (the verifier-cache manifest) exports every
+survivor so the full candidate set stays loadable and auditable.
 """
 
 
 PAGE_SIZE = 0x1000
 PREFILTER_QEMU_TIMEOUT = 60.0  # same as BinRadarQemuRunner.test_with_patched
-
-INT64_MIN = -(1 << 63)
-_INT64_MAX = (1 << 63) - 1
-_MASK64 = (1 << 64) - 1
-
-# sbsv schemas for the rows this module parses:
-#   [prefilter-state] [v0 N] [v1 N] ... [v15 N]  (written by
-#     brpatch-prefilter.c::dest to the PATCH_FD pipe)
-#   [prefilter] [res] [id N] [pass true|false] [new-id N|-1] (prefilter.sbsv)
-#   [prefilter] [done] [total N] [survived N] [time T]  (prefilter.sbsv marker)
-PREFILTER_STATE_SCHEMA = (
-    "[prefilter-state] " + " ".join(f"[v{i}: int]" for i in range(16))
-)
-
-CONSTANTS: Dict[str, int] = {
-    "max1": 0,
-    "min2": -2,
-    "max2": 1,
-    "min3": -4,
-    "max3": 3,
-    "min4": -8,
-    "max4": 7,
-    "min5": -16,
-    "max5": 15,
-    "min6": -32,
-    "max6": 31,
-    "min7": -64,
-    "max7": 63,
-    "min8": -128,
-    "max8": 127,
-    "min9": -256,
-    "min16": -32768,
-    "max16": 32767,
-    "min17": -65536,
-    "min32": -2147483648,
-    "max32": 2147483647,
-    "min33": -4294967296,
-    "min64": -9223372036854775808,
-    "max64": 9223372036854775807,
-}
-
-REGISTER_TO_VAR: Dict[str, int] = {
-    "rax": 0,
-    "rbx": 1,
-    "rcx": 2,
-    "rdx": 3,
-    "rsi": 4,
-    "rdi": 5,
-    "rsp": 6,
-    "rbp": 7,
-    "r8": 8,
-    "r9": 9,
-    "r10": 10,
-    "r11": 11,
-    "r12": 12,
-    "r13": 13,
-    "r14": 14,
-    "r15": 15,
-}
-
-TOKEN_RE = re.compile(
-    r"<=|>=|==|!=|<<|>>|[()~+\-*/%&|^<>]|[A-Za-z_][A-Za-z0-9_]*|\d+"
-)
-
-AstNode = Union[
-    Tuple[str, int],              # ("const", value) | ("var", index)
-    Tuple[str, "AstNode"],        # unary
-    Tuple[str, "AstNode", "AstNode"],  # binary
-]
-
-
-class Parser:
-    def __init__(self, tokens: List[str]):
-        self.tokens = tokens
-        self.pos = 0
-
-    def peek(self) -> Optional[str]:
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
-
-    def pop(self, expected: Optional[str] = None) -> str:
-        tok = self.peek()
-        if tok is None:
-            raise ValueError("unexpected end of predicate")
-        if expected is not None and tok != expected:
-            raise ValueError(f"expected {expected!r}, got {tok!r}")
-        self.pos += 1
-        return tok
-
-    def parse(self) -> AstNode:
-        node = self.parse_bitor()
-        if self.peek() is not None:
-            raise ValueError(f"unexpected trailing token: {self.peek()!r}")
-        return node
-
-    def parse_bitor(self) -> AstNode:
-        node = self.parse_xor()
-        while self.peek() == "|":
-            self.pop("|")
-            node = ("|", node, self.parse_xor())
-        return node
-
-    def parse_xor(self) -> AstNode:
-        node = self.parse_bitand()
-        while self.peek() == "^":
-            self.pop("^")
-            node = ("^", node, self.parse_bitand())
-        return node
-
-    def parse_bitand(self) -> AstNode:
-        node = self.parse_equality()
-        while self.peek() == "&":
-            self.pop("&")
-            node = ("&", node, self.parse_equality())
-        return node
-
-    def parse_equality(self) -> AstNode:
-        node = self.parse_relational()
-        while self.peek() in ("==", "!="):
-            op = self.pop()
-            node = (op, node, self.parse_relational())
-        return node
-
-    def parse_relational(self) -> AstNode:
-        node = self.parse_shift()
-        while self.peek() in ("<", "<=", ">", ">="):
-            op = self.pop()
-            node = (op, node, self.parse_shift())
-        return node
-
-    def parse_shift(self) -> AstNode:
-        node = self.parse_additive()
-        while self.peek() in ("<<", ">>"):
-            op = self.pop()
-            node = (op, node, self.parse_additive())
-        return node
-
-    def parse_additive(self) -> AstNode:
-        node = self.parse_multiplicative()
-        while self.peek() in ("+", "-"):
-            op = self.pop()
-            node = (op, node, self.parse_multiplicative())
-        return node
-
-    def parse_multiplicative(self) -> AstNode:
-        node = self.parse_unary()
-        while self.peek() in ("*", "/", "%"):
-            op = self.pop()
-            node = (op, node, self.parse_unary())
-        return node
-
-    def parse_unary(self) -> AstNode:
-        tok = self.peek()
-        if tok == "+":
-            self.pop("+")
-            return ("u+", self.parse_unary())
-        if tok == "-":
-            self.pop("-")
-            return ("u-", self.parse_unary())
-        if tok == "~":
-            self.pop("~")
-            return ("u~", self.parse_unary())
-        return self.parse_primary()
-
-    def parse_primary(self) -> AstNode:
-        tok = self.peek()
-        if tok == "(":
-            self.pop("(")
-            node = self.parse_bitor()
-            self.pop(")")
-            return node
-
-        tok = self.pop()
-        if tok.isdigit():
-            return ("const", int(tok))
-        if tok in CONSTANTS:
-            return ("const", CONSTANTS[tok])
-        if tok in REGISTER_TO_VAR:
-            return ("var", REGISTER_TO_VAR[tok])
-        raise ValueError(f"unknown identifier: {tok}")
-
-
-def emit_patch(node: AstNode) -> str:
-    kind = node[0]
-
-    if kind == "const":
-        value = node[1]
-        if type(value) != int:
-            raise ValueError(f"invalid constant value: {value!r}")
-        return f"p{value}" if value >= 0 else f"n{-value}"
-
-    if kind == "var":
-        value = node[1]
-        if type(value) != int:
-            raise ValueError(f"invalid variable value: {value!r}")
-        return f"v{value}"
-
-    if kind == "u+":
-        return emit_patch(cast(AstNode, node[1]))
-
-    if kind == "u-":
-        return f"-p0{emit_patch(cast(AstNode, node[1]))}"
-
-    if kind == "u~":
-        return f"~{emit_patch(cast(AstNode, node[1]))}"
-
-    op_map = {
-        "+": "+",
-        "-": "-",
-        "*": "*",
-        "/": "/",
-        "%": "%",
-        "&": "&",
-        "|": "|",
-        "^": "^",
-        "<<": "l",
-        ">>": "r",
-        "<": "<",
-        "<=": "<=",
-        "==": "=",
-        ">=": ">=",
-        ">": ">",
-        "!=": "!",
-    }
-
-    if len(node) != 3 or kind not in op_map:
-        raise ValueError(f"unsupported AST node: {node!r}")
-
-    _, lhs, rhs = node
-    return f"{op_map[kind]}{emit_patch(lhs)}{emit_patch(rhs)}"
-
-
-def predicate_to_patch_str(predicate: str) -> str:
-    tokens = TOKEN_RE.findall(predicate)
-    if not tokens:
-        raise ValueError("empty predicate")
-    ast = Parser(tokens).parse()
-    return emit_patch(ast)
-
-
-def predicate_to_branch_patch_str(predicate: str) -> str:
-    """Encode taosc's predicate as BinRadar's branch condition.
-
-    Taosc's generic patch jumps when its generated predicate is zero, while
-    brpatch.c jumps when the encoded expression is non-zero.
-    """
-    return f"={predicate_to_patch_str(predicate)}p0"
 
 
 def load_env(file: Path) -> Dict[str, str]:
@@ -322,213 +124,6 @@ def save_env(env: Dict[str, str], file: Path):
     with file.open("w") as f:
         for key, value in env.items():
             f.write(f"{key}=\"{value}\"\n")
-
-
-def load_predicates(file: Path) -> List[Tuple[int, str]]:
-    """Load non-empty predicates with their physical source line numbers."""
-    predicates: List[Tuple[int, str]] = list()
-    with file.open("r") as f:
-        for line_number, line in enumerate(f, start=1):
-            predicate = line.strip()
-            if predicate:
-                predicates.append((line_number, predicate))
-    return predicates
-
-
-def load_prefilter_passed_ids(prefilter_file: Path) -> Optional[Dict[int, int]]:
-    """Read source predicate IDs and their compact runtime patch IDs.
-
-    Each passing row must contain a positive, unique ``new-id``.  A false
-    row must contain ``new-id -1``.  Returns ``None`` on malformed input so
-    setup fails open and keeps every predicate.
-    """
-    parser = sbsv.parser()
-    parser.add_schema(
-        "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
-    parser.add_schema(
-        "[prefilter] [done] [total: int] [survived: int] [time: float]")
-    passed_ids: Dict[int, int] = dict()
-    used_new_ids = set()
-    with prefilter_file.open("r") as f:
-        for line_number, line in enumerate(f, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = parser.parse_line_detached(line, line_number)
-            except Exception:
-                return None
-            if row is None:
-                return None
-            if row.schema_name == "prefilter$done":
-                continue
-            if row.schema_name != "prefilter$res":
-                return None
-            source_id = row["id"]
-            new_id = row["new-id"]
-            if row["pass"]:
-                if source_id <= 0 or new_id <= 0:
-                    return None
-                if source_id in passed_ids or new_id in used_new_ids:
-                    return None
-                passed_ids[source_id] = new_id
-                used_new_ids.add(new_id)
-            elif new_id != -1:
-                return None
-    if sorted(used_new_ids) != list(range(1, len(used_new_ids) + 1)):
-        return None
-    return passed_ids
-
-
-class PrefilterTrap(Exception):
-    """Arithmetic that would raise SIGFPE in C (div/mod by zero, INT64_MIN / -1)."""
-
-
-def wrap64(v: int) -> int:
-    """Reinterpret v as a signed 64-bit two's-complement integer."""
-    v &= _MASK64
-    return v - (1 << 64) if v >= (1 << 63) else v
-
-
-def _parse_int(s: str, pos: List[int]) -> int:
-    """Parse decimal digits; accumulate with the same wraparound as the
-    int64_t arithmetic in brpatch.c::scani."""
-    i = 0
-    n = len(s)
-    while pos[0] < n and "0" <= s[pos[0]] <= "9":
-        i = wrap64(i * 10 + (ord(s[pos[0]]) - 48))
-        pos[0] += 1
-    return i
-
-
-def _trunc_div(a: int, b: int) -> int:
-    """C truncating division (round toward zero), not Python floor division."""
-    q = abs(a) // abs(b)
-    return -q if (a < 0) != (b < 0) else q
-
-
-def _shift_left(a: int, b: int) -> int:
-    """Mirror Zig std.math.shl(i64), including negative shift counts."""
-    if b >= 64:
-        return 0
-    if b <= -64:
-        return -1 if a < 0 else 0
-    if b >= 0:
-        return wrap64(a << b)
-    return a >> -b
-
-
-def _shift_right(a: int, b: int) -> int:
-    """Mirror Zig std.math.shr(i64), including negative shift counts."""
-    if b >= 64:
-        return -1 if a < 0 else 0
-    if b <= -64:
-        return 0
-    if b >= 0:
-        return a >> b
-    return wrap64(a << -b)
-
-
-def eval_patch_str(s: str, env: List[int]) -> int:
-    """Evaluate a prefix-Polish patch string with taosc's i64 semantics.
-
-    Mirrors brpatch.c::eval exactly: constants p<N>/n<N>, variable lookup
-    v<N> into env (16 captured STATE slots), unary ~, and the binary prefix
-    operators + - * / % & | ^ l r = ! > >= < <=.  env must have at least
-    16 entries.
-
-    Raises PrefilterTrap on arithmetic that would SIGFPE in C.
-    """
-    pos = [0]
-
-    def ev() -> int:
-        op = s[pos[0]]
-        pos[0] += 1
-        if op == "n":  # negative integer
-            return wrap64(-_parse_int(s, pos))
-        if op == "p":  # positive integer
-            return _parse_int(s, pos)
-        if op == "v":  # variable lookup
-            return env[_parse_int(s, pos)]
-        if op == "~":  # bitwise not
-            return wrap64(~ev())
-
-        eq = pos[0] < len(s) and s[pos[0]] == "=" and op in "<>"
-        if eq:
-            pos[0] += 1
-
-        a = ev()
-        b = ev()
-
-        if op == "=":
-            return 1 if a == b else 0
-        if op == "!":
-            return 1 if a != b else 0
-        if op == ">":
-            return 1 if (a >= b if eq else a > b) else 0
-        if op == "<":
-            return 1 if (a <= b if eq else a < b) else 0
-        if op == "+":
-            return wrap64(a + b)
-        if op == "-":
-            return wrap64(a - b)
-        if op == "*":
-            return wrap64(a * b)
-        if op == "&":
-            return wrap64(a & b)
-        if op == "|":
-            return wrap64(a | b)
-        if op == "^":
-            return wrap64(a ^ b)
-        if op == "l":  # Zig std.math.shl
-            return _shift_left(a, b)
-        if op == "r":  # Zig std.math.shr
-            return _shift_right(a, b)
-        if op == "/":
-            if b == 0:
-                raise PrefilterTrap("division by zero")
-            if a == INT64_MIN and b == -1:
-                raise PrefilterTrap("INT64_MIN / -1")
-            return _trunc_div(a, b)
-        if op == "%":
-            if b == 0:
-                raise PrefilterTrap("modulo by zero")
-            if a == INT64_MIN and b == -1:
-                raise PrefilterTrap("INT64_MIN % -1")
-            q = _trunc_div(a, b)
-            return wrap64(a - q * b)
-        raise ValueError(f"unknown patch operator {op!r}")
-
-    return ev()
-
-
-def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, str]:
-    """Return (keep, note) for one predicate line.
-
-    Taosc's generic patch jumps when a generated predicate evaluates to zero.
-    The predicate is encoded as ``predicate == 0`` for brpatch.c, then kept
-    iff that branch condition is non-zero on at least one captured state.
-
-    A predicate that would trap in C on any captured state (division or
-    modulo by zero, INT64_MIN / -1) is rejected: brpatch.c reports it as
-    `br 2` and returns NULL, so the patch follows the original path and is
-    filtered out by the FILTER phase.
-    """
-    try:
-        patch_str = predicate_to_branch_patch_str(predicate)
-    except Exception as e:
-        # prepare_patch would crash on this predicate anyway; keep it so
-        # the existing pipeline surfaces the error.
-        return True, f"unparseable predicate kept ({e})"
-    # Reject on any trap first, regardless of what other states evaluate to.
-    for state in states:
-        try:
-            eval_patch_str(patch_str, state)
-        except PrefilterTrap as e:
-            return False, f"patch would trap in C ({e})"
-    for state in states:
-        if eval_patch_str(patch_str, state) != 0:
-            return True, ""
-    return False, "evaluates to 0 on all captured states"
 
 
 def _pipe_reader(rfd: int, chunks: List[bytes]):
@@ -588,11 +183,20 @@ def resolve_poc(configdir: Path, workdir: Path, poc_input: str) -> Optional[Path
     return None
 
 
-def compile_capture_plugin(workdir: Path) -> None:
-    """Copy and compile brpatch-prefilter.c in the workdir (e9compile)."""
+def compile_capture_plugin(workdir: Path,
+                           allocator: Optional[AllocatorTrace] = None) -> None:
+    """Copy and compile brpatch-prefilter.c in the workdir (e9compile).
+
+    CWE-805 families compile the allocation tracker and binary snapshot
+    capture in (BRPATCH_CWE805 + the allocator kind define); generic
+    families keep the sbsv register capture.
+    """
     shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
            "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
+    if allocator is not None:
+        cmd += ["-DBRPATCH_CWE805",
+                f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -600,21 +204,30 @@ def compile_capture_plugin(workdir: Path) -> None:
 
 
 def build_capture_binary(workdir: Path, configdir: Path, config: dict,
-                         patch_loc: str) -> Path:
-    """Instrument the original binary with the capture plugin at PATCH_LOC.
+                         patch_loc: str,
+                         allocator: Optional[AllocatorTrace] = None) -> Path:
+    """Instrument the original binary with the capture plugin.
+
+    CWE-805 families use the same ordered multipoint instrumentation spec
+    as the final binary (allocator hooks then the patch site, plan §8);
+    generic families patch the single PATCH_LOC site.
 
     Returns the path of <BINARY>.brprefilter.  Also dumps e9tool JSON
-    metadata (needed by extract_trampoline_info) as
+    metadata (needed by extract_e9_runtime_metadata) as
     <BINARY>.brprefilter.json.
     """
     original_binary = ensure_original_binary(workdir, configdir, config)
     brprefilter = workdir / f"{config['BINARY']}.brprefilter"
     metadata = workdir / f"{config['BINARY']}.brprefilter.json"
-    for output, fmt in ((metadata, ["--format=json"]), (brprefilter, [])):
-        cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool"] + fmt + [
-            "-100", "-M", f"addr={patch_loc}",
-            "-P", "if dest(state)@brpatch-prefilter goto",
-            "-o", str(output), str(original_binary)]
+    if allocator is not None:
+        spec = build_instrumentation_spec(
+            allocator, patch_loc, "if dest(state)@brpatch-prefilter goto",
+            plugin_name="brpatch-prefilter")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_loc, "if dest(state)@brpatch-prefilter goto"),))
+    for output, fmt in ((metadata, "json"), (brprefilter, None)):
+        cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
         print(" ".join(cmd))
         result = subprocess.run(cmd, cwd=workdir)
         if result.returncode != 0:
@@ -624,36 +237,182 @@ def build_capture_binary(workdir: Path, configdir: Path, config: dict,
     return brprefilter
 
 
-def capture_states(workdir: Path, configdir: Path, config: dict,
-                   patch_loc: str) -> Optional[List[List[int]]]:
-    """Run the POC once against <BINARY>.brprefilter and return the
-    captured STATE vectors (each a list of 16 signed ints).
+def build_cached_binary(
+    workdir: Path,
+    configdir: Path,
+    binradar_env: Dict[str, str],
+    family: PredicateFamily,
+    allocator: Optional[AllocatorTrace],
+) -> "E9RuntimeMetadata":
+    """Build the verifier's selected-predicate capture artifact.
 
-    Returns None if the run failed (timeout / subprocess error) so the
-    caller can fail open.
+    Generic ERM instruments only PATCH_LOC.  CWE-805 ERM uses the same
+    allocator hooks and ordered multipoint specification as .brpatched.
+    The selected predicate is provided per run through TAOSC_PRED.
+    """
+    if family not in (PredicateFamily.GENERIC_ERM,
+                      PredicateFamily.CWE805_ERM):
+        raise RuntimeError(f"cannot cache patch family {family.value}")
+
+    binary = binradar_env["BINARY"]
+    patch_loc = binradar_env["PATCH_LOC"]
+    original_binary = ensure_original_binary(workdir, configdir, binradar_env)
+    brcached = workdir / f"{binary}.brcached"
+    metadata = workdir / f"{binary}.brcached.json"
+    if not (workdir / "brpatch.c").exists() \
+            or not (workdir / "brpatches.inc").exists():
+        raise RuntimeError("brpatch.c and brpatches.inc must be prepared "
+                           "before building .brcached")
+
+    shutil.copy(BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
+    destinations_file = workdir / "destinations"
+    if not destinations_file.exists():
+        raise RuntimeError(
+            f"{destinations_file.name} not found in {workdir}: the cached "
+            f"artifact needs the patch destination")
+    dest = None
+    with destinations_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                dest = f"0x{line}"
+                break
+    if dest is None:
+        raise RuntimeError(f"no destination found in {destinations_file}")
+
+    compile_defines = [f"-DTAOSC_DEST={dest}"]
+    if family == PredicateFamily.CWE805_ERM:
+        if allocator is None:
+            raise RuntimeError("CWE-805 cache requires an allocator trace")
+        compile_defines += ["-DBRPATCH_CWE805",
+                            f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+           "e9compile", "brpatch-cached.c"] + compile_defines
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=workdir)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"e9compile failed with exit code {result.returncode}")
+
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
+        spec = build_instrumentation_spec(
+            allocator, patch_loc,
+            "if dest(state)@brpatch-cached goto",
+            plugin_name="brpatch-cached")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_loc, "if dest(state)@brpatch-cached goto"),))
+    for output, fmt in ((metadata, "json"), (brcached, None)):
+        cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"e9tool failed with exit code {result.returncode}: "
+                f"cannot create {output.name}")
+
+    e9_metadata = extract_e9_runtime_metadata(
+        brcached, metadata, original_binary, int(patch_loc, 0))
+    persist_e9_metadata(workdir, "brcached", e9_metadata)
+    return e9_metadata
+
+
+def _remove_cached_artifact(workdir: Path,
+                            binradar_env: Dict[str, str]) -> None:
+    binary = binradar_env["BINARY"]
+    for name in (f"{binary}.brcached", f"{binary}.brcached.json",
+                 "brpatch-cached.c", "brpatches.json"):
+        (workdir / name).unlink(missing_ok=True)
+    for key in binradar_utils.e9_metadata_keys("brcached"):
+        binradar_env.pop(key, None)
+    binradar_env.pop("BRCACHE_STACK_SIZE", None)
+
+
+def build_cached_artifact(
+    workdir: Path,
+    configdir: Path,
+    binradar_env: Dict[str, str],
+    family: PredicateFamily,
+    allocator: Optional[AllocatorTrace],
+    selected: List[PredicateRecord],
+    survived: Optional[List[PredicateRecord]] = None,
+) -> None:
+    """Build .brcached only when branch-equivalence can skip executions.
+
+    The runtime-id manifest (brpatches.json) exports ``survived`` — every
+    predicate that survived the offline prefilter — not just the top-30
+    ``selected`` subset compiled into the binaries.  The manifest consumers
+    (FILTER cache and concrete verifier) only look up candidate ids up to
+    TOTAL_PATCHES, so the extra ids are harmless and keep the prefilter
+    survivors fully auditable.
+    """
+    _remove_cached_artifact(workdir, binradar_env)
+    if family not in (PredicateFamily.GENERIC_ERM,
+                      PredicateFamily.CWE805_ERM) or len(selected) <= 1:
+        return
+
+    if family == PredicateFamily.CWE805_ERM:
+        stack_size_file = workdir / "stack-size"
+        try:
+            stack_size = int(stack_size_file.read_text().strip(), 0)
+        except (OSError, ValueError) as e:
+            print(f"Error: CWE-805 cache needs a valid {stack_size_file.name}: "
+                  f"{e}")
+            exit(1)
+        if stack_size <= 0 or stack_size > 0x100000:
+            print(f"Error: invalid CWE-805 cache stack size {stack_size}")
+            exit(1)
+        binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
+    else:
+        binradar_env["BRCACHE_STACK_SIZE"] = "0"
+
+    manifest_records = survived if survived is not None else selected
+    write_runtime_predicates(
+        workdir / "brpatches.json", family, manifest_records)
+    try:
+        metadata = build_cached_binary(
+            workdir, configdir, binradar_env, family, allocator)
+    except RuntimeError as e:
+        print(f"Error building cached binary: {e}")
+        exit(1)
+    binradar_utils.set_e9_metadata(
+        binradar_env, "brcached",
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+
+
+def capture_states(workdir: Path, configdir: Path, config: dict,
+                   patch_loc: str,
+                   allocator: Optional[AllocatorTrace] = None,
+                   stack_size: Optional[int] = None,
+                   ) -> Optional[Union[List[List[int]], List[CWE805Snapshot]]]:
+    """Run the POC once against <BINARY>.brprefilter and return the
+    captured patch-site states.
+
+    Generic families return a list of 16-slot STATE vectors; CWE-805
+    families return a list of CWE805Snapshot records (clamps + registers +
+    stack).  Returns None if the run failed (timeout / subprocess error) so
+    the caller can fail open.
     """
     if not QEMU_STACKTRACE_RELEASE.exists():
         print(f"Warning: {QEMU_STACKTRACE_RELEASE} not found")
         return None
 
-    compile_capture_plugin(workdir)
-    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc)
+    compile_capture_plugin(workdir, allocator)
+    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc,
+                                       allocator)
 
-    extracted = extract_trampoline_info(
+    metadata = extract_e9_runtime_metadata(
         brprefilter,
         workdir / f"{config['BINARY']}.brprefilter.json",
         ensure_original_binary(workdir, configdir, config),
         int(patch_loc, 0),
     )
-    try:
-        exclude_addrs = [extracted["PATCH_RESERVE_RANGE"],
-                         extracted["E9_TRAMPOLINE_RANGE"],
-                         extracted["E9_LOADER_RANGE"]]
-    except KeyError as e:
-        print(f"Warning: could not extract trampoline info from brprefilter: {e}")
-        return None
+    # Persist the prefilter artifact's metadata under its own prefix so
+    # later phases never borrow .brpatched layout values.
+    persist_e9_metadata(workdir, "prefilter", metadata)
     e9_relocated_calls: List[str] = []
-    for record in extracted.get("E9_RELOCATED_CALL_JUMPS", "").split(","):
+    for record in metadata.relocated_calls_str().split(","):
         record = record.strip()
         if record:
             fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
@@ -668,8 +427,9 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
 
     command = [str(QEMU_STACKTRACE_RELEASE), "--input", str(poc),
                "--patch-loc", patch_loc, "--asan", "host"]
-    for addr_range in exclude_addrs:
-        command += ["--asan-exclude", addr_range]
+    # --asan-exclude is explicitly ignored by the local afl-qemu-trace
+    # compatibility runner; only the active --e9-relocated-call records
+    # are passed.
     for record in e9_relocated_calls:
         command += ["--e9-relocated-call", record]
     command += [str(brprefilter), "--"] + shlex.split(test_cmd)
@@ -679,6 +439,14 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     env["AFL_USE_QASAN"] = "1"
     env["PATCH_ID"] = "0"
     env["PATCH_FD"] = str(wfd)
+    if allocator is not None:
+        if stack_size is None:
+            print("Warning: CWE-805 prefilter requires stack-size; "
+                  "failing open")
+            os.close(rfd)
+            os.close(wfd)
+            return None
+        env["PREFILTER_STACK_SIZE"] = str(stack_size)
     # The run is expected to crash: the capture plugin never jumps, so the
     # program follows the original buggy path.  We only need the pipe data.
     proc = subprocess.Popen(command, stdout=subprocess.PIPE,
@@ -706,52 +474,15 @@ def capture_states(workdir: Path, configdir: Path, config: dict,
     finally:
         thread.join()
 
-    data = b"".join(chunks).decode(errors="ignore")
-    return parse_state_lines(data)
-
-
-def parse_state_lines(data: str) -> List[List[int]]:
-    """Parse [prefilter-state] sbsv lines from the capture pipe, one 16-slot
-    STATE vector per line.  Non-state and malformed lines are skipped."""
-    parser = sbsv.parser()
-    parser.add_schema(PREFILTER_STATE_SCHEMA)
-    states: List[List[int]] = []
-    for line in data.splitlines():
-        line = line.strip()
-        if not line.startswith("[prefilter-state]"):
-            continue
-        try:
-            row = parser.parse_line_detached(line)
-        except ValueError:
-            continue
-        if row is None:
-            continue
-        states.append([row[f"v{i}"] for i in range(16)])
-    return states
-
-
-def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, str]],
-                    elapsed: float) -> None:
-    """Write source predicate IDs and compact runtime patch IDs.
-
-    Passing predicates receive consecutive ``new-id`` values starting at 1;
-    rejected predicates receive ``new-id -1``.  Runtime patch IDs therefore
-    remain compatible with ``range(1, TOTAL_PATCHES + 1)`` while ``id``
-    preserves the predicate source line.
-    """
-    survived = 0
-    with prefilter_file.open("w", encoding="utf-8") as f:
-        for idx, passed, note, predicate in results:
-            new_id = survived + 1 if passed else -1
-            f.write(f"[prefilter] [res] [id {idx}] "
-                    f"[pass {str(passed).lower()}] [new-id {new_id}] "
-                    f"{predicate} ({(' ' + note) if note else ''})\n")
-            if passed:
-                survived += 1
-        f.write(f"[prefilter] [done] [total {len(results)}] "
-                f"[survived {survived}] [time {elapsed:.2f}]\n")
-    print(f"[prefilter] [done] [total {len(results)}] "
-          f"[survived {survived}] [time {elapsed:.2f}]")
+    data = b"".join(chunks)
+    if allocator is not None:
+        snapshots, truncated = parse_CWE805_snapshots(data)
+        if truncated:
+            print("Warning: CWE-805 prefilter capture truncated; "
+                  "failing open (partial history is not complete evidence)")
+            return None
+        return snapshots
+    return parse_state_lines(data.decode(errors="ignore"))
 
 
 class E9MapType(enum.IntEnum):
@@ -761,8 +492,116 @@ class E9MapType(enum.IntEnum):
 
 
 E9_CONFIG_MAGIC = b"E9PATCH\0"
+# Taosc's $mem0 shell expansion (utils/taosc/helpers.in): the four E9
+# memory-operand fields of the matched instruction.
+E9_MEM0 = "mem[0].base,mem[0].index,mem[0].scale,mem[0].disp"
+E9_MEM0_ACCESS = f"{E9_MEM0},mem[0].size"
 E9_CONFIG_STRUCT = struct.Struct("<8s16sIIqqqqIIII" + "II" * 5 + "I")
 E9_MAP_STRUCT = struct.Struct("<iII")
+
+
+@dataclass(frozen=True, order=True)
+class AddressRange:
+    """Half-open [start, end) interval of an E9 mapping."""
+
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class E9RuntimeMetadata:
+    """Exact runtime metadata of one E9 artifact.
+
+    exclude_ranges: the exact union of the loader interval, every RESERVE
+        map, and every TRAMPOLINE map (never REFACTOR maps), sorted and
+        coalesced (overlap/adjacency only).
+    relocated_calls: (jump_addr, call_site, ret_addr) records for every
+        instrumented original call relocated into an E9 trampoline.
+    """
+
+    exclude_ranges: Tuple[AddressRange, ...]
+    relocated_calls: Tuple[Tuple[int, int, int], ...]
+
+    def exclude_ranges_str(self) -> str:
+        return serialize_exclude_ranges(self.exclude_ranges)
+
+    def relocated_calls_str(self) -> str:
+        return ",".join(
+            f"0x{jump:x}:0x{site:x}:0x{ret:x}"
+            for jump, site, ret in self.relocated_calls
+        )
+
+
+def normalize_address_ranges(
+    ranges: List[Tuple[int, int]],
+) -> Tuple[AddressRange, ...]:
+    """Validate, sort, and merge overlapping/adjacent half-open intervals.
+
+    Every interval must satisfy start < end.  The result is the exact
+    union: disjoint intervals stay disjoint, and only overlapping or
+    directly adjacent intervals are coalesced.
+    """
+    validated = []
+    for start, end in ranges:
+        if start >= end:
+            raise ValueError(
+                f"invalid E9 address range 0x{start:x}-0x{end:x}: "
+                f"start must be < end")
+        validated.append(AddressRange(start, end))
+    validated.sort()
+    merged: List[AddressRange] = []
+    for rng in validated:
+        if merged and rng.start <= merged[-1].end:
+            if rng.end > merged[-1].end:
+                merged[-1] = AddressRange(merged[-1].start, rng.end)
+        else:
+            merged.append(rng)
+    return tuple(merged)
+
+
+def serialize_exclude_ranges(ranges: Tuple[AddressRange, ...]) -> str:
+    """Canonical comma-separated lowercase hex interval list."""
+    return ",".join(f"0x{r.start:x}-0x{r.end:x}" for r in ranges)
+
+
+def parse_exclude_ranges(value: str) -> Tuple[AddressRange, ...]:
+    """Parse a canonical E9_EXCLUDE_RANGES value.
+
+    An empty string is the empty list.  Every non-empty token must match
+    the exact 0x<hex>-0x<hex> grammar with no trailing data and start <
+    end; a malformed non-empty value is a configuration error.
+    """
+    if value == "":
+        return ()
+    ranges = []
+    for token in value.split(","):
+        match = re.fullmatch(r"0x([0-9a-fA-F]+)-0x([0-9a-fA-F]+)", token)
+        if match is None:
+            raise ValueError(
+                f"malformed E9 exclude range {token!r}: expected "
+                f"0x<hex>-0x<hex>")
+        start = int(match.group(1), 16)
+        end = int(match.group(2), 16)
+        if start >= end:
+            raise ValueError(
+                f"invalid E9 exclude range {token!r}: start must be < end")
+        ranges.append((start, end))
+    return normalize_address_ranges(ranges)
+
+
+def persist_e9_metadata(workdir: Path, prefix: str,
+                        metadata: E9RuntimeMetadata) -> None:
+    """Write one artifact's E9 metadata into binradar.env under its prefix.
+
+    Loads the existing binradar.env (creating it when absent) and updates
+    only the prefixed keys, so subject-level fields are preserved.
+    """
+    env_path = workdir / "binradar.env"
+    env_file = load_env(env_path) if env_path.exists() else {}
+    binradar_utils.set_e9_metadata(
+        env_file, prefix,
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    save_env(env_file, env_path)
 
 
 def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, bytes, str]]:
@@ -803,14 +642,14 @@ def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, by
         map_path.unlink(missing_ok=True)
 
 
-def _parse_e9tool_patch_metadata(path: Path) -> Tuple[Optional[int], Dict[int, Tuple[int, int]]]:
-    """Read patch offset and instruction address/length from e9tool JSON output.
+def _parse_e9tool_patch_metadata(path: Path) -> Tuple[List[int], Dict[int, Tuple[int, int]]]:
+    """Read all patch offsets and instruction address/length from e9tool JSON output.
 
     e9tool's JSON stream contains JSON-RPC instruction messages but the
     metadata payload can contain trailing commas.  Regex parsing therefore
     keeps this independent of whether the whole line is strict JSON.
     """
-    patch_offset: Optional[int] = None
+    patch_offsets: List[int] = []
     instructions: Dict[int, Tuple[int, int]] = {}
     instruction_re = re.compile(
         r'"method"\s*:\s*"instruction".*?'
@@ -833,9 +672,178 @@ def _parse_e9tool_patch_metadata(path: Path) -> Tuple[Optional[int], Dict[int, T
                 continue
             match = patch_re.search(line)
             if match is not None:
-                patch_offset = int(match.group(1))
+                patch_offsets.append(int(match.group(1)))
 
-    return patch_offset, instructions
+    return patch_offsets, instructions
+
+
+def _find_executed_trampoline_map(cfg: Dict, site_address: int,
+                                  brpatched_binary: Path) -> Optional[Dict]:
+    """Return the trampoline map that the refactored code at site_address
+    jumps to, or None when the site is not in a refactored region.
+
+    E9Patch -O0 rewrites the code containing a patch site into a REFACTOR
+    map whose copy of the site is a ``jmp <trampoline-entry>``.  The
+    executed call-emulation pair lives in the trampoline map containing
+    that entry; the other trampoline copies of the same bytes are dead.
+    """
+    for mapping in cfg["maps"]:
+        if mapping["type"] != E9MapType.REFACTOR:
+            continue
+        if not (mapping["address"] <= site_address
+                < mapping["address"] + mapping["size"]):
+            continue
+        with brpatched_binary.open("rb") as f:
+            f.seek(mapping["file_offset"])
+            data = f.read(mapping["size"])
+        if len(data) != mapping["size"]:
+            raise ValueError("refactor mapping extends past the patched binary")
+        for address, _, text in _parse_objdump_instructions(
+                data, mapping["address"]):
+            if address != site_address:
+                continue
+            match = re.match(r"jmp\s+(?:0x)?([0-9a-fA-F]+)", text)
+            if match is None:
+                return None
+            entry = int(match.group(1), 16)
+            for trampoline in cfg["maps"]:
+                if trampoline["type"] != E9MapType.TRAMPOLINE:
+                    continue
+                if trampoline["address"] <= entry \
+                        < trampoline["address"] + trampoline["size"]:
+                    return trampoline
+            return None
+        return None
+    return None
+
+
+def extract_relocated_call_jumps(
+    brpatched_binary: Path,
+    metadata_path: Path,
+    original_binary: Path,
+    patch_addr: int,
+) -> List[Tuple[int, int, int]]:
+    """Find E9Patch's jumps used to emulate every instrumented original call.
+
+    With the default backend option ``-Ocall=false``, a relocated direct call
+    is emitted as ``push original_next; jmp target`` inside an E9Patch
+    trampoline.  For a direct call the jump target is unambiguous; for an
+    indirect call the rewritten instruction is an indirect jmp preceded by
+    the return-address setup.
+
+    Every patched original call must map to exactly one trampoline jump
+    (the executed copy, identified through the refactored region); the
+    requested patch address must resolve to exactly one instrumented site.
+    """
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
+
+    patch_offsets, instructions = _parse_e9tool_patch_metadata(metadata_path)
+    if not patch_offsets:
+        raise ValueError("no patch records in e9tool metadata")
+    sites: List[Tuple[int, int, int]] = []
+    for offset in patch_offsets:
+        site = instructions.get(offset)
+        if site is None:
+            raise ValueError(
+                f"patch offset {offset} has no instruction record in "
+                f"e9tool metadata")
+        sites.append((offset, site[0], site[1]))
+
+    # Require the requested patch address to exist exactly once.
+    patch_sites = [site for site in sites if site[1] == patch_addr]
+    if len(patch_sites) != 1:
+        raise ValueError(
+            f"requested patch address 0x{patch_addr:x} resolves to "
+            f"{len(patch_sites)} instrumented site(s); expected exactly one")
+
+    # Deduplicate sites: one address may carry several hooks.
+    unique_sites: List[Tuple[int, int, int]] = []
+    seen = set()
+    for site in sites:
+        if site[1] not in seen:
+            seen.add(site[1])
+            unique_sites.append(site)
+
+    cfg = parse_e9patch_config(brpatched_binary)
+    trampoline_insns: List[Tuple[Dict, List[Tuple[int, bytes, str]]]] = []
+    for mapping in cfg["maps"]:
+        if mapping["type"] != E9MapType.TRAMPOLINE:
+            continue
+        with brpatched_binary.open("rb") as f:
+            f.seek(mapping["file_offset"])
+            data = f.read(mapping["size"])
+        if len(data) != mapping["size"]:
+            raise ValueError("trampoline mapping extends past the patched binary")
+        trampoline_insns.append(
+            (mapping, _parse_objdump_instructions(data, mapping["address"])))
+
+    records: List[Tuple[int, int, int]] = []
+    with original_binary.open("rb") as f:
+        for offset, address, length in unique_sites:
+            f.seek(offset)
+            original_instruction = f.read(length)
+            call_kind, direct_displacement = _decode_call_site(
+                original_instruction)
+            if call_kind == "other":
+                continue
+            ret_addr = address + length
+            direct_target: Optional[int] = None
+            if call_kind == "direct":
+                if direct_displacement is None:
+                    raise ValueError("direct call has no rel32 displacement")
+                direct_target = ret_addr + direct_displacement
+
+            # The executed copy: the trampoline map the refactored site
+            # jumps to (used to prefer the right copy for indirect calls).
+            executed = _find_executed_trampoline_map(cfg, address,
+                                                     brpatched_binary)
+
+            matches: List[Tuple[int, int, int]] = []
+            for mapping, insns in trampoline_insns:
+                for index, (jump_addr, _, text) in enumerate(insns):
+                    if not text.startswith("jmp"):
+                        continue
+                    operand = text[len("jmp"):].strip()
+                    target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
+                    jump_target = int(target_match.group(1), 16) \
+                        if target_match else None
+                    if call_kind == "direct":
+                        if jump_target != direct_target:
+                            continue
+                    elif jump_target is not None:
+                        continue
+                    # Exact return-address setup: the preceding instruction
+                    # pushes the original return address.
+                    if index == 0 \
+                            or not insns[index - 1][2].startswith("push"):
+                        continue
+                    push_operand = insns[index - 1][2][len("push"):].strip()
+                    push_match = re.match(r"(?:0x)?([0-9a-fA-F]+)",
+                                          push_operand)
+                    if push_match is None \
+                            or int(push_match.group(1), 16) != ret_addr:
+                        continue
+                    matches.append((jump_addr, address, ret_addr))
+
+            if not matches:
+                raise ValueError(
+                    f"no relocated call-equivalent jump found for patched "
+                    f"original call at 0x{address:x}")
+
+            # Deduplicate by (site, ret): the same trampoline pages can be
+            # mapped at several VAs, and relative jumps resolve differently
+            # per mapping.  For direct calls the target match already selects
+            # the executed copy; for indirect calls prefer the executed map.
+            if executed is not None:
+                executed_matches = [m for m in matches
+                                    if executed["address"] <= m[0]
+                                    < executed["address"] + executed["size"]]
+                if executed_matches:
+                    matches = executed_matches
+            records.append(sorted(matches)[0])
+
+    return sorted(set(records))
 
 
 def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
@@ -857,88 +865,6 @@ def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
         if ((modrm >> 3) & 0x7) == 0x2:
             return "indirect", None
     return "other", None
-
-
-def extract_relocated_call_jumps(
-    brpatched_binary: Path,
-    metadata_path: Path,
-    original_binary: Path,
-    patch_addr: int,
-) -> List[Tuple[int, int, int]]:
-    """Find E9Patch's jump used to emulate the selected original call.
-
-    With the default backend option ``-Ocall=false``, a relocated direct call
-    is emitted as ``push original_next; jmp target``.  The jump is inside an
-    E9Patch trampoline, not at the original patch address.  For a direct call
-    the target is unambiguous; for an indirect call this returns indirect-jump
-    candidates preceded by the return-address setup sequence.
-    """
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
-
-    patch_offset, instructions = _parse_e9tool_patch_metadata(metadata_path)
-    site: Optional[Tuple[int, int]] = None
-    if patch_offset is not None:
-        site = instructions.get(patch_offset)
-    if site is None:
-        for address, length in instructions.values():
-            if address == patch_addr:
-                site = (address, length)
-                break
-    if site is None or patch_offset is None:
-        raise ValueError("could not resolve patched instruction from e9tool metadata")
-
-    _, instruction_length = site
-    with original_binary.open("rb") as f:
-        f.seek(patch_offset)
-        original_instruction = f.read(instruction_length)
-    call_kind, direct_displacement = _decode_call_site(original_instruction)
-    if call_kind == "other":
-        return []
-
-    direct_target: Optional[int] = None
-    if call_kind == "direct":
-        if direct_displacement is None:
-            raise ValueError("direct call has no rel32 displacement")
-        direct_target = patch_addr + instruction_length + direct_displacement
-
-    cfg = parse_e9patch_config(brpatched_binary)
-    original_call_site = site[0]
-    ret_addr = original_call_site + instruction_length
-    candidates: List[Tuple[int, int, int]] = []
-    for mapping in cfg["maps"]:
-        if mapping["type"] != E9MapType.TRAMPOLINE:
-            continue
-        with brpatched_binary.open("rb") as f:
-            f.seek(mapping["file_offset"])
-            data = f.read(mapping["size"])
-        if len(data) != mapping["size"]:
-            raise ValueError("trampoline mapping extends past the patched binary")
-
-        instructions_in_map = _parse_objdump_instructions(data, mapping["address"])
-        for index, (address, _, text) in enumerate(instructions_in_map):
-            if not text.startswith("jmp"):
-                continue
-
-            operand = text[len("jmp"):].strip()
-            target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
-            jump_target = int(target_match.group(1), 16) if target_match else None
-
-            if direct_target is not None:
-                if jump_target == direct_target:
-                    candidates.append((address, original_call_site, ret_addr))
-                continue
-
-            # For an indirect call the rewritten instruction is an indirect
-            # jmp.  It follows the push/lea/xchg return-address setup.  The
-            # short look-back avoids treating E9Patch's conditional-goto
-            # ``jmp *%fs:0x40`` as a call-equivalent jump.
-            if jump_target is None:
-                previous = instructions_in_map[max(0, index - 6):index]
-                if any(item[2].startswith("push") for item in previous):
-                    candidates.append((address, original_call_site, ret_addr))
-
-    return sorted(set(candidates))
 
 
 def parse_e9patch_config(path: Path) -> Dict:
@@ -1027,65 +953,62 @@ def run_fix(configdir: Path, config_path: Path, workdir: Path):
         print(f"Fix output: {result.stdout}")
 
 
-def extract_trampoline_info(
-    brpatched_binary: Path,
+def extract_e9_runtime_metadata(
+    patched_binary: Path,
     metadata_path: Optional[Path] = None,
     original_binary: Optional[Path] = None,
     patch_addr: Optional[int] = None,
-) -> Dict[str, str]:
-    # Parse e9patch embedded config from the patched binary to compute ASAN exclude ranges
-    binradar_env: Dict[str, str] = dict()
-    try:
-        cfg = parse_e9patch_config(brpatched_binary)
-        loader_base = cfg["loader_base"]
-        loader_size = cfg["loader_size"]
-        binradar_env["E9_LOADER_RANGE"] = f"0x{loader_base:x}-0x{loader_base + loader_size:x}"
-        print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
+) -> E9RuntimeMetadata:
+    """Extract the exact E9 runtime metadata of one patched artifact.
 
-        reserves = cfg["reserves"]
-        if reserves:
-            reserve_start = min(r[0] for r in reserves)
-            reserve_end = max(r[0] + r[1] for r in reserves)
-            binradar_env["PATCH_RESERVE_RANGE"] = f"0x{reserve_start:x}-0x{reserve_end:x}"
-            print(f"Full reserve range: 0x{reserve_start:x}-0x{reserve_end:x}")
-            # for addr, size, prot in sorted(reserves, key=lambda x: x[0]):
-            #     if 'x' in prot and "PATCH_RESERVE_ADDR" not in binradar_env:
-            #         binradar_env["PATCH_RESERVE_ADDR"] = f"0x{addr:x}"
-            #         print(f"Patch reserve addr: 0x{addr:x} prot={prot}")
-            #         break
-        trampolines = cfg["trampolines"]
-        if trampolines:
-            tramp_start = min(t[0] for t in trampolines)
-            tramp_end = max(t[0] + t[1] for t in trampolines)
-            binradar_env["E9_TRAMPOLINE_RANGE"] = f"0x{tramp_start:x}-0x{tramp_end:x}"
-            print(f"E9 trampoline range: 0x{tramp_start:x}-0x{tramp_end:x}")
+    The exclusion list is the exact union of the loader interval, every
+    RESERVE map, and every TRAMPOLINE map of the parsed artifact.  REFACTOR
+    maps execute relocated original instructions at original virtual
+    addresses and are never excluded.  An excluded map with the absolute
+    flag set is rejected: the current setup only emits relative mappings,
+    and applying load_bias to an absolute address would be wrong.
+    """
+    cfg = parse_e9patch_config(patched_binary)
+    loader_base = cfg["loader_base"]
+    loader_size = cfg["loader_size"]
+    ranges: List[Tuple[int, int]] = [
+        (loader_base, loader_base + loader_size)]
+    print(f"E9 loader range: 0x{loader_base:x}-0x{loader_base + loader_size:x}")
 
-        if metadata_path is not None and original_binary is not None and patch_addr is not None:
-            call_jumps = extract_relocated_call_jumps(
-                brpatched_binary,
-                metadata_path,
-                original_binary,
-                patch_addr,
-            )
-            if call_jumps:
-                records = ",".join(
-                    f"0x{jump_addr:x}:0x{call_site:x}:0x{ret_addr:x}"
-                    for jump_addr, call_site, ret_addr in call_jumps
-                )
-                binradar_env["E9_RELOCATED_CALL_JUMPS"] = records
-                # binradar_env["E9_RELOCATED_CALL_JUMP_COUNT"] = str(len(call_jumps))
-                print(f"E9 relocated call jump(s): {records}")
-            else:
-                print("No relocated call-equivalent jump found for the patch site")
-    except Exception as e:
-        print(f"Warning: could not parse e9patch config: {e}")
-    return binradar_env
+    for mapping in cfg["maps"]:
+        if mapping["type"] == E9MapType.REFACTOR:
+            continue
+        if mapping["absolute"]:
+            raise ValueError(
+                f"absolute E9 {mapping['type'].name} map at "
+                f"0x{mapping['address']:x} is not supported: setup only "
+                f"emits relative mappings")
+        ranges.append((mapping["address"],
+                       mapping["address"] + mapping["size"]))
+    exclude_ranges = normalize_address_ranges(ranges)
+    print(f"E9 exclude ranges: {serialize_exclude_ranges(exclude_ranges)}")
+
+    relocated_calls: Tuple[Tuple[int, int, int], ...] = ()
+    if metadata_path is not None and original_binary is not None \
+            and patch_addr is not None:
+        call_jumps = extract_relocated_call_jumps(
+            patched_binary,
+            metadata_path,
+            original_binary,
+            patch_addr,
+        )
+        relocated_calls = tuple(sorted(set(call_jumps)))
+        if relocated_calls:
+            print(f"E9 relocated call jump(s): "
+                  f"{E9RuntimeMetadata((), relocated_calls).relocated_calls_str()}")
+        else:
+            print("No relocated call-equivalent jump found for the patch site")
+
+    return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 
 def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     print(f"Preparing patch in {workdir}")
-    # Read predicates
-    predicate_records: List[Tuple[int, str]] = list()
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
     brpatched_binary = workdir / f"{binradar_env['BINARY']}.brpatched"
@@ -1094,51 +1017,194 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: original binary {original_binary.name} not found in {workdir}")
         exit(1)
 
-    if not predicates_file.exists():
-        # In certain bug types, taosc may not generate predicates
+    # Classify the workdir before any predicate parsing (plan §6.1).
+    try:
+        family, allocator = detect_predicate_family(workdir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
+    binradar_env["BINRADAR_PATCH_KIND"] = family.value
+    patch_format = read_patch_format(workdir)
+    if patch_format is not None:
+        print(f"Taosc patch-format: {patch_format} -> {family.value}")
+
+    if family == PredicateFamily.CWE805_DIRECT:
+        assert allocator is not None
+        binradar_env["PATCH_TYPE"] = family.value
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
+        # The direct call-site metapatch has no predicate list: the E9
+        # jnz($mem0,mem[0].size,dest) decision evaluates the complete access
+        # against the allocation clamps.  A leftover predicates file is stale Taosc
+        # output and must not be compiled in.  The binary is rebuilt with
+        # BinRadar patch-id switching and [patch] logging (plan §7.4).
+        if predicates_file.exists():
+            print(f"Warning: ignoring stale {predicates_file.name} "
+                  f"(CWE-805 direct call-site family)")
+        binradar_env["TOTAL_PATCHES"] = "1"
+        dest = None
+        destinations_file = workdir / "destinations"
+        if destinations_file.exists():
+            with destinations_file.open("r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        dest = f"0x{line}"
+                        break
+        if dest is None:
+            print(f"Error: no destination found in {destinations_file}")
+            exit(1)
+        brpatch_source = workdir / "brpatch.c"
+        shutil.copy(BRPATCH_SOURCE, brpatch_source)
+        brpatches_inc = workdir / "brpatches.inc"
+        _emit_brpatches_inc(brpatches_inc, [])
+        compile_defines = [f"-DTAOSC_DEST={dest}", "-DBRPATCH_CWE805",
+                           f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
+        cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+                "e9compile", "brpatch.c"] + compile_defines
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error compiling patch: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Patch compiled successfully")
+
+        # Patch the original binary with the allocator hooks and the
+        # jnz(mem[0].base,mem[0].index,mem[0].scale,mem[0].disp,
+        #     mem[0].size,dest) decision at the patch site. Taosc's $mem0
+        # expands to the first four fields; mem[0].size preserves joob's
+        # complete-access boundary check.
+        patch_addr = binradar_env["PATCH_LOC"]
+        metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+        spec = build_instrumentation_spec(
+            allocator, patch_addr,
+            f"if jnz({E9_MEM0_ACCESS},{dest})@brpatch goto")
+        cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error dumping patch metadata: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Patch metadata dumped successfully")
+        cmd = e9tool_command(spec, brpatched_binary, original_binary)
+        print(" ".join(cmd))
+        result = subprocess.run(cmd, cwd=workdir)
+        if result.returncode != 0:
+            print(f"Error preparing patch: {result.stderr}")
+            exit(1)
+        else:
+            print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
+
+        metadata = extract_e9_runtime_metadata(
+            brpatched_binary,
+            metadata_path,
+            original_binary,
+            int(patch_addr, 0),
+        )
+        binradar_utils.set_e9_metadata(
+            binradar_env, "brpatched",
+            metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+        print(f"Using CWE-805 direct call-site patch at "
+              f"{binradar_env['PATCH_LOC']} (candidate id 1)")
+        build_cached_artifact(
+            workdir, configdir, binradar_env, family, allocator, [])
+        return
+
+    if family == PredicateFamily.TAOSC_SPECIALIZED:
+        # No predicates: taosc generated a specialized (CWE-369/476/617)
+        # patch.  Reuse the prebuilt binary when present.
+        binradar_env["PATCH_TYPE"] = family.value
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
         if brpatched_binary.exists():
             metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
             patch_addr = int(binradar_env["PATCH_LOC"], 0)
-            extracted_env = extract_trampoline_info(
+            metadata = extract_e9_runtime_metadata(
                 brpatched_binary,
                 metadata_path if metadata_path.exists() else None,
                 original_binary,
                 patch_addr,
             )
-            binradar_env.update(extracted_env)
+            binradar_utils.set_e9_metadata(
+                binradar_env, "brpatched",
+                metadata.exclude_ranges_str(), metadata.relocated_calls_str())
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
+            build_cached_artifact(
+                workdir, configdir, binradar_env, family, allocator, [])
             return
-        print(f"Error: {predicates_file.name} file not found in {workdir}")
-        exit(1)
-    predicate_records = load_predicates(predicates_file)
+        # No prebuilt binary and no predicates: build the artifacts with
+        # zero candidates (TOTAL_PATCHES=0); binradar.py handles the
+        # no-patch case.
+        binradar_env["TAOSC_TOTAL_PATCHES"] = "0"
+        binradar_env["PREFILTER_TOTAL_PATCHES"] = "0"
+        print(f"Warning: no {predicates_file.name} and no prebuilt "
+              f"brpatched binary in {workdir}; building with zero "
+              f"candidate patches")
+
+    # GENERIC_ERM or CWE805_ERM: parse every line strictly.  A missing
+    # predicates file (specialized family without a prebuilt binary) is
+    # treated as an empty list.
+    predicate_records: List[PredicateRecord] = []
+    if predicates_file.exists():
+        try:
+            predicate_records = _parse_predicate_records(predicates_file,
+                                                         family)
+        except ValueError as e:
+            print(f"Error: {e}")
+            exit(1)
+    if not predicate_records:
+        # Empty predicate list: build the artifacts with zero candidates
+        # (TOTAL_PATCHES=0); binradar.py handles the no-patch case.
+        print(f"Warning: {predicates_file.name} is empty in {workdir}; "
+              f"building with zero candidate patches")
+
+    # PATCH_TYPE and the patch counters describe the pipeline inputs:
+    # TAOSC_TOTAL_PATCHES counts the predicates Taosc generated, and
+    # PREFILTER_TOTAL_PATCHES the ones that survive the offline prefilter
+    # (or all of them when no prefilter ran or it failed open).
+    binradar_env["PATCH_TYPE"] = family.value
+    binradar_env["TAOSC_TOTAL_PATCHES"] = str(len(predicate_records))
+    binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(predicate_records))
 
     patch_records = [
-        (patch_id, source_id, predicate)
-        for patch_id, (source_id, predicate)
-        in enumerate(predicate_records, start=1)
+        PredicateRecord(patch_id, record.source_line, record.source_text,
+                        record.parsed)
+        for patch_id, record in enumerate(predicate_records, start=1)
     ]
     # Apply the offline prefilter results, if any (see the `prefilter`
     # subcommand).  Predicates whose prefilter row evaluates to true
-    # survive; the rest are discarded before the top-10 cap, so the
+    # survive; the rest are discarded before the top-30 cap, so the
     # binradar pipeline never runs on patches that would be filtered out
-    # anyway.  Fail open on any parse trouble.
+    # anyway.  Fail open on any parse trouble.  The prefilter metadata
+    # (family + predicates-file SHA-256) must match, so a stale prefilter
+    # from a different predicate file or family is never applied.
     prefilter_file = workdir / "prefilter.sbsv"
     if prefilter_file.exists():
-        passed_ids = load_prefilter_passed_ids(prefilter_file)
+        passed_ids = load_prefilter_passed_ids(
+            prefilter_file,
+            expected_kind=family.value,
+            expected_sha256=predicates_sha256(predicates_file),
+        )
         if passed_ids is None:
-            print(f"Warning: failed to parse {prefilter_file.name}; "
-                  f"using all predicates (fail-open)")
+            print(f"Warning: failed to parse {prefilter_file.name} "
+                  f"(or metadata mismatch); using all predicates (fail-open)")
         else:
-            predicate_by_id = dict(predicate_records)
+            predicate_by_id = {record.source_line: record
+                               for record in predicate_records}
             survived = list()
             for source_id, new_id in sorted(
                     passed_ids.items(), key=lambda item: item[1]):
-                predicate = predicate_by_id.get(source_id)
-                if predicate is not None:
-                    survived.append((new_id, source_id, predicate))
+                record = predicate_by_id.get(source_id)
+                if record is not None:
+                    survived.append(PredicateRecord(
+                        new_id, record.source_line, record.source_text,
+                        record.parsed))
             print(f"[prefilter] loaded {len(predicate_records)} predicates, "
                   f"{len(survived)} survived")
+            binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(survived))
             patch_records = survived
 
     # Get patch destination
@@ -1158,25 +1224,27 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: no destination found in {destinations_file}")
         exit(1)
     # Generate brpatches.inc
-    # Currently, we only select top 10 patches.
     # Runtime patch IDs are compact and start at 1.  Each selected record
     # retains the original predicate source line for traceability.
-    selected_patch_records = patch_records[:10]
+    # The compiled candidates are capped at the top 30 prefilter survivors
+    # (keeps the binaries small); brpatches.json still exports every
+    # survivor past the cap.
+    selected_patch_records = patch_records[:30]
+    print(f"Targeting top {len(selected_patch_records)} of "
+          f"{len(patch_records)} prefilter survivor(s)")
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
     shutil.copy(BRPATCH_SOURCE, brpatch_source)
     brpatches_inc = workdir / "brpatches.inc"
-    with brpatches_inc.open("w") as f:
-        f.write("case 0:\n\treturn \"p0\";\n")
-        for patch_id, source_id, predicate in selected_patch_records:
-            patch_str = predicate_to_branch_patch_str(predicate)
-            f.write(f"case {patch_id}:\n"
-                    f"\treturn \"{patch_str}\"; "
-                    f"/* predicate line {source_id} */\n")
-        f.write("default:\n\treturn \"p0\";\n")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--",
-            "e9compile", "brpatch.c", f"-DTAOSC_DEST={dest}"]
+    _emit_brpatches_inc(brpatches_inc, selected_patch_records)
+    compile_defines = [f"-DTAOSC_DEST={dest}"]
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
+        compile_defines.append("-DBRPATCH_CWE805")
+        compile_defines.append(f"-DBRPATCH_ALLOC_{allocator.kind.upper()}")
+    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
+            "e9compile", "brpatch.c"] + compile_defines
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1185,12 +1253,26 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Patch compiled successfully")
 
-    # Patch the original binary
+    # Patch the original binary.  The JSON-metadata and final-binary e9tool
+    # commands use one identical ordered instrumentation specification
+    # (plan §6.3): generic ERM patches the single PATCH_LOC site; CWE-805
+    # ERM and direct builds add the allocator hooks (mark/set_size/set_base)
+    # before the patch site.
     patch_addr = binradar_env["PATCH_LOC"]
     metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
+    if family == PredicateFamily.CWE805_ERM:
+        assert allocator is not None
+        spec = build_instrumentation_spec(
+            allocator, patch_addr, "if dest(state)@brpatch goto")
+    elif family == PredicateFamily.CWE805_DIRECT:
+        spec = build_instrumentation_spec(
+            allocator, patch_addr,
+            f"if jnz({E9_MEM0_ACCESS},{dest})@brpatch goto")
+    else:
+        spec = InstrumentationSpec(
+            ((patch_addr, "if dest(state)@brpatch goto"),))
     # dump metadata
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "--format=json", "-100", "-M", f"addr={patch_addr}",
-            "-P", "if dest(state)@brpatch goto", "-o", str(metadata_path), str(original_binary)]
+    cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1198,8 +1280,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         exit(1)
     else:
         print(f"Patch metadata dumped successfully")
-    cmd = ["guix", "shell", "e9patch@1.0.0", "--", "e9tool", "-100", "-M", f"addr={patch_addr}",
-            "-P", "if dest(state)@brpatch goto", "-o", str(brpatched_binary), str(original_binary)]
+    cmd = e9tool_command(spec, brpatched_binary, original_binary)
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1208,17 +1289,32 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     else:
         print(f"Prepare patch succeeded, patched binary at {brpatched_binary}")
 
-    extracted_env = extract_trampoline_info(
+    metadata = extract_e9_runtime_metadata(
         brpatched_binary,
         metadata_path,
         original_binary,
         int(patch_addr, 0),
     )
-    binradar_env.update(extracted_env)
+    binradar_utils.set_e9_metadata(
+        binradar_env, "brpatched",
+        metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    build_cached_artifact(
+        workdir, configdir, binradar_env, family, allocator,
+        selected_patch_records, survived=patch_records)
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
-    env = load_env(config_path)
+    # Start from the workdir's existing binradar.env (e.g. PREFILTER_* keys
+    # persisted by the prefilter phase) so setup's save_env never clobbers
+    # other artifacts' metadata; config.env overlays the subject fields.
+    env = dict()
+    env_path = workdir / "binradar.env"
+    if env_path.exists():
+        env = load_env(env_path)
+        # The removed unprefixed E9 storage keys must not survive.
+        env.pop("E9_EXCLUDE_RANGES", None)
+        env.pop("E9_RELOCATED_CALL_JUMPS", None)
+    env.update(load_env(config_path))
     if "POC_INPUT" not in env:
         print("Error: POC_INPUT not found in config.env")
         exit(1)
@@ -1239,6 +1335,7 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
 
 
 def cmd_setup(configdir: Path, workdir: Path):
+    configdir = configdir.resolve()
     config_path = configdir / "config.env"
     if not config_path.exists():
         print(f"Error: config.env not found in {configdir}")
@@ -1252,44 +1349,149 @@ def cmd_setup(configdir: Path, workdir: Path):
 
     workdir = workdir.resolve()
     binradar_env = create_binradar_env(configdir, config_path, workdir)
-    prepare_patch(configdir, workdir, binradar_env)
+    # Offline prefilter first: it writes workdir/prefilter.sbsv, which
+    # prepare_patch applies before the top-30 cap.  Fail-open: on any
+    # prefilter problem prepare_patch keeps all predicates.
+    run_prefilter(configdir, workdir)
+    # run_prefilter persists capture-artifact E9 metadata directly to the
+    # environment file.  Refresh those keys before prepare_patch's final
+    # save, otherwise the stale in-memory dict erases them.
     binradar_env_path = workdir / "binradar.env"
+    if binradar_env_path.exists():
+        persisted_env = load_env(binradar_env_path)
+        for key in binradar_utils.e9_metadata_keys("prefilter"):
+            if key in persisted_env:
+                binradar_env[key] = persisted_env[key]
+    prepare_patch(configdir, workdir, binradar_env)
     save_env(binradar_env, binradar_env_path)
     print(f"binradar environment variables saved to {binradar_env_path}")
 
 
-def cmd_prefilter(configdir: Path, workdir: Path):
-    configdir = configdir.resolve()
-    workdir = workdir.resolve()
+def run_prefilter(configdir: Path, workdir: Path):
+    """Offline prefilter run inside `setup` (fail-open, never exits).
+
+    Runs the POC once against the capture-instrumented binary and writes
+    workdir/prefilter.sbsv.  Any problem (missing files, family-detection
+    failure, capture failure) skips the prefilter or fails open so
+    prepare_patch continues with all predicates.  A prefilter.sbsv whose
+    metadata (family + predicates-file SHA-256) still matches is reused
+    instead of re-running the capture.
+    """
     prefilter_file = workdir / "prefilter.sbsv"
     start = time.time()
 
     config_path = configdir / "config.env"
     if not config_path.exists():
-        print(f"Error: config.env not found in {configdir}")
-        sys.exit(1)
+        print(f"Warning: config.env not found in {configdir}; "
+              "skipping prefilter")
+        return
     config = load_env(config_path)
 
     predicates_file = workdir / "predicates"
     if not predicates_file.exists():
         # No predicates (CWE synth path); nothing to prefilter.
         print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
-        sys.exit(0)
+        return
+
+    # Classify the workdir first (plan §6.1): the CWE-805 direct family
+    # has no predicate list to compact, so the prefilter is a no-op and
+    # FILTER remains the behavioral gate.
+    try:
+        family, allocator = detect_predicate_family(workdir)
+    except ValueError as e:
+        print(f"Warning: prefilter family detection failed ({e}); "
+              "skipping prefilter")
+        return
+    if family == PredicateFamily.CWE805_DIRECT:
+        print(f"Workdir is {family.value}; prefilter is a no-op "
+              "(FILTER is the behavioral gate).")
+        return
+
+    # Reuse a prefilter.sbsv that still matches this family and the exact
+    # predicates-file bytes (load_prefilter_passed_ids returns None on any
+    # metadata mismatch, so a stale prefilter is never reused).
+    if prefilter_file.exists():
+        passed_ids = load_prefilter_passed_ids(
+            prefilter_file,
+            expected_kind=family.value,
+            expected_sha256=predicates_sha256(predicates_file),
+        )
+        if passed_ids is not None:
+            print(f"[prefilter] reusing {prefilter_file.name} "
+                  f"({len(passed_ids)} survivors); delete it to re-run")
+            return
+
     predicate_records = load_predicates(predicates_file)
     if not predicate_records:
-        write_prefilter(prefilter_file, [], time.time() - start)
+        write_prefilter(prefilter_file, [], time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
         print("No predicates; prefilter is a no-op.")
-        sys.exit(0)
+        return
 
     for key in ("BINARY", "POC_INPUT", "TEST_CMD"):
         if key not in config:
-            print(f"Error: {key} not found in config.env")
-            sys.exit(1)
+            print(f"Warning: {key} not found in config.env; "
+                  "skipping prefilter")
+            return
     patch_location_file = workdir / "patch-location"
     if not patch_location_file.exists():
-        print(f"Error: {patch_location_file.name} file not found in {workdir}")
-        sys.exit(1)
+        print(f"Warning: {patch_location_file.name} file not found in "
+              f"{workdir}; skipping prefilter")
+        return
     patch_loc = f"0x{patch_location_file.read_text().strip()}"
+
+    if family == PredicateFamily.CWE805_ERM:
+        # Full-context prefilter (plan §8): the capture binary carries the
+        # same allocator hooks as the final binary and dumps binary
+        # snapshots (clamps + registers + stack) at the patch site.  A
+        # candidate passes iff it branches on at least one complete
+        # captured state.  Truncation fails open (never rejects).
+        assert allocator is not None
+        stack_size_file = workdir / "stack-size"
+        if not stack_size_file.exists():
+            print(f"Warning: {stack_size_file.name} file not found in "
+                  f"{workdir} (CWE-805 prefilter needs the stack size); "
+                  "keeping all predicates (fail-open)")
+            return
+        stack_size = int(stack_size_file.read_text().strip())
+        snapshots = capture_states(workdir, configdir, config, patch_loc,
+                                   allocator, stack_size)
+        if snapshots is None:
+            print("Warning: CWE-805 prefilter capture failed; keeping all "
+                  "predicates (fail-open)")
+            results = [(source_id, True, "capture failed (fail-open)",
+                        predicate)
+                       for source_id, predicate in predicate_records]
+            write_prefilter(prefilter_file, results, time.time() - start,
+                            kind=family.value,
+                            sha256=predicates_sha256(predicates_file))
+            return
+        if not snapshots:
+            print("Warning: patch site never hit on the POC; discarding "
+                  "all predicates")
+            results = [(source_id, False, "patch site never hit",
+                        predicate)
+                       for source_id, predicate in predicate_records]
+            write_prefilter(prefilter_file, results, time.time() - start,
+                            kind=family.value,
+                            sha256=predicates_sha256(predicates_file))
+            return
+
+        print(f"Captured {len(snapshots)} CWE-805 snapshot(s)")
+        results = []
+        for source_id, predicate in predicate_records:
+            parsed = parse_CWE805_predicate(predicate)
+            passed = any(
+                CWE805_snapshot_branch_taken(parsed, snapshot) == 1
+                for snapshot in snapshots)
+            note = "" if passed else \
+                "evaluates to 0 on all captured snapshots"
+            results.append((source_id, passed, note, predicate))
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
+        return
 
     states = capture_states(workdir, configdir, config, patch_loc)
     if states is None:
@@ -1298,8 +1500,10 @@ def cmd_prefilter(configdir: Path, workdir: Path):
               "(fail-open)")
         results = [(source_id, True, "capture failed (fail-open)", predicate)
                    for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start)
-        sys.exit(0)
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
+        return
     if not states:
         # The patch site is never hit on the POC, so every predicate would
         # be filtered out by the FILTER phase anyway (the patch never
@@ -1308,8 +1512,10 @@ def cmd_prefilter(configdir: Path, workdir: Path):
               "predicates")
         results = [(source_id, False, "patch site never hit", predicate)
                    for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start)
-        sys.exit(0)
+        write_prefilter(prefilter_file, results, time.time() - start,
+                        kind=family.value,
+                        sha256=predicates_sha256(predicates_file))
+        return
 
     print(f"Captured {len(states)} patch-site state vector(s)")
     results = []
@@ -1324,18 +1530,22 @@ def cmd_prefilter(configdir: Path, workdir: Path):
                   f"[pass {str(passed).lower()}] [new-id {new_id}] "
                   f"{predicate!r}: {note}")
         results.append((source_id, passed, note, predicate))
-    write_prefilter(prefilter_file, results, time.time() - start)
+    write_prefilter(prefilter_file, results, time.time() - start,
+                    kind=family.value,
+                    sha256=predicates_sha256(predicates_file))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="binradar-setup: setup the binradar workdir and "
-                    "prefilter candidate patches")
+        description="binradar-setup: setup the binradar workdir "
+                    "(runs the patch prefilter and prepares the patched "
+                    "binaries)")
     subparsers = parser.add_subparsers(
-        dest="command", required=True, metavar="setup|prefilter")
+        dest="command", required=True, metavar="setup")
 
     setup_parser = subparsers.add_parser(
-        "setup", help="generate <BINARY>.brpatched and binradar.env")
+        "setup", help="prefilter candidate predicates and generate "
+                      "<BINARY>.brpatched and binradar.env")
     setup_parser.add_argument("-c", "--configdir", type=Path, required=False,
                               default=Path.cwd(),
                               help="Config directory (default: current directory)")
@@ -1343,22 +1553,8 @@ def main():
                               default=Path.cwd() / "workdir",
                               help="Working directory (default: ./workdir)")
 
-    prefilter_parser = subparsers.add_parser(
-        "prefilter", help="evaluate predicates offline against the POC and "
-                          "write prefilter.sbsv")
-    prefilter_parser.add_argument("-c", "--configdir", type=Path, required=False,
-                                  default=Path.cwd(),
-                                  help="Directory containing config.env "
-                                       "(default: current directory)")
-    prefilter_parser.add_argument("-w", "--workdir", type=Path,
-                                  default=Path.cwd() / "workdir",
-                                  help="Working directory (default: ./workdir)")
-
     args = parser.parse_args()
-    if args.command == "setup":
-        cmd_setup(args.configdir, args.workdir)
-    else:
-        cmd_prefilter(args.configdir, args.workdir)
+    cmd_setup(args.configdir, args.workdir)
 
 
 if __name__ == "__main__":

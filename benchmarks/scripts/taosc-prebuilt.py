@@ -14,6 +14,7 @@ def main() -> int:
     )
     parser.add_argument("-w", "--workdir", required=True, type=Path,
                         help="Destination directory")
+    parser.add_argument("--substitute-urls", type=str, help="guix substitutes server")
     args = parser.parse_args()
 
     cwd = Path.cwd()
@@ -27,8 +28,12 @@ def main() -> int:
         cve = match.group(0).upper()
 
     try:
+        cmd = ["guix", "build"]
+        if args.substitute_urls != None:
+            cmd.append(f"--substitute-urls={args.substitute_urls}")
+        cmd.append(f"taoscadh@{cve}")
         result = subprocess.run(
-            ["guix", "build", f"taoscadh@{cve}"],
+            cmd,
             check=True,
             text=True,
             stdout=subprocess.PIPE,

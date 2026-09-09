@@ -17,7 +17,7 @@ QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "bina
 AFL_PATH = os.path.join(ROOT_DIR, "utils", "AFLplusplus")
 
 class BinRadarFuzzer:
-    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, exclude_addrs: List[str] = []):
+    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -25,8 +25,12 @@ class BinRadarFuzzer:
         self.poc_input = poc_input
         self.patch_loc = patch_loc
         self.test_cmd = test_cmd
-        self.exclude_addrs = exclude_addrs
+        # AFL's '+' form uses this value as a dry-run ceiling and then
+        # auto-scales where possible. The previous fixed 3000 ms limit caused
+        # valid slow seeds to abort under high parallel benchmark load.
+        self.afl_exec_timeout = afl_exec_timeout
         self.process: Optional[subprocess.Popen] = None
+        self.pgid: Optional[int] = None
     
     @classmethod
     def from_workdir(cls, dir: str, outdir: str) -> "BinRadarFuzzer":
@@ -42,7 +46,7 @@ class BinRadarFuzzer:
             poc_input=env["POC_INPUT"],
             patch_loc=env["PATCH_LOC"],
             test_cmd=env["TEST_CMD"],
-            exclude_addrs=[env["PATCH_RESERVE_RANGE"], env["E9_TRAMPOLINE_RANGE"], env["E9_LOADER_RANGE"]]
+            afl_exec_timeout=env.get("BINRADAR_AFL_EXEC_TIMEOUT", "10000+"),
         )
     
     def get_patched_binary_path(self) -> str:
@@ -51,12 +55,18 @@ class BinRadarFuzzer:
     def start(self) -> subprocess.Popen:
         raise NotImplementedError("start() method must be implemented in subclasses")
 
-    def wait(self, timeout: float = 1800.0):
-        if self.process:
-            result = binradar_utils.execute_await(self.process, timeout=timeout, verbose=True)
-            if result is None:
-                logger.info("Fuzzer execution timed out.")
-                return
+    def wait(self, timeout: float = 1800.0) -> Optional[binradar_utils.ExecutionResult]:
+        if self.process is None:
+            return None
+        result = binradar_utils.execute_await(
+            self.process, timeout=timeout, verbose=True)
+        # execute_await group-kills on its own timeout path, but returns
+        # instantly when the leader is already dead; sweep the recorded
+        # group so afl-qemu-trace children never survive as orphans
+        # (br-test 2026-09-08 F2).
+        if self.pgid is not None:
+            binradar_utils.kill_process_group(self.pgid, grace=1)
+        return result
     
     def get_testcase_dirs(self) -> List[str]:
         raise NotImplementedError("get_testcase_dirs() method must be implemented")
@@ -70,8 +80,6 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
             "-o", self.outdir,
             "--asan", "host",
         ]
-        for addr_range in self.exclude_addrs:
-            cmd += ["--asan-exclude", addr_range]
         cmd = cmd + [binary, "--",] + shlex.split(self.test_cmd)
         return cmd
 
@@ -82,6 +90,7 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
+        self.pgid = binradar_utils.process_group_id(self.process)
         return self.process
 
     def get_testcase_dirs(self) -> List[str]:
@@ -92,12 +101,10 @@ class AFLppFuzzer(BinRadarFuzzer):
         cmd = [
             os.path.join(AFL_PATH, "afl-fuzz"),
             "-Q",
-            "-t", "3000",
+            "-t", self.afl_exec_timeout,
             "-i", input_path,
             "-o", self.outdir,
         ]
-        # for addr_range in self.exclude_addrs:
-        #     cmd += ["--asan-exclude", addr_range]
         cmd = cmd + ["--", binary] + shlex.split(self.test_cmd)
         return cmd
 
@@ -114,11 +121,16 @@ class AFLppFuzzer(BinRadarFuzzer):
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
+        self.pgid = binradar_utils.process_group_id(self.process)
         return self.process
 
-    def get_testcase_dirs(self) -> List[str]:
-        outdirs = [
-            os.path.join(self.outdir, "default", "queue"),
-            os.path.join(self.outdir, "default", "crashes")
+    @staticmethod
+    def testcase_dirs_for_outdir(outdir: str) -> List[str]:
+        """Return AFL++ testcase paths without creating or mutating outdir."""
+        return [
+            os.path.join(outdir, "default", "queue"),
+            os.path.join(outdir, "default", "crashes"),
         ]
-        return outdirs
+
+    def get_testcase_dirs(self) -> List[str]:
+        return self.testcase_dirs_for_outdir(self.outdir)

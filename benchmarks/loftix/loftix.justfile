@@ -20,22 +20,23 @@ taosc workdir="workdir":
     guix shell taosc -- taosc-fix 10 {{workdir}} {{poc_dir}} "$BINARY_PATH" {{test_cmd}}
 
 taosc-prebuilt workdir="workdir":
-    uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}}
+    uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}} --substitute-urls=http://10.20.26.21:2425
 
 setup workdir="workdir":
     [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py setup -w {{workdir}}
 
-prefilter workdir="workdir":
-    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-setup.py prefilter -w {{workdir}}
-
 @_ensure_binradar_is_ready workdir="workdir":
     [ -d "{{workdir}}" ] || just taosc {{workdir}}
-    [ -f "{{workdir}}/binradar.env" ] || (just prefilter {{workdir}} && just setup {{workdir}})
+    [ -f "{{workdir}}/binradar.env" ] || just setup {{workdir}}
 
 binradar workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
-    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir
+    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir  --target-patches all
+
+binradar-fo workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_is_ready workdir)
+    ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
+    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/fuzzolic/binradar.py -w /workdir --run-prefix br-fo --target-patches all --fuzzer-only --less-strict
 
 binradar-dev workdir="workdir" binradar_image="fuzzolic:2204":
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
@@ -49,6 +50,15 @@ binradar-guix workdir="workdir":
 br workdir="workdir":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br
 
+br-all workdir="workdir":
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-all --target-patches all
+
+br-fo workdir="workdir":
+    uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar.py -w {{workdir}} --timeout 21600 --run-prefix br-fo --target-patches all --fuzzer-only --less-strict
+
 eval workdir="workdir" fuzzer="sdfuzz" fuzz_out="/workspace/binradar/benchmarks/sdfuzz":
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-evaluation.py -w {{workdir}} --fuzzer {{fuzzer}} --fuzz-out {{fuzz_out}}
 
+collect-results workdir="workdir" binradar_image="fuzzolic:2204" run_prefix="br-fo":
+    ABS_BENCHMARK_DIR=$(pwd); \
+    docker run --user $(id -u):$(id -g) -v $ABS_BENCHMARK_DIR:/workspace/fuzzolic/benchmarks/loftix -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/benchmarks/scripts/binradar-collect-results.py --workdir {{workdir}} --run-prefix {{run_prefix}} --format tsv

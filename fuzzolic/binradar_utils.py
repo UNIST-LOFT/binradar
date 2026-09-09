@@ -2,16 +2,54 @@ import subprocess
 import os
 import signal
 import threading
+import time
 from typing import List, Set, Tuple, Dict, Optional, Any
 
 import logger
 
+# E9 runtime metadata keys in binradar.env, prefixed per artifact so a
+# future .brcached can never borrow .brpatched layout values.  All current
+# artifacts are built with the same e9patch invocation, so the values are
+# shared; selection is by prefix at load time.
+E9_METADATA_PREFIXES = {
+    "brpatched": "BRPATCHED",
+    "prefilter": "PREFILTER",
+    "brcached": "BRCACHED",
+}
+
+
+def e9_metadata_keys(prefix: str) -> Tuple[str, str]:
+    """Return (exclude-ranges key, relocated-calls key) for an artifact.
+
+    `prefix` is the artifact name ("brpatched", "prefilter", "brcached");
+    the stored keys carry the uppercase prefix.
+    """
+    upper = E9_METADATA_PREFIXES[prefix]
+    return (f"{upper}_E9_EXCLUDE_RANGES",
+            f"{upper}_E9_RELOCATED_CALL_JUMPS")
+
+
+def set_e9_metadata(env: Dict[str, str], prefix: str,
+                    exclude_ranges: str, relocated_calls: str) -> None:
+    """Write one artifact's E9 metadata into an env dict under its prefix."""
+    ranges_key, calls_key = e9_metadata_keys(prefix)
+    env[ranges_key] = exclude_ranges
+    env[calls_key] = relocated_calls
+
+
+def get_e9_metadata(env: Dict[str, str], prefix: str) -> Tuple[str, str]:
+    """Read one artifact's E9 metadata; missing keys yield empty strings."""
+    ranges_key, calls_key = e9_metadata_keys(prefix)
+    return env.get(ranges_key, ""), env.get(calls_key, "")
+
 class ExecutionResult:
-    def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str):
+    def __init__(self, success: bool, exit_code: int, stdout: str, stderr: str,
+                 timed_out: bool = False):
         self.success = success
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+        self.timed_out = timed_out
     
     def decode_status(self) -> int:
         if os.WIFEXITED(self.exit_code):
@@ -55,6 +93,46 @@ def create_pipe_reader_thread(rfd: int, verbose: bool = False) -> Tuple[threadin
     thread.start()
     return thread, patch_chunks
 
+def process_group_id(process: subprocess.Popen) -> int:
+    """Return the process group id of `process`.
+    """
+    try:
+        return os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError):
+        return process.pid
+
+
+def kill_process_group(pgid: int, grace: float = 5.0,
+                       first_signal: int = signal.SIGTERM) -> None:
+    """Terminate a whole process group: `first_signal`, wait up to `grace`
+    seconds for the group to empty, then SIGKILL.
+    """
+    try:
+        os.killpg(pgid, first_signal)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)  # existence probe: raises once the group is empty
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _sweep_session_group(process: subprocess.Popen) -> None:
+    """Best-effort SIGKILL of `process`'s whole process group after reaping.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: bool = False) -> ExecutionResult:
 
     if verbose:
@@ -62,6 +140,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
     
     try:
         stdout, stderr = process.communicate(timeout=timeout)
+        _sweep_session_group(process)
         return ExecutionResult(
             success=True,
             exit_code=process.returncode,
@@ -83,11 +162,13 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()
+        _sweep_session_group(process)
         return ExecutionResult(
             success=False,
             exit_code=process.returncode,
             stdout=decode_output(stdout),
-            stderr=decode_output(stderr))
+            stderr=decode_output(stderr),
+            timed_out=True)
     
     except Exception as e:
         try:
@@ -95,6 +176,7 @@ def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: boo
         except ProcessLookupError:
             pass
         stdout, stderr = process.communicate()
+        _sweep_session_group(process)
         logger.debug(f"Command failed: Error: {str(e)}")
         return ExecutionResult(
             success=False,

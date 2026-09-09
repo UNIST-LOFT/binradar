@@ -21,9 +21,11 @@ def executor(tmp_path):
     instance = object.__new__(binradar.BinRadarExecutor)
     instance.config = {}
     instance.probe_result = SimpleNamespace(patch_func_hit_cnt=3)
-    instance.patch_addr_ranges = ("0x10-0x20", "0x30-0x40", "0x50-0x60")
     instance.timeout = 17
     instance.reverse_directed = False
+    instance.e9_exclude_ranges = ""
+    instance.e9_relocated_calls = ""
+    instance.forkserver_child_timeout = 900
     instance.filter_result = [1, 2]
     return instance, tmp_path
 
@@ -82,7 +84,6 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     instance.run_dir = str(run_dir)
     instance.run_prefix = "run"
     instance.run_id = 0
-    instance.patch_addr_ranges = ("0x10-0x20", "0x30-0x40", "0x50-0x60")
     instance.config = {}
     instance.extract_config = dict
     instance.save_progress = lambda _row: None

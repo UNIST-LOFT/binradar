@@ -176,16 +176,17 @@ def write_final(final_file: str, verified_file: str, survived: List[int],
                 fuzzer: str) -> List[int]:
     """Parse the verifier output and write the final remaining-patches analysis.
 
-    Mirrors binradar.run_final for the concrete-verifier part: a patch stays in
-    the remaining set unless the verifier explicitly rejected it. Only patches
-    that survived the filter phase are considered.
+    Mirrors binradar.run_final for the concrete-verifier part. The verifier
+    file must contain exactly one verdict for every filter survivor; an absent
+    verdict is incomplete evidence, never implicit acceptance.
     """
     verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verified_file)
     if verifier_result is None:
         sys.exit(f"ERROR: failed to parse verifier result: {verified_file}")
+    verifier_result.require_complete_verdicts(survived)
     remaining = set(survived)
-    for patch_id, verified in verifier_result.patch_verified.items():
-        if not verified:
+    for patch_id in survived:
+        if not verifier_result.patch_verified[patch_id]:
             remaining.discard(patch_id)
     with open(final_file, "w", encoding="utf-8") as f:
         f.write(f"[final] [start] [fuzzer {fuzzer}] [verified {os.path.basename(verified_file)}]\n")
@@ -230,8 +231,7 @@ def main():
         sys.exit(f"ERROR: binradar.env not found: {env_path}")
     env = binradar_utils.load_env(env_path)
 
-    for key in ("BINARY", "TEST_CMD", "PATCH_LOC", "TOTAL_PATCHES",
-                "PATCH_RESERVE_RANGE", "E9_TRAMPOLINE_RANGE", "E9_LOADER_RANGE"):
+    for key in ("BINARY", "TEST_CMD", "PATCH_LOC", "TOTAL_PATCHES"):
         if key not in env:
             sys.exit(f"ERROR: {key} not found in binradar.env")
 
@@ -313,10 +313,13 @@ def main():
 
         # 3. Concrete verifier (on the filtered patches only) runs concurrently
         runner = binradar_verifier.BinRadarQemuRunner.from_env(workdir, env)
+        cached_binary = os.path.join(workdir, f"{binary}.brcached")
+        verifier_binary = cached_binary \
+            if len(survived) > 1 and os.path.exists(cached_binary) \
+            else os.path.join(workdir, f"{binary}.brpatched")
         verifier = binradar_verifier.BinRadarConcreteVerifier(
             workdir, minimizer_dir, runner, probe_result,
-            os.path.join(workdir, f"{binary}.brpatched"),
-            survived)
+            verifier_binary, survived)
         minimizer_result_file = os.path.join(minimizer_dir, "minimizer.sbsv")
         binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file)

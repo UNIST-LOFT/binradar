@@ -1,0 +1,342 @@
+s->rax >= i->begin && s->rax < i->end
+s->rbx >= i->begin && s->rbx < i->end
+s->rcx >= i->begin && s->rcx < i->end
+s->rdx >= i->begin && s->rdx < i->end
+s->rsi >= i->begin && s->rsi < i->end
+s->rdi >= i->begin && s->rdi < i->end
+s->rsp >= i->begin && s->rsp < i->end
+s->rbp >= i->begin && s->rbp < i->end
+s->r8 >= i->begin && s->r8 < i->end
+s->r9 >= i->begin && s->r9 < i->end
+s->r10 >= i->begin && s->r10 < i->end
+s->r11 >= i->begin && s->r11 < i->end
+s->r12 >= i->begin && s->r12 < i->end
+s->r13 >= i->begin && s->r13 < i->end
+s->r14 >= i->begin && s->r14 < i->end
+s->r15 >= i->begin && s->r15 < i->end
+((uint64_t *)s->rsp)[0] >= i->begin && ((uint64_t *)s->rsp)[0] < i->end
+((uint64_t *)s->rsp)[1] >= i->begin && ((uint64_t *)s->rsp)[1] < i->end
+((uint64_t *)s->rsp)[2] >= i->begin && ((uint64_t *)s->rsp)[2] < i->end
+((uint64_t *)s->rsp)[3] >= i->begin && ((uint64_t *)s->rsp)[3] < i->end
+((uint64_t *)s->rsp)[4] >= i->begin && ((uint64_t *)s->rsp)[4] < i->end
+((uint64_t *)s->rsp)[5] >= i->begin && ((uint64_t *)s->rsp)[5] < i->end
+((uint64_t *)s->rsp)[6] >= i->begin && ((uint64_t *)s->rsp)[6] < i->end
+((uint64_t *)s->rsp)[7] >= i->begin && ((uint64_t *)s->rsp)[7] < i->end
+((uint64_t *)s->rsp)[8] >= i->begin && ((uint64_t *)s->rsp)[8] < i->end
+((uint64_t *)s->rsp)[9] >= i->begin && ((uint64_t *)s->rsp)[9] < i->end
+((uint64_t *)s->rsp)[10] >= i->begin && ((uint64_t *)s->rsp)[10] < i->end
+((uint64_t *)s->rsp)[11] >= i->begin && ((uint64_t *)s->rsp)[11] < i->end
+((uint64_t *)s->rsp)[12] >= i->begin && ((uint64_t *)s->rsp)[12] < i->end
+1 * s->rbx < i->end - i->begin
+1 * s->rcx < i->end - i->begin
+1 * s->rdx < i->end - i->begin
+1 * s->rsi < i->end - i->begin
+1 * s->rdi < i->end - i->begin
+1 * s->rsp < i->end - i->begin
+1 * s->rbp < i->end - i->begin
+1 * s->r8 < i->end - i->begin
+1 * s->r9 < i->end - i->begin
+1 * s->r10 < i->end - i->begin
+1 * s->r11 < i->end - i->begin
+1 * s->r12 < i->end - i->begin
+1 * s->r13 < i->end - i->begin
+1 * s->r14 < i->end - i->begin
+1 * s->r15 < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[16] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[17] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[18] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[19] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[20] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[21] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[22] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[23] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[40] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[41] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[42] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[48] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[49] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[50] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[51] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[56] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[57] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[58] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[59] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[72] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[73] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[74] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[80] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[81] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[82] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[83] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[84] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[85] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[86] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[87] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[88] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[96] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[97] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[98] < i->end - i->begin
+1 * ((uint8_t *)s->rsp)[99] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[8] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[9] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[10] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[11] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[20] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[21] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[24] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[25] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[28] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[29] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[36] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[37] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[40] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[41] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[42] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[43] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[44] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[48] < i->end - i->begin
+1 * ((uint16_t *)s->rsp)[49] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[4] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[5] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[10] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[12] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[14] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[18] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[20] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[21] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[22] < i->end - i->begin
+1 * ((uint32_t *)s->rsp)[24] < i->end - i->begin
+2 * s->rbx < i->end - i->begin
+2 * s->rcx < i->end - i->begin
+2 * s->rdx < i->end - i->begin
+2 * s->rsi < i->end - i->begin
+2 * s->rdi < i->end - i->begin
+2 * s->rsp < i->end - i->begin
+2 * s->rbp < i->end - i->begin
+2 * s->r8 < i->end - i->begin
+2 * s->r9 < i->end - i->begin
+2 * s->r10 < i->end - i->begin
+2 * s->r11 < i->end - i->begin
+2 * s->r12 < i->end - i->begin
+2 * s->r14 < i->end - i->begin
+2 * s->r15 < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[16] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[17] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[18] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[19] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[20] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[21] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[22] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[23] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[40] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[41] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[42] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[48] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[49] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[50] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[51] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[56] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[57] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[58] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[59] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[72] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[73] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[74] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[80] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[81] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[82] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[83] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[84] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[85] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[86] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[87] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[88] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[96] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[97] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[98] < i->end - i->begin
+2 * ((uint8_t *)s->rsp)[99] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[8] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[9] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[10] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[11] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[20] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[21] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[24] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[25] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[28] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[29] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[36] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[37] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[40] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[41] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[42] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[43] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[44] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[48] < i->end - i->begin
+2 * ((uint16_t *)s->rsp)[49] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[4] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[5] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[10] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[12] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[14] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[18] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[20] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[21] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[22] < i->end - i->begin
+2 * ((uint32_t *)s->rsp)[24] < i->end - i->begin
+4 * s->rbx < i->end - i->begin
+4 * s->rcx < i->end - i->begin
+4 * s->rdx < i->end - i->begin
+4 * s->rsi < i->end - i->begin
+4 * s->rdi < i->end - i->begin
+4 * s->rsp < i->end - i->begin
+4 * s->rbp < i->end - i->begin
+4 * s->r8 < i->end - i->begin
+4 * s->r9 < i->end - i->begin
+4 * s->r10 < i->end - i->begin
+4 * s->r11 < i->end - i->begin
+4 * s->r12 < i->end - i->begin
+4 * s->r14 < i->end - i->begin
+4 * s->r15 < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[16] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[17] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[18] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[19] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[20] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[21] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[22] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[23] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[40] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[41] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[42] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[48] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[49] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[50] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[51] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[56] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[57] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[58] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[59] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[72] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[73] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[74] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[80] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[81] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[82] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[83] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[84] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[85] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[86] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[87] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[88] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[96] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[97] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[98] < i->end - i->begin
+4 * ((uint8_t *)s->rsp)[99] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[8] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[9] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[10] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[11] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[20] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[21] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[24] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[25] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[28] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[29] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[36] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[37] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[40] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[41] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[42] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[43] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[44] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[48] < i->end - i->begin
+4 * ((uint16_t *)s->rsp)[49] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[4] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[5] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[10] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[12] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[14] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[18] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[20] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[21] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[22] < i->end - i->begin
+4 * ((uint32_t *)s->rsp)[24] < i->end - i->begin
+8 * s->rbx < i->end - i->begin
+8 * s->rcx < i->end - i->begin
+8 * s->rdx < i->end - i->begin
+8 * s->rsi < i->end - i->begin
+8 * s->rdi < i->end - i->begin
+8 * s->rsp < i->end - i->begin
+8 * s->rbp < i->end - i->begin
+8 * s->r8 < i->end - i->begin
+8 * s->r9 < i->end - i->begin
+8 * s->r10 < i->end - i->begin
+8 * s->r11 < i->end - i->begin
+8 * s->r12 < i->end - i->begin
+8 * s->r14 < i->end - i->begin
+8 * s->r15 < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[16] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[17] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[18] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[19] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[20] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[21] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[22] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[23] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[40] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[41] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[42] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[48] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[49] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[50] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[51] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[56] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[57] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[58] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[59] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[72] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[73] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[74] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[80] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[81] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[82] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[83] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[84] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[85] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[86] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[87] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[88] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[96] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[97] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[98] < i->end - i->begin
+8 * ((uint8_t *)s->rsp)[99] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[8] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[9] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[10] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[11] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[20] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[21] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[24] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[25] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[28] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[29] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[36] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[37] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[40] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[41] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[42] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[43] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[44] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[48] < i->end - i->begin
+8 * ((uint16_t *)s->rsp)[49] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[4] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[5] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[10] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[12] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[14] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[18] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[20] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[21] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[22] < i->end - i->begin
+8 * ((uint32_t *)s->rsp)[24] < i->end - i->begin

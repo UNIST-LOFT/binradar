@@ -39,7 +39,7 @@ run-all cmd:
 @_resume-from-file command argfile jobs prefix workdir:
     #!/usr/bin/env bash
     mkdir -p logs/{{command}}-results
-    parallel --resume --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
+    parallel --resume-failed --tag --joblog "logs/{{command}}.tsv" --results logs/{{command}}-results -j {{jobs}} \
       'cd "{}" && just {{command}} {{workdir}}' \
       :::: "{{argfile}}"
 
@@ -75,6 +75,9 @@ build-all:
 backup-all workdir_old="workdir" workdir_bak="workdir-bak":
     just _run-all backup "mv {{workdir_old}} {{workdir_bak}}" 30
 
+copy-all workdir_old="workdir" workdir_bak="workdir-bak":
+    just _run-all copy "cp -r {{workdir_old}} {{workdir_bak}}" 30
+
 clean-all workdir="workdir":
     just _run-all clean "rm -rf {{workdir}}" 30
 
@@ -84,3 +87,18 @@ eval-all workdir="workdir" fuzzer="sdfuzz" fuzz_out_root="/home/binradar/code/lo
     parallel --tag --joblog logs/eval-{{fuzzer}}.tsv --results logs/eval-{{fuzzer}}-results -j {{jobs}} \
       'cd "{}" && just eval "{{workdir}}" "{{fuzzer}}" "{{fuzz_out_root}}/{}/work-{{fuzzer}}/out"' \
       :::: "{{argfile}}"
+
+
+copy-from-workdir:
+    #!/usr/bin/env bash
+    for workdir in */*/workdir; do
+        [ -d "$workdir" ] || continue
+
+        workdir_prebuilt="${workdir%/workdir}/workdir-prebuilt"
+
+        if [ ! -d "$workdir_prebuilt" ] || ! compgen -G "$workdir_prebuilt/*.brpatched" > /dev/null; then
+            echo "Copying: $workdir -> $workdir_prebuilt"
+            rm -rf "$workdir_prebuilt"
+            cp -r "$workdir" "$workdir_prebuilt"
+        fi
+    done

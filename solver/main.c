@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <execinfo.h>
 #include <string.h>
+#include <errno.h>
+#include <stdlib.h>
 
 #include "debug-config.h"
 #include "solver.h"
@@ -67,6 +69,8 @@ static ssize_t query_end_idx = -1;
 static int reverse_directed_mode = 0;
 static int reverse_directed_lowering = 0;
 static int reverse_directed_solving = 0;
+/* Defined near reverse_directed_solve; called only from there. */
+static Z3_solver reverse_scratch_solver(void);
 
 typedef struct ReverseCandidate {
     Query*       query;
@@ -75,6 +79,9 @@ typedef struct ReverseCandidate {
 } ReverseCandidate;
 
 static GArray* reverse_candidates = NULL;
+static uint64_t reverse_lowering_raw     = 0;
+static uint64_t reverse_lowering_selected = 0;
+static uint64_t reverse_lowering_skipped  = 0;
 
 enum query_range_mode {
     QUERY_DEFAULT = 0,
@@ -181,7 +188,13 @@ typedef struct {
 } TestcaseMutation;
 
 static Testcase testcase;
-static TestcaseMutation mutations[32];
+/* 32 mutation slots + 1 terminator slot: the MODEL_STRLEN handler in
+ * smt_model_expr emits up to 2 mutations per iteration over 16 iterations
+ * (s1_len >= 16), and the NO_MUTATION sentinel is written at index
+ * mutation_count afterwards. With a 32-element array the sentinel landed on
+ * &mutations[32] == &testcase, truncating testcase.data -> SIGSEGV in
+ * perform_mutations (see problem/SOLVER_MODEL_STRLEN_MUTATIONS_OOB_WRITE.md). */
+static TestcaseMutation mutations[33];
 
 static int debug_translation = 0;
 
@@ -560,6 +573,10 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
                                                  size_t      query_idx,
                                                  Z3_solver solver, Z3_ast* deps)
 {
+    if (query_idx >= EXPR_QUERY_CAPACITY || !z3_ast_exprs[query_idx]) {
+        ABORT("Cannot register query %lu without a Z3 constraint.", query_idx);
+    }
+
     GHashTableIter iter, iter2;
     gpointer       key, value;
     gboolean       res;
@@ -872,23 +889,6 @@ static inline Z3_ast get_deps_upto(GHashTable* inputs, ssize_t max_query_idx,
     return result;
 }
 
-static inline Z3_ast get_forward_prefix_upto(ssize_t max_query_idx)
-{
-    Z3_ast result = Z3_mk_true(smt_solver.ctx);
-    if (max_query_idx < 0) {
-        return result;
-    }
-
-    for (ssize_t idx = 0; idx <= max_query_idx; idx++) {
-        if (!z3_ast_exprs[idx]) {
-            continue;
-        }
-        Z3_ast args[2] = {result, z3_ast_exprs[idx]};
-        result = Z3_mk_and(smt_solver.ctx, 2, args);
-    }
-    return result;
-}
-
 static Z3_ast z3_new_symbol(const char* name, size_t n_bits)
 {
     Z3_sort   bv_sort = Z3_mk_bv_sort(smt_solver.ctx, n_bits);
@@ -946,6 +946,61 @@ Z3_ast smt_new_const(uint64_t value, size_t n_bits)
 
 uintptr_t sub_idx_offset = 0;
 
+#define BINRADAR_PART_SUFFIX ".binradar-part"
+
+static void atomic_output_error(const char* action, const char* path)
+{
+    int saved_errno = errno;
+    fprintf(stderr, "Failed to %s testcase output %s: %s\n",
+            action, path, strerror(saved_errno));
+    exit(EXIT_FAILURE);
+}
+
+static FILE* atomic_output_open(const char* final_path,
+                                char* partial_path,
+                                size_t partial_path_size)
+{
+    int n = snprintf(partial_path, partial_path_size, "%s%s",
+                     final_path, BINRADAR_PART_SUFFIX);
+    if (n < 0 || (size_t)n >= partial_path_size) {
+        errno = ENAMETOOLONG;
+        atomic_output_error("name", final_path);
+    }
+    if (remove(partial_path) != 0 && errno != ENOENT) {
+        atomic_output_error("remove stale partial", partial_path);
+    }
+    FILE* fp = fopen(partial_path, "wb");
+    if (fp == NULL) {
+        atomic_output_error("open partial", partial_path);
+    }
+    return fp;
+}
+
+static void atomic_output_publish(FILE* fp,
+                                  const char* partial_path,
+                                  const char* final_path)
+{
+    if (fflush(fp) != 0 || ferror(fp)) {
+        int saved_errno = errno;
+        fclose(fp);
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("write", partial_path);
+    }
+    if (fclose(fp) != 0) {
+        int saved_errno = errno;
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("close", partial_path);
+    }
+    if (rename(partial_path, final_path) != 0) {
+        int saved_errno = errno;
+        remove(partial_path);
+        errno = saved_errno;
+        atomic_output_error("publish", final_path);
+    }
+}
+
 static void perform_mutations(size_t idx,
                               size_t sub_idx,
                               const char* data,
@@ -961,7 +1016,9 @@ static void perform_mutations(size_t idx,
 #if 0
         printf("Running mutation: %s\n", testcase_name);
 #endif
-        FILE* fp = fopen(testcase_name, "w");
+        char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+        FILE* fp = atomic_output_open(
+            testcase_name, partial_name, sizeof(partial_name));
         switch (mutations[mutation_count].type) {
             case TRIM: {
                 for (size_t i = 0; i < size * stride; i += stride) {
@@ -1049,7 +1106,7 @@ static void perform_mutations(size_t idx,
             }
         }
 
-        fclose(fp);
+        atomic_output_publish(fp, partial_name, testcase_name);
         mutation_count += 1;
     }
 }
@@ -1089,7 +1146,9 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
 
     char    var_name[128];
     Z3_sort bv_sort = Z3_mk_bv_sort(ctx, 8);
-    FILE*   fp      = fopen(testcase_name, "w");
+    char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+    FILE* fp = atomic_output_open(
+        testcase_name, partial_name, sizeof(partial_name));
     for (long i = 0; i < input_size; i++) {
 #if 0
         int n = snprintf(var_name, sizeof(var_name), "k!%lu", i);
@@ -1126,7 +1185,7 @@ static void smt_dump_solution(Z3_context ctx, Z3_model m, size_t idx,
         }
         fwrite(&solution_byte, sizeof(char), 1, fp);
     }
-    fclose(fp);
+    atomic_output_publish(fp, partial_name, testcase_name);
     //
     perform_mutations(idx, sub_idx, last_testcase.data, testcase.size, 1);
 }
@@ -1143,7 +1202,9 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
     SAYF("Dumping solution into %s\n", testcase_name);
 #endif
     fprintf(stderr, "[dump] [byte] [name %s]\n", testcase_name);
-    FILE* fp = fopen(testcase_name, "w");
+    char partial_name[sizeof(testcase_name) + sizeof(BINRADAR_PART_SUFFIX)];
+    FILE* fp = atomic_output_open(
+        testcase_name, partial_name, sizeof(partial_name));
     for (size_t i = 0; i < size * stride; i += stride) {
         uint8_t byte = data[i];
 #if 0
@@ -1153,7 +1214,7 @@ static void smt_dump_testcase(const uint8_t* data, size_t size, size_t stride,
 #endif
         fwrite(&byte, sizeof(char), 1, fp);
     }
-    fclose(fp);
+    atomic_output_publish(fp, partial_name, testcase_name);
     //
     perform_mutations(idx, sub_idx, data, size, stride);
 }
@@ -3866,6 +3927,19 @@ Z3_ast optimize_z3_query(Z3_ast e)
                         g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
                         return e;
                     }
+                } else if (value >= SIZE(op1)) {
+                    /* ashR by a constant >= operand width saturates to the
+                     * sign bit; the Z3_mk_extract calls in the else branch
+                     * below would be invalid (low > high) */
+                    if (value2 == 0) {
+                        e = smt_new_const(0, SIZE(e));
+                        g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
+                        return e;
+                    } else if (SIZE(e) <= 64) {
+                        e = smt_new_const(FF_MASK(SIZE(e)), SIZE(e));
+                        g_hash_table_insert(z3_opt_cache, (gpointer)original_e, (gpointer)e);
+                        return e;
+                    }
                 } else {
                     if (value2 == 0) {
                         Z3_ast a = smt_new_const(0, value);
@@ -5512,10 +5586,7 @@ static inline void smt_notify_fuzzy_constraint(Z3_ast constraint)
 static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs, int mode)
 {
     Z3_solver solver = smt_new_solver();
-    if (reverse_directed_solving) {
-        Z3_ast prefix = get_forward_prefix_upto((ssize_t)GET_QUERY_IDX(q) - 1);
-        Z3_solver_assert(smt_solver.ctx, solver, prefix);
-    } else if (mode == 2) {
+    if (mode == 2) {
         add_deps_to_solver(inputs, solver, GET_QUERY_IDX(q));
     } else {
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), solver,  NULL);
@@ -5553,6 +5624,10 @@ static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs
     }
 #endif
     if (mode && !is_sat) {
+        /* Reverse-directed candidates never reach this function (their
+         * ordinary check and scratch-solver optimistic retry live in
+         * reverse_directed_solve), so the cached solver reset here is
+         * safe. */
         Z3_solver_reset(smt_solver.ctx, solver);
         Z3_solver_assert(smt_solver.ctx, solver, z3_neg_query);
         is_sat = smt_query_check(solver, GET_QUERY_IDX(q), 1);
@@ -5665,13 +5740,19 @@ static void smt_branch_query(Query* q)
     }
 
     if (reverse_directed_lowering) {
-        if (has_real_inputs) {
+        reverse_lowering_raw++;
+        if (has_real_inputs && is_interesting_branch(q->address,
+                                                     q->args8.arg0,
+                                                     q->args8.arg1)) {
             ReverseCandidate candidate = {
                 .query = q,
                 .alternate = z3_neg_query,
                 .inputs = inputs,
             };
             g_array_append_val(reverse_candidates, candidate);
+            reverse_lowering_selected++;
+        } else {
+            reverse_lowering_skipped++;
         }
         if (inputs) {
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
@@ -7010,8 +7091,8 @@ static void smt_binradar_heap_bound_check(Query* q)
     smt_bv_resize(&offset_expr, &size_expr, 0);
     Z3_ast check = Z3_mk_bvult(smt_solver.ctx, offset_expr, size_expr);
     inputs = merge_inputs(inputs, size_inputs);
+    z3_ast_exprs[GET_QUERY_IDX(q)] = check;
     if (reverse_directed_lowering) {
-        z3_ast_exprs[GET_QUERY_IDX(q)] = check;
         if (inputs) {
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
         }
@@ -7770,6 +7851,102 @@ static void smt_query(Query* q)
     }
 }
 
+/* Persistent prefix solver for reverse-directed solving (audit plan §C).
+ *
+ * Semantics per selected candidate at query index i (unchanged vs. the old
+ * per-candidate rebuild):
+ *   ordinary check = AND(z3_ast_exprs[j] for 0 <= j < i, non-NULL)
+ *                    AND alternate_i
+ *   optimistic retry = alternate_i alone (scratch solver, never a reset
+ *   of the prefix solver).
+ *
+ * Candidate indices are c0 < c1 < ... < c(S-1), visited S-1..0. The solver
+ * is built by asserting non-NULL exprs [0, c0) at the base level, then one
+ * nested scope per later candidate interval [c(j-1), cj). Total assertions
+ * are O(Q) instead of the old O(Q*C) nested Z3_mk_and chains
+ * (get_forward_prefix_upto); no giant n-ary conjunction is materialized.
+ */
+static Z3_solver reverse_prefix_solver       = NULL;
+static Z3_solver reverse_scratch_solver_inst = NULL;
+
+/* Wall-clock budget (step D): the main loops enforce config.timeout (ms)
+ * between queries; the reverse path must do the same across its lowering
+ * pass and per-candidate checks. Exceeding the budget stops cleanly
+ * before the orchestrator's hard kill so bitmaps and finished testcases
+ * flush; exit status stays nonzero/incomplete. */
+static struct timespec reverse_budget_start;
+static uint64_t reverse_budget_elapsed_ms(void)
+{
+    struct timespec now;
+    get_time(&now);
+    return get_diff_time_microsec(&reverse_budget_start, &now) / 1000;
+}
+static int reverse_budget_exceeded(void)
+{
+    if (config.timeout <= 0) {
+        return 0;
+    }
+    if (reverse_budget_elapsed_ms() <= (uint64_t)config.timeout) {
+        return 0;
+    }
+    SAYF("\n\n[reverse-directed] budget exceeded (%llu ms > %lu ms). "
+         "Stopping cleanly...\n",
+         (unsigned long long)reverse_budget_elapsed_ms(),
+         (unsigned long)config.timeout);
+    return 1;
+}
+
+static Z3_solver reverse_scratch_solver(void)
+{
+    if (!reverse_scratch_solver_inst) {
+        reverse_scratch_solver_inst = Z3_mk_solver(smt_solver.ctx);
+        Z3_solver_inc_ref(smt_solver.ctx, reverse_scratch_solver_inst);
+        Z3_params params = Z3_mk_params(smt_solver.ctx);
+        Z3_symbol timeout = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
+        Z3_params_set_uint(smt_solver.ctx, params, timeout,
+                           SOLVER_TIMEOUT_Z3_MS);
+        Z3_solver_set_params(smt_solver.ctx, reverse_scratch_solver_inst,
+                             params);
+    } else {
+        Z3_solver_reset(smt_solver.ctx, reverse_scratch_solver_inst);
+    }
+    return reverse_scratch_solver_inst;
+}
+
+static void reverse_directed_prefix_init(ssize_t first_idx)
+{
+    reverse_prefix_solver = Z3_mk_solver(smt_solver.ctx);
+    Z3_solver_inc_ref(smt_solver.ctx, reverse_prefix_solver);
+    Z3_params params    = Z3_mk_params(smt_solver.ctx);
+    Z3_symbol timeout   = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
+    Z3_params_set_uint(smt_solver.ctx, params, timeout, SOLVER_TIMEOUT_Z3_MS);
+    Z3_solver_set_params(smt_solver.ctx, reverse_prefix_solver, params);
+
+    uint64_t asserted = 0;
+    for (ssize_t idx = 0; idx < first_idx; idx++) {
+        if (!z3_ast_exprs[idx]) {
+            continue;
+        }
+        Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                         z3_ast_exprs[idx]);
+        asserted++;
+    }
+    printf("[reverse-directed] [prefix-init] [first %ld] [asserted %llu]\n",
+           (long)first_idx, (unsigned long long)asserted);
+}
+
+static void reverse_directed_prefix_destroy(void)
+{
+    if (reverse_scratch_solver_inst) {
+        Z3_solver_dec_ref(smt_solver.ctx, reverse_scratch_solver_inst);
+        reverse_scratch_solver_inst = NULL;
+    }
+    if (reverse_prefix_solver) {
+        Z3_solver_dec_ref(smt_solver.ctx, reverse_prefix_solver);
+        reverse_prefix_solver = NULL;
+    }
+}
+
 static void reverse_directed_solve(void)
 {
     if (!reverse_candidates || reverse_candidates->len == 0) {
@@ -7777,21 +7954,102 @@ static void reverse_directed_solve(void)
         return;
     }
 
+    const unsigned int S = reverse_candidates->len;
+    printf("[reverse-directed] [raw %llu] [selected %u] [skipped %llu]\n",
+           (unsigned long long)reverse_lowering_raw,
+           S,
+           (unsigned long long)reverse_lowering_skipped);
+
+    /* Selected indices, ascending. Scope depth is bounded by S; if a
+     * pathological trace still selects too many candidates, that is a
+     * selection-policy problem (audit plan §C.6), not a solver fallback. */
+    ssize_t* indices = malloc(sizeof(ssize_t) * S);
+    if (!indices) {
+        PFATAL("reverse-directed: candidate index array allocation failed");
+    }
+    for (unsigned int i = 0; i < S; i++) {
+        indices[i] = (ssize_t)GET_QUERY_IDX(
+            g_array_index(reverse_candidates, ReverseCandidate, i).query);
+    }
+
+    /* Candidate j (0-based, ascending) needs the prefix strictly below
+     * indices[j], i.e. all non-NULL exprs in [0, indices[j]). Build every
+     * interval once while ascending. The reverse loop then pops one interval
+     * after each candidate, so its active solver state is exactly the prefix
+     * for that candidate rather than an inverted or skipped interval. */
+    reverse_directed_prefix_init(indices[0]);
+    for (unsigned int j = 1; j < S; j++) {
+        Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
+        for (ssize_t i = indices[j - 1]; i < indices[j]; i++) {
+            if (z3_ast_exprs[i]) {
+                Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                                 z3_ast_exprs[i]);
+            }
+        }
+    }
+
     reverse_directed_solving = 1;
     printf("[reverse-directed] solving %u candidates from termination to entry\n",
-           reverse_candidates->len);
-    for (ssize_t i = (ssize_t)reverse_candidates->len - 1; i >= 0; i--) {
-        ReverseCandidate* candidate =
-            &g_array_index(reverse_candidates, ReverseCandidate, i);
-        if (!candidate->inputs || !candidate->alternate) {
-            continue;
+           S);
+
+    uint64_t sat_count = 0, unsat_count = 0;
+    for (ssize_t j = (ssize_t)S - 1; j >= 0; j--) {
+        if (reverse_budget_exceeded()) {
+            printf("[reverse-directed] [budget] [phase solving]"
+                   " [elapsed %llu] [attempted %llu of %u]\n",
+                   (unsigned long long)reverse_budget_elapsed_ms(),
+                   (unsigned long long)(S - 1 - j), S);
+            printf("[reverse-directed] [solved] [sat %llu] [unsat %llu]"
+                   " [incomplete 1]\n",
+                   (unsigned long long)sat_count,
+                   (unsigned long long)unsat_count);
+            save_bitmaps();
+            reverse_directed_solving = 0;
+            reverse_directed_prefix_destroy();
+            free(indices);
+            exit(1);
         }
-        printf("[reverse-directed] candidate index=%lu address=%lx\n",
-               GET_QUERY_IDX(candidate->query), candidate->query->address);
-        smt_check_z3(candidate->query, candidate->alternate,
-                     candidate->inputs, 2);
+        ReverseCandidate* candidate =
+            &g_array_index(reverse_candidates, ReverseCandidate, j);
+        ssize_t idx = indices[j];
+        if (candidate->inputs && candidate->alternate) {
+            printf("[reverse-directed] candidate index=%lu address=%lx\n",
+                   (unsigned long)idx, candidate->query->address);
+            /* Ordinary check: current solver state == prefix [0, idx) plus
+             * the alternate asserted on top. */
+            Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
+            Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
+                             candidate->alternate);
+            int is_sat = smt_query_check(reverse_prefix_solver, (size_t)idx,
+                                          0);
+            if (is_sat) {
+                sat_count++;
+            } else {
+                /* Optimistic retry on the scratch solver: alternate alone. */
+                Z3_solver scratch = reverse_scratch_solver();
+                Z3_solver_assert(smt_solver.ctx, scratch, candidate->alternate);
+                is_sat = smt_query_check(scratch, (size_t)idx, 1);
+                if (is_sat) {
+                    sat_count++;
+                } else {
+                    unsat_count++;
+                }
+            }
+            Z3_solver_pop(smt_solver.ctx, reverse_prefix_solver, 1);
+        }
+        /* Remove interval [c(j-1), cj) to expose exactly the prefix for the
+         * next lower candidate. */
+        if (j > 0) {
+            Z3_solver_pop(smt_solver.ctx, reverse_prefix_solver, 1);
+        }
     }
+
+    printf("[reverse-directed] [solved] [sat %llu] [unsat %llu]\n",
+           (unsigned long long)sat_count,
+           (unsigned long long)unsat_count);
     reverse_directed_solving = 0;
+    reverse_directed_prefix_destroy();
+    free(indices);
 }
 
 static int is_reverse_directed_mode(void)
@@ -7803,13 +8061,33 @@ static int is_reverse_directed_mode(void)
 static void handle_query_reverse_directed(void)
 {
     current_query_mode = QUERY_MODE_ORIGINAL;
+    get_time(&reverse_budget_start);
     reverse_candidates = g_array_new(FALSE, FALSE, sizeof(ReverseCandidate));
     reverse_directed_lowering = 1;
     for (Query* q = query_queue + 1; q->query != FINAL_QUERY; q++) {
         if (!q->query) {
             break;
         }
+        if (reverse_budget_exceeded()) {
+            printf("[reverse-directed] [budget] [phase lowering]"
+                   " [elapsed %llu]\n",
+                   (unsigned long long)reverse_budget_elapsed_ms());
+            save_bitmaps();
+            reverse_directed_lowering = 0;
+            exit(1);
+        }
         smt_query(q);
+    }
+    /* The final lowering query may itself consume the wall-clock budget. Do
+     * not enter solving (or report success for an empty candidate set) after
+     * that query has exceeded it. */
+    if (reverse_budget_exceeded()) {
+        printf("[reverse-directed] [budget] [phase lowering]"
+               " [elapsed %llu]\n",
+               (unsigned long long)reverse_budget_elapsed_ms());
+        save_bitmaps();
+        reverse_directed_lowering = 0;
+        exit(1);
     }
     reverse_directed_lowering = 0;
     reverse_directed_solving = 0;
