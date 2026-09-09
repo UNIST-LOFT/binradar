@@ -1032,12 +1032,15 @@ class BinRadarExecutor:
         if os.path.exists(log_file):
             open(log_file, "w").close()
         env["BINRADAR_TRACER_LOG_FILE"] = log_file
-        # Tracer
-        env["E9_EXCLUDE_RANGES"] = self.e9_exclude_ranges
-        # E9Patch relocated call records (jump:site:return, comma separated).
-        # Every patched symbolic tracer mode needs these to reinterpret E9's
-        # push original_return; jmp target sequence as the original call.
-        env["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
+        # Tracer.  Fuzzolic and directed execute the original binary, so
+        # they must not inherit the patched artifact's E9 address metadata.
+        # Keeping these ranges on an original run can suppress instrumentation
+        # in unrelated mappings and makes relocated-call matching invalid.
+        env["E9_EXCLUDE_RANGES"] = ""
+        env["E9_RELOCATED_CALL_JUMPS"] = ""
+        if mode == "binradar":
+            env["E9_EXCLUDE_RANGES"] = self.e9_exclude_ranges
+            env["E9_RELOCATED_CALL_JUMPS"] = self.e9_relocated_calls
         # Reverse-directed query routing is meaningful only for the directed
         # phase; inherited CLI environment must not affect fuzzolic/binradar.
         env["BINRADAR_REVERSE_DIRECTED"] = "0"

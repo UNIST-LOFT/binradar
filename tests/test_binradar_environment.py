@@ -23,8 +23,8 @@ def executor(tmp_path):
     instance.probe_result = SimpleNamespace(patch_func_hit_cnt=3)
     instance.timeout = 17
     instance.reverse_directed = False
-    instance.e9_exclude_ranges = ""
-    instance.e9_relocated_calls = ""
+    instance.e9_exclude_ranges = "0x70000000-0x70001000"
+    instance.e9_relocated_calls = "0x70000010:0x401000:0x401005"
     instance.forkserver_child_timeout = 900
     instance.filter_result = [1, 2]
     return instance, tmp_path
@@ -40,6 +40,12 @@ def test_get_env_gates_osprey_by_mode(monkeypatch, executor, mode, expected_ospr
     env = instance.get_env(mode, str(run_dir))
     assert env["BINRADAR_OSPREY_ENABLE"] == expected_osprey
     assert env["BINRADAR_TRACER_LOG_FILE"] == str(run_dir / f"{mode}-tracer-msg.log")
+    if mode == "binradar":
+        assert env["E9_EXCLUDE_RANGES"] == instance.e9_exclude_ranges
+        assert env["E9_RELOCATED_CALL_JUMPS"] == instance.e9_relocated_calls
+    else:
+        assert env["E9_EXCLUDE_RANGES"] == ""
+        assert env["E9_RELOCATED_CALL_JUMPS"] == ""
 
 
 def test_binradar_disables_trace_artifact(executor):

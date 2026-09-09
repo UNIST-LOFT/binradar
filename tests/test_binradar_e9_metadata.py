@@ -776,26 +776,24 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     return executor
 
 
-def test_get_env_sets_relocated_calls_for_patched_modes(tmp_path):
-    """P0-2: every patched symbolic tracer mode receives the records.
-
-    The old get_env() set only the three range variables; the
-    E9_RELOCATED_CALL_JUMPS value retained by from_env()/extract_config()
-    never reached the tracer environment.
-    """
+def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
+    """Original producers get empty E9 metadata; BinRadar gets its pair."""
     config = {
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000,0x2cc7000-0x2cc9000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
     }
     executor = _stub_executor(tmp_path, config=config)
-    for mode in ("fuzzolic", "directed", "binradar"):
+    for mode in ("fuzzolic", "directed"):
         env = executor.get_env(mode, str(tmp_path))
-        assert env.get("E9_RELOCATED_CALL_JUMPS") == RECORDS, mode
-        assert env.get("E9_EXCLUDE_RANGES") == \
-            "0x54b000-0x54c000,0x2cc7000-0x2cc9000", mode
-        assert "PATCH_RESERVE_RANGE" not in env, mode
-        assert "E9_TRAMPOLINE_RANGE" not in env, mode
-        assert "E9_LOADER_RANGE" not in env, mode
+        assert env["E9_RELOCATED_CALL_JUMPS"] == ""
+        assert env["E9_EXCLUDE_RANGES"] == ""
+    env = executor.get_env("binradar", str(tmp_path))
+    assert env["E9_RELOCATED_CALL_JUMPS"] == RECORDS
+    assert env["E9_EXCLUDE_RANGES"] == \
+        "0x54b000-0x54c000,0x2cc7000-0x2cc9000"
+    for key in ("PATCH_RESERVE_RANGE", "E9_TRAMPOLINE_RANGE",
+                "E9_LOADER_RANGE"):
+        assert key not in env
 
 
 def test_metadata_selection_is_artifact_scoped(tmp_path):
@@ -814,8 +812,8 @@ def test_metadata_selection_is_artifact_scoped(tmp_path):
                                config=config)
     prefilter = _stub_executor(tmp_path, e9_metadata_prefix="prefilter",
                                config=config)
-    env_b = brpatched.get_env("fuzzolic", str(tmp_path))
-    env_p = prefilter.get_env("fuzzolic", str(tmp_path))
+    env_b = brpatched.get_env("binradar", str(tmp_path))
+    env_p = prefilter.get_env("binradar", str(tmp_path))
     assert env_b["E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env_b["E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
