@@ -1,0 +1,303 @@
+# taosc (makeshift binary patch generator) — Docker build without Guix
+#
+# This replicates the Guix package definitions of the UNIST-LOFT loftix channel
+# (https://github.com/UNIST-LOFT/loftix) with the same versions and wiring:
+#   - taosc        0.1.17 (loftix/synthesis.scm)
+#   - e9patch      v1.0.0 (gnu/packages/patchutils.scm)
+#   - dyninst      v13.0.0 (gnu/packages/instrumentation.scm)
+#   - aflplusplus  v5.02c (gnu/packages/debug.scm)
+#   - valgrind     (Debian/Ubuntu package)
+#   - fuzzolic     season-lab/fuzzolic @ 39937821 (loftix/fuzzing.scm)
+#   - qemu-for-fuzzolic  qemu-4.1.1 + season-lab/qemu symbolic diff
+#   - z3-for-fuzzolic    z3-4.14.1 + fuzzolic patches (loftix/deduction.scm)
+#   - fuzzy-sat    season-lab/fuzzy-sat @ 99094f66 (loftix/deduction.scm)
+#   - zig          0.16.0 (gnu/packages/zig.scm)
+#
+# Test artefact (like taoscadh-cve-2017-15025 in loftix/artefacts.scm):
+#   cd /work && ./taosc-fix 10 workdir poc "nm" -l @@
+# where `poc` contains the CVE-2017-15025 reproducer inputs and `nm`
+# is a vulnerable binutils-2.29 nm installed in /usr/local/bin.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    AFL_PATH=/usr/local/lib/afl \
+    OMP_NUM_THREADS=32 \
+    PATH=/usr/local/bin:/usr/local/lib/afl:$PATH
+
+# Cap `nproc` (GNU nproc honours OMP_NUM_THREADS) so that taosc's
+# -P$(nproc) valgrind loops stay far below taosc-fix's per-run timeout.
+# Without this, a SIGKILL from `timeout` can land in the middle of the
+# snapshot writes of the collect patches, corrupting the ERM data.
+
+# ---------------------------------------------------------------- system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential g++ gcc-multilib gcc-13-plugin-dev \
+        make cmake ninja-build meson automake autoconf libtool pkg-config \
+        git wget curl xz-utils bzip2 file unzip ca-certificates \
+        python3 python3-dev python3-pip python3-venv python3-setuptools \
+        python-is-python3 \
+        libglib2.0-dev libpixman-1-dev zlib1g-dev \
+        libboost-all-dev libtbb-dev libelf-dev libdw-dev libiberty-dev binutils-dev \
+        libxxhash-dev \
+        valgrind binutils \
+        markdown xxd \
+        && rm -rf /var/lib/apt/lists/*
+
+# Taosc's shell scripts use Bash-isms (${@:5}, pushd, ...) and its .in files
+# are only tested with GNU Bash, so /bin/sh must be Bash (as on Guix).
+RUN ln -sf /usr/bin/bash /bin/sh
+
+# ---------------------------------------------------------------- Zig 0.16.0
+# native-inputs of the taosc package (loftix/synthesis.scm: (list zig-0.16))
+RUN wget -q https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+        -O /tmp/zig.tar.xz \
+    && tar -xJf /tmp/zig.tar.xz -C /usr/local \
+    && mv /usr/local/zig-x86_64-linux-0.16.0 /usr/local/zig \
+    && ln -sf /usr/local/zig/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+
+# -------------------------------------------------------- Zycore + Zydis
+# e9patch is built against system Zydis like Guix does
+# (gnu/packages/engineering.scm: zycore 1.5.1, zydis 4.1.1).
+RUN git clone --depth 1 --branch v1.5.1 https://github.com/zyantific/zycore-c /opt/zycore \
+    && cmake -S /opt/zycore -B /opt/zycore/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /opt/zycore/build -j"$(nproc)" \
+    && cmake --install /opt/zycore/build \
+    && git clone --depth 1 --branch v4.1.1 https://github.com/zyantific/zydis /opt/zydis \
+    && cmake -S /opt/zydis -B /opt/zydis/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DZYAN_SYSTEM_ZYCORE=ON -DZYDIS_BUILD_SHARED_LIB=ON \
+    && cmake --build /opt/zydis/build -j"$(nproc)" \
+    && cmake --install /opt/zydis/build \
+    && ldconfig
+
+# ------------------------------------------------------------------- E9Patch
+# gnu/packages/patchutils.scm: e9patch 1.0.0, `make CC=... PREFIX=...`,
+# with the Guix e9patch-zydis-4.1-compat.patch applied.
+RUN git clone --depth 1 --branch v1.0.0 \
+        https://github.com/GJDuck/e9patch /opt/e9patch \
+    && wget -q https://codeberg.org/guix/guix/raw/branch/master/gnu/packages/patches/e9patch-zydis-4.1-compat.patch \
+        -O /tmp/e9patch-zydis-compat.patch \
+    && cd /opt/e9patch \
+    && patch -p1 < /tmp/e9patch-zydis-compat.patch \
+    && make -j"$(nproc)" CC=gcc PREFIX=/usr/local \
+    && make install PREFIX=/usr/local \
+    && ldconfig
+
+# ------------------------------------------------------------------- Dyninst
+# gnu/packages/instrumentation.scm: dyninst 13.0.0, cmake with
+# -DSTERILE_BUILD=ON and system elfutils/libiberty/boost/onetbb.
+RUN git clone --depth 1 --branch v13.0.0 \
+        https://github.com/dyninst/dyninst /opt/dyninst \
+    && cmake -S /opt/dyninst -B /opt/dyninst/build \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DSTERILE_BUILD=ON \
+    && cmake --build /opt/dyninst/build -j"$(nproc)" \
+    && cmake --install /opt/dyninst/build \
+    && ldconfig
+
+# ------------------------------------------------------------------ AFL++ v5.02c
+# gnu/packages/debug.scm: aflplusplus 5.02c + qemu_mode/libqasan.
+# NO_UNICORN/NO_NYX/NO_CORESIGHT avoid rust and other extras (unused by taosc).
+RUN git clone --depth 1 --branch v5.02c \
+        https://github.com/AFLplusplus/AFLplusplus /opt/AFLplusplus \
+    && cd /opt/AFLplusplus \
+    && make -j"$(nproc)" distrib CC=gcc CXX=g++ \
+        NO_UNICORN=1 NO_NYX=1 NO_CORESIGHT=1 IS_DOCKER=1 \
+    && make install PREFIX=/usr/local \
+    && mkdir -p /usr/local/lib/afl \
+    && test -f /usr/local/lib/afl/libqasan.so \
+    && install -m 755 libqasan.so /usr/local/bin/ \
+    && ls -la /usr/local/bin/afl-qemu-trace /usr/local/lib/afl/
+
+# ------------------------------------------------------- QEMU tracer (fuzzolic)
+# loftix/emulation.scm: qemu-for-fuzzolic = qemu-4.1.1 +
+# https://github.com/season-lab/qemu v4.1.1..5dd13fc5 diff +
+# patches/qemu-for-fuzzolic-test-opts-range-beyond.patch,
+# configured with --target-list=x86_64-linux-user.
+# The symbolic-struct.h header is installed for the fuzzolic solver.
+RUN mkdir -p /opt/qemu-fuzzolic \
+    && wget -q https://download.qemu.org/qemu-4.1.1.tar.xz -O /tmp/qemu.tar.xz \
+    && tar -xJf /tmp/qemu.tar.xz -C /opt/qemu-fuzzolic --strip-components=1 \
+    && wget -q https://github.com/season-lab/qemu/compare/v4.1.1..5dd13fc54ade8ebeedfddf10a98dd2d672467bfd.diff \
+        -O /tmp/qemu-fuzzolic.diff \
+    && cd /opt/qemu-fuzzolic \
+    && patch -p1 < /tmp/qemu-fuzzolic.diff \
+    && LDFLAGS="-lrt" ./configure --cc=gcc --host-cc=gcc \
+        --target-list=x86_64-linux-user \
+        --disable-debug-info --disable-werror \
+        --prefix=/usr/local --sysconfdir=/etc \
+    && make -j"$(nproc)" \
+    && make install \
+    && install -Dm 644 tcg/symbolic/symbolic-struct.h \
+        /usr/local/include/qemu/tcg/symbolic/symbolic-struct.h
+
+# --------------------------------------------------------- Z3 for fuzzolic
+# loftix/deduction.scm: z3-for-fuzzolic = z3-4.14.1 tag +
+# https://github.com/Z3Prover/z3 z3-4.14.1..268d10d0 diff
+RUN git clone --depth 1 --branch z3-4.14.1 https://github.com/Z3Prover/z3 /opt/z3 \
+    && wget -q https://github.com/Z3Prover/z3/compare/z3-4.14.1..268d10d0d99083a18cde2d615e0f9de82d7b201d.diff \
+        -O /tmp/z3-fuzzolic.diff \
+    && cd /opt/z3 && patch -p1 < /tmp/z3-fuzzolic.diff \
+    && cmake -S /opt/z3 -B /opt/z3/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DZ3_BUILD_PYTHON_BINDINGS=ON \
+    && cmake --build /opt/z3/build -j"$(nproc)" \
+    && cmake --install /opt/z3/build \
+    && ldconfig
+
+# ----------------------------------------------------------------- FUZZY-SAT
+# loftix/deduction.scm: fuzzy-sat @ 99094f66 + fuzzy-sat-unbundle.patch +
+# fuzzy-sat-install.patch (installs libZ3Fuzzy, z3-fuzzy.h and cmake config)
+RUN git clone https://github.com/season-lab/fuzzy-sat /opt/fuzzy-sat \
+    && cd /opt/fuzzy-sat \
+    && git checkout 99094f664abcc7cb8ff7d04eb894616b89a15efc \
+    && wget -q https://raw.githubusercontent.com/UNIST-LOFT/loftix/main/patches/fuzzy-sat-unbundle.patch \
+    && wget -q https://raw.githubusercontent.com/UNIST-LOFT/loftix/main/patches/fuzzy-sat-install.patch \
+    && patch -p1 < fuzzy-sat-unbundle.patch \
+    && patch -p1 < fuzzy-sat-install.patch \
+    && cmake -S /opt/fuzzy-sat -B /opt/fuzzy-sat/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+    && cmake --build /opt/fuzzy-sat/build -j"$(nproc)" \
+    && cmake --install /opt/fuzzy-sat/build \
+    && ldconfig
+
+# ------------------------------------------------------------------ FUZZOLIC
+# loftix/fuzzing.scm:
+#  - fuzzolic-solver: solver/ built with cmake, unbundled z3/fuzzy-sat/xxhash
+#  - fuzzolic-utils : Makefile builds fuzzolic-merge-bitmap and
+#                     fuzzolic-find-models-addrs
+#  - fuzzolic       : fuzzolic/ turned into a Python package with console
+#                     script `fuzzolic`; executor.py paths patched to the
+#                     installed tracer/solver binaries (patch-paths phase)
+RUN git clone https://github.com/season-lab/fuzzolic /opt/fuzzolic \
+    && cd /opt/fuzzolic \
+    && git checkout 39937821d5360b139f026f09e2019f214a4929c1 \
+    && for p in fuzzolic-python-package fuzzolic-solver-install fuzzolic-solver-unbundle; do \
+           wget -q https://raw.githubusercontent.com/UNIST-LOFT/loftix/main/patches/$p.patch; \
+           patch -p1 < $p.patch; \
+       done \
+    && cmake -S /opt/fuzzolic/solver -B /opt/fuzzolic/solver/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /opt/fuzzolic/solver/build -j"$(nproc)" \
+    && cmake --install /opt/fuzzolic/solver/build \
+    && test -x /usr/local/bin/solver-smt && test -x /usr/local/bin/solver-fuzzy \
+    && for p in fuzzolic-utils-make fuzzolic-showmap; do \
+           wget -q https://raw.githubusercontent.com/UNIST-LOFT/loftix/main/patches/$p.patch; \
+       done \
+    && patch -p1 < fuzzolic-utils-make.patch \
+    && make PREFIX=/usr/local CC=gcc install
+
+# fuzzolic-showmap: patched afl-showmap built from a second AFL++ checkout
+# (loftix/fuzzing.scm `fuzzolic-showmap` package)
+RUN cp -a /opt/AFLplusplus /opt/AFLplusplus-showmap \
+    && cd /opt/AFLplusplus-showmap \
+    && wget -q https://raw.githubusercontent.com/UNIST-LOFT/loftix/main/patches/fuzzolic-showmap.patch \
+    && patch -p1 < fuzzolic-showmap.patch \
+    && make -j"$(nproc)" afl-showmap CC=gcc CXX=g++ \
+    && cp -a afl-showmap /usr/local/bin/fuzzolic-showmap
+
+# The `fuzzolic` Python package (mirrors the Guix `patch-paths` phase and the
+# pyproject.toml generated by loftix/fuzzing.scm), then a `fuzzolic` wrapper.
+RUN cd /opt/fuzzolic \
+    && sed -i \
+        -e 's#^SOLVER_SMT_BIN = .*#SOLVER_SMT_BIN = "/usr/local/bin/solver-smt"#' \
+        -e 's#^SOLVER_FUZZY_BIN = .*#SOLVER_FUZZY_BIN = "/usr/local/bin/solver-fuzzy"#' \
+        -e 's#SCRIPT_DIR + "/find_models_addrs\.py"#"/usr/local/bin/fuzzolic-find-models-addrs"#' \
+        fuzzolic/executor.py \
+    && sed -i 's#^TRACER_BIN = .*#TRACER_BIN = "/usr/local/bin/qemu-x86_64"#' \
+        fuzzolic/executor.py fuzzolic/minimizer.py fuzzolic/testcase_checker.py \
+    && sed -i \
+        -e 's#os\.path\.join(SCRIPT_DIR, "\.\./utils/afl-showmap")#"/usr/local/bin/fuzzolic-showmap"#' \
+        -e 's#^\( *self\.showmap = \).*#\1"/usr/local/bin/afl-showmap"#' \
+        -e "s#SCRIPT_DIR + '/\.\./utils/merge_bitmap'#\"/usr/local/bin/fuzzolic-merge-bitmap\"#" \
+        fuzzolic/minimizer_qsym.py \
+    && sed -i \
+        -e 's#^AFL_BIN = .*#AFL_BIN = "/usr/local/bin/afl-fuzz"#' \
+        -e 's#^FUZZOLIC_BIN = .*#FUZZOLIC_BIN = "/usr/local/bin/fuzzolic"#' \
+        fuzzolic/run_afl_fuzzolic.py \
+    && python3 -m py_compile fuzzolic/executor.py fuzzolic/minimizer.py \
+        fuzzolic/minimizer_qsym.py fuzzolic/testcase_checker.py \
+        fuzzolic/run_afl_fuzzolic.py fuzzolic/fuzzolic.py \
+    && touch fuzzolic/__init__.py \
+    && printf '%s\n' \
+        "[build-system]" \
+        "requires = ['flit_core >=3.2']" \
+        "build-backend = 'flit_core.buildapi'" \
+        "" \
+        "[project]" \
+        "name = 'fuzzolic'" \
+        "version = '0'" \
+        "description = 'Concolic fuzzer'" \
+        "" \
+        "[project.scripts]" \
+        "fuzzolic = 'fuzzolic.fuzzolic:main'" \
+        "fuzzolic-with-afl = 'fuzzolic.run_afl_fuzzolic:main'" \
+        > pyproject.toml \
+    && python3 -m pip install --break-system-packages . \
+    && python3 -c "import z3" \
+    && which fuzzolic
+
+# ------------------------------------------------------------------- binutils 2.29
+# loftix/bugs.scm: binutils-2.29 (unpatched), used as the "nm" test target.
+# Like the Guix toolchain, build a non-PIE binary and strip it: QASAN then
+# reports absolute addresses equal to binary offsets and prints frames as
+# "func (nm+0xoffset)", which taosc's parsers expect.
+RUN wget -q https://ftp.gnu.org/gnu/binutils/binutils-2.29.tar.bz2 -O /tmp/binutils.tar.bz2 \
+    && mkdir -p /opt/binutils-2.29-src /opt/binutils-2.29-build \
+    && tar -xjf /tmp/binutils.tar.bz2 -C /opt/binutils-2.29-src --strip-components=1 \
+    && cd /opt/binutils-2.29-build \
+    && CFLAGS="-O2 -fcommon -fno-pie" CXXFLAGS="-O2 -fcommon -fno-pie" LDFLAGS="-no-pie" \
+       /opt/binutils-2.29-src/configure --prefix=/opt/binutils-2.29 \
+        --disable-werror --disable-nls \
+    && make -j"$(nproc)" MAKEINFO=true \
+    && make install MAKEINFO=true \
+    && strip /opt/binutils-2.29/bin/nm \
+    && cp /opt/binutils-2.29/bin/nm /usr/local/bin/nm
+
+# --------------------------------------------------------------------- TAOSC
+# loftix/synthesis.scm: taosc 0.1.17 with the make-flags
+#   E9COMPILE/E9TOOL (e9patch), FIND/XARGS (findutils), FUZZOLIC,
+#   QEMUAFL (aflplusplus), VALGRIND, PREFIX.
+COPY taosc /opt/taosc
+RUN cd /opt/taosc \
+    && make -j"$(nproc)" \
+        E9COMPILE=/usr/local/bin/e9compile \
+        E9TOOL=/usr/local/bin/e9tool \
+        FIND=/usr/bin/find \
+        XARGS=/usr/bin/xargs \
+        FUZZOLIC=/usr/local/bin/fuzzolic \
+        QEMUAFL=/usr/local/bin/afl-qemu-trace \
+        VALGRIND=/usr/bin/valgrind \
+        PREFIX=/usr/local \
+    && make install \
+        E9COMPILE=/usr/local/bin/e9compile \
+        E9TOOL=/usr/local/bin/e9tool \
+        FIND=/usr/bin/find \
+        XARGS=/usr/bin/xargs \
+        FUZZOLIC=/usr/local/bin/fuzzolic \
+        QEMUAFL=/usr/local/bin/afl-qemu-trace \
+        VALGRIND=/usr/bin/valgrind \
+        PREFIX=/usr/local
+
+# --------------------------------------------------- test artefact (BinRadar)
+# Like taoscadh-cve-2017-15025: `taosc-fix 10 workdir poc "nm" -l @@`
+# COPY bugs/cve/2017/15025/ /work/poc/
+# RUN ln -s /usr/local/bin/taosc-fix /work/taosc-fix
+
+# Smoke test: must run without errors.
+# RUN cd /work && ./taosc-fix 10 workdir poc "nm" -l @@ \
+#     && echo SMOKE-TEST-OK \
+#     && cat workdir/patch-location workdir/destinations workdir/patch-format \
+#     && test -s workdir/predicates \
+#     && test -x workdir/nm.patched \
+#     && rm -rf workdir && rm -f /work/vgcore.*
+
+WORKDIR /work
+CMD ["/bin/bash"]
