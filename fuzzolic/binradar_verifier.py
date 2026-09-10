@@ -637,6 +637,8 @@ class BinRadarConcreteVerifierResult:
     patch_confidence: Dict[int, float]
     accept_evidences: Dict[int, int]
     total_evidences: Dict[int, int]
+    feedback: Dict[int, Dict[str, Any]]
+    feedback_counts: Dict[int, int]
     stop_reason: Optional[str]
     def __init__(self, results: dict):
         self.patch_verified = dict()
@@ -644,6 +646,8 @@ class BinRadarConcreteVerifierResult:
         self.patch_confidence = dict()
         self.accept_evidences = dict()
         self.total_evidences = dict()
+        self.feedback = dict()
+        self.feedback_counts = dict()
         stopped_rows = results.get("verifier", {}).get("stopped", [])
         self.stop_reason = (stopped_rows[-1]["reason"]
                             if stopped_rows else None)
@@ -663,6 +667,11 @@ class BinRadarConcreteVerifierResult:
             # in-memory value always follows the metric definition.
             self.patch_confidence[patch_id] = (
                 accepted / total if total > 0 else 0.0)
+        for feedback in results.get("verifier-feedback", []):
+            patch_id = feedback["patch"]
+            self.feedback_counts[patch_id] = self.feedback_counts.get(patch_id, 0) + 1
+            self.feedback[patch_id] = dict(feedback.data)
+        
         # Legacy verifier files have verdict rows but no confidence rows.
         # Represent their unknown evidence as the documented 0/0 score.
         for patch_id in self.patch_verified:
@@ -691,6 +700,21 @@ class BinRadarConcreteVerifierResult:
                 f"unexpected patches {unexpected}; "
                 f"duplicate patches {duplicates}")
 
+    def require_complete_feedback(self, patches: List[int]) -> None:
+        """Require exactly one machine-readable feedback row per patch."""
+        expected = set(patches)
+        actual = set(self.feedback_counts)
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        duplicates = sorted(
+            patch for patch, count in self.feedback_counts.items()
+            if count != 1)
+        if missing or unexpected or duplicates:
+            raise ValueError(
+                "Verifier feedback coverage mismatch: "
+                f"missing patches {missing}; unexpected patches {unexpected}; "
+                f"duplicate patches {duplicates}")
+
     @classmethod
     def from_sbsv(cls, sbsv_file: str) -> Optional["BinRadarConcreteVerifierResult"]:
         parser = sbsv.parser()
@@ -699,6 +723,13 @@ class BinRadarConcreteVerifierResult:
         parser.add_schema(
             "[verifier-confidence] [patch: int] [score: float] "
             "[accept-evidences: int] [total-evidences: int]")
+        parser.add_schema(
+            "[verifier-feedback] [patch: int] [feedback-res: str] "
+            "[feedback-reason: str] [security-res: str] "
+            "[patch-crashed: int] [crash-fail: int] [crash-pass: int] "
+            "[no-crash-fail: int] [no-crash-pass-same-br: int] "
+            "[behavior-diff: int] [accept-evidences: int] "
+            "[total-evidences: int]")
         parser.add_schema("[verifier] [stopped] [reason: str]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
             result = parser.load(f)
@@ -720,6 +751,7 @@ class BinRadarConcreteVerifier:
     patched_binary: str
     testcases: List[Testcase]
     patches: List[int]
+    feedback_mode: bool
     start_time: float
     logger: logging.Logger
     minimized_dir: str
@@ -727,8 +759,11 @@ class BinRadarConcreteVerifier:
     cache_family: Optional[PredicateFamily]
     accept_evidences: Dict[int, int]
     total_evidences: Dict[int, int]
+    observation_counts: Dict[int, Dict[str, int]]
+    security_rejected: Set[int]
+    feedback_hard_rejected: Set[int]
     timeout_cutoff_logged: bool
-    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int]):
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False):
         self.dir = dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -736,9 +771,13 @@ class BinRadarConcreteVerifier:
         self.probe_result = probe_result
         self.patched_binary = patched_binary
         self.patches = patches
+        self.feedback_mode = feedback_mode
         self.testcases = list()
         self.accept_evidences = {patch: 0 for patch in patches}
         self.total_evidences = {patch: 0 for patch in patches}
+        self.observation_counts = {patch: {} for patch in patches}
+        self.security_rejected = set()
+        self.feedback_hard_rejected = set()
         self.timeout_cutoff_logged = False
         self.start_time = time.time()
         # Setup logger
@@ -792,6 +831,10 @@ class BinRadarConcreteVerifier:
             br=row["br"]
         )
 
+    def _record_observation(self, patch: int, name: str) -> None:
+        counts = self.observation_counts.setdefault(patch, {})
+        counts[name] = counts.get(name, 0) + 1
+
     def _record_evidence(self, patch: int, accepted: bool) -> None:
         self.total_evidences[patch] = self.total_evidences.get(patch, 0) + 1
         if accepted:
@@ -825,6 +868,41 @@ class BinRadarConcreteVerifier:
             f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
             f"[total-evidences {self.total_evidences.get(patch, 0)}]")
 
+
+    def _log_feedback_summary(self, patch: int) -> None:
+        if not self.feedback_mode:
+            return
+        counts = self.observation_counts.get(patch, {})
+        hard_reason = ""
+        if counts.get("patch-crashed", 0):
+            hard_reason = "patch-crashed"
+        elif counts.get("no-crash-fail", 0):
+            hard_reason = "no-crash-fail"
+        elif counts.get("crash-fail", 0):
+            hard_reason = "crash-fail-security-rejection"
+        else:
+            hard_reason = "eligible"
+        feedback_res = (
+            "rejected" if patch in self.feedback_hard_rejected else "accepted")
+        security_res = (
+            "rejected" if patch in self.security_rejected else "verified")
+        self.logger.info(
+            f"[verifier-feedback] [patch {patch}] "
+            f"[feedback-res {feedback_res}] [feedback-reason {hard_reason}] "
+            f"[security-res {security_res}] "
+            f"[patch-crashed {counts.get('patch-crashed', 0)}] "
+            f"[crash-fail {counts.get('crash-fail', 0)}] "
+            f"[crash-pass {counts.get('crash-pass', 0)}] "
+            f"[no-crash-fail {counts.get('no-crash-fail', 0)}] "
+            f"[no-crash-pass-same-br {counts.get('no-crash-pass-same-br', 0)}] "
+            f"[behavior-diff {counts.get('no-crash-confidence-diff-br', 0)}] "
+            f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
+            f"[total-evidences {self.total_evidences.get(patch, 0)}]")
+
+    def _log_all_feedback_summaries(self) -> None:
+        for patch in self.patches:
+            self._log_feedback_summary(patch)
+
     def _test_result(
         self, patch: int, testcase: Testcase, result: BinRadarProbeResult,
         patch_result: Optional[BinRadarPatchResult],
@@ -837,22 +915,29 @@ class BinRadarConcreteVerifier:
         rejection.
         """
         if patch_result is not None and patch_result.crashed():
+            self._record_observation(patch, "patch-crashed")
             self._record_evidence(patch, False)
             self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+            self.security_rejected.add(patch)
+            self.feedback_hard_rejected.add(patch)
             return True
         if testcase.exit == "crash":
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
                     return False
+                self.security_rejected.add(patch)
+                self._record_observation(patch, "crash-fail")
                 self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                return True
+                return not self.feedback_mode # In feedback mode, do not immediately reject
             if result.is_normal_exit():
+                self._record_observation(patch, "crash-pass")
                 self._record_evidence(patch, True)
                 self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
             if result.is_timeout():
+                self._record_observation(patch, "crash-timeout")
                 self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         else:
@@ -860,6 +945,9 @@ class BinRadarConcreteVerifier:
                 if result.fault_addr != self.probe_result.fault_addr:
                     self.logger.info(f"[verifier] [no-crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
                     return False
+                self.security_rejected.add(patch)
+                self.feedback_hard_rejected.add(patch)
+                self._record_observation(patch, "no-crash-fail")
                 self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
                 return True
@@ -868,13 +956,16 @@ class BinRadarConcreteVerifier:
                     self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
                     return False
                 if testcase.br == patch_result.br_selection:
+                    self._record_observation(patch, "no-crash-pass-same-br")
                     self._record_evidence(patch, True)
                     self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                     return False
+                self._record_observation(patch, "no-crash-confidence-diff-br")
                 self._record_evidence(patch, False)
                 self.logger.info(f"[verifier] [no-crash-confidence-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
             if result.is_timeout():
+                self._record_observation(patch, "no-crash-timeout")
                 self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
                 return False
         return False
@@ -1144,4 +1235,6 @@ class BinRadarConcreteVerifier:
             self.mark_timeout_cutoff()
         for patch in pending_patches:
             self._log_result(patch, "verified", "")
+        if self.feedback_mode:
+            self._log_all_feedback_summaries()
         return timed_out

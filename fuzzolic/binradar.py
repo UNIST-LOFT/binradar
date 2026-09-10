@@ -94,10 +94,11 @@ class BinRadarPhase(enum.IntEnum):
     VERIFIER = 7
     BINRADAR = 8
     FINAL = 9
+    FEEDBACK = 10
     # Combined single phase: minimizer + concrete verifier running
     # concurrently over already-produced testcases (same as their part of
     # --seq). CLI name: "minimizer-verifier".
-    MINIMIZER_VERIFIER = 10
+    MINIMIZER_VERIFIER = 11
 
 
 def phase_from_name(name: str) -> BinRadarPhase:
@@ -112,7 +113,7 @@ def phase_from_name(name: str) -> BinRadarPhase:
 # Valid --run-single-phase names; each must map through phase_from_name.
 SINGLE_PHASE_NAMES = ["probe", "filter", "fuzzolic", "directed", "fuzzer",
                       "minimizer", "verifier", "minimizer-verifier",
-                      "binradar", "final"]
+                      "binradar", "feedback", "final"]
 
 
 def setlimits():
@@ -725,11 +726,7 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
-    # Artifact whose E9 metadata this run executes: "brpatched" (default),
-    # "prefilter", or "brcached".  The prefixed binradar.env keys
-    # (<PREFIX>_E9_EXCLUDE_RANGES / <PREFIX>_E9_RELOCATED_CALL_JUMPS) are
-    # selected at load time; the tracer process env receives the unprefixed
-    # names as its runtime contract.
+    # E9 metadata for each binaries: "brpatched", "prefilter", or "brcached".
     e9_metadata_prefix: str
     e9_exclude_ranges: str
     e9_relocated_calls: str
@@ -740,6 +737,8 @@ class BinRadarExecutor:
     less_strict: bool
     binradar_failed: bool
     concrete_evidence_timed_out: bool
+    feedback_mode: bool
+    # Control
     phase_failures: Dict[str, str]
     phase_failure_lock: threading.Lock
     # Data
@@ -752,7 +751,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -764,6 +763,7 @@ class BinRadarExecutor:
         self.reverse_directed = reverse_directed
         self.disable_binradar = disable_binradar
         self.less_strict = less_strict
+        self.feedback_mode = feedback_mode
         self.binradar_failed = False
         self.concrete_evidence_timed_out = False
         self.phase_failures = {}
@@ -829,6 +829,7 @@ class BinRadarExecutor:
             reverse_directed=env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1",
             disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1",
             less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
+            feedback_mode=env.get("BINRADAR_FEEDBACK_MODE", "0") == "1",
             forkserver_child_timeout=forkserver_child_timeout)
         # Retain every artifact's prefixed E9 metadata so extract_config
         # passes all of it to BinRadarQemuRunner.from_env, which selects
@@ -1054,13 +1055,6 @@ class BinRadarExecutor:
                 raise RuntimeError(
                     "forkserver child timeout cap must be positive")
             env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-            # Cap a single forkserver child well below python's fixed 1800 s
-            # forkserver read timeout: a hung child must cost one bounded
-            # iteration (child cap + tracer-side analyze margin), not a
-            # python TimeoutError that fails the whole phase (br-test
-            # 2026-09-08: BINRADAR_FORKSERVER_CHILD_TIMEOUT was set to the
-            # whole-run budget, making the tracer's child-timeout salvage
-            # path unreachable).
             child_timeout = self.forkserver_child_timeout
             if self.timeout > 0:
                 child_timeout = min(child_timeout, self.timeout)
@@ -1637,12 +1631,23 @@ class BinRadarExecutor:
             logger.error("Probe result not found. Cannot run feedback analysis.")
             raise RuntimeError("Probe result not found.")
         self.save_progress(f"[feedback] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        # Implement feedback analysis logic here.
-        # Make feedback directory, which contains:
-        # 1. Metadata about the feedback analysis. binradar.env file + binradar-feedback.json (including survived patch list)
-        # 2. Required files for the feedback analysis: poc dir, original binaries, brpatches.json
-        # 3. Generated concrete test cases from minimized/ -> concrete/benign, concrete/malicious
-        # 4. binradar produced snapshots (brcached -> expected value)
+        # Make feedback directory:
+        feedback_dir = os.path.join(self.run_dir, "feedback")
+        if os.path.exists(feedback_dir):
+            shutil.rmtree(feedback_dir)
+        os.makedirs(feedback_dir)
+        # 1. Required files for the feedback analysis
+        shutil.copyfile(os.path.join(self.workdir, "binradar.env"), os.path.join(feedback_dir, "binradar.env"))
+        shutil.copyfile(self.original_binary(), os.path.join(feedback_dir, os.path.basename(self.original_binary())))
+        os.makedirs(os.path.join(feedback_dir, "poc"), exist_ok=True)
+        shutil.copyfile(os.path.join(self.workdir, self.poc_input), os.path.join(feedback_dir, self.poc_input))
+        shutil.copyfile(os.path.join(self.workdir, "brpatches.json"), os.path.join(feedback_dir, "brpatches.json"))
+        # 2. Generated concrete test cases from minimized/ -> concrete/benign, concrete/malicious
+        os.makedirs(os.path.join(feedback_dir, "concrete", "benign"), exist_ok=True)
+        os.makedirs(os.path.join(feedback_dir, "concrete", "malicious"), exist_ok=True)
+        
+        
+        # 3. binradar produced snapshots (brcached -> expected value) - later work
         self.save_progress(f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_final(self):
@@ -1952,6 +1957,8 @@ class BinRadarExecutor:
             self._run_optional_phase("binradar", self.run_binradar)
         else:
             logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
+        if self.feedback_mode:
+            self._run_optional_phase("feedback", self.run_feedback)
         self.run_final()
         self.done()
     
@@ -1988,6 +1995,8 @@ class BinRadarExecutor:
             self._run_optional_phase("binradar", self.run_binradar)
         elif phase == BinRadarPhase.FINAL:
             self.run_final()
+        elif phase == BinRadarPhase.FEEDBACK:
+            self._run_optional_phase("feedback", self.run_feedback)
         else:
             raise ValueError(f"Unknown phase: {phase}")
         self.done()
@@ -2100,6 +2109,8 @@ class BinRadarExecutor:
                 stop_running_processes()
                 binradar_thread.join(timeout=10)
         raise_thread_error_if_any()
+        if self.feedback_mode:
+            self._run_optional_phase("feedback", self.run_feedback)
         self.run_final()
         self.done()
 
@@ -2121,12 +2132,8 @@ def main():
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
     parser.add_argument("--fuzzy", action="store_true", help="use the Fuzzy-SAT solver")
-    parser.add_argument(
-        "--feedback", nargs="?", const=True, default=True, type=parse_bool,
-        help="Give feedback to taosc (optionally pass true/false)")
-    parser.add_argument(
-        "--reverse-directed", nargs="?", const=True, default=True,
-        type=parse_bool,
+    parser.add_argument("--feedback-mode", default=False, type=bool, help="Give feedback to taosc")
+    parser.add_argument("--reverse-directed", default=True, type=bool,
         help="prioritize directed candidates from the end of the forward trace (Z3 only); optionally pass true/false")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
@@ -2170,6 +2177,7 @@ def main():
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if (args.disable_binradar or args.fuzzer_only) else "0"
     env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
+    env["BINRADAR_FEEDBACK_MODE"] = "1" if args.feedback_mode else "0"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     if args.target_patches == "all":
         # Run every predicate that survived the offline prefilter instead of

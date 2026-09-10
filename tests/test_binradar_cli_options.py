@@ -59,7 +59,7 @@ def test_boolean_parser_accepts_true_false_values():
 
 def test_reverse_directed_bare_flag_and_explicit_disable(tmp_path, monkeypatch):
     enabled = _run_main(monkeypatch, tmp_path / "enabled", [
-        "--reverse-directed"])
+        "--reverse-directed", "true"])
     assert enabled["BINRADAR_REVERSE_DIRECTED"] == "1"
 
     disabled = _run_main(monkeypatch, tmp_path / "disabled", [
