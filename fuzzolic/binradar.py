@@ -1778,7 +1778,7 @@ class BinRadarExecutor:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
         if (concrete_verifier_result.stop_reason == "timeout"
-                and not self.self.concrete_evidence_timed_out:
+                and not self.concrete_evidence_timed_out):
             # Preserve the degraded marker when FINAL is resumed in a fresh
             # process after graceful timeout finalization already produced a
             # complete verifier result file.
