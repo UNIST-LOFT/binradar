@@ -65,6 +65,11 @@ def test_reverse_directed_bare_flag_and_explicit_disable(tmp_path, monkeypatch):
     disabled = _run_main(monkeypatch, tmp_path / "disabled", [
         "--reverse-directed", "false", "--feedback", "false"])
     assert disabled["BINRADAR_REVERSE_DIRECTED"] == "0"
+    assert disabled["BINRADAR_FEEDBACK_MODE"] == "0"
+
+    enabled_feedback = _run_main(monkeypatch, tmp_path / "feedback", [
+        "--feedback"])
+    assert enabled_feedback["BINRADAR_FEEDBACK_MODE"] == "1"
 
 
 def test_target_patches_all_stays_within_compiled_count(tmp_path, monkeypatch):

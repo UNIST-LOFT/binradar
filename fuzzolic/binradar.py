@@ -18,6 +18,7 @@ import io
 import time
 import enum
 import fcntl
+import hashlib
 from pathlib import Path
 from types import TracebackType
 from typing import Callable, Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
@@ -42,7 +43,7 @@ MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 # may fail open. Phases needed to establish or serialize a verdict are never
 # members of this set.
 OPTIONAL_EVIDENCE_PHASES = frozenset({
-    "fuzzolic", "directed", "fuzzer", "binradar",
+    "fuzzolic", "directed", "fuzzer", "binradar", "feedback",
 })
 
 RUNNING_PROCESSES: List[subprocess.Popen] = []
@@ -903,13 +904,13 @@ class BinRadarExecutor:
             target()
             return True
         except Exception as exc:
-            if not getattr(self, "less_strict", False):
+            if not self.less_strict:
                 raise
             self._record_tolerated_phase_failure(phase, exc)
             return False
 
     def failed_phase_names(self) -> List[str]:
-        lock = getattr(self, "phase_failure_lock", None)
+        lock = self.phase_failure_lock
         if lock is None:
             return []
         with lock:
@@ -1456,7 +1457,7 @@ class BinRadarExecutor:
         self.save_progress(f"[fuzzer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
         fuzzer_outdir = self.fuzzer_outdir()
-        if not getattr(self, "_fuzzer_output_prepared", False):
+        if not self._fuzzer_output_prepared:
             self.prepare_fuzzer_output()
         self._fuzzer_output_prepared = False
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(
@@ -1630,25 +1631,134 @@ class BinRadarExecutor:
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run feedback analysis.")
             raise RuntimeError("Probe result not found.")
-        self.save_progress(f"[feedback] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        # Make feedback directory:
+
+        minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
+        if not os.path.exists(minimizer_result_file):
+            raise FileNotFoundError(
+                f"Minimizer result file not found: {minimizer_result_file}")
+
+        self.save_progress(
+            f"[feedback] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+
         feedback_dir = os.path.join(self.run_dir, "feedback")
         if os.path.exists(feedback_dir):
             shutil.rmtree(feedback_dir)
         os.makedirs(feedback_dir)
-        # 1. Required files for the feedback analysis
-        shutil.copyfile(os.path.join(self.workdir, "binradar.env"), os.path.join(feedback_dir, "binradar.env"))
-        shutil.copyfile(self.original_binary(), os.path.join(feedback_dir, os.path.basename(self.original_binary())))
-        os.makedirs(os.path.join(feedback_dir, "poc"), exist_ok=True)
-        shutil.copyfile(os.path.join(self.workdir, self.poc_input), os.path.join(feedback_dir, self.poc_input))
-        shutil.copyfile(os.path.join(self.workdir, "brpatches.json"), os.path.join(feedback_dir, "brpatches.json"))
-        # 2. Generated concrete test cases from minimized/ -> concrete/benign, concrete/malicious
-        os.makedirs(os.path.join(feedback_dir, "concrete", "benign"), exist_ok=True)
-        os.makedirs(os.path.join(feedback_dir, "concrete", "malicious"), exist_ok=True)
-        
-        
-        # 3. binradar produced snapshots (brcached -> expected value) - later work
-        self.save_progress(f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+
+        # Required files for the feedback analysis.
+        shutil.copyfile(
+            os.path.join(self.workdir, "binradar.env"),
+            os.path.join(feedback_dir, "binradar.env"))
+        shutil.copyfile(
+            self.original_binary(),
+            os.path.join(feedback_dir, os.path.basename(self.original_binary())))
+
+        poc_source = self.resolved_poc_input()
+        poc_relative = os.path.relpath(poc_source, self.workdir)
+        if poc_relative == os.pardir or poc_relative.startswith(
+                os.pardir + os.sep):
+            poc_relative = os.path.join("poc", os.path.basename(poc_source))
+        poc_destination = os.path.join(feedback_dir, poc_relative)
+        os.makedirs(os.path.dirname(poc_destination), exist_ok=True)
+        shutil.copyfile(poc_source, poc_destination)
+        shutil.copyfile(
+            os.path.join(self.workdir, "brpatches.json"),
+            os.path.join(feedback_dir, "brpatches.json"))
+
+        concrete_dir = os.path.join(feedback_dir, "concrete")
+        benign_dir = os.path.join(concrete_dir, "benign")
+        malicious_dir = os.path.join(concrete_dir, "malicious")
+        os.makedirs(benign_dir, exist_ok=True)
+        os.makedirs(malicious_dir, exist_ok=True)
+
+        # The full minimizer row is emitted by BinRadarMinimizer.  The
+        # fallback schema keeps feedback usable with older minimizer logs,
+        # whose rows contain only the fields consumed by the verifier.
+        full_parser = sbsv.parser()
+        full_parser.add_custom_type("hex", lambda x: int(x, 16))
+        full_parser.add_schema(
+            "[testcase] [result] [id: int] [file: str] [exit: str] "
+            "[patch-loc: hex] [func-entry: hex] [patch-hit: int] "
+            "[func-hit: int] [fault-addr: hex] "
+            "[tracer-fault-addr: hex] "
+            "[patch-func-candidates: list[str]] [stacktrace: list[str]] "
+            "[pid: int] [br: list[int]]")
+        legacy_parser = sbsv.parser()
+        legacy_parser.add_custom_type("hex", lambda x: int(x, 16))
+        legacy_parser.add_schema(
+            "[testcase] [result] [id: int] [file: str] [exit: str] "
+            "[fault-addr: hex] [pid: int] [br: list[int]]")
+        minimal_parser = sbsv.parser()
+        minimal_parser.add_custom_type("hex", lambda x: int(x, 16))
+        minimal_parser.add_schema(
+            "[testcase] [result] [id: int] [file: str] [exit: str] "
+            "[fault-addr: hex]")
+
+        def parse_result_row(line: str):
+            for parser in (full_parser, legacy_parser, minimal_parser):
+                try:
+                    row = parser.parse_line_detached(line)
+                except ValueError:
+                    continue
+                if row is not None and row.schema_name == "testcase$result":
+                    return row
+            return None
+
+        copied_hashes: Set[str] = set()
+        copied_counts = {"benign": 0, "malicious": 0}
+        minimized_dir = os.path.join(self.run_dir, "minimized")
+        with open(minimizer_result_file, "r", encoding="utf-8") as result_file:
+            for line_number, line in enumerate(result_file, start=1):
+                row = parse_result_row(line)
+                if row is None:
+                    continue
+
+                patch_hit = row.data.get("patch-hit")
+                if patch_hit is not None and patch_hit <= 0:
+                    continue
+
+                exit_info = row["exit"]
+                if exit_info == "ok":
+                    category = "benign"
+                elif (exit_info == "crash"
+                      and row["fault-addr"] == self.probe_result.fault_addr):
+                    category = "malicious"
+                else:
+                    # Timeouts, unrelated crashes, and malformed baseline
+                    # outcomes are not useful concrete feedback.
+                    continue
+
+                filename = os.path.basename(row["file"])
+                source = os.path.join(minimized_dir, filename)
+                try:
+                    with open(source, "rb") as source_file:
+                        data = source_file.read()
+                except OSError as exc:
+                    logger.warning(
+                        f"[FEEDBACK] Skipping missing testcase {source} "
+                        f"from minimizer line {line_number}: {exc}")
+                    continue
+
+                digest = hashlib.sha256(data).hexdigest()
+                if digest in copied_hashes:
+                    continue
+
+                destination_dir = benign_dir if category == "benign" \
+                    else malicious_dir
+                destination = os.path.join(destination_dir, filename)
+                if os.path.exists(destination):
+                    destination = os.path.join(
+                        destination_dir, f"{row['id']}_{filename}")
+                shutil.copyfile(source, destination)
+                copied_hashes.add(digest)
+                copied_counts[category] += 1
+
+        logger.info(
+            f"[FEEDBACK] Copied concrete inputs: "
+            f"benign {copied_counts['benign']}, "
+            f"malicious {copied_counts['malicious']}")
+        self.save_progress(
+            f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_final(self):
         # Read verifier.sbsv and, when enabled, binradar-trace-msg.log to
@@ -1668,7 +1778,7 @@ class BinRadarExecutor:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
         if (concrete_verifier_result.stop_reason == "timeout"
-                and not getattr(self, "concrete_evidence_timed_out", False)):
+                and not self.self.concrete_evidence_timed_out:
             # Preserve the degraded marker when FINAL is resumed in a fresh
             # process after graceful timeout finalization already produced a
             # complete verifier result file.
@@ -1698,7 +1808,7 @@ class BinRadarExecutor:
             if accepted:
                 accept_evidences[patch] = accept_evidences.get(patch, 0) + 1
 
-        binradar_failed = getattr(self, "binradar_failed", False)
+        binradar_failed = self.binradar_failed
         skip_binradar_analysis = self.disable_binradar or binradar_failed
         if self.disable_binradar:
             logger.info("[FINAL] BinRadar phase disabled; skipping trace analysis.")
@@ -1872,7 +1982,7 @@ class BinRadarExecutor:
                 target()
             except BaseException as exc:
                 if (name in OPTIONAL_EVIDENCE_PHASES
-                        and getattr(self, "less_strict", False)
+                        and self.less_strict
                         and isinstance(exc, Exception)):
                     self._record_tolerated_phase_failure(name, exc)
                     return
@@ -1936,6 +2046,8 @@ class BinRadarExecutor:
         self._run_streaming_concrete_producers([
             ("fuzzer", self.run_fuzzer),
         ])
+        if self.feedback_mode:
+            self._run_optional_phase("feedback", self.run_feedback)
         self.run_final()
         self.done()
 
@@ -2026,7 +2138,7 @@ class BinRadarExecutor:
             # KeyboardInterrupt. Ordinary optional-phase failures are the only
             # failures relaxed by --less-strict.
             if (name not in OPTIONAL_EVIDENCE_PHASES
-                    or not getattr(self, "less_strict", False)
+                    or not self.less_strict
                     or not isinstance(exc, Exception)):
                 return False
             self._record_tolerated_phase_failure(name, exc)
@@ -2132,14 +2244,20 @@ def main():
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
     parser.add_argument("--fuzzy", action="store_true", help="use the Fuzzy-SAT solver")
-    parser.add_argument("--feedback-mode", default=False, type=bool, help="Give feedback to taosc")
-    parser.add_argument("--reverse-directed", default=True, type=bool,
+    parser.add_argument(
+        "--feedback-mode", "--feedback", dest="feedback_mode",
+        default=False, nargs="?", const=True, type=parse_bool,
+        help="Give feedback to taosc")
+    parser.add_argument(
+        "--reverse-directed", default=True, nargs="?", const=True,
+        type=parse_bool,
         help="prioritize directed candidates from the end of the forward trace (Z3 only); optionally pass true/false")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
     parser.add_argument("--less-strict", action="store_true",
         help=("continue when optional evidence phases (fuzzolic, directed, "
-              "fuzzer, or binradar) fail; final output is marked degraded"))
+              "fuzzer, binradar, or feedback) fail; final output is marked "
+              "degraded"))
     parser.add_argument("--fuzzer-only", action="store_true",
         help=("run probe/filter, AFL++ fuzzer, minimizer/verifier, and final; "
               "skip fuzzolic, directed, and binradar"))
