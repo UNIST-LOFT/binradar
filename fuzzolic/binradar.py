@@ -280,6 +280,7 @@ class TracerExecutor:
         self.workdir = workdir
         self.rundir = rundir
         self.timeout = timeout
+        self.deadline = (time.monotonic() + timeout if timeout > 0 else None)
         self.process = None
         self.pgid = None
         self._process_cleanup_started = False
@@ -288,6 +289,21 @@ class TracerExecutor:
         self.iter = 0
         self.run_result = None
         self.pipe_manager = None
+
+    def remaining_phase_time(self, cap: Optional[float] = None) -> float:
+        """Return a positive wait bounded by this tracer phase's deadline."""
+        if self.deadline is None:
+            if cap is None:
+                return self.timeout
+            return cap
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"[TRACER] [{self.mode}] Phase deadline reached")
+        return remaining if cap is None else min(cap, remaining)
+
+    def phase_deadline_reached(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
     
     def start(self):
         """ 
@@ -328,11 +344,13 @@ class TracerExecutor:
         
         # Handshake with forkserver
         logger.info(f"[TRACER] [{self.mode}] Started tracer {' '.join(self.command)}")
-        banner = self._read_u32(self.forkserver_init_timeout)
+        banner = self._read_u32(
+            self.remaining_phase_time(self.forkserver_init_timeout))
         if banner != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
         self._write_u32(HANDSHAKE_EXPECTED ^ 0xFFFFFFFF)
-        ack = self._read_u32(self.forkserver_timeout)
+        ack = self._read_u32(
+            self.remaining_phase_time(self.forkserver_timeout))
         if ack != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
         logger.info(f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
@@ -342,13 +360,15 @@ class TracerExecutor:
             raise RuntimeError(f"[TRACER] [{self.mode}] Tracer process not started")
         start_time = time.time()
         if not self.forkserver_mode:
-            self.run_result = binradar_utils.execute_await(self.process, timeout=self.timeout)
+            self.run_result = binradar_utils.execute_await(
+                self.process, timeout=self.remaining_phase_time())
             logger.info(f"[TRACER] [{self.mode}] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
         is_timeout = False
         try:
             self._write_u32(0)  # was_killed - send run command to forkserver
-            exit_status, patch_id, iter = self._read_status(self.forkserver_timeout)
+            exit_status, patch_id, iter = self._read_status(
+                self.remaining_phase_time(self.forkserver_timeout))
             self.iter = iter
             if self.mode != "binradar":
                 # In binradar mode the caller logs one line per iteration;
@@ -357,7 +377,8 @@ class TracerExecutor:
             # Keep the remaining-count read in this try block.  A peer that
             # stalls after its status must use the same bounded group cleanup
             # as a peer that stalls while sending the status.
-            remaining = self._read_u32(self.forkserver_timeout)
+            remaining = self._read_u32(
+                self.remaining_phase_time(self.forkserver_timeout))
         except Exception as e:
             is_timeout = True
             logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
@@ -513,6 +534,7 @@ class SolverExecutor:
     process: Optional[subprocess.Popen]
     timeout: float
     run_result: Optional[binradar_utils.ExecutionResult]
+    timed_out: bool
     def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float, fuzzy: bool = False, reverse_directed: bool = False):
         self.mode = mode
         global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
@@ -541,6 +563,7 @@ class SolverExecutor:
         self.process = None
         self.pgid = None
         self.run_result = None
+        self.timed_out = False
     
     def start(self):
         logger.info(f"[SOLVER] [{self.mode}] Starting solver with command: {' '.join(self.command)}")
@@ -565,21 +588,27 @@ class SolverExecutor:
     def wait(self) -> Tuple[int, bool]:
         if self.process is None:
             raise RuntimeError(f"[SOLVER] [{self.mode}] Solver process not started - cannot wait")
-        start_time = time.time()
-        elapsed = 0
-        is_timeout = False
+        start_time = time.monotonic()
+        deadline = (start_time + self.timeout
+                    if self.timeout > 0 else None)
+        self.timed_out = False
         while True:
+            wait_timeout = SOLVER_TIMEOUT
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.timed_out = True
+                    break
+                wait_timeout = min(wait_timeout, remaining)
             try:
-                self.process.wait(SOLVER_TIMEOUT)
+                self.process.wait(wait_timeout)
                 break
             except subprocess.TimeoutExpired:
-                pass
-            elapsed += SOLVER_TIMEOUT
-            if self.timeout > 0 and elapsed > (self.timeout + 10):
-                is_timeout = True
-                break
-        if is_timeout:
-            logger.info(f"[SOLVER] [{self.mode}] Solver is taking too long. Let us stop it.")
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.timed_out = True
+                    break
+        if self.timed_out:
+            logger.info(f"[SOLVER] [{self.mode}] Solver reached its phase deadline. Let us stop it.")
             self.process.send_signal(signal.SIGUSR2)
             try:
                 self.process.wait(SOLVER_TIMEOUT)
@@ -594,8 +623,8 @@ class SolverExecutor:
                     logger.warning(
                         f"[SOLVER] [{self.mode}] No registered process "
                         f"group for pid {self.process.pid}")
-        succeeded = (not is_timeout and self.process.returncode == 0)
-        return int((time.time() - start_time) * 1000), succeeded
+        succeeded = (not self.timed_out and self.process.returncode == 0)
+        return int((time.monotonic() - start_time) * 1000), succeeded
 
     def stop(self):
         if self.process:
@@ -767,6 +796,7 @@ class BinRadarExecutor:
         self.feedback_mode = feedback_mode
         self.binradar_failed = False
         self.concrete_evidence_timed_out = False
+        self._fuzzer_output_prepared = False
         self.phase_failures = {}
         self.phase_failure_lock = threading.Lock()
         self.test_cmd = test_cmd
@@ -933,6 +963,32 @@ class BinRadarExecutor:
             self.save_progress(
                 f"[{phase}] [timeout] [prefix {self.run_prefix}] "
                 f"[id {self.run_id}]")
+
+    def phase_deadline(self, factor: float = 1.0) -> Optional[float]:
+        """Return an absolute monotonic deadline for a phase."""
+        if self.timeout <= 0:
+            return None
+        return time.monotonic() + self.timeout * factor
+
+    @staticmethod
+    def remaining_phase_time(deadline: Optional[float]) -> Optional[float]:
+        """Return the non-negative time left before ``deadline``."""
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    def remaining_concrete_timeout(
+            self, deadline: Optional[float]) -> Optional[float]:
+        """Return a concrete-worker timeout without turning expiry into off.
+
+        Concrete workers interpret non-positive values as "deadline disabled".
+        Once an orchestrator deadline has expired, pass the smallest positive
+        float so the worker takes its normal graceful-cutoff path immediately.
+        """
+        remaining = self.remaining_phase_time(deadline)
+        if remaining is None or remaining > 0:
+            return remaining
+        return sys.float_info.min
 
     def minimizer_verifier_timeout(self) -> Optional[float]:
         """Wall-clock budget for each minimizer/verifier phase.
@@ -1356,86 +1412,110 @@ class BinRadarExecutor:
         if self.probe_result is None:
             sys.exit("ERROR: probe result not found. Please run the probe phase first.")
     
+    def _run_concolic_phase(self, exec_mode: str) -> None:
+        """Run fuzzolic/directed under one total, graceful phase deadline."""
+        testcase = self.resolved_poc_input()
+        self.check_requirements()
+        phase_name = exec_mode.capitalize()
+
+        logger.info(
+            f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} "
+            f"with testcase: {testcase}")
+        self.save_progress(
+            f"[{exec_mode}] [start] [prefix {self.run_prefix}] "
+            f"[id {self.run_id}]")
+        deadline = self.phase_deadline()
+
+        phase_env = self.get_env(exec_mode, self.run_dir)
+        shm = SharedMemoryManager(phase_env)
+        shm.assign_random_keys()
+        initial_timeout = self.remaining_phase_time(deadline)
+        if initial_timeout is None:
+            initial_timeout = self.timeout
+        solver = SolverExecutor(
+            exec_mode, testcase, self.run_dir, phase_env, self.workdir,
+            timeout=initial_timeout, fuzzy=self.fuzzy,
+            reverse_directed=(self.reverse_directed
+                              if exec_mode == "directed" else False))
+        tracer = TracerExecutor(
+            exec_mode, phase_env, self.workdir, self.run_dir,
+            self.original_binary(), self.test_cmd, testcase,
+            timeout=initial_timeout)
+        timed_out = False
+
+        try:
+            solver.start()
+            if deadline is not None and self.remaining_phase_time(deadline) == 0:
+                timed_out = True
+            else:
+                tracer.start()
+                tracer_time, tracer_success, _ = tracer.run()
+                self.save_progress(
+                    f"[{exec_mode}] [tracer] [prefix {self.run_prefix}] "
+                    f"[id {self.run_id}] [tracer-time {tracer_time}] "
+                    f"[tracer-success {tracer_success}]")
+                if not tracer_success:
+                    if (tracer.run_result is not None
+                            and tracer.run_result.timed_out):
+                        timed_out = True
+                    else:
+                        raise RuntimeError(f"{phase_name} tracer failed")
+            if not timed_out:
+                remaining = self.remaining_phase_time(deadline)
+                if remaining is not None and remaining == 0:
+                    timed_out = True
+                else:
+                    solver.create_inputs()
+                    if remaining is not None:
+                        solver.timeout = remaining
+                    solver_time, solver_success = solver.wait()
+                    self.save_progress(
+                        f"[{exec_mode}] [solver] "
+                        f"[prefix {self.run_prefix}] [id {self.run_id}] "
+                        f"[solver-time {solver_time}] "
+                        f"[solver-success {solver_success}]")
+                    if not solver_success:
+                        if (solver.timed_out
+                                or (deadline is not None
+                                    and self.remaining_phase_time(deadline) == 0)):
+                            timed_out = True
+                        else:
+                            raise RuntimeError(
+                                f"{phase_name} solver exited with status "
+                                f"{solver.process.returncode if solver.process else 'unknown'}")
+        except TimeoutError as exc:
+            if (tracer.phase_deadline_reached()
+                    or (deadline is not None
+                        and self.remaining_phase_time(deadline) == 0)):
+                timed_out = True
+            else:
+                logger.error(
+                    f"Error during {exec_mode} execution: {str(exc)}")
+                raise
+        except Exception as exc:
+            logger.error(f"Error during {exec_mode} execution: {str(exc)}")
+            raise
+        finally:
+            tracer.stop()
+            solver.stop()
+            shm.cleanup()
+
+        if timed_out:
+            logger.info(
+                f"[{phase_name.upper()}] Reached its configured phase "
+                "timeout; keeping testcases published before the cutoff.")
+            self.save_progress(
+                f"[{exec_mode}] [timeout] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}]")
+        self.save_progress(
+            f"[{exec_mode}] [done] [prefix {self.run_prefix}] "
+            f"[id {self.run_id}]")
+
     def run_fuzzolic(self):
-        testcase = self.resolved_poc_input()
-        self.check_requirements()
-        
-        exec_mode = "fuzzolic"
-        logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[fuzzolic] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self._run_concolic_phase("fuzzolic")
 
-        fuzzolic_env = self.get_env(exec_mode, self.run_dir)
-        shm = SharedMemoryManager(fuzzolic_env)
-        shm.assign_random_keys()
-        
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, fuzzolic_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
-        tracer = TracerExecutor(exec_mode, fuzzolic_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
-        
-        try:
-            solver.start()
-            tracer.start()
-            tracer_time, tracer_success, _ = tracer.run()
-            self.save_progress(f"[fuzzolic] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
-            if not tracer_success:
-                raise RuntimeError("Fuzzolic tracer timed out or failed")
-            solver.create_inputs()
-            solver_time, solver_success = solver.wait()
-            self.save_progress(f"[fuzzolic] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
-            if not solver_success:
-                raise RuntimeError(
-                    f"Fuzzolic solver timed out or exited with status "
-                    f"{solver.process.returncode if solver.process else 'unknown'}")
-            tracer.stop()
-            solver.stop()
-        except Exception as e:
-            logger.error(f"Error during fuzzolic execution: {str(e)}")
-            tracer.stop()
-            solver.stop()
-            raise e
-        finally:
-            shm.cleanup()
-        
-        self.save_progress(f"[fuzzolic] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
-    
     def run_directed(self):
-        testcase = self.resolved_poc_input()
-        self.check_requirements()
-        
-        exec_mode = "directed"
-        logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
-        self.save_progress(f"[directed] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        
-        directed_env = self.get_env(exec_mode, self.run_dir)
-        shm = SharedMemoryManager(directed_env)
-        shm.assign_random_keys()
-        
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, directed_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy, reverse_directed=self.reverse_directed)
-        tracer = TracerExecutor(exec_mode, directed_env, self.workdir, self.run_dir, self.original_binary(), self.test_cmd, testcase, timeout=self.timeout)
-        try:
-            solver.start()
-            tracer.start()
-            tracer_time, tracer_success, _ = tracer.run()
-            self.save_progress(f"[directed] [tracer] [prefix {self.run_prefix}] [id {self.run_id}] [tracer-time {tracer_time}] [tracer-success {tracer_success}]")
-            if not tracer_success:
-                raise RuntimeError("Directed tracer timed out or failed")
-            solver.create_inputs()
-            solver_time, solver_success = solver.wait()
-            self.save_progress(f"[directed] [solver] [prefix {self.run_prefix}] [id {self.run_id}] [solver-time {solver_time}] [solver-success {solver_success}]")
-            if not solver_success:
-                raise RuntimeError(
-                    f"Directed solver timed out or exited with status "
-                    f"{solver.process.returncode if solver.process else 'unknown'}")
-            tracer.stop()
-            solver.stop()
-        except Exception as e:
-            logger.error(f"Error during directed execution: {str(e)}")
-            tracer.stop()
-            solver.stop()
-            raise e
-        finally:
-            shm.cleanup()
-
-        self.save_progress(f"[directed] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self._run_concolic_phase("directed")
     
     def fuzzer_outdir(self) -> str:
         return os.path.join(self.run_dir, "fuzzer-out")
@@ -1455,9 +1535,10 @@ class BinRadarExecutor:
         self.check_requirements()
         exec_mode = "fuzzer"
         self.save_progress(f"[fuzzer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        deadline = self.phase_deadline()
         config = self.extract_config()
         fuzzer_outdir = self.fuzzer_outdir()
-        if not self._fuzzer_output_prepared:
+        if not getattr(self, "_fuzzer_output_prepared", False):
             self.prepare_fuzzer_output()
         self._fuzzer_output_prepared = False
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(
@@ -1467,7 +1548,9 @@ class BinRadarExecutor:
             raise RuntimeError("Failed to start fuzzer process")
         register_running_process(fuzzer.process)
         try:
-            result = fuzzer.wait(timeout=self.timeout)
+            remaining = self.remaining_phase_time(deadline)
+            result = fuzzer.wait(
+                timeout=self.timeout if remaining is None else remaining)
         finally:
             unregister_running_process(fuzzer.process)
         if result is None:
@@ -1476,6 +1559,9 @@ class BinRadarExecutor:
             # AFL++ intentionally runs until the phase deadline. execute_await
             # terminates the process group and waits for it to exit.
             logger.info("Fuzzer reached its configured phase timeout.")
+            self.save_progress(
+                f"[fuzzer] [timeout] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}]")
         elif not result.success or result.exit_code != 0:
             raise RuntimeError(
                 f"Fuzzer exited unexpectedly with status {result.exit_code}")
@@ -1488,6 +1574,7 @@ class BinRadarExecutor:
             raise RuntimeError("Probe result not found.")
         exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         testcase_dirs.extend(
@@ -1503,7 +1590,7 @@ class BinRadarExecutor:
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         minimizer.load_testcases()
         timed_out = minimizer.run_testcases(
-            timeout=self.minimizer_verifier_timeout())
+            timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
             self._record_concrete_evidence_timeout(["minimizer"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
@@ -1521,13 +1608,14 @@ class BinRadarExecutor:
         
         config = self.extract_config()
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
         verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
         timed_out = verifier.run_verification_streaming(
             minimizer_result_file,
-            timeout=self.minimizer_verifier_timeout())
+            timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
             self._record_concrete_evidence_timeout(["verifier"])
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
@@ -1550,6 +1638,7 @@ class BinRadarExecutor:
             raise RuntimeError("Probe result not found.")
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
         config = self.extract_config()
         testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
         testcase_dirs.extend(
@@ -1571,7 +1660,7 @@ class BinRadarExecutor:
             minimizer, verifier, minimizer_result_file,
             producer_threads=producer_threads,
             producer_exc_queue=producer_exc_queue,
-            timeout=self.minimizer_verifier_timeout())
+            timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
             self._record_concrete_evidence_timeout(
                 ["minimizer", "verifier"])
@@ -1661,10 +1750,10 @@ class BinRadarExecutor:
         poc_destination = os.path.join(feedback_dir, poc_relative)
         os.makedirs(os.path.dirname(poc_destination), exist_ok=True)
         shutil.copyfile(poc_source, poc_destination)
-        shutil.copyfile(
-            os.path.join(self.workdir, "brpatches.json"),
-            os.path.join(feedback_dir, "brpatches.json"))
-
+        if os.path.exists(os.path.join(self.workdir, "brpatches.json")):
+            shutil.copyfile(
+                os.path.join(self.workdir, "brpatches.json"),
+                os.path.join(feedback_dir, "brpatches.json"))
         concrete_dir = os.path.join(feedback_dir, "concrete")
         benign_dir = os.path.join(concrete_dir, "benign")
         malicious_dir = os.path.join(concrete_dir, "malicious")

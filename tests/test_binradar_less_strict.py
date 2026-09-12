@@ -22,7 +22,9 @@ _spec.loader.exec_module(binradar)
 def _policy_executor(tmp_path, less_strict):
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.less_strict = less_strict
+    executor.feedback_mode = False
     executor.binradar_failed = False
+    executor.concrete_evidence_timed_out = False
     executor.phase_failures = {}
     executor.phase_failure_lock = threading.Lock()
     executor.run_prefix = "run"

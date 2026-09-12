@@ -597,6 +597,7 @@ def _stub_executor(tmp_path):
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = True
+    executor.feedback_mode = False
     executor.config = {}
     executor.progress_filename = str(tmp_path / "out" / "progress.sbsv")
     executor.previous_progress = None
@@ -680,6 +681,7 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
 
     executor.run_fuzzer()
 
+    assert any("[fuzzer] [timeout]" in row for row in progress)
     assert any("[fuzzer] [done]" in row for row in progress)
     assert process not in binradar.RUNNING_PROCESSES
 
@@ -693,7 +695,158 @@ def test_solver_wait_rejects_nonzero_exit():
     _, succeeded = solver.wait()
 
     assert succeeded is False
+    assert solver.timed_out is False
     assert solver.process.returncode == 7
+
+
+def test_solver_wait_stops_at_deadline():
+    solver = binradar.SolverExecutor.__new__(binradar.SolverExecutor)
+    solver.mode = "test"
+    solver.timeout = 0.05
+    solver.process = subprocess.Popen([
+        sys.executable, "-c",
+        "import signal, sys, time; signal.signal(signal.SIGUSR2, lambda *_: sys.exit(0)); time.sleep(60)",
+    ], start_new_session=True)
+    solver.pgid = solver.process.pid
+
+    started = time.monotonic()
+    _, succeeded = solver.wait()
+
+    assert succeeded is False
+    assert solver.timed_out is True
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize("method_name, mode", [
+    ("run_fuzzolic", "fuzzolic"),
+    ("run_directed", "directed"),
+])
+def test_concolic_solver_deadline_is_graceful(
+        tmp_path, monkeypatch, method_name, mode):
+    executor = _stub_executor(tmp_path)
+    executor.run_dir = str(tmp_path / "run")
+    Path(executor.run_dir).mkdir()
+    executor.check_requirements = lambda: None
+    executor.get_env = lambda phase, run_dir: {}
+    progress = []
+    executor.save_progress = progress.append
+
+    class FakeShm:
+        def __init__(self, env):
+            pass
+
+        def assign_random_keys(self):
+            pass
+
+        def cleanup(self):
+            pass
+
+    solvers = []
+
+    class FakeSolver:
+        def __init__(self, *args, timeout, **kwargs):
+            self.timeout = timeout
+            self.timed_out = True
+            self.process = SimpleNamespace(returncode=1)
+            solvers.append(self)
+
+        def start(self):
+            pass
+
+        def create_inputs(self):
+            pass
+
+        def wait(self):
+            return 5, False
+
+        def stop(self):
+            pass
+
+    class FakeTracer:
+        def __init__(self, *args, timeout, **kwargs):
+            self.run_result = None
+
+        def start(self):
+            pass
+
+        def run(self):
+            return 3, True, 0
+
+        def stop(self):
+            pass
+
+        def phase_deadline_reached(self):
+            return False
+
+    monkeypatch.setattr(binradar, "SharedMemoryManager", FakeShm)
+    monkeypatch.setattr(binradar, "SolverExecutor", FakeSolver)
+    monkeypatch.setattr(binradar, "TracerExecutor", FakeTracer)
+
+    getattr(executor, method_name)()
+
+    assert 0 < solvers[0].timeout <= executor.timeout
+    assert any(f"[{mode}] [timeout]" in row for row in progress)
+    assert any(f"[{mode}] [done]" in row for row in progress)
+
+
+def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
+    executor = _stub_executor(tmp_path)
+    executor.run_dir = str(tmp_path / "run")
+    Path(executor.run_dir).mkdir()
+    executor.check_requirements = lambda: None
+    executor.get_env = lambda phase, run_dir: {}
+    executor.save_progress = lambda row: None
+
+    class FakeShm:
+        def __init__(self, env):
+            pass
+
+        def assign_random_keys(self):
+            pass
+
+        def cleanup(self):
+            pass
+
+    class FakeSolver:
+        def __init__(self, *args, timeout, **kwargs):
+            self.timeout = timeout
+            self.timed_out = False
+            self.process = SimpleNamespace(returncode=7)
+
+        def start(self):
+            pass
+
+        def create_inputs(self):
+            pass
+
+        def wait(self):
+            return 5, False
+
+        def stop(self):
+            pass
+
+    class FakeTracer:
+        def __init__(self, *args, timeout, **kwargs):
+            self.run_result = None
+
+        def start(self):
+            pass
+
+        def run(self):
+            return 3, True, 0
+
+        def stop(self):
+            pass
+
+        def phase_deadline_reached(self):
+            return False
+
+    monkeypatch.setattr(binradar, "SharedMemoryManager", FakeShm)
+    monkeypatch.setattr(binradar, "SolverExecutor", FakeSolver)
+    monkeypatch.setattr(binradar, "TracerExecutor", FakeTracer)
+
+    with pytest.raises(RuntimeError, match="Directed solver exited with status 7"):
+        executor.run_directed()
 
 
 def test_run_multithreaded_starts_minimizer_while_producers_run(

@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,11 @@ def _stub_executor(tmp_path):
     executor.probe_result = SimpleNamespace()
     executor.filter_result = [1, 2]
     executor.disable_binradar = True
+    executor.feedback_mode = False
+    executor.binradar_failed = False
+    executor.concrete_evidence_timed_out = False
+    executor.phase_failures = {}
+    executor.phase_failure_lock = threading.Lock()
     return executor
 
 
