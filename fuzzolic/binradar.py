@@ -1950,7 +1950,10 @@ class BinRadarExecutor:
                 logger.warning("[FINAL] tracer_fault_addr is 0; binradar crash comparison will not match any fault address.")
 
             for iter in iter_map:
-                original = iter_map[iter][0]
+                # A timeout can stop the forkserver after a candidate result
+                # but before the baseline result or commit is written. Such a
+                # partial tail iteration contributes no comparable evidence.
+                original = iter_map[iter].get(0)
                 if original is None:
                     continue
                 if "result" not in original or "br" not in original:

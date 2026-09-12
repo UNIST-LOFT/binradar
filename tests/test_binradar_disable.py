@@ -240,6 +240,43 @@ def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
     assert "[binradar_remaining_patches [1]]" in final_text
 
 
+def test_final_ignores_interrupted_iteration_without_baseline(tmp_path):
+    (tmp_path / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n"
+        "[verifier-confidence] [patch 1] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n"
+        "[verifier-result] [res verified] [patch 2] [testcase ]\n"
+        "[verifier-confidence] [patch 2] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n"
+    )
+    (tmp_path / "binradar-tracer-msg.log").write_text(
+        # Complete iteration: both candidates match the baseline.
+        "[binradar] [normal] [iter 1] [patch 0]\n"
+        "[binradar] [commit] [iter 1] [patch 0] [br 0]\n"
+        "[binradar] [normal] [iter 1] [patch 1]\n"
+        "[binradar] [commit] [iter 1] [patch 1] [br 0]\n"
+        "[binradar] [normal] [iter 1] [patch 2]\n"
+        "[binradar] [commit] [iter 1] [patch 2] [br 0]\n"
+        # The forkserver was stopped mid-iteration. Patch 0 timed out without
+        # a result, while a later candidate emitted a termination crash.
+        "[binradar] [crash] [iter 2] [patch 2] [guest_pc dead] "
+        "[guest_cs_base 0] [fault_addr dead] [host_fault_addr 0]\n"
+    )
+    executor = _stub_executor(tmp_path)
+    executor.disable_binradar = False
+    executor.probe_result = SimpleNamespace(tracer_fault_addr=0xDEAD)
+    executor.save_progress = lambda row: None
+
+    executor.run_final()
+
+    final_text = (tmp_path / "final.sbsv").read_text()
+    assert ("[final] [confidence] [patch 1] [score 1.000000] "
+            "[accept-evidences 2] [total-evidences 2]") in final_text
+    assert ("[final] [confidence] [patch 2] [score 1.000000] "
+            "[accept-evidences 2] [total-evidences 2]") in final_text
+    assert "[binradar_remaining_patches [1, 2]]" in final_text
+
+
 def test_final_confidence_rows_sorted_and_only_accepted_patches(tmp_path):
     (tmp_path / "verifier.sbsv").write_text(
         "[verifier-result] [res verified] [patch 1] [testcase ]\n"
