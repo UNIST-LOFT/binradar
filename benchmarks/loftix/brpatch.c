@@ -421,7 +421,7 @@ static int CWE805_branch_taken(const struct STATE *state,
 	struct clamp *i = buffers + 256;
 	if (pred->kind == BR_PRED_CWE805_POINTER) {
 		while (i-- > buffers)
-			if (value >= i->begin && value < i->end)
+			if (value >= i->begin && value <= i->end)
 				return 0;
 		return 1;
 	}
