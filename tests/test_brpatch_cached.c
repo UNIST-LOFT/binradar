@@ -88,6 +88,7 @@ int main(void)
 	if (setenv_checked("TAOSC_PRED", "c1p1") < 0)
 		return 4;
 	state.rbx = 0x3000;
+	selected_initialized = 0;
 	if (dest(&state) != (const void *)TAOSC_DEST)
 		return 5;
 #else
@@ -100,6 +101,7 @@ int main(void)
 
 	if (setenv_checked("TAOSC_PRED", "=p0p0") < 0)
 		return 8;
+	selected_initialized = 0;
 	if (dest(&state) != (const void *)TAOSC_DEST)
 		return 9;
 #endif
@@ -123,6 +125,7 @@ int main(void)
 	cache_selector = selector;
 	cache_selector_size = sizeof(selector_storage);
 	env_patch_id = MAGIC_VALUE_PATCH;
+	selected_initialized = 0;
 	if (dest(&state) != (const void *)TAOSC_DEST)
 		return 10;
 

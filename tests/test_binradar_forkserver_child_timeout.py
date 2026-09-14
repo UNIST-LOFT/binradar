@@ -58,6 +58,8 @@ def test_directed_env_gets_the_same_cap(tmp_path):
     env = executor.get_env("directed", str(tmp_path))
     assert (int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"])
             == binradar.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
+    assert (int(env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"])
+            == binradar.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
 
 
 def test_reverse_directed_is_enabled_only_for_directed_mode(tmp_path):
@@ -69,24 +71,27 @@ def test_reverse_directed_is_enabled_only_for_directed_mode(tmp_path):
 
 
 def test_cap_is_clamped_to_the_run_budget(tmp_path):
-    # A short whole-run budget must also cap the child timeout.
+    # A short whole-run budget caps both child and logical-iteration waits.
     executor = _executor(tmp_path, timeout=600, cap=900)
     env = executor.get_env("binradar", str(tmp_path))
     assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "600"
+    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "600"
 
 
 @pytest.mark.parametrize("timeout", [0, -1])
 def test_non_positive_run_timeout_keeps_positive_child_cap(tmp_path, timeout):
-    # Unlimited whole-run execution must still bound each forkserver child.
+    # Unlimited whole-run execution still bounds children and each iteration.
     executor = _executor(tmp_path, timeout=timeout, cap=900)
     env = executor.get_env("binradar", str(tmp_path))
     assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "900"
+    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "900"
 
 
 def test_custom_cap_flag_is_honoured(tmp_path):
     executor = _executor(tmp_path, timeout=21600, cap=600)
     env = executor.get_env("binradar", str(tmp_path))
     assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "600"
+    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "600"
 
 
 @pytest.mark.parametrize("cap", [0, -1])
@@ -106,14 +111,14 @@ def test_cap_above_read_timeout_fails_at_phase_start(tmp_path):
     # A cap that would exceed python's read timeout must fail loudly at
     # phase start, not silently reintroduce the 1800 s TimeoutError.
     executor = _executor(tmp_path, timeout=21600, cap=1700)
-    with pytest.raises(RuntimeError, match="forkserver child timeout"):
+    with pytest.raises(RuntimeError, match="forkserver iteration timeout"):
         executor.get_env("binradar", str(tmp_path))
 
 
 def test_cap_of_one_marginal_second_fails(tmp_path):
     # 1500 + 300 == 1800 is not strictly below the read timeout.
     executor = _executor(tmp_path, timeout=21600, cap=1500)
-    with pytest.raises(RuntimeError, match="forkserver child timeout"):
+    with pytest.raises(RuntimeError, match="forkserver iteration timeout"):
         executor.get_env("binradar", str(tmp_path))
 
 

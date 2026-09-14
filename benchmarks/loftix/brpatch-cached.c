@@ -81,6 +81,11 @@ static int cache_fd = -1;
 static const struct brcache_patch_selector *cache_selector;
 static size_t cache_selector_size;
 static mutex_t cache_mutex = MUTEX_INITIALIZER;
+static int selected_initialized;
+static int selected_invalid;
+static uint32_t selected_patch_id;
+static uint32_t selected_iteration;
+static struct br_predicate selected_predicate;
 
 static void attach_cache_selector(void)
 {
@@ -251,19 +256,15 @@ static const char *select_descriptor(uint32_t *patch_id,
 	return cache_selector->descriptor;
 }
 
-static int evaluate_selected(const struct STATE *state, const char *encoded,
+static int evaluate_selected(const struct STATE *state,
+                             const struct br_predicate *predicate,
                              int *invalid)
 {
-	struct br_predicate predicate = {0};
-	if (encoded == NULL || parse_predicate(encoded, &predicate) < 0) {
-		*invalid = 1;
-		return 0;
-	}
-	if (predicate.kind == BR_PRED_GENERIC) {
+	if (predicate->kind == BR_PRED_GENERIC) {
 		int64_t env[16];
 		state_to_env(state, env);
 		int crashed = 0;
-		const char *cursor = predicate.generic_branch_expression;
+		const char *cursor = predicate->generic_branch_expression;
 		const int branch = eval(&cursor, env, &crashed) != 0;
 		if (*cursor != '\0') {
 			*invalid = 1;
@@ -272,7 +273,7 @@ static int evaluate_selected(const struct STATE *state, const char *encoded,
 		return crashed ? 2 : branch;
 	}
 #ifdef BRPATCH_CWE805
-	return CWE805_branch_taken(state, &predicate);
+	return CWE805_branch_taken(state, predicate);
 #else
 	*invalid = 1;
 	return 0;
@@ -282,14 +283,21 @@ static int evaluate_selected(const struct STATE *state, const char *encoded,
 /* E9 action: if dest(state)@brpatch-cached goto */
 const void *dest(const struct STATE *state)
 {
-	int invalid = 0;
-	uint32_t patch_id;
-	uint32_t iteration;
-	const char *encoded = select_descriptor(&patch_id, &iteration, &invalid);
+	if (!selected_initialized) {
+		const char *encoded = select_descriptor(&selected_patch_id,
+		                                      &selected_iteration,
+		                                      &selected_invalid);
+		if (!selected_invalid &&
+		    (encoded == NULL ||
+		     parse_predicate(encoded, &selected_predicate) < 0))
+			selected_invalid = 1;
+		selected_initialized = 1;
+	}
+	int invalid = selected_invalid;
 	const int branch = invalid ? 0
-		: evaluate_selected(state, encoded, &invalid);
+		: evaluate_selected(state, &selected_predicate, &invalid);
 
-	log_patch(patch_id, branch, iteration);
-	capture_snapshot(state, patch_id, branch, invalid);
+	log_patch(selected_patch_id, branch, selected_iteration);
+	capture_snapshot(state, selected_patch_id, branch, invalid);
 	return branch == 1 ? (const void *)TAOSC_DEST : NULL;
 }

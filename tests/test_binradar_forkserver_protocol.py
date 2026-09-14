@@ -46,7 +46,7 @@ ctrl = int(os.environ["BINRADAR_FORKSERVER_CTRL_R"])
 stat = int(os.environ["BINRADAR_FORKSERVER_STAT_W"])
 mode = os.environ.get("FAKE_MODE", "normal")
 log_path = os.environ.get("FAKE_LOG")
-version = int(os.environ.get("FAKE_VERSION", "0x41464c01"), 0)
+version = int(os.environ.get("FAKE_VERSION", "0x41464c02"), 0)
 wrong_ack = int(os.environ.get("FAKE_WRONG_ACK", "0x12345678"), 0)
 
 
@@ -70,8 +70,8 @@ def send(value):
     os.write(stat, struct.pack("<I", value))
 
 
-def run_statuses(statuses):
-    for status, patch, iteration, remaining in statuses:
+def run_summaries(summaries):
+    for iteration, representative_runs, remaining in summaries:
         command = read_exact(ctrl, 4)
         if len(command) != 4:
             log("parent-eof")
@@ -80,23 +80,21 @@ def run_statuses(statuses):
         if mode == "stall_after_command":
             time.sleep(3)
             return
-        if mode in ("partial_status", "close_during_status"):
-            os.write(stat, struct.pack("<I", status)[:2])
-            if mode == "partial_status":
+        summary = struct.pack("<III", iteration, representative_runs,
+                              remaining)
+        if mode in ("partial_summary", "close_during_summary"):
+            os.write(stat, summary[:2])
+            if mode == "partial_summary":
                 time.sleep(3)
             else:
                 os.close(stat)
             return
-        os.write(stat, struct.pack("<III", status, patch, iteration))
-        log("status:%d:%d:%d" % (status, patch, iteration))
-        if mode == "stall_after_status":
+        os.write(stat, summary)
+        log("summary:%d:%d:%d" %
+            (iteration, representative_runs, remaining))
+        if mode == "stall_after_summary":
             time.sleep(3)
             return
-        if mode == "close_before_remaining":
-            os.close(stat)
-            return
-        send(remaining)
-        log("remaining:%d" % remaining)
 
 
 if mode == "close_before_banner":
@@ -129,11 +127,11 @@ if mode == "wrong_ack":
     raise SystemExit(0)
 
 send(version)
-statuses_text = os.environ.get("FAKE_STATUSES", "7,11,1,5")
-statuses = []
-for item in statuses_text.split(";"):
-    statuses.append(tuple(int(part, 0) for part in item.split(",")))
-run_statuses(statuses)
+summaries_text = os.environ.get("FAKE_STATUSES", "1,1,5")
+summaries = []
+for item in summaries_text.split(";"):
+    summaries.append(tuple(int(part, 0) for part in item.split(",")))
+run_summaries(summaries)
 if mode == "check_unread":
     ready, _, _ = select.select([ctrl], [], [], 0.2)
     if ready:
@@ -225,12 +223,12 @@ def test_new_protocol_one_run_has_no_payload(monkeypatch, tmp_path, fake_script)
         assert success is True
         assert remaining == 5
         assert executor.iter == 1
+        assert executor.representative_runs == 1
     finally:
         stop_executor(executor)
     rows = log_path.read_text(encoding="ascii").splitlines()
     assert rows.count("command:00000000") == 1
-    assert "status:7:11:1" in rows
-    assert "remaining:5" in rows
+    assert "summary:1:1:5" in rows
     assert "extra:none" in rows
 
 
@@ -239,21 +237,21 @@ def test_back_to_back_runs_keep_status_boundaries(monkeypatch, tmp_path, fake_sc
         tmp_path,
         monkeypatch,
         fake_script,
-        statuses=[(1, 101, 1, 4), (2, 202, 2, 3)],
+        statuses=[(1, 3, 4), (2, 2, 3)],
     )
     try:
         executor.start()
         assert executor.run()[2] == 4
+        assert executor.representative_runs == 3
         assert executor.run()[2] == 3
+        assert executor.representative_runs == 2
         assert executor.iter == 2
     finally:
         stop_executor(executor)
     rows = log_path.read_text(encoding="ascii").splitlines()
     assert rows.count("command:00000000") == 2
-    assert "status:1:101:1" in rows
-    assert "status:2:202:2" in rows
-    assert rows.count("remaining:4") == 1
-    assert rows.count("remaining:3") == 1
+    assert "summary:1:3:4" in rows
+    assert "summary:2:2:3" in rows
 
 
 @pytest.mark.parametrize(
@@ -261,8 +259,7 @@ def test_back_to_back_runs_keep_status_boundaries(monkeypatch, tmp_path, fake_sc
     [
         ("close_before_banner", "start"),
         ("close_during_handshake", "start"),
-        ("close_during_status", "run"),
-        ("close_before_remaining", "run"),
+        ("close_during_summary", "run"),
     ],
 )
 def test_protocol_eof_is_fatal(monkeypatch, tmp_path, fake_script, mode, phase):
@@ -287,7 +284,7 @@ def test_idle_parent_close_terminates_tracer(monkeypatch, tmp_path, fake_script)
     assert "parent-eof" in log_path.read_text(encoding="ascii").splitlines()
 
 
-@pytest.mark.parametrize("mode", ["stall_after_command", "partial_status", "stall_after_status"])
+@pytest.mark.parametrize("mode", ["stall_after_command", "partial_summary"])
 def test_stalled_peer_hits_bounded_timeout(monkeypatch, tmp_path, fake_script, mode):
     executor, _ = make_executor(tmp_path, monkeypatch, fake_script, mode=mode)
     started = time.monotonic()
@@ -314,7 +311,7 @@ def test_wrong_acknowledgement_fails_handshake(monkeypatch, tmp_path, fake_scrip
 
 def test_old_word_tracer_fails_new_runner(monkeypatch, tmp_path, fake_script):
     executor, _ = make_executor(tmp_path, monkeypatch, fake_script, mode="normal")
-    executor.env["FAKE_VERSION"] = "0x41464c00"
+    executor.env["FAKE_VERSION"] = "0x41464c01"
     started = time.monotonic()
     try:
         with pytest.raises(RuntimeError, match="Unexpected forkserver handshake"):
@@ -349,7 +346,7 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
     try:
         banner = struct.unpack("<I", read_pipe(stat_r, 4))[0]
         assert banner == binradar.HANDSHAKE_EXPECTED
-        old_word = 0x41464C00
+        old_word = 0x41464C01
         os.write(ctrl_w, struct.pack("<I", old_word ^ 0xFFFFFFFF))
         proc.wait(timeout=1)
     finally:
@@ -366,7 +363,7 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
         tmp_path,
         monkeypatch,
         fake_script,
-        statuses=[(139, 0, 1, 0)],
+        statuses=[(1, 1, 0)],
     )
     try:
         executor.start()
@@ -377,5 +374,5 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
     finally:
         stop_executor(executor)
     rows = log_path.read_text(encoding="ascii").splitlines()
-    assert "status:139:0:1" in rows
+    assert "summary:1:1:0" in rows
     assert "extra:none" in rows

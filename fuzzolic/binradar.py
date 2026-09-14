@@ -53,8 +53,8 @@ RUNNING_PROCESS_PGIDS: Dict[int, int] = {}
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 
-# Tracer forkserver protocol v2
-HANDSHAKE_EXPECTED = 0x41464C01
+# Tracer forkserver protocol v3: one 12-byte logical-iteration summary.
+HANDSHAKE_EXPECTED = 0x41464C02
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 
 
@@ -297,6 +297,7 @@ class TracerExecutor:
         self._process_cleanup_done = False
         self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
         self.iter = 0
+        self.representative_runs = 0
         self.run_result = None
         self.pipe_manager = None
 
@@ -373,22 +374,24 @@ class TracerExecutor:
             self.run_result = binradar_utils.execute_await(
                 self.process, timeout=self.remaining_phase_time())
             logger.info(f"[TRACER] [{self.mode}] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
+            self.representative_runs = 1
             return int((time.time() - start_time) * 1000), self.run_result.success, 0
         is_timeout = False
         try:
             self._write_u32(0)  # was_killed - send run command to forkserver
-            exit_status, patch_id, iter = self._read_status(
+            iteration, representative_runs, remaining = self._read_status(
                 self.remaining_phase_time(self.forkserver_timeout))
-            self.iter = iter
+            self.iter = iteration
+            self.representative_runs = representative_runs
+            if representative_runs == 0:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned an empty "
+                    f"iteration summary for iteration {iteration}")
             if self.mode != "binradar":
-                # In binradar mode the caller logs one line per iteration;
-                # logging it here too would duplicate every iteration.
-                logger.debug(f"[TRACER] [{self.mode}] Target process patch {patch_id}, iter {iter}, finished with status {exit_status:#x}")
-            # Keep the remaining-count read in this try block.  A peer that
-            # stalls after its status must use the same bounded group cleanup
-            # as a peer that stalls while sending the status.
-            remaining = self._read_u32(
-                self.remaining_phase_time(self.forkserver_timeout))
+                logger.debug(
+                    f"[TRACER] [{self.mode}] Logical iteration {iteration} "
+                    f"finished after {representative_runs} child run(s); "
+                    f"remaining {remaining}")
         except Exception as e:
             is_timeout = True
             logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
@@ -1054,6 +1057,47 @@ class BinRadarExecutor:
             return self.cached_binary()
         return self.patched_binary()
 
+    def binradar_binary(self) -> str:
+        """Select the tracer artifact only after validating its cache inputs."""
+        if len(self.filter_result) <= 1 or not os.path.exists(
+                self.cached_binary()):
+            return self.patched_binary()
+        manifest = Path(self.workdir) / "brpatches.json"
+        if not manifest.exists():
+            logger.warning(
+                "[BINRADAR] Cached tracer disabled: brpatches.json missing")
+            return self.patched_binary()
+        try:
+            family, predicates = binradar_verifier.load_runtime_predicates(
+                manifest)
+        except ValueError as e:
+            logger.warning(f"[BINRADAR] Cached tracer disabled: {e}")
+            return self.patched_binary()
+        configured_kind = self.config.get("BINRADAR_PATCH_KIND", "")
+        if configured_kind and configured_kind != family.value:
+            logger.warning(
+                f"[BINRADAR] Cached tracer disabled: manifest family "
+                f"{family.value} != configured family {configured_kind}")
+            return self.patched_binary()
+        missing = [patch for patch in self.filter_result
+                   if patch not in predicates]
+        if missing:
+            logger.warning(
+                f"[BINRADAR] Cached tracer disabled: missing runtime patch "
+                f"ids {missing}")
+            return self.patched_binary()
+        if family == binradar_verifier.PredicateFamily.CWE805_ERM:
+            try:
+                stack_size = int(self.config.get("BRCACHE_STACK_SIZE", "0"), 0)
+            except ValueError:
+                stack_size = 0
+            if stack_size <= 0:
+                logger.warning(
+                    "[BINRADAR] Cached tracer disabled: invalid CWE-805 "
+                    "cache stack size")
+                return self.patched_binary()
+        return self.cached_binary()
+
     def resolved_poc_input(self) -> str:
         if os.path.isabs(self.poc_input):
             return self.poc_input
@@ -1125,14 +1169,19 @@ class BinRadarExecutor:
             child_timeout = self.forkserver_child_timeout
             if self.timeout > 0:
                 child_timeout = min(child_timeout, self.timeout)
-            if TracerExecutor.forkserver_timeout <= child_timeout + TracerExecutor.forkserver_analyze_margin:
+            iteration_timeout = child_timeout
+            if TracerExecutor.forkserver_timeout <= iteration_timeout + \
+                    TracerExecutor.forkserver_analyze_margin:
                 raise RuntimeError(
-                    f"forkserver child timeout {child_timeout}s + analyze "
-                    f"margin {TracerExecutor.forkserver_analyze_margin:g}s must "
-                    f"stay below the forkserver read timeout "
+                    f"forkserver iteration timeout {iteration_timeout}s + "
+                    f"analyze margin "
+                    f"{TracerExecutor.forkserver_analyze_margin:g}s must stay "
+                    f"below the forkserver read timeout "
                     f"{TracerExecutor.forkserver_timeout:g}s; lower "
                     f"--forkserver-child-timeout")
             env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(child_timeout))
+            env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] = str(
+                int(iteration_timeout))
             env["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(self.probe_result.patch_func_hit_cnt)
             if mode == "directed":
                 env["BINRADAR_REVERSE_DIRECTED"] = "1" if self.reverse_directed else "0"
@@ -1689,13 +1738,25 @@ class BinRadarExecutor:
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
         self.save_progress(f"[binradar] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         
+        tracer_binary = self.binradar_binary()
         binradar_env = self.get_env(exec_mode, self.run_dir)
+        if tracer_binary == self.cached_binary():
+            binradar_env["BINRADAR_PATCH_CACHE_ENABLE"] = "1"
+            binradar_env["BINRADAR_PATCH_MANIFEST"] = str(
+                (Path(self.workdir) / "brpatches.json").resolve())
+            binradar_env["E9_EXCLUDE_RANGES"] = self.config.get(
+                "BRCACHED_E9_EXCLUDE_RANGES", "")
+            binradar_env["E9_RELOCATED_CALL_JUMPS"] = self.config.get(
+                "BRCACHED_E9_RELOCATED_CALL_JUMPS", "")
+        else:
+            binradar_env.pop("BINRADAR_PATCH_CACHE_ENABLE", None)
+            binradar_env.pop("BINRADAR_PATCH_MANIFEST", None)
         shm = SharedMemoryManager(binradar_env)
         shm.assign_random_keys()
         shm.assign_random_key_for_binradar()
         
         solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
-        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, self.patched_binary(), self.test_cmd, testcase, timeout=self.timeout)
+        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, tracer_binary, self.test_cmd, testcase, timeout=self.timeout)
         
         try:
             solver.start()
@@ -1707,6 +1768,8 @@ class BinRadarExecutor:
                     break
                 tracer_time, tracer_success, remaining = tracer.run()
                 message = (f"[binradar] [tracer] [iter {tracer.iter}] "
+                           f"[representative-runs "
+                           f"{tracer.representative_runs}] "
                            f"[time {tracer_time}] [remaining {remaining}]")
                 if tracer_success:
                     logger.debug(message)

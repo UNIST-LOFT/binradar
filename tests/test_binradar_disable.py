@@ -334,6 +334,26 @@ def test_verifier_binary_uses_cached_artifact_for_multiple_patches(tmp_path):
     assert executor.verifier_binary() == str(tmp_path / "imginfo.brpatched")
 
 
+def test_binradar_binary_requires_valid_manifest_and_active_ids(tmp_path):
+    executor = _stub_executor(tmp_path)
+    executor.workdir = str(tmp_path)
+    executor.binary = "imginfo"
+    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm"}
+    executor.filter_result = [1, 2]
+    (tmp_path / "imginfo.brpatched").write_bytes(b"patched")
+    (tmp_path / "imginfo.brcached").write_bytes(b"cached")
+
+    _write_generic_manifest(tmp_path, ["=p0p0", "=p1p0"])
+    assert executor.binradar_binary() == str(tmp_path / "imginfo.brcached")
+
+    executor.filter_result = [1, 3]
+    assert executor.binradar_binary() == str(tmp_path / "imginfo.brpatched")
+
+    executor.filter_result = [1, 2]
+    executor.config["BINRADAR_PATCH_KIND"] = "CWE805-erm"
+    assert executor.binradar_binary() == str(tmp_path / "imginfo.brpatched")
+
+
 def _write_generic_manifest(workdir, descriptors):
     (workdir / "brpatches.json").write_text(json.dumps({
         "version": 1,
