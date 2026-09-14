@@ -265,7 +265,11 @@ def build_cached_binary(
                            "before building .brcached")
 
     shutil.copy(BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
-    destinations_file = workdir / "destinations"
+    destinations_file = workdir / "patch-destination"
+    if not destinations_file.exists():
+        destinations_file_original = workdir / "destinations"
+        if destinations_file_original.exists():
+            shutil.copy(destinations_file_original, destinations_file)
     if not destinations_file.exists():
         raise RuntimeError(
             f"{destinations_file.name} not found in {workdir}: the cached "
@@ -1043,7 +1047,11 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                   f"(CWE-805 direct call-site family)")
         binradar_env["TOTAL_PATCHES"] = "1"
         dest = None
-        destinations_file = workdir / "destinations"
+        destinations_file = workdir / "patch-destination"
+        if not destinations_file.exists():
+            destinations_file_original = workdir / "destinations"
+            if destinations_file_original.exists():
+                shutil.copy(destinations_file_original, destinations_file)
         if destinations_file.exists():
             with destinations_file.open("r") as f:
                 for line in f:
@@ -1208,7 +1216,11 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             patch_records = survived
 
     # Get patch destination
-    destinations_file = workdir / "destinations"
+    destinations_file = workdir / "patch-destination"
+    if not destinations_file.exists():
+        destinations_file_original = workdir / "destinations"
+        if destinations_file_original.exists():
+            shutil.copy(destinations_file_original, destinations_file)
     if not destinations_file.exists():
         print(f"Error: {destinations_file.name} file not found in {workdir}")
         exit(1)
