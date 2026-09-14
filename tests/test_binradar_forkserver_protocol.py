@@ -21,6 +21,21 @@ binradar = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar)
 
 
+def test_pipe_manager_keeps_cached_binary_records_off_patch_log():
+    env = {"BINRADAR_PATCH_CACHE_ENABLE": "1"}
+    pipes = binradar.PipeManager(env, "binradar")
+    pipes.setup_pipe()
+    try:
+        assert env["PATCH_FD"] != env["PATCH_CACHED_FD"]
+        os.write(int(env["PATCH_FD"]), b"[patch] [id 7] [br 1] [v 11]\n")
+        os.write(int(env["PATCH_CACHED_FD"]), b"BRCH")
+        assert os.read(int(env["BINRADAR_PATCH_FD_R"]), 64) == \
+            b"[patch] [id 7] [br 1] [v 11]\n"
+        assert os.read(int(env["BINRADAR_PATCH_CACHED_FD_R"]), 4) == b"BRCH"
+    finally:
+        pipes.cleanup()
+
+
 FAKE_FORKSERVER = r'''#!/usr/bin/env python3
 import os
 import select

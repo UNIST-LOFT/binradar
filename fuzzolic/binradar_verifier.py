@@ -547,29 +547,53 @@ class BinRadarQemuRunner:
     def _test_with_capture(
         self, binary: str, patch_id: str, testcase: str,
         verbose: bool = False, extra_env: Optional[Dict[str, str]] = None,
-    ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes]]:
+        capture_cached: bool = False,
+    ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes],
+               Optional[bytes]]:
+        """Run one probe and drain the patch text and cached binary channels.
+
+        PATCH_FD always carries ordinary ``[patch]`` rows.  Cached artifacts
+        additionally write binary BRCH records to PATCH_CACHED_FD; keeping the
+        channels separate makes partial reads unambiguous.
+        """
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
-        rfd, wfd = os.pipe()
-        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=wfd,
+        patch_rfd, patch_wfd = os.pipe()
+        cache_rfd = cache_wfd = None
+        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=patch_wfd,
                                     binary=binary)
+        pass_fds = [patch_wfd]
+        if capture_cached:
+            cache_rfd, cache_wfd = os.pipe()
+            env["PATCH_CACHED_FD"] = str(cache_wfd)
+            pass_fds.append(cache_wfd)
         if extra_env is not None:
             env.update(extra_env)
         proc = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=self.dir, start_new_session=True, pass_fds=(wfd,), env=env)
-        os.close(wfd)
-        thread, chunks = binradar_utils.create_pipe_reader_thread(
-            rfd, verbose=verbose)
+            cwd=self.dir, start_new_session=True, pass_fds=tuple(pass_fds),
+            env=env)
+        os.close(patch_wfd)
+        if cache_wfd is not None:
+            os.close(cache_wfd)
+        patch_thread, patch_chunks = binradar_utils.create_pipe_reader_thread(
+            patch_rfd, verbose=verbose)
+        cache_thread = None
+        cache_chunks: List[bytes] = []
+        if cache_rfd is not None:
+            cache_thread, cache_chunks = \
+                binradar_utils.create_pipe_reader_thread(cache_rfd)
         result = binradar_utils.execute_await(
             proc, timeout=60.0, verbose=verbose)
-        thread.join()
+        patch_thread.join()
+        if cache_thread is not None:
+            cache_thread.join()
         if not result.success:
             reason = (f"timed out after 60s" if result.timed_out
                       else f"exit status {result.decode_status()}")
             logger.error(f"Failed to run probe on {binary} (patch_id={patch_id}, "
                          f"testcase={testcase}): {reason}; "
                          f"command: {shlex.join(command)}")
-            return None, None
+            return None, None, None
         probe = BinRadarProbeResult.from_log(result.stderr)
         if probe is not None:
             # A crash with the fault pc inside the artifact's E9 trampoline/
@@ -578,12 +602,13 @@ class BinRadarQemuRunner:
             # and verifier comparisons against the .orig fault address work.
             probe.fault_addr = self.normalize_fault_addr(probe.fault_addr,
                                                          binary)
-        return probe, b"".join(chunks)
+        cached_data = b"".join(cache_chunks) if capture_cached else None
+        return probe, b"".join(patch_chunks), cached_data
 
     def test_with_patched(
         self, patch_id: str, testcase: str, verbose: bool = False,
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
-        probe, data = self._test_with_capture(
+        probe, data, _ = self._test_with_capture(
             self.patched_binary(), patch_id, testcase, verbose)
         if probe is None or data is None:
             return None, None
@@ -597,15 +622,16 @@ class BinRadarQemuRunner:
         self, patch_id: int, predicate: ParsedPredicate, testcase: str,
         verbose: bool = False,
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
-        probe, data = self._test_with_capture(
+        probe, patch_data, cached_data = self._test_with_capture(
             self.cached_binary(), "0", testcase, verbose,
             {
                 "TAOSC_PRED": predicate_descriptor(predicate),
                 "BRCACHE_STACK_SIZE": str(self.brcache_stack_size),
-            })
-        if probe is None or data is None:
+            },
+            capture_cached=True)
+        if probe is None or patch_data is None or cached_data is None:
             return None, None
-        snapshots, error = parse_cached_snapshots(data)
+        snapshots, error = parse_cached_snapshots(cached_data)
         if error is not None:
             logger.warning(f"Cached capture rejected: {error}")
             return probe, None
@@ -613,6 +639,17 @@ class BinRadarQemuRunner:
             logger.warning(
                 f"Cached capture hit mismatch: probe={probe.patch_hit_cnt} "
                 f"snapshots={len(snapshots)}")
+            return probe, None
+        patch_result = BinRadarPatchResult.from_log(
+            patch_data.decode(errors="ignore"))
+        snapshot_branches = [snapshot.branch for snapshot in snapshots]
+        text_branches = (patch_result.br_selection
+                         if patch_result is not None else [])
+        if (patch_result is not None and patch_result.patch_id != 0) \
+                or text_branches != snapshot_branches:
+            logger.warning(
+                "Cached capture branch mismatch between PATCH_FD and "
+                "PATCH_CACHED_FD")
             return probe, None
         return probe, BinRadarCachedRun(patch_id, snapshots)
 

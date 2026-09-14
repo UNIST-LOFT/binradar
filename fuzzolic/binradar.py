@@ -211,7 +211,9 @@ class PipeManager:
         self.stat_w = 0
         self.patch_fd_r = 0
         self.patch_fd_w = 0
-    
+        self.patch_cached_fd_r = 0
+        self.patch_cached_fd_w = 0
+
     def setup_pipe(self):
         result = list()
         self.ctrl_r, self.ctrl_w = os.pipe()
@@ -222,12 +224,20 @@ class PipeManager:
             self.patch_fd_r, self.patch_fd_w = os.pipe()
             self.env["PATCH_FD"] = str(self.patch_fd_w)
             self.env["BINRADAR_PATCH_FD_R"] = str(self.patch_fd_r)
+            if self.env.get("BINRADAR_PATCH_CACHE_ENABLE") == "1":
+                self.patch_cached_fd_r, self.patch_cached_fd_w = os.pipe()
+                self.env["PATCH_CACHED_FD"] = str(self.patch_cached_fd_w)
+                self.env["BINRADAR_PATCH_CACHED_FD_R"] = \
+                    str(self.patch_cached_fd_r)
         return result
-    
+
     def get_pass_fds(self) -> List[int]:
         pass_fds = [self.ctrl_r, self.stat_w]
         if self.mode == "binradar":
             pass_fds += [self.patch_fd_r, self.patch_fd_w]
+            if self.patch_cached_fd_r:
+                pass_fds += [self.patch_cached_fd_r,
+                             self.patch_cached_fd_w]
         return pass_fds
     
     def close_passed_fds(self):

@@ -50,14 +50,14 @@ static int setenv_checked(const char *name, const char *value)
 	return -1;
 }
 
-static int forward_pipe(int fd)
+static int forward_pipe(int fd, int output_fd)
 {
 	char buf[8192];
 	for (;;) {
 		const ssize_t n = read(fd, buf, sizeof(buf));
 		if (n == 0)
 			return 0;
-		if (n < 0 || write_all(1, buf, (size_t)n) < 0)
+		if (n < 0 || write_all(output_fd, buf, (size_t)n) < 0)
 			return -1;
 	}
 }
@@ -67,10 +67,11 @@ int main(void)
 	uint8_t stack[8] = {0};
 	struct STATE state = {0};
 	state.rsp = (int64_t)(uintptr_t)stack;
-	int fds[2];
-	if (pipe(fds) < 0)
+	int patch_fds[2], cache_fds[2];
+	if (pipe(patch_fds) < 0 || pipe(cache_fds) < 0)
 		return 1;
-	patch_fd = fds[1];
+	patch_fd = patch_fds[1];
+	cache_fd = cache_fds[1];
 
 #ifdef BRPATCH_CWE805
 	if (setenv_checked("TAOSC_PRED", "c1p0") < 0)
@@ -103,8 +104,33 @@ int main(void)
 		return 9;
 #endif
 
-	close(fds[1]);
-	const int result = forward_pipe(fds[0]);
-	close(fds[0]);
-	return result < 0 ? 10 : 0;
+	/* Dynamic tracer mode: the extended selector preserves the legacy id and
+	 * iteration words while supplying the runtime descriptor as a string. */
+	uint8_t selector_storage[
+		sizeof(struct brcache_patch_selector) + 16] = {0};
+	struct brcache_patch_selector *selector =
+		(struct brcache_patch_selector *)selector_storage;
+#ifdef BRPATCH_CWE805
+	const char *dynamic_descriptor = "c1p1";
+#else
+	const char *dynamic_descriptor = "=p0p0";
+#endif
+	selector->patch_id = 7;
+	selector->iteration = 11;
+	selector->descriptor_capacity = 16;
+	selector->descriptor_length = strlen(dynamic_descriptor);
+	strcpy(selector->descriptor, dynamic_descriptor);
+	cache_selector = selector;
+	cache_selector_size = sizeof(selector_storage);
+	env_patch_id = MAGIC_VALUE_PATCH;
+	if (dest(&state) != (const void *)TAOSC_DEST)
+		return 10;
+
+	close(patch_fds[1]);
+	close(cache_fds[1]);
+	const int patch_result = forward_pipe(patch_fds[0], 2);
+	const int cache_result = forward_pipe(cache_fds[0], 1);
+	close(patch_fds[0]);
+	close(cache_fds[0]);
+	return patch_result < 0 || cache_result < 0 ? 11 : 0;
 }

@@ -534,6 +534,31 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
         assert "if dest(state)@brpatch-cached goto" in joined
 
 
+def test_verifier_capture_drains_text_and_cached_channels(tmp_path, monkeypatch):
+    helper = tmp_path / "emit-cached-capture.py"
+    helper.write_text(
+        "import os\n"
+        "os.write(int(os.environ['PATCH_FD']), b'[patch] [id 0] [br 1] [v 0]\\n')\n"
+        "os.write(int(os.environ['PATCH_CACHED_FD']), b'BRCH-snapshot')\n")
+    runner = binradar.binradar_verifier.BinRadarQemuRunner(
+        dir=str(tmp_path), binary="subject", test_cmd="",
+        patch_loc="0x401000")
+    monkeypatch.setattr(
+        runner, "get_qemu_stacktrace_command_for_binary",
+        lambda _binary, _testcase: [sys.executable, str(helper)])
+    probe = SimpleNamespace(fault_addr=0)
+    monkeypatch.setattr(
+        binradar.binradar_verifier.BinRadarProbeResult, "from_log",
+        lambda _log: probe)
+
+    captured_probe, patch_data, cached_data = runner._test_with_capture(
+        runner.cached_binary(), "0", "input", capture_cached=True)
+
+    assert captured_probe is probe
+    assert patch_data == b"[patch] [id 0] [br 1] [v 0]\n"
+    assert cached_data == b"BRCH-snapshot"
+
+
 def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
     workdir = tmp_path / "workdir"
     run_dir = tmp_path / "run"

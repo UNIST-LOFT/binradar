@@ -747,26 +747,50 @@ def _run_cached_runtime_test(tmp_path, cwe805):
         cmd[1:1] = ["-DBRPATCH_CWE805", "-DBRPATCH_ALLOC_MALLOC"]
     subprocess.run(cmd, check=True)
     return subprocess.run(
-        [str(executable)], check=True, capture_output=True).stdout
+        [str(executable)], check=True, capture_output=True)
 
 
 def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
     predicates = binradar_setup.binradar_taosc_predicates
 
-    generic_data = _run_cached_runtime_test(tmp_path, False)
-    snapshots, error = predicates.parse_cached_snapshots(generic_data)
+    generic_run = _run_cached_runtime_test(tmp_path, False)
+    generic_record_size = len(generic_run.stdout) // 3
+    snapshots, error = predicates.parse_cached_snapshots(
+        generic_run.stdout[:2 * generic_record_size])
+    dynamic_snapshots, dynamic_error = predicates.parse_cached_snapshots(
+        generic_run.stdout[2 * generic_record_size:])
     assert error is None
-    assert all(snapshot.patch_id == 0 for snapshot in snapshots)
+    assert dynamic_error is None
+    assert [snapshot.patch_id for snapshot in snapshots] == [0, 0]
     assert [snapshot.branch for snapshot in snapshots] == [0, 1]
+    assert [snapshot.patch_id for snapshot in dynamic_snapshots] == [7]
+    assert [snapshot.branch for snapshot in dynamic_snapshots] == [1]
+    assert generic_run.stderr.decode().splitlines() == [
+        "[patch] [id 0] [br 0] [v 0]",
+        "[patch] [id 0] [br 1] [v 0]",
+        "[patch] [id 7] [br 1] [v 11]",
+    ]
     assert all(not snapshot.is_CWE805 for snapshot in snapshots)
     assert predicates.evaluate_cached_predicate(
         "=p1p0", [snapshots[0]]) == [0]
 
-    cwe805_data = _run_cached_runtime_test(tmp_path, True)
-    snapshots, error = predicates.parse_cached_snapshots(cwe805_data)
+    cwe805_run = _run_cached_runtime_test(tmp_path, True)
+    cwe805_record_size = len(cwe805_run.stdout) // 3
+    snapshots, error = predicates.parse_cached_snapshots(
+        cwe805_run.stdout[:2 * cwe805_record_size])
+    dynamic_snapshots, dynamic_error = predicates.parse_cached_snapshots(
+        cwe805_run.stdout[2 * cwe805_record_size:])
     assert error is None
-    assert all(snapshot.patch_id == 0 for snapshot in snapshots)
+    assert dynamic_error is None
+    assert [snapshot.patch_id for snapshot in snapshots] == [0, 0]
     assert [snapshot.branch for snapshot in snapshots] == [0, 1]
+    assert [snapshot.patch_id for snapshot in dynamic_snapshots] == [7]
+    assert [snapshot.branch for snapshot in dynamic_snapshots] == [1]
+    assert cwe805_run.stderr.decode().splitlines() == [
+        "[patch] [id 0] [br 0] [v 0]",
+        "[patch] [id 0] [br 1] [v 0]",
+        "[patch] [id 7] [br 1] [v 11]",
+    ]
     assert all(snapshot.is_CWE805 for snapshot in snapshots)
     assert all(len(snapshot.clamps) == 256 for snapshot in snapshots)
     assert all(len(snapshot.stack) == 8 for snapshot in snapshots)
