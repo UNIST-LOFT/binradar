@@ -81,7 +81,7 @@ def test_parse_timestamped_progress_with_sbsv(tmp_path):
     assert rows[2]["remaining_patches"] == "[1]"
 
 
-def test_collect_marks_less_strict_final_as_degraded(tmp_path):
+def test_collect_marks_failed_phases_as_issues(tmp_path):
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"
     run_dir = out_dir / "run-00000"
@@ -90,11 +90,12 @@ def test_collect_marks_less_strict_final_as_degraded(tmp_path):
         "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
         "[fuzzer] [start] [prefix run] [id 0]\n"
         "[fuzzer] [failed] [prefix run] [id 0] [less-strict true]\n"
-        "[final] [degraded] [prefix run] [id 0] "
+        "[final] [failed-phases] [prefix run] [id 0] "
         "[failed-phases fuzzer]\n"
         "[final] [done] [prefix run] [id 0] "
         "[remaining_patches [1]] [binradar_remaining_patches [1]] "
-        "[degraded true] [failed-phases fuzzer]\n")
+        "[issues true] [failed-phases fuzzer] "
+        "[wall-time-reached false]\n")
     (run_dir / "verifier.sbsv").write_text(
         "[verifier-result] [res verified] [patch 1] [testcase ]\n")
 
@@ -102,10 +103,118 @@ def test_collect_marks_less_strict_final_as_degraded(tmp_path):
         str(tmp_path), "workdir", "run")
 
     run = result.runs[0]
-    assert run.degraded is True
+    assert run.issues is True
     assert run.failed_phases == "fuzzer"
-    assert run.status == "DEGRADED: failed phases: fuzzer"
+    assert run.wall_time_reached is False
+    assert run.status == "ISSUES: failed phases: fuzzer"
     assert result.overall_status == "issues"
+
+
+def test_collect_legacy_degraded_final_still_reports_failed_phases(tmp_path):
+    """Runs recorded before the rename must keep their failure meaning."""
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[final] [degraded] [prefix run] [id 0] [failed-phases binradar]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[degraded true] [failed-phases binradar]\n")
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.issues is True
+    assert run.failed_phases == "binradar"
+    assert run.wall_time_reached is False
+    assert run.status == "ISSUES: failed phases: binradar"
+    assert result.overall_status == "issues"
+
+
+def test_collect_legacy_cutoff_only_is_not_an_issue(tmp_path):
+    """The pre-rename cutoff label must not read back as a failed phase.
+
+    Legacy rows encoded the concrete wall-clock cutoff as the synthetic
+    ``minimizer-verifier`` entry of the failure list; that run was a graceful
+    cut, so it must report as a cutoff rather than as an issue.
+    """
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[verifier] [timeout] [prefix run] [id 0]\n"
+        "[final] [degraded] [prefix run] [id 0] "
+        "[failed-phases minimizer-verifier]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[degraded true] [failed-phases minimizer-verifier]\n")
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.issues is False
+    assert run.failed_phases == ""
+    assert run.wall_time_reached is True
+    assert run.status == "OK (wall-time-reached)"
+    assert result.overall_status == "ok"
+
+
+def test_collect_legacy_cutoff_with_real_failure_reports_only_the_failure(
+        tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[degraded true] [failed-phases fuzzer,minimizer-verifier]\n")
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.issues is True
+    assert run.failed_phases == "fuzzer"
+    assert run.wall_time_reached is True
+    assert run.status == "ISSUES: failed phases: fuzzer; wall-time-reached"
+
+
+def test_collect_wall_time_reached_is_not_an_issue(tmp_path):
+    """A graceful wall-clock cutoff is expected behavior, not a failure."""
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[verifier] [wall-time-reached] [prefix run] [id 0]\n"
+        "[final] [wall-time-reached] [prefix run] [id 0]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[issues false] [failed-phases none] "
+        "[wall-time-reached true]\n")
+    (run_dir / "verifier.sbsv").write_text(
+        "[verifier-result] [res verified] [patch 1] [testcase ]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.wall_time_reached is True
+    assert run.issues is False
+    assert run.failed_phases == ""
+    assert run.status == "OK (wall-time-reached)"
+    assert result.overall_status == "ok"
 
 
 def test_parse_final_sbsv(tmp_path):

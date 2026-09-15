@@ -24,7 +24,7 @@ def _policy_executor(tmp_path, less_strict):
     executor.less_strict = less_strict
     executor.feedback_mode = False
     executor.binradar_failed = False
-    executor.concrete_evidence_timed_out = False
+    executor.wall_time_reached = False
     executor.phase_failures = {}
     executor.phase_failure_lock = threading.Lock()
     executor.run_prefix = "run"
@@ -212,7 +212,7 @@ def test_multithreaded_less_strict_fuzzer_failure_reaches_final(
     assert events[-2:] == ["final", "done"]
 
 
-def test_failed_binradar_trace_is_ignored_and_final_is_marked_degraded(
+def test_failed_binradar_trace_is_ignored_and_final_reports_failed_phase(
         tmp_path):
     (tmp_path / "verifier.sbsv").write_text(
         "[verifier-result] [res verified] [patch 1] [testcase ]\n"
@@ -233,12 +233,13 @@ def test_failed_binradar_trace_is_ignored_and_final_is_marked_degraded(
 
     final = (tmp_path / "final.sbsv").read_text()
     assert "[binradar failed]" in final
-    assert ("[final] [degraded] [prefix run] [id 0] "
+    assert ("[final] [failed-phases] [prefix run] [id 0] "
             "[failed-phases binradar]") in final
     assert "[final] [binradar] [patch 1]" not in final
-    assert "[degraded true] [failed-phases binradar]" in final
+    assert "[issues true] [failed-phases binradar]" in final
+    assert "[wall-time-reached false]" in final
     assert "[remaining_patches [1]]" in final
-    assert any("[degraded true]" in row for row in progress)
+    assert any("[issues true]" in row for row in progress)
 
 
 def test_afl_timeout_defaults_to_autoscaling_slow_seed_ceiling(tmp_path):

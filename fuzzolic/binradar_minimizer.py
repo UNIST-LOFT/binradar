@@ -14,6 +14,7 @@ import fcntl
 
 from typing import List, Dict, Set, Tuple, Any, Optional
 
+import binradar_utils
 import binradar_verifier
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -234,7 +235,8 @@ class BinRadarMinimizer:
                         break
                     time.sleep(poll_interval)
         except _MinimizerTimeout:
-            self.log("[minimizer] [stopped] [reason timeout]")
+            self.log(f"[minimizer] [stopped] "
+                     f"[reason {binradar_utils.WALL_TIME_REACHED}]")
             return True
         self.log("[minimizer] [done]")
         return False
@@ -376,10 +378,11 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
     elif timed_out:
         # The verifier or join deadline cancelled the minimizer before its own
         # deadline handler could serialize the terminal cutoff marker.
-        minimizer.log("[minimizer] [stopped] [reason timeout]")
-    if timed_out and hasattr(verifier, "mark_timeout_cutoff"):
+        minimizer.log(f"[minimizer] [stopped] "
+                      f"[reason {binradar_utils.WALL_TIME_REACHED}]")
+    if timed_out and hasattr(verifier, "mark_wall_time_reached"):
         # The verifier can finish early after rejecting every patch while the
         # minimizer continues. If the shared pair then reaches its deadline,
         # retain the cutoff metadata in verifier.sbsv for resumed FINAL runs.
-        verifier.mark_timeout_cutoff()
+        verifier.mark_wall_time_reached()
     return timed_out

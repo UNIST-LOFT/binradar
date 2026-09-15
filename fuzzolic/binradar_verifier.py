@@ -799,7 +799,7 @@ class BinRadarConcreteVerifier:
     observation_counts: Dict[int, Dict[str, int]]
     security_rejected: Set[int]
     feedback_hard_rejected: Set[int]
-    timeout_cutoff_logged: bool
+    wall_time_reached_logged: bool
     def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False):
         self.dir = dir
         self.run_dir = run_dir
@@ -815,7 +815,7 @@ class BinRadarConcreteVerifier:
         self.observation_counts = {patch: {} for patch in patches}
         self.security_rejected = set()
         self.feedback_hard_rejected = set()
-        self.timeout_cutoff_logged = False
+        self.wall_time_reached_logged = False
         self.start_time = time.time()
         # Setup logger
         log_file = os.path.join(run_dir, "verifier.sbsv")
@@ -888,12 +888,19 @@ class BinRadarConcreteVerifier:
         if deadline is not None and time.monotonic() >= deadline:
             raise _VerifierTimeout("Verifier phase timed out")
 
-    def mark_timeout_cutoff(self) -> None:
-        """Serialize the partial-evidence marker exactly once."""
-        if self.timeout_cutoff_logged:
+    def mark_wall_time_reached(self) -> None:
+        """Serialize the partial-evidence marker exactly once.
+
+        The reason string is the canonical wall-clock-cutoff name shared with
+        ``binradar.py`` (which compares it as ``stop_reason``) and with
+        ``binradar-collect-results.py``. It is deliberately not a failure
+        label: reaching the configured budget is a graceful stop.
+        """
+        if self.wall_time_reached_logged:
             return
-        self.logger.info("[verifier] [stopped] [reason timeout]")
-        self.timeout_cutoff_logged = True
+        self.logger.info(
+            f"[verifier] [stopped] [reason {binradar_utils.WALL_TIME_REACHED}]")
+        self.wall_time_reached_logged = True
 
     def _log_result(self, patch: int, result: str, testcase: str) -> None:
         self.logger.info(
@@ -1222,7 +1229,7 @@ class BinRadarConcreteVerifier:
                         elif row.schema_name == "minimizer$stopped":
                             stop_reason = row["reason"]
                     if stop_reason is not None:
-                        if stop_reason != "timeout":
+                        if stop_reason != binradar_utils.WALL_TIME_REACHED:
                             raise RuntimeError(
                                 f"Minimizer stopped for unsupported reason: "
                                 f"{stop_reason}")
@@ -1269,7 +1276,7 @@ class BinRadarConcreteVerifier:
             timed_out = True
 
         if timed_out:
-            self.mark_timeout_cutoff()
+            self.mark_wall_time_reached()
         for patch in pending_patches:
             self._log_result(patch, "verified", "")
         if self.feedback_mode:

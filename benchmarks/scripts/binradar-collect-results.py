@@ -79,9 +79,11 @@ from itertools import repeat
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
+sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "fuzzolic"))
+
+import binradar_utils
 
 
 def display_path(exp_file_dir: str, path: str) -> str:
@@ -148,8 +150,28 @@ def _build_sbsv_parser() -> sbsv.parser:
     parser.add_schema(
         "[final] [done] [prefix: str] [id: str] "
         "[remaining_patches?: str] [binradar_remaining_patches?: str]")
+    # Real issues: optional evidence phases that failed under --less-strict.
+    parser.add_schema(
+        "[final] [failed-phases] [prefix: str] [id: str] [failed-phases: str]")
+    # Planned graceful cutoff: a phase (or the minimizer/verifier pair)
+    # reached its configured wall-clock budget. Never an issue.
+    for phase in ("rundir", "probe", "filter", "fuzzolic", "directed",
+                  "fuzzer", "minimizer", "verifier", "binradar", "feedback",
+                  "final"):
+        parser.add_schema(
+            f"[{phase}] [{binradar_utils.WALL_TIME_REACHED}] "
+            f"[prefix: str] [id: str]")
+    # Legacy notation from runs recorded before the wall-time-reached rename.
+    # ``[final] [degraded]`` bundled both the tolerated-failure and the
+    # wall-clock-cutoff cases, so it maps onto the failure concept it used to
+    # report; ``[<phase>] [timeout]`` was only ever the planned cutoff.
     parser.add_schema(
         "[final] [degraded] [prefix: str] [id: str] [failed-phases: str]")
+    for phase in ("rundir", "probe", "filter", "fuzzolic", "directed",
+                  "fuzzer", "minimizer", "verifier", "binradar", "feedback",
+                  "final"):
+        parser.add_schema(
+            f"[{phase}] [timeout] [prefix: str] [id: str]")
     parser.add_schema("[verifier-result] [res: str] [patch: str]")
     parser.add_schema("[patch] [id: int] [pass: bool]")
     parser.add_schema("[final] [verifier] [patch: str] [res: str]")
@@ -205,8 +227,12 @@ class RunResult:
     filter_done: bool = False
     filter_survived: str = ""  # e.g. "[1, 2]" or "[]"
     filter_rejected: str = ""  # e.g. "3" or "" if none
-    degraded: bool = False
+    # Real issues: optional evidence phases that failed under --less-strict.
+    issues: bool = False
     failed_phases: str = ""
+    # Planned graceful cutoff: a phase (or the concrete minimizer/verifier
+    # pair) reached its configured wall-clock budget. Informational only.
+    wall_time_reached: bool = False
     prefilter_total: int = -1  # predicates evaluated by the prefilter
     prefilter_survived: int = -1  # predicates kept (pass=true)
     prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
@@ -304,6 +330,44 @@ class StatsExperimentResult:
     runs: List[StatsRunResult] = field(default_factory=list)
 
 
+_DONE_STATUS_MARKER_RE = re.compile(r"\[(issues|failed-phases|wall-time-reached) ([^\]]*)\]")
+
+# The pre-rename cutoff recorder inserted this synthetic entry into the
+# phase-failure map, so a legacy `failed-phases` list can mix a real tolerated
+# failure with the wall-clock cutoff. The name is not a
+# ``binradar.OPTIONAL_EVIDENCE_PHASES`` member and no other code path writes it.
+LEGACY_WALL_TIME_PHASE = "minimizer-verifier"
+
+
+def _split_legacy_failed_phases(value: str) -> Tuple[str, bool]:
+    """Split a legacy ``failed-phases`` list into (real failures, cutoff).
+
+    Rows written before the wall-time-reached rename stored the concrete
+    cutoff under the synthetic phase name ``minimizer-verifier`` inside the
+    same list as genuine tolerated failures, so both must be separated here to
+    keep the two concepts distinct for historical runs.
+    """
+    names = [n.strip() for n in value.split(",")] if value else []
+    cutoff = LEGACY_WALL_TIME_PHASE in names
+    remaining = [n for n in names
+                 if n and n != "none" and n != LEGACY_WALL_TIME_PHASE]
+    return ",".join(remaining), cutoff
+
+
+def _done_status_markers(line: str) -> Dict[str, str]:
+    """Extract the ``[final] [done]`` status markers from a raw log line.
+
+    The markers trail the schema-mapped fields, so they are read from the raw
+    line instead of widening the ``final$done`` schema: the sbsv parser
+    rejects a row with fewer tokens than the schema declares, which would
+    break every previously written row. Absent markers (legacy rows) simply
+    stay absent, so callers must treat "missing" as "not recorded" rather
+    than as ``false``.
+    """
+    return {name: value.strip()
+            for name, value in _DONE_STATUS_MARKER_RE.findall(line)}
+
+
 def parse_sbsv_line(line: str) -> Optional[Dict[str, str]]:
     """Parse one timestamp-prefixed or plain SBSV row with ``sbsv``."""
     payload = _strip_log_prefix(line.strip())
@@ -321,6 +385,8 @@ def parse_sbsv_line(line: str) -> Optional[Dict[str, str]]:
         entry["_action"] = schema_parts[1]
     for key, value in row.data.items():
         entry[key] = str(value)
+    if row.schema_name == "final$done":
+        entry.update(_done_status_markers(payload))
     return entry
 
 
@@ -788,8 +854,10 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         started: set = set()
         done_phases: set = set()
         final_entry: Optional[Dict[str, str]] = None
-        degraded_entry: Optional[Dict[str, str]] = None
+        failed_phases_entry: Optional[Dict[str, str]] = None
+        legacy_degraded_entry: Optional[Dict[str, str]] = None
         filter_entry: Optional[Dict[str, str]] = None
+        wall_time_reached = False
 
         for entry in entries:
             phase = entry.get("_phase", "")
@@ -803,8 +871,14 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                     final_entry = entry
                 elif phase == "filter":
                     filter_entry = entry
+            elif action == binradar_utils.WALL_TIME_REACHED:
+                wall_time_reached = True
+            elif phase == "final" and action == "failed-phases":
+                failed_phases_entry = entry
             elif phase == "final" and action == "degraded":
-                degraded_entry = entry
+                # Legacy notation: bundled tolerated failures with the
+                # wall-clock cutoff, so it maps onto the failure concept.
+                legacy_degraded_entry = entry
 
         incomplete_phases = started - done_phases
 
@@ -822,18 +896,38 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         if incomplete_phases or log_errors:
             tracer_errors = find_errors_in_tracer_msg(tracer_msg_log)
 
-        # Determine status. A --less-strict run deliberately reaches FINAL
-        # after optional evidence phases fail, but must not be reported as a
-        # complete security-verification result.
-        degraded = final_entry is not None and degraded_entry is not None
-        failed_phases = (degraded_entry.get("failed-phases", "")
-                         if degraded_entry is not None else "")
-        if final_entry is not None and degraded:
-            status = f"DEGRADED: failed phases: {failed_phases or 'unknown'}"
+        # Determine status from two orthogonal signals.
+        #   * failed phases (--less-strict toleration) are real issues and must
+        #     not be reported as a complete security-verification result;
+        #   * a reached wall-clock budget is a planned graceful cutoff and is
+        #     not an error, so it never turns the run into an issue.
+        failed_phases = ""
+        if failed_phases_entry is not None:
+            failed_phases = failed_phases_entry.get("failed-phases", "")
+        elif legacy_degraded_entry is not None:
+            failed_phases = legacy_degraded_entry.get("failed-phases", "")
+        elif final_entry is not None:
+            failed_phases = final_entry.get("failed-phases", "")
+        # Legacy rows can hide the cutoff inside the failure list; split it out
+        # so the two concepts stay distinct for historical runs too.
+        failed_phases, legacy_cutoff = _split_legacy_failed_phases(failed_phases)
+        if legacy_cutoff:
+            wall_time_reached = True
+        issues = bool(failed_phases)
+        if final_entry is not None:
+            if final_entry.get("issues", "").lower() == "true":
+                issues = True
+            if final_entry.get("wall-time-reached", "").lower() == "true":
+                wall_time_reached = True
+        if issues:
+            status = f"ISSUES: failed phases: {failed_phases or 'unknown'}"
+            if wall_time_reached:
+                status += "; wall-time-reached"
             has_any_final = True
             overall_ok = False
         elif final_entry is not None:
-            status = "OK"
+            status = ("OK (wall-time-reached)" if wall_time_reached
+                      else "OK")
             has_any_final = True
         elif not incomplete_phases:
             status = "OK (rundir done, no final)"
@@ -871,8 +965,9 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             filter_done=("filter" in done_phases or bool(filter_results)),
             filter_survived=filter_survived,
             filter_rejected=filter_rejected,
-            degraded=degraded,
+            issues=issues,
             failed_phases=failed_phases,
+            wall_time_reached=wall_time_reached,
             prefilter_total=prefilter["total"],
             prefilter_survived=prefilter["survived"],
             prefilter_done=prefilter_done_status(workdir, prefilter),
@@ -1140,7 +1235,9 @@ def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
         started: set = set()
         done_phases: set = set()
         final_entry: Optional[Dict[str, str]] = None
-        degraded_entry: Optional[Dict[str, str]] = None
+        failed_phases_entry: Optional[Dict[str, str]] = None
+        legacy_degraded_entry: Optional[Dict[str, str]] = None
+        wall_time_reached = False
         for entry in entries:
             phase = entry.get("_phase", "")
             action = entry.get("_action", "")
@@ -1150,18 +1247,39 @@ def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
                 done_phases.add(phase)
                 if phase == "final":
                     final_entry = entry
+            elif action == binradar_utils.WALL_TIME_REACHED:
+                wall_time_reached = True
+            elif phase == "final" and action == "failed-phases":
+                failed_phases_entry = entry
             elif phase == "final" and action == "degraded":
-                degraded_entry = entry
+                legacy_degraded_entry = entry
 
         incomplete_phases = started - done_phases
-        degraded = final_entry is not None and degraded_entry is not None
-        if final_entry is not None and degraded:
-            status = (f"DEGRADED: failed phases: "
-                      f"{degraded_entry.get('failed-phases', '') or 'unknown'}")
+        failed_phases = ""
+        if failed_phases_entry is not None:
+            failed_phases = failed_phases_entry.get("failed-phases", "")
+        elif legacy_degraded_entry is not None:
+            failed_phases = legacy_degraded_entry.get("failed-phases", "")
+        elif final_entry is not None:
+            failed_phases = final_entry.get("failed-phases", "")
+        failed_phases, legacy_cutoff = _split_legacy_failed_phases(failed_phases)
+        if legacy_cutoff:
+            wall_time_reached = True
+        issues = bool(failed_phases)
+        if final_entry is not None:
+            if final_entry.get("issues", "").lower() == "true":
+                issues = True
+            if final_entry.get("wall-time-reached", "").lower() == "true":
+                wall_time_reached = True
+        if issues:
+            status = f"ISSUES: failed phases: {failed_phases or 'unknown'}"
+            if wall_time_reached:
+                status += "; wall-time-reached"
             has_any_final = True
             overall_ok = False
         elif final_entry is not None:
-            status = "OK"
+            status = ("OK (wall-time-reached)" if wall_time_reached
+                      else "OK")
             has_any_final = True
         elif not incomplete_phases:
             status = "OK (rundir done, no final)"

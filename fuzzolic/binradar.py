@@ -779,7 +779,10 @@ class BinRadarExecutor:
     disable_binradar: bool
     less_strict: bool
     binradar_failed: bool
-    concrete_evidence_timed_out: bool
+    # The concrete minimizer/verifier pair reached its configured wall-clock
+    # budget. This is a planned, graceful cutoff, not a phase failure, so it is
+    # tracked separately from ``phase_failures`` throughout.
+    wall_time_reached: bool
     feedback_mode: bool
     # Control
     phase_failures: Dict[str, str]
@@ -808,7 +811,7 @@ class BinRadarExecutor:
         self.less_strict = less_strict
         self.feedback_mode = feedback_mode
         self.binradar_failed = False
-        self.concrete_evidence_timed_out = False
+        self.wall_time_reached = False
         self._fuzzer_output_prepared = False
         self.phase_failures = {}
         self.phase_failure_lock = threading.Lock()
@@ -916,8 +919,8 @@ class BinRadarExecutor:
 
         Required phases (probe, filter, minimizer, verifier, and final) never
         call this helper. Keeping the failure separate from a successful
-        ``[phase] [done]`` marker prevents a degraded run from masquerading as
-        a complete run in progress logs.
+        ``[phase] [done]`` marker prevents a run with failed optional phases
+        from masquerading as a complete run in progress logs.
         """
         if phase not in OPTIONAL_EVIDENCE_PHASES:
             raise ValueError(
@@ -959,22 +962,24 @@ class BinRadarExecutor:
         with lock:
             return sorted(self.phase_failures)
 
-    def _record_concrete_evidence_timeout(self, phases: List[str]) -> None:
-        """Mark a planned concrete-evidence cutoff as degraded, not fatal."""
-        if not hasattr(self, "phase_failure_lock"):
-            # Some unit tests construct executors with __new__.
-            self.phase_failure_lock = threading.Lock()
-            self.phase_failures = {}
-        self.concrete_evidence_timed_out = True
-        with self.phase_failure_lock:
-            self.phase_failures["minimizer-verifier"] = (
-                "wall-clock evidence budget reached")
+    def _record_wall_time_reached(self, phases: List[str]) -> None:
+        """Record the planned concrete-evidence wall-clock cutoff.
+
+        Reaching the configured budget is a graceful, expected stop: no new
+        concrete work is started, already-observed hard failures stay
+        rejected, and the remaining verdicts are finalized from the evidence
+        consumed so far. It is deliberately **not** a phase failure, so it is
+        never added to ``phase_failures`` and never reported as an issue by
+        ``binradar-collect-results.py``.
+        """
+        self.wall_time_reached = True
         logger.warning(
             "[MINIMIZER/VERIFIER] Wall-clock budget reached; finalizing "
-            "verdicts and confidence from the evidence collected so far.")
+            "verdicts and confidence from the evidence collected so far. "
+            "This is a planned graceful cutoff, not a phase failure.")
         for phase in phases:
             self.save_progress(
-                f"[{phase}] [timeout] [prefix {self.run_prefix}] "
+                f"[{phase}] [wall-time-reached] [prefix {self.run_prefix}] "
                 f"[id {self.run_id}]")
 
     def phase_deadline(self, factor: float = 1.0) -> Optional[float]:
@@ -1562,10 +1567,11 @@ class BinRadarExecutor:
         if timed_out:
             logger.info(
                 f"[{phase_name.upper()}] Reached its configured phase "
-                "timeout; keeping testcases published before the cutoff.")
+                "wall-clock budget; keeping testcases published before the "
+                "cutoff. This is a planned graceful cutoff, not a failure.")
             self.save_progress(
-                f"[{exec_mode}] [timeout] [prefix {self.run_prefix}] "
-                f"[id {self.run_id}]")
+                f"[{exec_mode}] [{binradar_utils.WALL_TIME_REACHED}] "
+                f"[prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(
             f"[{exec_mode}] [done] [prefix {self.run_prefix}] "
             f"[id {self.run_id}]")
@@ -1617,10 +1623,12 @@ class BinRadarExecutor:
         if result.timed_out:
             # AFL++ intentionally runs until the phase deadline. execute_await
             # terminates the process group and waits for it to exit.
-            logger.info("Fuzzer reached its configured phase timeout.")
+            logger.info(
+                "Fuzzer reached its configured phase wall-clock budget; this "
+                "is a planned graceful cutoff, not a failure.")
             self.save_progress(
-                f"[fuzzer] [timeout] [prefix {self.run_prefix}] "
-                f"[id {self.run_id}]")
+                f"[fuzzer] [{binradar_utils.WALL_TIME_REACHED}] "
+                f"[prefix {self.run_prefix}] [id {self.run_id}]")
         elif not result.success or result.exit_code != 0:
             raise RuntimeError(
                 f"Fuzzer exited unexpectedly with status {result.exit_code}")
@@ -1651,7 +1659,7 @@ class BinRadarExecutor:
         timed_out = minimizer.run_testcases(
             timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
-            self._record_concrete_evidence_timeout(["minimizer"])
+            self._record_wall_time_reached(["minimizer"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
     def run_verifier(self):
@@ -1676,7 +1684,7 @@ class BinRadarExecutor:
             minimizer_result_file,
             timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
-            self._record_concrete_evidence_timeout(["verifier"])
+            self._record_wall_time_reached(["verifier"])
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_minimizer_and_verifier(self,
@@ -1721,7 +1729,7 @@ class BinRadarExecutor:
             producer_exc_queue=producer_exc_queue,
             timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
-            self._record_concrete_evidence_timeout(
+            self._record_wall_time_reached(
                 ["minimizer", "verifier"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
@@ -1939,12 +1947,12 @@ class BinRadarExecutor:
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
-        if (concrete_verifier_result.stop_reason == "timeout"
-                and not self.concrete_evidence_timed_out):
-            # Preserve the degraded marker when FINAL is resumed in a fresh
+        if (concrete_verifier_result.stop_reason == "wall-time-reached"
+                and not self.wall_time_reached):
+            # Preserve the cutoff marker when FINAL is resumed in a fresh
             # process after graceful timeout finalization already produced a
             # complete verifier result file.
-            self._record_concrete_evidence_timeout([])
+            self._record_wall_time_reached([])
         try:
             concrete_verifier_result.require_complete_verdicts(
                 self.filter_result)
@@ -2060,16 +2068,26 @@ class BinRadarExecutor:
                         record_evidence(patch, same_behavior)
                         if not same_behavior:
                             logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}); reducing confidence without rejecting the patch.")
+        # Two orthogonal status concepts, kept distinct in every output row:
+        #   * failed phases (--less-strict) are real issues;
+        #   * a reached wall-clock budget is a planned graceful cutoff.
         failed_phases = self.failed_phase_names()
-        degraded_suffix = (
-            f" [degraded true] [failed-phases {','.join(failed_phases)}]"
-            if failed_phases else " [degraded false] [failed-phases none]")
+        issues_suffix = (
+            f" [issues true] [failed-phases {','.join(failed_phases)}]"
+            if failed_phases else " [issues false] [failed-phases none]")
+        wall_time_suffix = (
+            " [wall-time-reached true]" if self.wall_time_reached
+            else " [wall-time-reached false]")
         if failed_phases:
             self.save_progress(
-                f"[final] [degraded] [prefix {self.run_prefix}] "
+                f"[final] [failed-phases] [prefix {self.run_prefix}] "
                 f"[id {self.run_id}] "
                 f"[failed-phases {','.join(failed_phases)}]")
-        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]{degraded_suffix}")
+        if self.wall_time_reached:
+            self.save_progress(
+                f"[final] [wall-time-reached] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}]")
+        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]{issues_suffix}{wall_time_suffix}")
 
         # Write a self-contained final.sbsv with per-patch verdicts from the
         # concrete verifier and, when enabled, the binradar analysis.
@@ -2085,9 +2103,12 @@ class BinRadarExecutor:
                     f"[verifier {os.path.basename(verifier_result_file)}] "
                     f"{trace_metadata}\n")
             if failed_phases:
-                f.write(f"[final] [degraded] [prefix {self.run_prefix}] "
+                f.write(f"[final] [failed-phases] [prefix {self.run_prefix}] "
                         f"[id {self.run_id}] "
                         f"[failed-phases {','.join(failed_phases)}]\n")
+            if self.wall_time_reached:
+                f.write(f"[final] [wall-time-reached] "
+                        f"[prefix {self.run_prefix}] [id {self.run_id}]\n")
             for patch_id in sorted(self.filter_result):
                 verified = concrete_verifier_result.patch_verified[patch_id]
                 res = "verified" if verified else "rejected"
@@ -2121,7 +2142,7 @@ class BinRadarExecutor:
             f.write(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
                     f"[remaining_patches {sorted(remaining_patches)}] "
                     f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]"
-                    f"{degraded_suffix}\n")
+                    f"{issues_suffix}{wall_time_suffix}\n")
         logger.info(f"[FINAL] Saved final result: {final_result_file}")
 
     def done(self):
@@ -2421,8 +2442,8 @@ def main():
         help="disable the binradar phase")
     parser.add_argument("--less-strict", action="store_true",
         help=("continue when optional evidence phases (fuzzolic, directed, "
-              "fuzzer, binradar, or feedback) fail; final output is marked "
-              "degraded"))
+              "fuzzer, binradar, or feedback) fail; final output records the "
+              "failed phases as issues"))
     parser.add_argument("--fuzzer-only", action="store_true",
         help=("run probe/filter, AFL++ fuzzer, minimizer/verifier, and final; "
               "skip fuzzolic, directed, and binradar"))

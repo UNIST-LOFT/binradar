@@ -209,7 +209,8 @@ def test_standalone_minimizer_timeout_is_graceful_cutoff(tmp_path, monkeypatch):
     assert minimizer.run_testcases(timeout=0.01) is True
 
     minimizer_log = (tmp_path / "run" / "minimizer.sbsv").read_text()
-    assert "[minimizer] [stopped] [reason timeout]" in minimizer_log
+    assert (f"[minimizer] [stopped] "
+            f"[reason {binradar_utils.WALL_TIME_REACHED}]") in minimizer_log
     assert "[minimizer] [done]" not in minimizer_log
 
 
@@ -236,13 +237,14 @@ def test_standalone_verifier_timeout_finalizes_partial_evidence(tmp_path):
         str(minimizer_log), timeout=0.01) is True
 
     verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier] [stopped] [reason timeout]" in verifier_log
+    assert (f"[verifier] [stopped] "
+            f"[reason {binradar_utils.WALL_TIME_REACHED}]") in verifier_log
     assert "[verifier-result] [res verified] [patch 1]" in verifier_log
     assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
     parsed = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(
         str(run_dir / "verifier.sbsv"))
     assert parsed is not None
-    assert parsed.stop_reason == "timeout"
+    assert parsed.stop_reason == binradar_utils.WALL_TIME_REACHED
 
 
 def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
@@ -251,13 +253,15 @@ def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
     (run_dir / "minimized").mkdir()
     minimizer_log = run_dir / "minimizer.sbsv"
     minimizer_log.write_text(
-        "[minimizer] [stopped] [reason timeout] [time 10]\n")
+        f"[minimizer] [stopped] "
+        f"[reason {binradar_utils.WALL_TIME_REACHED}] [time 10]\n")
 
     verifier = _make_verifier(tmp_path)
     assert verifier.run_verification_streaming(str(minimizer_log)) is True
 
     verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier] [stopped] [reason timeout]" in verifier_log
+    assert (f"[verifier] [stopped] "
+            f"[reason {binradar_utils.WALL_TIME_REACHED}]") in verifier_log
     assert "[verifier-result] [res verified] [patch 1]" in verifier_log
     assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
 
@@ -681,7 +685,8 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
 
     executor.run_fuzzer()
 
-    assert any("[fuzzer] [timeout]" in row for row in progress)
+    assert any(f"[fuzzer] [{binradar_utils.WALL_TIME_REACHED}]" in row
+               for row in progress)
     assert any("[fuzzer] [done]" in row for row in progress)
     assert process not in binradar.RUNNING_PROCESSES
 
@@ -785,7 +790,8 @@ def test_concolic_solver_deadline_is_graceful(
     getattr(executor, method_name)()
 
     assert 0 < solvers[0].timeout <= executor.timeout
-    assert any(f"[{mode}] [timeout]" in row for row in progress)
+    assert any(f"[{mode}] [{binradar_utils.WALL_TIME_REACHED}]" in row
+               for row in progress)
     assert any(f"[{mode}] [done]" in row for row in progress)
 
 

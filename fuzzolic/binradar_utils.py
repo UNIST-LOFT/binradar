@@ -17,6 +17,9 @@ E9_METADATA_PREFIXES = {
     "brcached": "BRCACHED",
 }
 
+# Canonical notation for a planned, graceful wall-clock cutoff.
+WALL_TIME_REACHED = "wall-time-reached"
+
 
 def e9_metadata_keys(prefix: str) -> Tuple[str, str]:
     """Return (exclude-ranges key, relocated-calls key) for an artifact.

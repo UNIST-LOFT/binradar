@@ -18,6 +18,7 @@ assert _spec is not None
 assert _spec.loader is not None
 binradar = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar)
+import binradar_utils  # noqa: E402  (same fuzzolic module path)
 
 
 def _stub_executor(tmp_path):
@@ -32,7 +33,7 @@ def _stub_executor(tmp_path):
     executor.disable_binradar = True
     executor.feedback_mode = False
     executor.binradar_failed = False
-    executor.concrete_evidence_timed_out = False
+    executor.wall_time_reached = False
     executor.phase_failures = {}
     executor.phase_failure_lock = threading.Lock()
     return executor
@@ -69,9 +70,9 @@ def test_disabled_binradar_final_uses_concrete_result_without_trace(tmp_path):
     assert any(row.startswith("[final] [done]") for row in progress)
 
 
-def test_final_marks_graceful_verifier_timeout_as_degraded(tmp_path):
+def test_final_records_graceful_wall_time_reached_without_issues(tmp_path):
     (tmp_path / "verifier.sbsv").write_text(
-        "[verifier] [stopped] [reason timeout]\n"
+        f"[verifier] [stopped] [reason {binradar_utils.WALL_TIME_REACHED}]\n"
         "[verifier-result] [res rejected] [patch 1] [testcase crash]\n"
         "[verifier-confidence] [patch 1] [score 0.0] "
         "[accept-evidences 0] [total-evidences 1]\n"
@@ -89,9 +90,13 @@ def test_final_marks_graceful_verifier_timeout_as_degraded(tmp_path):
     assert "[final] [verifier] [patch 1] [res rejected]" in final_text
     assert "[final] [verifier] [patch 2] [res verified]" in final_text
     assert "[final] [confidence] [patch 2] [score 0.500000]" in final_text
-    assert "[final] [degraded]" in final_text
-    assert "[failed-phases minimizer-verifier]" in final_text
-    assert any("[degraded true]" in row for row in progress
+    # A reached wall-clock budget is a planned graceful cutoff: it is
+    # recorded under its own name and never reported as failed phases.
+    assert "[final] [wall-time-reached] [prefix run] [id 0]" in final_text
+    assert "[final] [failed-phases]" not in final_text
+    assert "[issues false] [failed-phases none]" in final_text
+    assert "[wall-time-reached true]" in final_text
+    assert any("[wall-time-reached true]" in row for row in progress
                if row.startswith("[final] [done]"))
 
 
