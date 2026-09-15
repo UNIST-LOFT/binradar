@@ -228,10 +228,12 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 }
 
 static const char *select_descriptor(uint32_t *patch_id,
-                                     uint32_t *iteration, int *invalid)
+                                     uint32_t *iteration, int *invalid,
+                                     int *unpublished)
 {
 	*patch_id = env_patch_id;
 	*iteration = 0;
+	*unpublished = 0;
 	if (env_patch_id != MAGIC_VALUE_PATCH)
 		return getenv("TAOSC_PRED");
 
@@ -242,6 +244,13 @@ static const char *select_descriptor(uint32_t *patch_id,
 	}
 	*patch_id = cache_selector->patch_id;
 	*iteration = cache_selector->iteration;
+	if (*iteration == 0) {
+		/* The patched call can precede the tracer entrypoint.  Iteration 0
+		 * is the publication sentinel; preserve original control flow and
+		 * leave selection uninitialized for the forkserver child. */
+		*unpublished = 1;
+		return NULL;
+	}
 	const uint32_t length = cache_selector->descriptor_length;
 	const uint32_t capacity = cache_selector->descriptor_capacity;
 	const size_t header_size = offsetof(struct brcache_patch_selector,
@@ -284,9 +293,13 @@ static int evaluate_selected(const struct STATE *state,
 const void *dest(const struct STATE *state)
 {
 	if (!selected_initialized) {
+		int unpublished = 0;
 		const char *encoded = select_descriptor(&selected_patch_id,
 		                                      &selected_iteration,
-		                                      &selected_invalid);
+		                                      &selected_invalid,
+		                                      &unpublished);
+		if (unpublished)
+			return NULL;
 		if (!selected_invalid &&
 		    (encoded == NULL ||
 		     parse_predicate(encoded, &selected_predicate) < 0))

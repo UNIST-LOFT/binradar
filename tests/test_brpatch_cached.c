@@ -117,17 +117,24 @@ int main(void)
 #else
 	const char *dynamic_descriptor = "=p0p0";
 #endif
-	selector->patch_id = 7;
-	selector->iteration = 11;
 	selector->descriptor_capacity = 16;
-	selector->descriptor_length = strlen(dynamic_descriptor);
-	strcpy(selector->descriptor, dynamic_descriptor);
 	cache_selector = selector;
 	cache_selector_size = sizeof(selector_storage);
 	env_patch_id = MAGIC_VALUE_PATCH;
 	selected_initialized = 0;
-	if (dest(&state) != (const void *)TAOSC_DEST)
+
+	/* The instrumented call can run before the tracer reaches its entrypoint
+	 * and publishes iteration 1.  Iteration 0 is an unpublished selector: it
+	 * must preserve original control flow and emit no rows or snapshots. */
+	if (dest(&state) != NULL)
 		return 10;
+
+	selector->patch_id = 7;
+	selector->iteration = 11;
+	selector->descriptor_length = strlen(dynamic_descriptor);
+	strcpy(selector->descriptor, dynamic_descriptor);
+	if (dest(&state) != (const void *)TAOSC_DEST)
+		return 11;
 
 	close(patch_fds[1]);
 	close(cache_fds[1]);
@@ -135,5 +142,5 @@ int main(void)
 	const int cache_result = forward_pipe(cache_fds[0], 1);
 	close(patch_fds[0]);
 	close(cache_fds[0]);
-	return patch_result < 0 || cache_result < 0 ? 11 : 0;
+	return patch_result < 0 || cache_result < 0 ? 12 : 0;
 }

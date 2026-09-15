@@ -157,8 +157,10 @@ if (row != NULL) {
 - Strings returned through row getters are owned by their row. Strings allocated by
   `sbsv_escape_str()` and `sbsv_unescape_str()` are caller-owned and freed with
   `sbsv_free_string()`.
-- `sbsv_tokenize_line()` allocates each token and the token array; release them with
-  `sbsv_free_token_list()`.
+- `sbsv_tokenize_line()` stores the pointer table and token bytes in one owned
+  allocation recorded by `sbsv_token_list.allocation`. Token pointers alias that
+  allocation: do not free individual tokens or `items`; release the complete list
+  only with `sbsv_free_token_list()`.
 - Custom values can store owned pointers with `sbsv_value_set_custom_ptr()`. Their
   `custom_free` callback runs from `sbsv_value_clear()` / `sbsv_row_free()` /
   `sbsv_parser_free()`.
@@ -167,8 +169,11 @@ The parser stores owned copies of schema names, field names, row values, tokeniz
 strings, and custom values. Query APIs avoid copying rows by returning row
 references. `sbsv_parser_clear_rows()` releases parsed rows while retaining
 compiled schemas, custom types, groups, and allocated row capacities for parser
-reuse. Full parsing still copies strings so data remains valid after input buffers
-are released.
+reuse. Rows borrow schema-owned field-name pointers, so implementations must clear
+rows before destroying schemas. Full parsing still copies retained row strings so
+data remains valid after input buffers are released. With
+`SBSV_PARSER_IGNORE_UNKNOWN`, an unregistered root schema is rejected before full
+tokenization.
 
 ## Thread Safety And Incremental Parsing
 

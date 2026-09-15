@@ -197,12 +197,13 @@ static int test_parser_basic(void) {
             "[node] [id 1] [value 2]\n"
             "[node] [id 2] [value 3]\n"
             "[edge] [src 1] [dst 2] [value 6]\n"
+            "2026-09-15 12:00:00 - [node] [id 3] [value 4]\n"
         ) == SBSV_OK,
         "parse basic content"
     );
 
     if (!failed) {
-        failed |= assert_true(sbsv_parser_row_count(parser) == 3, "row count should be 3");
+        failed |= assert_true(sbsv_parser_row_count(parser) == 4, "row count should include text-prefixed SBSV");
     }
 
     if (!failed) {
