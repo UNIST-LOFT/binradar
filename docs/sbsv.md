@@ -8,9 +8,27 @@ Human readable, easy to write (you can write it without any dependencies: simple
 python3 -m pip install sbsv
 ```
 
-## C library (experimental)
+## Native acceleration and C library
 
-[libsbsv](./libsbsv) is a C library for parsing SBSV files. It provides a C API for loading and querying SBSV data, and can be used in C/C++ projects.
+The Python package builds an optional CPython extension backed by
+[libsbsv](./libsbsv). `parser.loads()`, `parser.load()`, and
+`parser.parse_line_detached()` use it automatically while preserving the
+existing `SbsvData` result API. Schemas are compiled once per parser. Built-in
+fields stay entirely in C; only values declared with a Python custom type call
+its converter.
+
+```python
+sbsv.native_available()        # True when the extension was built
+parser = sbsv.parser()         # native acceleration when available
+parser = sbsv.parser(use_native=False)  # force the pure Python parser
+```
+
+A source installation attempts to compile the extension and remains usable
+without a C compiler because the extension is optional. Native `load()` reads
+the supplied text stream in one operation; use `use_native=False` when input
+must be consumed line by line.
+
+`libsbsv` also provides a standalone C API for C and C++ projects.
 
 ## Use
 You can read this log-like data:
@@ -235,9 +253,12 @@ use index
 ```
 
 
-### Primitive types
-Primitive types are `str`, `int`, `float`, `bool`, `null`.
-Schema types are checked when `add_schema()` is called. Unknown types, including unknown list subtypes, raise `ValueError`.
+### Built-in types
+Built-in types are `str`, `int`, `hex`, `float`, `bool`, and `null`. `hex`
+produces an arbitrary-precision Python integer and also works in lists:
+`[addresses: list[hex]]`. No registration or Python callback is required.
+Schema types are checked when `add_schema()` is called. Unknown types,
+including unknown list subtypes, raise `ValueError`.
 
 ### Complex types
 
@@ -266,27 +287,29 @@ parser.add_schema("[data] [token] [id: int] [actual: list[str]]")
 ```
 
 ### Custom types
-You can define your own types by providing a converter function that takes a string and returns a value (x: str -> custom_type).
+Register a converter only for types that do not have a built-in representation.
+The converter takes a string and returns the desired Python value:
 
 ```python
 parser = sbsv.parser()
+parser.add_custom_type("severity", lambda value: value.upper())
+parser.add_schema("[event] [address: hex] [level: severity]")
 
-# Define a custom type "hex" to parse hexadecimal numbers
-parser.add_custom_type("hex", lambda x: int(x, 16))
-
-# Use the custom type in schema
-parser.add_schema("[data] [id: hex] [val: hex]")
-
-result = parser.loads("""
-[data] [id ff] [val deadbeef]
-""")
-
-# result["data"][0]["id"] == 255
-# result["data"][0]["val"] == 3735928559
+result = parser.loads("[event] [address deadbeef] [level warning]\n")
+result["event"][0]["address"] == 3735928559
+result["event"][0]["level"] == "WARNING"
 ```
+
+With native acceleration, tokenization, schema matching, built-in conversion,
+and row construction remain in C. The Python converter runs only for fields
+whose declared type is `severity`; the presence of that field does not move the
+schema or the rest of the input to the Python parser. Custom values are
+collected first and converted after native parsing, so converters are not
+called twice if native parsing must retry through the compatibility path.
 
 Notes:
 - Register custom types before adding any schema. `add_custom_type()` raises `ValueError` if a schema already exists.
+- Built-in names cannot be replaced by custom converters.
 - Schemas that reference an unregistered custom type raise `ValueError`.
 - Custom types are local to each parser instance. Registering a custom type on one parser does not affect other parsers in the same process.
 
@@ -369,3 +392,9 @@ Build and update
 uv build
 uv publish
 ```
+
+Binary wheels for Linux, Windows, and macOS are built by the
+[build-wheels workflow](.github/workflows/build-wheels.yml) with
+[cibuildwheel](https://cibuildwheel.readthedocs.io/). It runs automatically
+when a GitHub release is published and then publishes every wheel and the
+sdist to PyPI.

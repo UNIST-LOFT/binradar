@@ -48,7 +48,6 @@ def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
 
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
-    line_parser.add_custom_type("hex", lambda x: int(x, 16))
     line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     def __init__(self, patch_loc: int, patch_func_entry: int, stacktrace: List[Tuple[int, str]], exit_info: str, patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int, patch_func_candidates: List[Tuple[int, int]], tracer_fault_addr: int = 0):
@@ -66,7 +65,6 @@ class BinRadarProbeResult:
     @staticmethod
     def get_parser() -> sbsv.parser:
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[patch-info] [set: bool] [location: hex]")
         parser.add_schema("[exit] [result: str]")
         parser.add_schema("[qemu-exit] [kind: str] [detail: str]")
@@ -83,7 +81,6 @@ class BinRadarProbeResult:
     @staticmethod
     def get_parser_for_file_trace() -> sbsv.parser:
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[patch-func-entry] [set] [set: bool]")
         parser.add_schema("[file-trace] [open] [path: str] [fd: int] [gid: int] [offset: int] [seekable: bool] [after_patch: bool]")
         parser.add_schema("[file-trace] [read] [syscall: int] [fd: int] [gid: int] [offset: int] [seekable: bool] [bytes: int] [after_patch: bool]")
@@ -156,7 +153,6 @@ class BinRadarProbeResult:
     @staticmethod
     def from_sbsv(sbsv_file: str) -> Optional["BinRadarProbeResult"]:
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
         parser.add_schema("[file-trace] [need-file-hook: bool]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
@@ -1157,7 +1153,6 @@ class BinRadarConcreteVerifier:
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
         parser.add_schema("[minimizer] [done] [time: int]")
         parser.add_schema(

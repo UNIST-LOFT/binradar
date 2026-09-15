@@ -447,7 +447,6 @@ def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
 
 
 _TRACER_PARSER = sbsv.parser()
-_TRACER_PARSER.add_custom_type("hex", lambda x: int(x, 16))
 _TRACER_PARSER.add_schema(
     "[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] "
     "[guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")

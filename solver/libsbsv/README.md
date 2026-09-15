@@ -124,13 +124,24 @@ if (row != NULL) {
 ## Validation Rules
 
 - Names use `[A-Za-z0-9_-]`. Field tags use `$`, for example `node$0`.
-- Custom types are parser-local and must be registered before schemas.
+- Built-in types are `str`, `int`, `hex`, `float`, `bool`, and `null`. `hex`
+  parses without a callback. Values through `LLONG_MAX` use `SBSV_VALUE_INT`,
+  values through `ULLONG_MAX` use `SBSV_VALUE_UINT`, and wider values use
+  `SBSV_VALUE_BIG_HEX`.
+- Custom types are parser-local, cannot replace built-ins, and must be
+  registered before schemas.
 - Unknown schema types and unknown list subtypes fail during schema registration.
 - `sbsv_parser_ignore_prefix()` must be called before schemas are added.
 - The first body field of a full-line schema cannot be nullable. `sbsv_body_parser`
   allows nullable first fields.
 - Strings support quoted values and balanced unquoted brackets. Escaping happens
   during value conversion, not during tokenization.
+- `sbsv_tokenize_line()` keeps best-effort unmatched-closing behavior;
+  `sbsv_tokenize_line_strict()` rejects unmatched closing brackets. Parser
+  entry points use the strict form.
+- Integer values outside the signed 64-bit range are retained as
+  `SBSV_VALUE_BIG_INT`; access their decimal representation with
+  `sbsv_row_get_big_int()`.
 
 ## Ownership And Memory
 
@@ -154,8 +165,10 @@ if (row != NULL) {
 
 The parser stores owned copies of schema names, field names, row values, tokenized
 strings, and custom values. Query APIs avoid copying rows by returning row
-references; this is the main zero-copy path. Full parsing still copies strings into
-owned rows so parsed data remains valid after input buffers are released.
+references. `sbsv_parser_clear_rows()` releases parsed rows while retaining
+compiled schemas, custom types, groups, and allocated row capacities for parser
+reuse. Full parsing still copies strings so data remains valid after input buffers
+are released.
 
 ## Thread Safety And Incremental Parsing
 

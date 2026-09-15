@@ -689,7 +689,6 @@ class BinRadarProgress:
         if not os.path.exists(file):
             return None
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[rundir] [set] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[rundir] [done] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[probe] [done] [prefix: str] [id: int]")
@@ -1251,7 +1250,6 @@ class BinRadarExecutor:
         tracer_result = binradar_utils.execute(
             tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=60.0, verbose=False)
         parser = sbsv.parser()
-        parser.add_custom_type("hex", lambda x: int(x, 16))
         parser.add_schema("[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
         tracer_fault_addr = 0
         if tracer_result.success:
@@ -1845,7 +1843,6 @@ class BinRadarExecutor:
         # fallback schema keeps feedback usable with older minimizer logs,
         # whose rows contain only the fields consumed by the verifier.
         full_parser = sbsv.parser()
-        full_parser.add_custom_type("hex", lambda x: int(x, 16))
         full_parser.add_schema(
             "[testcase] [result] [id: int] [file: str] [exit: str] "
             "[patch-loc: hex] [func-entry: hex] [patch-hit: int] "
@@ -1854,12 +1851,10 @@ class BinRadarExecutor:
             "[patch-func-candidates: list[str]] [stacktrace: list[str]] "
             "[pid: int] [br: list[int]]")
         legacy_parser = sbsv.parser()
-        legacy_parser.add_custom_type("hex", lambda x: int(x, 16))
         legacy_parser.add_schema(
             "[testcase] [result] [id: int] [file: str] [exit: str] "
             "[fault-addr: hex] [pid: int] [br: list[int]]")
         minimal_parser = sbsv.parser()
-        minimal_parser.add_custom_type("hex", lambda x: int(x, 16))
         minimal_parser.add_schema(
             "[testcase] [result] [id: int] [file: str] [exit: str] "
             "[fault-addr: hex]")
@@ -2001,7 +1996,6 @@ class BinRadarExecutor:
         binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
         with trace_file as f:
             parser = sbsv.parser()
-            parser.add_custom_type("hex", lambda x: int(x, 16))
             parser.add_schema("[binradar] [crash] [iter: int] [patch: int] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
             parser.add_schema("[binradar] [normal] [iter: int] [patch: int]")
             parser.add_schema("[binradar] [commit] [iter: int] [patch: int] [br: str]")
