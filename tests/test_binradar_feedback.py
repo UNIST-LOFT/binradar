@@ -70,7 +70,7 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
         "[fault-addr 0] [pid 0] [br [0]] [time 1]\n"
     )
 
-    # No verifier.sbsv is needed: the classification is the PATCH_ID=0
+    # No verifier.br is needed: the classification is the PATCH_ID=0
     # result already serialized by the minimizer.
     executor.run_feedback()
 

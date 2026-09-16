@@ -43,6 +43,7 @@ def test_get_env_gates_osprey_by_mode(monkeypatch, executor, mode, expected_ospr
     if mode == "binradar":
         assert env["E9_EXCLUDE_RANGES"] == instance.e9_exclude_ranges
         assert env["E9_RELOCATED_CALL_JUMPS"] == instance.e9_relocated_calls
+        assert env["BINRADAR_EVIDENCE_FILE"] == str(run_dir / "binradar.br")
     else:
         assert env["E9_EXCLUDE_RANGES"] == ""
         assert env["E9_RELOCATED_CALL_JUMPS"] == ""

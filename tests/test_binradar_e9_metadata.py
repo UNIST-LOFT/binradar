@@ -788,6 +788,7 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     executor.e9_exclude_ranges, executor.e9_relocated_calls = \
         binradar_utils.get_e9_metadata(executor.config, e9_metadata_prefix)
     executor.total_patches = 2
+    executor.brpatched_total_patches = 2
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = False

@@ -22,6 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
+import binradar_evidence
 import binradar_fuzzer
 import binradar_minimizer
 import binradar_utils
@@ -95,6 +96,10 @@ def _make_verifier(tmp_path):
     return binradar_verifier.BinRadarConcreteVerifier(
         str(tmp_path), str(tmp_path / "run"), runner, _probe(),
         "nm.brpatched", [1])
+
+
+def _verifier_result(run_dir: Path):
+    return binradar_evidence.read_verifier(run_dir / "verifier.br")
 
 
 def test_default_min_file_age_is_10s(tmp_path):
@@ -236,15 +241,32 @@ def test_standalone_verifier_timeout_finalizes_partial_evidence(tmp_path):
     assert verifier.run_verification_streaming(
         str(minimizer_log), timeout=0.01) is True
 
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert (f"[verifier] [stopped] "
-            f"[reason {binradar_utils.WALL_TIME_REACHED}]") in verifier_log
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
-    assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
-    parsed = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(
-        str(run_dir / "verifier.sbsv"))
+    evidence = _verifier_result(run_dir)
+    assert evidence.stop_reason == binradar_utils.WALL_TIME_REACHED
+    assert evidence.patches[1].verified
+    assert evidence.patches[1].accept_evidences == 0
+    assert evidence.patches[1].total_evidences == 0
+    parsed = binradar_verifier.BinRadarConcreteVerifierResult.from_file(
+        str(run_dir / "verifier.br"))
     assert parsed is not None
     assert parsed.stop_reason == binradar_utils.WALL_TIME_REACHED
+
+
+def test_late_shared_cutoff_replaces_completed_verifier_evidence(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "minimized").mkdir()
+    minimizer_log = run_dir / "minimizer.sbsv"
+    minimizer_log.write_text("[minimizer] [done] [time 0]\n")
+
+    verifier = _make_verifier(tmp_path)
+    assert verifier.run_verification_streaming(str(minimizer_log)) is False
+    assert _verifier_result(run_dir).stop_reason is None
+
+    verifier.mark_wall_time_reached()
+
+    assert (_verifier_result(run_dir).stop_reason
+            == binradar_utils.WALL_TIME_REACHED)
 
 
 def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
@@ -259,11 +281,11 @@ def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
     verifier = _make_verifier(tmp_path)
     assert verifier.run_verification_streaming(str(minimizer_log)) is True
 
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert (f"[verifier] [stopped] "
-            f"[reason {binradar_utils.WALL_TIME_REACHED}]") in verifier_log
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
-    assert "[accept-evidences 0] [total-evidences 0]" in verifier_log
+    evidence = _verifier_result(run_dir)
+    assert evidence.stop_reason == binradar_utils.WALL_TIME_REACHED
+    assert evidence.patches[1].verified
+    assert evidence.patches[1].accept_evidences == 0
+    assert evidence.patches[1].total_evidences == 0
 
 
 def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path):
@@ -297,11 +319,11 @@ def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path):
     assert verifier.run_verification_streaming(
         str(minimizer_log), timeout=0.01) is True
 
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res rejected] [patch 1]" in verifier_log
-    assert "[accept-evidences 0] [total-evidences 1]" in verifier_log
-    assert "[verifier-result] [res verified] [patch 2]" in verifier_log
-    assert "[verifier-result] [res verified] [patch 1]" not in verifier_log
+    evidence = _verifier_result(run_dir)
+    assert not evidence.patches[1].verified
+    assert evidence.patches[1].accept_evidences == 0
+    assert evidence.patches[1].total_evidences == 1
+    assert evidence.patches[2].verified
 
 
 def test_dedup_across_dirs(tmp_path, stub_runner_env):
@@ -423,8 +445,7 @@ def test_streaming_minimizer_and_verifier(tmp_path, stub_runner_env):
     assert "[minimizer] [done]" in (run_dir / "minimizer.sbsv").read_text()
     # The verifier consumed the streamed rows and verified patch 1.
     assert len(verifier.testcases) == 5
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
+    assert _verifier_result(run_dir).patches[1].verified
 
 
 def test_streaming_verifier_rejects_patch_while_producer_is_running(
@@ -480,9 +501,7 @@ def test_streaming_verifier_rejects_patch_while_producer_is_running(
         poll_interval=0.01, producer_threads=[producer_thread])
     producer_thread.join()
 
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res rejected] [patch 1]" in verifier_log
-    assert "[verifier-result] [res verified] [patch 1]" not in verifier_log
+    assert not _verifier_result(run_dir).patches[1].verified
 
 
 def test_queued_producer_failure_aborts(tmp_path, stub_runner_env):
@@ -520,8 +539,7 @@ def test_producer_timeout_exception_remains_fatal(tmp_path, stub_runner_env):
             poll_interval=0.01, producer_threads=[],
             producer_exc_queue=exc_queue, timeout=1.0)
 
-    verifier_log = (run_dir / "verifier.sbsv").read_text()
-    assert "[verifier-result]" not in verifier_log
+    assert not (run_dir / "verifier.br").exists()
 
 
 def test_producer_thread_failure_propagates(tmp_path, stub_runner_env):
@@ -598,6 +616,7 @@ def _stub_executor(tmp_path):
     executor.e9_exclude_ranges = ""
     executor.e9_relocated_calls = ""
     executor.total_patches = 1
+    executor.brpatched_total_patches = 1
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = True
@@ -911,6 +930,5 @@ def test_run_multithreaded_starts_minimizer_while_producers_run(
     assert len(os.listdir(Path(executor.run_dir) / "minimized")) == 10
     assert "[minimizer] [done]" in \
         (Path(executor.run_dir) / "minimizer.sbsv").read_text()
-    verifier_log = (Path(executor.run_dir) / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
+    assert _verifier_result(Path(executor.run_dir)).patches[1].verified
     assert "final" in events and "done" in events

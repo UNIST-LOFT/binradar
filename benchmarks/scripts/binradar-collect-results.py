@@ -11,8 +11,8 @@ Usage:
 
 Subcommands:
     binradar (default)
-        Collect results from <workdir>/out (progress.sbsv, verifier.sbsv,
-        final.sbsv).
+        Collect results from <workdir>/out (progress.sbsv, verifier.br,
+        final.sbsv; legacy verifier.sbsv is accepted).
         For each experiment listed in exp.list, it:
           1. Checks if the workdir exists and has output
           2. Parses progress.sbsv to determine if the run completed successfully
@@ -51,9 +51,8 @@ Subcommands:
     binradar-stats
         Collect per-patch verifier evidence-class statistics for the top
         --top patches ranked by confidence (from final.sbsv). Counts the
-        [verifier] [...] observation rows that
-        BinRadarConcreteVerifier._test_result emits per (patch, testcase)
-        in <run>/verifier.sbsv: pc (patch-crashed), csda
+        aggregate observation counters in <run>/verifier.br (or legacy
+        [verifier] [...] rows in verifier.sbsv): pc (patch-crashed), csda
         (crash-skip-diff-addr), cf (crash-fail), cp (crash-pass), ct
         (crash-timeout), ncsda (no-crash-skip-diff-addr), ncf
         (no-crash-fail), ncpsb (no-crash-pass-same-br), nccdb
@@ -83,7 +82,15 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "fuzzolic"))
 
+import binradar_evidence
 import binradar_utils
+
+
+def _result_artifact(run_dir: str, stem: str) -> str:
+    compact = os.path.join(run_dir, f"{stem}.br")
+    if os.path.isfile(compact):
+        return compact
+    return os.path.join(run_dir, f"{stem}.sbsv")
 
 
 def display_path(exp_file_dir: str, path: str) -> str:
@@ -284,8 +291,8 @@ class TaoscResult:
 
 # Observation classes of BinRadarConcreteVerifier._test_result
 # (fuzzolic/binradar_verifier.py), mapped to the short keys used by the
-# binradar-stats output. Each verifier.sbsv row name maps to exactly one
-# class; note that a naive substring match is unsafe (e.g. "crash-fail" is
+# binradar-stats output. Each compact counter or legacy verifier.sbsv row
+# name maps to exactly one class; note that a naive substring match is unsafe (e.g. "crash-fail" is
 # a substring of "no-crash-fail"), so the row action is matched exactly.
 VERIFIER_RESULT_ROW_KEYS = {
     "patch-crashed": "pc",
@@ -452,10 +459,16 @@ def find_errors_in_tracer_msg(log_path: str) -> List[str]:
 
 
 def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
-    """Parse verifier-result rows with the schema-driven SBSV parser."""
+    """Parse compact verifier results or legacy verifier-result rows."""
     results: Dict[int, List[str]] = {}
     if not os.path.isfile(sbsv_path):
         return results
+    if sbsv_path.endswith(".br"):
+        evidence = binradar_evidence.read_verifier(sbsv_path)
+        return {
+            patch: ["verified" if result.verified else "rejected"]
+            for patch, result in evidence.patches.items()
+        }
 
     with open(sbsv_path, "r") as f:
         for line in f:
@@ -478,9 +491,10 @@ _VERIFIER_PATCH_RE = re.compile(r"\[patch (\d+)\]")
 
 
 def parse_verifier_test_result_stats(sbsv_path: str) -> Dict[int, Dict[str, int]]:
-    """Count _test_result observation rows per patch from verifier.sbsv.
+    """Load aggregate observation counts from compact or legacy evidence.
 
-    Every counted row is a ``[verifier] [<action>] [patch N] ...`` log row
+    Compact ``verifier.br`` records carry the counters directly. For legacy
+    SBSV, every counted row is a ``[verifier] [<action>] [patch N] ...`` log row
     emitted by BinRadarConcreteVerifier._test_result, one per
     (patch, testcase) observation. The rows carry a logging timestamp
     prefix, which _strip_log_prefix removes; the action and patch id are
@@ -497,6 +511,16 @@ def parse_verifier_test_result_stats(sbsv_path: str) -> Dict[int, Dict[str, int]
     """
     counts: Dict[int, Dict[str, int]] = {}
     if not os.path.isfile(sbsv_path):
+        return counts
+    if sbsv_path.endswith(".br"):
+        evidence = binradar_evidence.read_verifier(sbsv_path)
+        for patch, result in evidence.patches.items():
+            entry = dict.fromkeys(STATS_KEYS, 0)
+            for name, count in result.observations.items():
+                key = VERIFIER_RESULT_ROW_KEYS.get(name)
+                if key is not None:
+                    entry[key] = count
+            counts[patch] = entry
         return counts
     with open(sbsv_path, "r") as f:
         for line in f:
@@ -519,10 +543,12 @@ def parse_verifier_test_result_stats(sbsv_path: str) -> Dict[int, Dict[str, int]
 
 
 def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
-    """Parse [patch] rows with the schema-driven SBSV parser."""
+    """Parse a compact filter bitmap or legacy [patch] rows."""
     results: Dict[int, bool] = {}
     if not os.path.isfile(sbsv_path):
         return results
+    if sbsv_path.endswith(".br"):
+        return binradar_evidence.read_filter(sbsv_path).decisions
 
     with open(sbsv_path, "r") as f:
         for line in f:
@@ -939,10 +965,9 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             status = "UNKNOWN"
             overall_ok = False
 
-        # Filter result: per-patch rows from filter.sbsv, with the survived
-        # list from the [filter] [done] progress entry as fallback (e.g. when
-        # a resumed run loaded filter.sbsv without logging [filter] [done]).
-        filter_path = os.path.join(run_dir, "filter.sbsv")
+        # Filter result: compact bitmap or legacy per-patch rows, with the
+        # [filter] [done] progress survivor list as fallback for older runs.
+        filter_path = _result_artifact(run_dir, "filter")
         filter_results = parse_filter_sbsv(filter_path)
         filter_survived = ""
         filter_rejected = ""
@@ -983,7 +1008,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             run_res.at_least_one_remaining_patches = bool(
                 _parse_patch_list(run_res.remaining_patches))
 
-            verifier_path = os.path.join(run_dir, "verifier.sbsv")
+            verifier_path = _result_artifact(run_dir, "verifier")
             verifier_results = parse_verifier_sbsv(verifier_path)
             if verifier_results:
                 run_res.verifier_data = verifier_results
@@ -1071,7 +1096,7 @@ def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
     Reads <workdir>/<fuzzer>/, the output layout of
     fuzzolic/binradar-evaluation.py:
       final.sbsv        final remaining patches + per-patch verdicts
-      verified.sbsv     concrete verifier result
+      verified.br       compact concrete-verifier result
       evaluation.log    evaluation log (minimizer/verifier counts, errors)
     """
     workdir = os.path.join(exp_dir, workdir_name)
@@ -1295,9 +1320,9 @@ def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
         _, _, confidence_data = parse_final_sbsv(
             os.path.join(run_dir, "final.sbsv"))
         filter_results = parse_filter_sbsv(
-            os.path.join(run_dir, "filter.sbsv"))
+            _result_artifact(run_dir, "filter"))
         stats = parse_verifier_test_result_stats(
-            os.path.join(run_dir, "verifier.sbsv"))
+            _result_artifact(run_dir, "verifier"))
 
         if confidence_data:
             top, total = top_patches_by_confidence(confidence_data,

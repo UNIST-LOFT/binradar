@@ -13,6 +13,28 @@ collector = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(collector)
 
 
+def test_parse_compact_filter_and_verifier_artifacts(tmp_path):
+    filter_path = tmp_path / "filter.br"
+    collector.binradar_evidence.write_filter(filter_path, 3, [1, 3])
+    assert collector.parse_filter_sbsv(str(filter_path)) == {
+        1: True, 2: False, 3: True,
+    }
+
+    verifier_path = tmp_path / "verifier.br"
+    collector.binradar_evidence.write_verifier(
+        verifier_path,
+        [collector.binradar_evidence.VerifierPatchResult(
+            patch=1, verified=False, accept_evidences=1,
+            total_evidences=2,
+            observations={"crash-fail": 1, "crash-pass": 1})])
+    assert collector.parse_verifier_sbsv(str(verifier_path)) == {
+        1: ["rejected"],
+    }
+    stats = collector.parse_verifier_test_result_stats(str(verifier_path))
+    assert stats[1]["cf"] == 1
+    assert stats[1]["cp"] == 1
+
+
 def test_parse_prefilter_new_id_rows(tmp_path):
     path = tmp_path / "prefilter.sbsv"
     path.write_text(

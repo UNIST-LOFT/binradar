@@ -35,6 +35,13 @@ def _patch_result():
     return binradar_verifier.BinRadarPatchResult(0, [0])
 
 
+def _verifier_result(run_dir: Path):
+    result = binradar_verifier.BinRadarConcreteVerifierResult.from_file(
+        str(run_dir / "verifier.br"))
+    assert result is not None
+    return result
+
+
 class StubQemuRunner:
     """Stands in for BinRadarQemuRunner inside probe/filter/minimizer/verifier."""
 
@@ -115,6 +122,7 @@ def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
     executor.e9_exclude_ranges = ""
     executor.e9_relocated_calls = ""
     executor.total_patches = 2
+    executor.brpatched_total_patches = 2
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = False
@@ -168,9 +176,9 @@ def test_run_single_phase_minimizer_verifier(tmp_path, stub_runner_env):
     assert "[minimizer] [done]" in minimizer_log
     assert "[testcase] [result]" in minimizer_log
     # The verifier streamed the rows concurrently and verified both patches.
-    verifier_log = (rundir / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
-    assert "[verifier-result] [res verified] [patch 2]" in verifier_log
+    verifier_result = _verifier_result(rundir)
+    assert verifier_result.patch_verified[1]
+    assert verifier_result.patch_verified[2]
     # The minimizer's patch-0 runs and the verifier's per-candidate runs
     # all went through the patched binary.
     patch_ids = {patch_id for patch_id, _ in StubQemuRunner.calls}
@@ -193,14 +201,14 @@ def test_run_single_phase_minimizer_then_verifier_replay(
 
     minimizer_log = (rundir / "minimizer.sbsv").read_text()
     assert "[minimizer] [done]" in minimizer_log
-    assert not (rundir / "verifier.sbsv").exists()
+    assert not (rundir / "verifier.br").exists()
 
     second = _build_executor(workdir)
     second.run_single_phase("run", "0", binradar.BinRadarPhase.VERIFIER)
 
-    verifier_log = (rundir / "verifier.sbsv").read_text()
-    assert "[verifier-result] [res verified] [patch 1]" in verifier_log
-    assert "[verifier-result] [res verified] [patch 2]" in verifier_log
+    verifier_result = _verifier_result(rundir)
+    assert verifier_result.patch_verified[1]
+    assert verifier_result.patch_verified[2]
     progress = (workdir / "out" / "progress.sbsv").read_text()
     assert "[verifier] [done] [prefix run] [id 0]" in progress
 
@@ -209,23 +217,23 @@ def test_run_single_phase_minimizer_verifier_on_prior_full_run(
         tmp_path, stub_runner_env):
     """Re-running minimizer-verifier on a run directory that already holds a
     completed minimizer/verifier state starts fresh: minimizer.sbsv and
-    verifier.sbsv are truncated and re-produced from the producer testcases."""
+    verifier.br are replaced from the producer testcases."""
     workdir, rundir = _make_workdir(tmp_path)
     executor = _build_executor(workdir)
     executor.run_single_phase(
         "run", "0", binradar.BinRadarPhase.MINIMIZER_VERIFIER)
 
-    stale_verifier_text = (rundir / "verifier.sbsv").read_text()
-    assert stale_verifier_text  # first combined run produced verdict rows
+    stale_verifier = (rundir / "verifier.br").read_bytes()
+    assert stale_verifier  # first combined run produced compact verdicts
 
     # Mark the stale artifacts and re-run on the same run id: the minimizer
     # must truncate minimizer.sbsv and regenerate everything.
     (rundir / "minimizer.sbsv").write_text("[stale] [row]\n")
+    (rundir / "verifier.br").write_bytes(b"stale")
     rerun = _build_executor(workdir)
     rerun.run_single_phase(
         "run", "0", binradar.BinRadarPhase.MINIMIZER_VERIFIER)
 
     assert "[stale] [row]" not in (rundir / "minimizer.sbsv").read_text()
     assert "[minimizer] [done]" in (rundir / "minimizer.sbsv").read_text()
-    assert "[verifier-result] [res verified] [patch 1]" in \
-        (rundir / "verifier.sbsv").read_text()
+    assert _verifier_result(rundir).patch_verified[1]

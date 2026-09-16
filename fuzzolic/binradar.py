@@ -14,15 +14,15 @@ import queue
 import sys
 import select
 import struct
-import io
 import time
 import enum
 import fcntl
 import hashlib
 from pathlib import Path
 from types import TracebackType
-from typing import Callable, Dict, List, Tuple, Set, Optional, TextIO, BinaryIO
+from typing import Callable, Dict, List, Tuple, Set, Optional, BinaryIO
 
+import binradar_evidence
 import binradar_verifier
 import binradar_fuzzer
 import binradar_minimizer
@@ -773,6 +773,10 @@ class BinRadarExecutor:
     e9_exclude_ranges: str
     e9_relocated_calls: str
     total_patches: int
+    # Candidate ids compiled into the .brpatched predicate table. With
+    # --target-patches all and a cached artifact covering the full prefilter
+    # survivor list, total_patches exceeds this cap.
+    brpatched_total_patches: int
     fuzzy: bool
     reverse_directed: bool
     disable_binradar: bool
@@ -796,7 +800,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT, brpatched_total_patches: Optional[int] = None):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -804,6 +808,9 @@ class BinRadarExecutor:
         self.binary = binary
         self.poc_input = poc_input
         self.total_patches = total_patches
+        self.brpatched_total_patches = (
+            total_patches if brpatched_total_patches is None
+            else brpatched_total_patches)
         self.fuzzy = fuzzy
         self.reverse_directed = reverse_directed
         self.disable_binradar = disable_binradar
@@ -876,7 +883,9 @@ class BinRadarExecutor:
             disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1",
             less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
             feedback_mode=env.get("BINRADAR_FEEDBACK_MODE", "0") == "1",
-            forkserver_child_timeout=forkserver_child_timeout)
+            forkserver_child_timeout=forkserver_child_timeout,
+            brpatched_total_patches=int(env.get(
+                "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])))
         # Retain every artifact's prefixed E9 metadata so extract_config
         # passes all of it to BinRadarQemuRunner.from_env, which selects
         # by the executed binary path.
@@ -1047,59 +1056,49 @@ class BinRadarExecutor:
     def cached_binary(self) -> str:
         return os.path.join(self.workdir, f"{self.binary}.brcached")
 
+    def cached_needed(self) -> bool:
+        """True when at least one surviving candidate is not compiled into
+        .brpatched, so only .brcached can execute it."""
+        return any(patch > self.brpatched_total_patches
+                   for patch in self.filter_result)
+
+    def _cached_predicate_set(self, patches: List[int]):
+        """Validate .brcached coverage for ``patches`` via the shared check."""
+        try:
+            stack_size = int(self.config.get("BRCACHE_STACK_SIZE", "0"), 0)
+        except ValueError:
+            stack_size = 0
+        return binradar_verifier.load_cached_predicate_set(
+            Path(self.workdir) / "brpatches.json",
+            Path(self.workdir) / f"{self.binary}.brcached",
+            self.config.get("BINRADAR_PATCH_KIND", ""), stack_size, patches)
+
     def verifier_binary(self) -> str:
         """Binary the concrete verifier runs candidates on.
 
         With more than one surviving patch, the verifier executes one
         representative per distinct branch vector on the cached capture
         artifact (<binary>.brcached) and reuses the result for equivalent
-        predicates; individual fallback runs still use .brpatched.  Without
-        the cached artifact (or with a single patch) the verifier runs
-        .brpatched directly.
+        predicates.  A survivor past the compiled .brpatched cap also forces
+        the cached artifact, because .brpatched has no predicate for it.
+        Without the cached artifact the verifier runs .brpatched directly.
         """
-        if len(self.filter_result) > 1 and os.path.exists(self.cached_binary()):
+        if (len(self.filter_result) > 1 or self.cached_needed()) \
+                and os.path.exists(self.cached_binary()):
             return self.cached_binary()
         return self.patched_binary()
 
     def binradar_binary(self) -> str:
         """Select the tracer artifact only after validating its cache inputs."""
-        if len(self.filter_result) <= 1 or not os.path.exists(
-                self.cached_binary()):
+        if not os.path.exists(self.cached_binary()):
             return self.patched_binary()
-        manifest = Path(self.workdir) / "brpatches.json"
-        if not manifest.exists():
+        if len(self.filter_result) <= 1 and not self.cached_needed():
+            return self.patched_binary()
+        coverage = self._cached_predicate_set(self.filter_result)
+        if coverage.predicates is None:
             logger.warning(
-                "[BINRADAR] Cached tracer disabled: brpatches.json missing")
+                f"[BINRADAR] Cached tracer disabled: {coverage.reason}")
             return self.patched_binary()
-        try:
-            family, predicates = binradar_verifier.load_runtime_predicates(
-                manifest)
-        except ValueError as e:
-            logger.warning(f"[BINRADAR] Cached tracer disabled: {e}")
-            return self.patched_binary()
-        configured_kind = self.config.get("BINRADAR_PATCH_KIND", "")
-        if configured_kind and configured_kind != family.value:
-            logger.warning(
-                f"[BINRADAR] Cached tracer disabled: manifest family "
-                f"{family.value} != configured family {configured_kind}")
-            return self.patched_binary()
-        missing = [patch for patch in self.filter_result
-                   if patch not in predicates]
-        if missing:
-            logger.warning(
-                f"[BINRADAR] Cached tracer disabled: missing runtime patch "
-                f"ids {missing}")
-            return self.patched_binary()
-        if family == binradar_verifier.PredicateFamily.CWE805_ERM:
-            try:
-                stack_size = int(self.config.get("BRCACHE_STACK_SIZE", "0"), 0)
-            except ValueError:
-                stack_size = 0
-            if stack_size <= 0:
-                logger.warning(
-                    "[BINRADAR] Cached tracer disabled: invalid CWE-805 "
-                    "cache stack size")
-                return self.patched_binary()
         return self.cached_binary()
 
     def resolved_poc_input(self) -> str:
@@ -1197,9 +1196,14 @@ class BinRadarExecutor:
                 env["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
                 env["PATCH_ID"] = "123456"
                 env["BINRADAR_PATCH_CNT"] = str(len(self.filter_result))
-                filter_file = os.path.join(run_dir, "filter.sbsv")
+                env["BINRADAR_EVIDENCE_FILE"] = os.path.join(
+                    run_dir, "binradar.br")
+                filter_file = os.path.join(run_dir, "filter.br")
+                legacy_filter_file = os.path.join(run_dir, "filter.sbsv")
                 if os.path.exists(filter_file):
                     env["BINRADAR_PATCH_FILTER_FILE"] = filter_file
+                elif os.path.exists(legacy_filter_file):
+                    env["BINRADAR_PATCH_FILTER_FILE"] = legacy_filter_file
         return env
     
     def run_probe(self):
@@ -1275,6 +1279,14 @@ class BinRadarExecutor:
             f.write(f"[file-trace] {file_trace_result.serialize_file_trace_result()}\n")
     
     def load_filter_result(self, filter_result_file: str) -> List[int]:
+        """Load compact filter evidence, with read-only legacy SBSV support."""
+        if filter_result_file.endswith(".br"):
+            result = binradar_evidence.read_filter(filter_result_file)
+            if result.total != self.total_patches:
+                raise ValueError(
+                    f"filter candidate count {result.total} does not match "
+                    f"configured TOTAL_PATCHES {self.total_patches}")
+            return result.passed
         survived_patches: List[int] = list()
         with open(filter_result_file, encoding="utf-8") as f:
             parser = sbsv.parser()
@@ -1285,178 +1297,194 @@ class BinRadarExecutor:
                 survived_patches.append(row["id"])
         return survived_patches
 
-    def _load_cached_predicates(self, runner) -> Optional[Dict[int, binradar_verifier.ParsedPredicate]]:
+    def _load_cached_predicates(self) -> Optional[Dict[int, binradar_verifier.ParsedPredicate]]:
         """Load the runtime predicate manifest for cached filter execution.
 
-        Returns None when the cache is unavailable (single patch, missing
-        manifest or .brcached, family mismatch, or missing CWE-805 stack
-        size), so the filter falls back to individual executions.
+        Returns None when the cache is unavailable (single candidate with no
+        uncompiled survivor, missing manifest or .brcached, family mismatch,
+        or missing CWE-805 stack size), so the filter falls back to
+        individual execution.
         """
-        if self.total_patches <= 1:
+        if self.total_patches <= 1 and not self.cached_needed():
             return None
-        manifest = os.path.join(self.workdir, "brpatches.json")
-        if not os.path.exists(manifest) \
-                or not os.path.exists(runner.cached_binary()):
-            return None
-        try:
-            family, predicates = binradar_verifier.load_runtime_predicates(
-                Path(manifest))
-        except ValueError as e:
-            logger.warning(f"[FILTER] Predicate cache disabled: {e}")
-            return None
-        if runner.patch_kind and runner.patch_kind != family.value:
+        coverage = self._cached_predicate_set(
+            list(range(1, self.total_patches + 1)))
+        if coverage.predicates is None:
             logger.warning(
-                f"[FILTER] Predicate cache disabled: manifest family "
-                f"{family.value} != configured family {runner.patch_kind}")
+                f"[FILTER] Predicate cache disabled: {coverage.reason}")
             return None
-        missing = [patch for patch in range(1, self.total_patches + 1)
-                   if patch not in predicates]
-        if missing:
-            logger.warning(
-                f"[FILTER] Predicate cache disabled: missing runtime "
-                f"patch ids {missing}")
-            return None
-        if family == binradar_verifier.PredicateFamily.CWE805_ERM \
-                and runner.brcache_stack_size <= 0:
-            logger.warning(
-                "[FILTER] Predicate cache disabled: missing CWE-805 "
-                "cache stack size")
-            return None
-        return predicates
+        return coverage.predicates
 
-    def _filter_decision(self, patch_id: int, result,
-                         patch_result: Optional[binradar_verifier.BinRadarPatchResult],
-                         f: TextIO) -> bool:
-        """Evaluate one filter observation and write its [patch] row."""
+    def _require_cached_coverage(self, survived_patches: List[int]) -> None:
+        """Fail closed when a survivor has no artifact that can execute it.
+
+        Every candidate past the .brpatched compile cap must have a live
+        .brcached coverage set.  Otherwise the concrete verifier would either
+        run those ids on an artifact that cannot express them or record no
+        evidence at all, and the run would silently lose candidates.
+        """
+        uncompiled = [patch for patch in survived_patches
+                      if patch > self.brpatched_total_patches]
+        if not uncompiled:
+            return
+        coverage = self._cached_predicate_set(survived_patches)
+        if coverage.predicates is None:
+            raise RuntimeError(
+                f"{len(uncompiled)} surviving candidate(s) "
+                f"(e.g. {uncompiled[:8]}) are not compiled into .brpatched "
+                f"and the cached artifact cannot execute them either: "
+                f"{coverage.reason}")
+
+    def _filter_decision(
+            self, patch_id: int, result,
+            patch_result: Optional[
+                binradar_verifier.BinRadarPatchResult]) -> bool:
+        """Evaluate one filter observation."""
         assert self.probe_result is not None
         if result is None:
             logger.warning(
                 f"[FILTER] [patch {patch_id}] Failed to run patched binary "
                 f"with the poc input. Keeping the patch.")
-            passed = True
-        elif patch_result is not None and patch_result.crashed():
-            passed = False
+            return True
+        if patch_result is not None and patch_result.crashed():
             logger.info(
                 f"[FILTER] [patch {patch_id}] Patch itself crashed "
                 f"(division/modulo by zero). Filtered out.")
-        elif result.is_crash() and result.fault_addr == self.probe_result.fault_addr:
-            passed = False
+            return False
+        if result.is_crash() \
+                and result.fault_addr == self.probe_result.fault_addr:
             logger.info(
                 f"[FILTER] [patch {patch_id}] Still crashes at the original "
                 f"fault address {result.fault_addr:#x}. Filtered out.")
-        else:
-            # Surviving patches are not logged individually: with many
-            # candidates this floods the log; the [patch] rows in filter.sbsv
-            # and the [FILTER] [survived ...] summary cover them.
-            passed = True
-        f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
-        return passed
+            return False
+        return True
 
     def _filter_patch(self, patch_id: int, runner,
-                      testcase: str, f: TextIO) -> bool:
-        """Run one candidate individually on .brpatched and evaluate it."""
+                      testcase: str) -> bool:
+        """Run one candidate individually on .brpatched and evaluate it.
+
+        A candidate that was never compiled into .brpatched has no predicate
+        table entry there, so it would evaluate as the false predicate and be
+        dropped for a reason unrelated to its semantics. Those candidates are
+        kept instead, mirroring the unusable-execution rule above.
+        """
+        if patch_id > self.brpatched_total_patches:
+            logger.warning(
+                f"[FILTER] [patch {patch_id}] Cached run unusable and the id "
+                f"is not compiled into .brpatched; keeping the patch.")
+            return True
         result, patch_result = runner.test_with_patched(
             str(patch_id), testcase)
-        return self._filter_decision(patch_id, result, patch_result, f)
+        return self._filter_decision(patch_id, result, patch_result)
 
     def run_filter(self) -> List[int]:
         self.check_requirements()
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run filter.")
             raise RuntimeError("Probe result not found.")
-        filter_result_file = os.path.join(self.run_dir, "filter.sbsv")
-        if os.path.exists(filter_result_file):
+        filter_result_file = os.path.join(self.run_dir, "filter.br")
+        legacy_filter_file = os.path.join(self.run_dir, "filter.sbsv")
+        reusable_filter = (filter_result_file
+                           if os.path.exists(filter_result_file)
+                           else legacy_filter_file)
+        if os.path.exists(reusable_filter):
             try:
-                survived_patches = self.load_filter_result(filter_result_file)
+                survived_patches = self.load_filter_result(reusable_filter)
             except Exception:
-                logger.warning("[FILTER] Failed to load the existing filter result. Re-running the filter phase.")
+                logger.warning(
+                    "[FILTER] Failed to load the existing filter result. "
+                    "Re-running the filter phase.")
             else:
-                logger.info(f"[FILTER] Loaded existing filter result: {survived_patches}")
+                logger.info(
+                    f"[FILTER] Loaded existing filter result: "
+                    f"{len(survived_patches)} survivor(s)")
                 self.filter_result = survived_patches
+                self._require_cached_coverage(survived_patches)
                 return survived_patches
-        exec_mode = "filter"
-        self.save_progress(f"[filter] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self.save_progress(
+            f"[filter] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         config = self.extract_config()
-        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
+        runner = binradar_verifier.BinRadarQemuRunner.from_env(
+            self.workdir, config)
         testcase = self.resolved_poc_input()
         survived_patches: List[int] = list()
-        with open(filter_result_file, "w", encoding="utf-8") as f:
-            cached_predicates = self._load_cached_predicates(runner)
-            if cached_predicates is None:
-                for patch_id in range(1, self.total_patches + 1):
-                    if self._filter_patch(patch_id, runner, testcase, f):
-                        survived_patches.append(patch_id)
-            else:
-                # Cached execution: run one representative per distinct
-                # complete branch vector on .brcached and reuse its process
-                # result for every predicate with the same vector.
-                remaining = list(range(1, self.total_patches + 1))
-                while remaining:
-                    representative = remaining.pop(0)
-                    logger.info(
-                        f"[FILTER] [cache-run] [patch {representative}]")
-                    result, cached = runner.test_with_cached(
-                        representative, cached_predicates[representative],
-                        testcase)
-                    if result is None or cached is None:
-                        logger.warning(
-                            f"[FILTER] [patch {representative}] Cached run "
-                            f"failed; falling back to individual execution.")
-                        if self._filter_patch(
-                                representative, runner, testcase, f):
-                            survived_patches.append(representative)
-                        continue
-                    observed = cached.br_selection
+        cached_predicates = self._load_cached_predicates()
+        if cached_predicates is None:
+            for patch_id in range(1, self.total_patches + 1):
+                if self._filter_patch(patch_id, runner, testcase):
+                    survived_patches.append(patch_id)
+        else:
+            # Cached execution: run one representative per distinct complete
+            # branch vector and persist only the final survivor bitmap.
+            remaining = list(range(1, self.total_patches + 1))
+            while remaining:
+                representative = remaining.pop(0)
+                logger.info(
+                    f"[FILTER] [cache-run] [patch {representative}]")
+                result, cached = runner.test_with_cached(
+                    representative, cached_predicates[representative],
+                    testcase)
+                if result is None or cached is None:
+                    logger.warning(
+                        f"[FILTER] [patch {representative}] Cached run "
+                        f"failed; falling back to individual execution.")
+                    if self._filter_patch(
+                            representative, runner, testcase):
+                        survived_patches.append(representative)
+                    continue
+                observed = cached.br_selection
+                try:
+                    evaluated = binradar_verifier.evaluate_cached_predicate(
+                        cached_predicates[representative], cached.snapshots)
+                except (IndexError, ValueError) as e:
+                    logger.warning(
+                        f"[FILTER] [patch {representative}] Predicate "
+                        f"evaluation failed ({e}); falling back to "
+                        f"individual execution.")
+                    evaluated = None
+                if evaluated is None or evaluated != observed:
+                    logger.warning(
+                        f"[FILTER] [patch {representative}] Cached branch "
+                        f"vector mismatch; falling back to individual "
+                        f"execution.")
+                    if self._filter_patch(
+                            representative, runner, testcase):
+                        survived_patches.append(representative)
+                    continue
+                equivalent = [representative]
+                for patch in remaining:
                     try:
-                        evaluated = binradar_verifier.evaluate_cached_predicate(
-                            cached_predicates[representative],
-                            cached.snapshots)
-                    except (IndexError, ValueError) as e:
-                        logger.warning(
-                            f"[FILTER] [patch {representative}] Predicate "
-                            f"evaluation failed ({e}); falling back to "
-                            f"individual execution.")
-                        evaluated = None
-                    if evaluated is None or evaluated != observed:
-                        logger.warning(
-                            f"[FILTER] [patch {representative}] Cached "
-                            f"branch vector mismatch; falling back to "
-                            f"individual execution.")
-                        if self._filter_patch(
-                                representative, runner, testcase, f):
-                            survived_patches.append(representative)
-                        continue
-                    # Reuse the representative's result for every predicate
-                    # with the same complete branch vector.
-                    equivalent = [representative]
-                    for patch in remaining:
-                        try:
-                            branches = binradar_verifier.evaluate_cached_predicate(
+                        branches = \
+                            binradar_verifier.evaluate_cached_predicate(
                                 cached_predicates[patch], cached.snapshots)
-                        except (IndexError, ValueError):
-                            branches = None
-                        if branches is not None and branches == observed:
-                            equivalent.append(patch)
-                    reused = equivalent[1:]
-                    for patch in reused:
-                        remaining.remove(patch)
-                    if reused:
-                        logger.info(
-                            f"[FILTER] [cache-reuse] [representative "
-                            f"{representative}] [patches {reused}]")
-                    for patch in equivalent:
-                        if self._filter_decision(
-                                patch, result,
-                                binradar_verifier.BinRadarPatchResult(
-                                    patch, observed), f):
-                            survived_patches.append(patch)
+                    except (IndexError, ValueError):
+                        branches = None
+                    if branches is not None and branches == observed:
+                        equivalent.append(patch)
+                for patch in equivalent[1:]:
+                    remaining.remove(patch)
+                if len(equivalent) > 1:
+                    logger.info(
+                        f"[FILTER] [cache-reuse] [representative "
+                        f"{representative}] [members {len(equivalent)}]")
+                for patch in equivalent:
+                    if self._filter_decision(
+                            patch, result,
+                            binradar_verifier.BinRadarPatchResult(
+                                patch, observed)):
+                        survived_patches.append(patch)
+        binradar_evidence.write_filter(
+            filter_result_file, self.total_patches, survived_patches)
         logger.info(
             f"[FILTER] [summary] [total {self.total_patches}] "
             f"[survived {len(survived_patches)}] "
-            f"[filtered {self.total_patches - len(survived_patches)}]")
-        logger.info(f"[FILTER] [survived {survived_patches}]")
-        self.save_progress(f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] [survived {survived_patches}]")
+            f"[filtered {self.total_patches - len(survived_patches)}] "
+            f"[result filter.br]")
         self.filter_result = survived_patches
+        self._require_cached_coverage(survived_patches)
+        self.save_progress(
+            f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
+            f"[survived-count {len(survived_patches)}] [result filter.br]")
         return survived_patches
 
     def check_requirements(self):
@@ -1676,8 +1704,13 @@ class BinRadarExecutor:
         deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
         # Implementation for concrete verifier
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
+        logger.info(
+            f"[VERIFIER] Verifying {len(self.filter_result)} patch(es)")
+        verifier = binradar_verifier.BinRadarConcreteVerifier(
+            self.workdir, self.run_dir, runner, self.probe_result,
+            self.verifier_binary(), self.filter_result,
+            patched_binary_patches=list(
+                range(1, self.brpatched_total_patches + 1)))
         timed_out = verifier.run_verification_streaming(
             minimizer_result_file,
             timeout=self.remaining_concrete_timeout(deadline))
@@ -1718,8 +1751,13 @@ class BinRadarExecutor:
         print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
         minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        logger.info(f"[VERIFIER] Verifying patches: {self.filter_result}")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(self.workdir, self.run_dir, runner, self.probe_result, self.verifier_binary(), self.filter_result)
+        logger.info(
+            f"[VERIFIER] Verifying {len(self.filter_result)} patch(es)")
+        verifier = binradar_verifier.BinRadarConcreteVerifier(
+            self.workdir, self.run_dir, runner, self.probe_result,
+            self.verifier_binary(), self.filter_result,
+            patched_binary_patches=list(
+                range(1, self.brpatched_total_patches + 1)))
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
         timed_out = binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file,
@@ -1925,20 +1963,87 @@ class BinRadarExecutor:
         self.save_progress(
             f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
 
+    @staticmethod
+    def _iter_legacy_binradar_results(trace_file: str):
+        """Stream old per-patch SBSV traces one iteration at a time."""
+        parser = sbsv.parser()
+        parser.add_schema(
+            "[binradar] [crash] [iter: int] [patch: int] "
+            "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
+            "[host_fault_addr: hex]")
+        parser.add_schema(
+            "[binradar] [normal] [iter: int] [patch: int]")
+        parser.add_schema(
+            "[binradar] [commit] [iter: int] [patch: int] [br: str]")
+        current_iteration: Optional[int] = None
+        current: Dict[int, dict] = {}
+        with open(trace_file, "r", encoding="utf-8") as stream:
+            for line in stream:
+                result = parser.parse_line_detached(line)
+                if result is None:
+                    continue
+                iteration = result["iter"]
+                if current_iteration is None:
+                    current_iteration = iteration
+                elif iteration != current_iteration:
+                    if iteration < current_iteration:
+                        raise ValueError(
+                            "legacy BINRADAR trace iterations are unordered")
+                    yield current_iteration, current
+                    current_iteration = iteration
+                    current = {}
+                patch = result["patch"]
+                patch_result = current.setdefault(patch, {})
+                if result.schema_name == "binradar$crash":
+                    patch_result["result"] = "crash"
+                    patch_result["fault_addr"] = result["fault_addr"]
+                elif result.schema_name == "binradar$normal":
+                    patch_result["result"] = "normal"
+                else:
+                    patch_result["br"] = result["br"]
+        if current_iteration is not None:
+            yield current_iteration, current
+
+    @staticmethod
+    def _iter_binary_binradar_results(evidence_file: str):
+        """Expand one compact equivalence-class frame at a time."""
+        for iteration in binradar_evidence.read_binradar(evidence_file):
+            results: Dict[int, dict] = {}
+            for group in iteration.groups:
+                branch = ("null" if group.branches is None else
+                          "".join(str(value) for value in group.branches))
+                for patch in group.members:
+                    result = {"result": group.outcome, "br": branch}
+                    if group.outcome == "crash":
+                        result["fault_addr"] = group.fault_addr
+                    results[patch] = result
+            yield iteration.iteration, results
+
     def run_final(self):
-        # Read verifier.sbsv and, when enabled, binradar-trace-msg.log to
-        # get final results and save them to the progress file.
+        # Read compact verifier and BINRADAR evidence and save final results.
+        # Legacy SBSV artifacts remain readable for completed old workdirs.
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run final analysis.")
             raise RuntimeError("Probe result not found.")
-        verifier_result_file = os.path.join(self.run_dir, "verifier.sbsv")
-        trace_msg_log_file = os.path.join(self.run_dir, "binradar-tracer-msg.log")
-        self.save_progress(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        verifier_result_file = os.path.join(self.run_dir, "verifier.br")
+        legacy_verifier_file = os.path.join(self.run_dir, "verifier.sbsv")
         if not os.path.exists(verifier_result_file):
-            logger.error("Verifier result file not found. BinRadar results might be incomplete.")
-            raise FileNotFoundError(f"Verifier result file not found: {verifier_result_file}")
+            verifier_result_file = legacy_verifier_file
+        binradar_evidence_file = os.path.join(self.run_dir, "binradar.br")
+        trace_msg_log_file = os.path.join(
+            self.run_dir, "binradar-tracer-msg.log")
+        self.save_progress(
+            f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        if not os.path.exists(verifier_result_file):
+            logger.error(
+                "Verifier result file not found. BinRadar results might be "
+                "incomplete.")
+            raise FileNotFoundError(
+                f"Verifier result file not found: {verifier_result_file}")
         remaining_patches = set(self.filter_result)
-        concrete_verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verifier_result_file)
+        concrete_verifier_result = \
+            binradar_verifier.BinRadarConcreteVerifierResult.from_file(
+                verifier_result_file)
         if concrete_verifier_result is None:
             logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
             raise ValueError("Failed to parse verifier result.")
@@ -1975,93 +2080,94 @@ class BinRadarExecutor:
 
         binradar_failed = self.binradar_failed
         skip_binradar_analysis = self.disable_binradar or binradar_failed
+        compact_binradar = False
         if self.disable_binradar:
-            logger.info("[FINAL] BinRadar phase disabled; skipping trace analysis.")
-            trace_file = io.StringIO()
+            logger.info(
+                "[FINAL] BinRadar phase disabled; skipping evidence analysis.")
+            binradar_iterations = iter(())
         elif binradar_failed:
             logger.warning(
                 "[FINAL] BinRadar phase failed under --less-strict; ignoring "
-                "its potentially incomplete trace and using concrete "
+                "its potentially incomplete evidence and using concrete "
                 "verifier evidence only.")
-            trace_file = io.StringIO()
+            binradar_iterations = iter(())
+        elif os.path.exists(binradar_evidence_file):
+            compact_binradar = True
+            binradar_iterations = self._iter_binary_binradar_results(
+                binradar_evidence_file)
+        elif os.path.exists(trace_msg_log_file):
+            binradar_iterations = self._iter_legacy_binradar_results(
+                trace_msg_log_file)
         else:
-            if not os.path.exists(trace_msg_log_file):
-                logger.error("Trace message log file not found. BinRadar results might be incomplete.")
-                raise FileNotFoundError(f"Trace message log file not found: {trace_msg_log_file}")
-            trace_file = open(trace_msg_log_file, "r", encoding="utf-8")
+            logger.error(
+                "BINRADAR evidence file not found. Results might be "
+                "incomplete.")
+            raise FileNotFoundError(
+                f"BINRADAR evidence file not found: {binradar_evidence_file}")
         for patch_id in self.filter_result:
             if not concrete_verifier_result.patch_verified[patch_id]:
                 remaining_patches.discard(patch_id)
         binradar_remaining_patches = remaining_patches.copy()
         binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
-        with trace_file as f:
-            parser = sbsv.parser()
-            parser.add_schema("[binradar] [crash] [iter: int] [patch: int] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
-            parser.add_schema("[binradar] [normal] [iter: int] [patch: int]")
-            parser.add_schema("[binradar] [commit] [iter: int] [patch: int] [br: str]")
-            iter_map: Dict[int, Dict[int, dict]] = dict()
-            for line in f:
-                result = parser.parse_line_detached(line)
-                if result is None:
-                    continue
-                iter = result["iter"]
-                patch = result["patch"]
-                if iter not in iter_map:
-                    iter_map[iter] = dict()
-                if patch not in iter_map[iter]:
-                    iter_map[iter][patch] = dict()
-                current = iter_map[iter][patch]
-                if result.schema_name == "binradar$crash":
-                    current["result"] = "crash"
-                    current["fault_addr"] = result["fault_addr"]
-                elif result.schema_name == "binradar$normal":
-                    current["result"] = "normal"
-                elif result.schema_name == "binradar$commit":
-                    current["br"] = result["br"]
-            
-            poc_fault_loc = (0 if skip_binradar_analysis
-                             else self.probe_result.tracer_fault_addr)
-            if not skip_binradar_analysis and poc_fault_loc == 0:
-                logger.warning("[FINAL] tracer_fault_addr is 0; binradar crash comparison will not match any fault address.")
+        poc_fault_loc = (0 if skip_binradar_analysis
+                         else self.probe_result.tracer_fault_addr)
+        if not skip_binradar_analysis and poc_fault_loc == 0:
+            logger.warning(
+                "[FINAL] tracer_fault_addr is 0; binradar crash comparison "
+                "will not match any fault address.")
 
-            for iter in iter_map:
-                # A timeout can stop the forkserver after a candidate result
-                # but before the baseline result or commit is written. Such a
-                # partial tail iteration contributes no comparable evidence.
-                original = iter_map[iter].get(0)
-                if original is None:
+        expected_candidates = set(self.filter_result)
+        processed_iterations = 0
+        for iteration, iteration_results in binradar_iterations:
+            actual = set(iteration_results)
+            expected = {0} if iteration == 1 \
+                else expected_candidates | {0}
+            if compact_binradar and actual != expected:
+                raise ValueError(
+                    f"BINRADAR iteration {iteration} coverage mismatch: "
+                    f"missing {sorted(expected - actual)}; "
+                    f"unexpected {sorted(actual - expected)}")
+            # A legacy timeout tail may have only one half of an outcome.
+            # Compact frames are committed atomically and were checked above.
+            original = iteration_results.get(0)
+            if original is None or "result" not in original \
+                    or "br" not in original or original["br"] == "null":
+                continue
+            processed_iterations += 1
+            for patch in remaining_patches:
+                patch_result = iteration_results.get(patch)
+                if patch_result is None or "result" not in patch_result \
+                        or "br" not in patch_result:
                     continue
-                if "result" not in original or "br" not in original:
-                    continue
-                if original["br"] == "null":
-                    continue
-                for patch in remaining_patches:
-                    patch_result = iter_map[iter].get(patch, None)
-                    if patch_result is None:
-                        continue
-                    if "result" not in patch_result or "br" not in patch_result:
-                        continue
-                    if original["result"] == "crash" and patch_result["result"] == "crash":
-                        if original["fault_addr"] == poc_fault_loc and patch_result["fault_addr"] == poc_fault_loc:
-                            record_evidence(patch, False)
-                            if patch in binradar_remaining_patches:
-                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] still causes the same crash - likely not fixed.")
-                            binradar_remaining_patches.discard(patch)
-                            binradar_reject_reasons[patch] = ("same-crash", iter)
-                    elif original["result"] == "crash" and patch_result["result"] == "normal":
-                        record_evidence(patch, True)
-                    elif original["result"] == "normal" and patch_result["result"] == "crash":
-                        if patch_result["fault_addr"] == poc_fault_loc:
-                            record_evidence(patch, False)
-                            if patch in binradar_remaining_patches:
-                                logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] introduces a crash - likely not fixed.")
-                            binradar_remaining_patches.discard(patch)
-                            binradar_reject_reasons[patch] = ("introduced-crash", iter)
-                    elif original["result"] == "normal" and patch_result["result"] == "normal":
-                        same_behavior = original["br"] == patch_result["br"]
-                        record_evidence(patch, same_behavior)
-                        if not same_behavior:
-                            logger.info(f"[final] [binradar] [patch {patch}] [iter {iter}] causes a different behavior (BR {patch_result['br']} vs original {original['br']}); reducing confidence without rejecting the patch.")
+                if original["result"] == "crash" \
+                        and patch_result["result"] == "crash":
+                    if original.get("fault_addr") == poc_fault_loc \
+                            and patch_result.get("fault_addr") == \
+                            poc_fault_loc:
+                        record_evidence(patch, False)
+                        binradar_remaining_patches.discard(patch)
+                        binradar_reject_reasons[patch] = (
+                            "same-crash", iteration)
+                elif original["result"] == "crash" \
+                        and patch_result["result"] == "normal":
+                    record_evidence(patch, True)
+                elif original["result"] == "normal" \
+                        and patch_result["result"] == "crash":
+                    if patch_result.get("fault_addr") == poc_fault_loc:
+                        record_evidence(patch, False)
+                        binradar_remaining_patches.discard(patch)
+                        binradar_reject_reasons[patch] = (
+                            "introduced-crash", iteration)
+                elif original["result"] == "normal" \
+                        and patch_result["result"] == "normal":
+                    record_evidence(
+                        patch, original["br"] == patch_result["br"])
+        if not skip_binradar_analysis:
+            logger.info(
+                f"[FINAL] Processed {processed_iterations} complete "
+                f"BINRADAR evidence iteration(s); rejected "
+                f"{len(remaining_patches - binradar_remaining_patches)} "
+                f"patch(es).")
         # Two orthogonal status concepts, kept distinct in every output row:
         #   * failed phases (--less-strict) are real issues;
         #   * a reached wall-clock budget is a planned graceful cutoff.
@@ -2090,6 +2196,9 @@ class BinRadarExecutor:
             trace_metadata = "[binradar disabled]"
         elif binradar_failed:
             trace_metadata = "[binradar failed]"
+        elif compact_binradar:
+            trace_metadata = (
+                f"[evidence {os.path.basename(binradar_evidence_file)}]")
         else:
             trace_metadata = f"[trace {os.path.basename(trace_msg_log_file)}]"
         with open(final_result_file, "w", encoding="utf-8") as f:
@@ -2477,21 +2586,47 @@ def main():
     env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
     env["BINRADAR_FEEDBACK_MODE"] = "1" if args.feedback_mode else "0"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
+    # .brpatched compiles only the setup-time top-30 prefilter survivors into
+    # its static predicate table. Record that cap explicitly so no phase can
+    # execute an uncompiled id on it, even when the effective candidate set is
+    # expanded to the full prefilter survivor list below.
+    env["BRPATCHED_TOTAL_PATCHES"] = env["TOTAL_PATCHES"]
     if args.target_patches == "all":
         # Run every predicate that survived the offline prefilter instead of
-        # the top-30 subset.  Setup caps the compiled candidates at the
-        # top 30, so candidates past the cap are never compiled into the
-        # binaries and cannot be run; clamp to the compiled set.
+        # the top-30 subset.  Two artifacts can execute candidates:
+        #   * .brpatched compiles at most the top-30 survivors into a static
+        #     predicate table, so ids past the cap are not executable there;
+        #   * .brcached resolves the predicate at run time from
+        #     brpatches.json, which exports every survivor, so it can execute
+        #     the full set without recompiling.
+        # Expand only when the cached artifact and manifest cover every
+        # survivor; otherwise clamp to the compiled set.
         compiled_total = int(env["TOTAL_PATCHES"])
         pref_total = int(env.get("PREFILTER_TOTAL_PATCHES",
                                  env["TOTAL_PATCHES"]))
-        if pref_total > compiled_total:
-            logger.warning(
-                f"--target-patches all: only the top {compiled_total} "
-                f"prefilter survivors are compiled into the binaries "
-                f"(PREFILTER_TOTAL_PATCHES={pref_total}); candidates past "
-                f"the compiled cap cannot be run")
-        env["TOTAL_PATCHES"] = str(min(pref_total, compiled_total))
+        if pref_total <= compiled_total:
+            env["TOTAL_PATCHES"] = str(pref_total)
+        else:
+            coverage = binradar_verifier.load_cached_predicate_set(
+                Path(workdir) / "brpatches.json",
+                Path(workdir) / f"{env['BINARY']}.brcached",
+                env.get("BINRADAR_PATCH_KIND", ""),
+                int(env.get("BRCACHE_STACK_SIZE", "0"), 0),
+                list(range(1, pref_total + 1)))
+            if coverage.predicates is None:
+                logger.warning(
+                    f"--target-patches all: only the top {compiled_total} "
+                    f"prefilter survivors are compiled into the binaries "
+                    f"(PREFILTER_TOTAL_PATCHES={pref_total}); candidates past "
+                    f"the compiled cap cannot be run ({coverage.reason})")
+                env["TOTAL_PATCHES"] = str(compiled_total)
+            else:
+                logger.info(
+                    f"--target-patches all: the .brcached artifact and "
+                    f"brpatches.json cover all {pref_total} prefilter "
+                    f"survivors; running the full set (the .brpatched "
+                    f"artifact compiles only the top {compiled_total})")
+                env["TOTAL_PATCHES"] = str(pref_total)
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

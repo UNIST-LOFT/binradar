@@ -30,6 +30,7 @@ def _stub_executor(tmp_path):
     executor.start_time = __import__("time").time()
     executor.probe_result = SimpleNamespace()
     executor.filter_result = [1, 2]
+    executor.brpatched_total_patches = 2
     executor.disable_binradar = True
     executor.feedback_mode = False
     executor.binradar_failed = False
@@ -373,7 +374,10 @@ def _write_generic_manifest(workdir, descriptors):
 def _filter_executor(tmp_path, workdir, total_patches):
     executor = _stub_executor(tmp_path)
     executor.workdir = str(workdir)
+    executor.binary = "imginfo"
     executor.total_patches = total_patches
+    executor.brpatched_total_patches = total_patches
+    executor.config = {}
     executor.probe_result = SimpleNamespace(fault_addr=0xDEAD)
     executor.check_requirements = lambda: None
     executor.resolved_poc_input = lambda: str(workdir / "poc")
@@ -450,10 +454,9 @@ def test_filter_uses_cached_execution_for_equivalent_predicates(
     assert survived == [2]
     assert runner.cached_calls == [(1, "=p1p0"), (2, "=p0p0")]
     assert runner.patched_calls == []
-    rows = (tmp_path / "filter.sbsv").read_text()
-    assert "[patch] [id 1] [pass False]" in rows
-    assert "[patch] [id 2] [pass True]" in rows
-    assert "[patch] [id 3] [pass False]" in rows
+    filter_result = binradar.binradar_evidence.read_filter(
+        tmp_path / "filter.br")
+    assert filter_result.decisions == {1: False, 2: True, 3: False}
     assert executor.filter_result == [2]
 
 
@@ -501,9 +504,9 @@ def test_filter_falls_back_to_individual_execution_when_cache_fails(
     assert survived == [1, 2]
     assert runner.cached_calls == [(1, "=p1p0"), (2, "=p0p0")]
     assert runner.patched_calls == [1, 2]
-    rows = (tmp_path / "filter.sbsv").read_text()
-    assert "[patch] [id 1] [pass True]" in rows
-    assert "[patch] [id 2] [pass True]" in rows
+    filter_result = binradar.binradar_evidence.read_filter(
+        tmp_path / "filter.br")
+    assert filter_result.decisions == {1: True, 2: True}
 
 
 def test_disabled_binradar_is_not_started_by_multithreaded_orchestration(

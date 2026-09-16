@@ -37,6 +37,7 @@ def _executor(tmp_path, timeout=21600, cap=binradar.FORKSERVER_CHILD_TIMEOUT_DEF
     executor.e9_relocated_calls = ""
     executor.reverse_directed = False
     executor.config = {}
+    executor.brpatched_total_patches = len(executor.filter_result)
     executor.outdir = str(tmp_path)
     return executor
 

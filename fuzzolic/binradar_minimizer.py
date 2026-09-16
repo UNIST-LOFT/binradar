@@ -383,6 +383,6 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
     if timed_out and hasattr(verifier, "mark_wall_time_reached"):
         # The verifier can finish early after rejecting every patch while the
         # minimizer continues. If the shared pair then reaches its deadline,
-        # retain the cutoff metadata in verifier.sbsv for resumed FINAL runs.
+        # retain the cutoff metadata in verifier.br for resumed FINAL runs.
         verifier.mark_wall_time_reached()
     return timed_out

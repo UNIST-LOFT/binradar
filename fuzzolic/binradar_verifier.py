@@ -7,12 +7,14 @@ import time
 import threading
 import fcntl
 from pathlib import Path
-from typing import List, Set, Tuple, Dict, Optional, Any, TextIO, Callable
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Set,
+                    TextIO, Tuple)
 
 import sbsv
 
 import logger
 
+import binradar_evidence
 import binradar_utils
 from binradar_taosc_predicates import (
     CachedSnapshot,
@@ -44,6 +46,57 @@ def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
         except ValueError:
             continue
     return False
+
+
+class CachedPredicateSet(NamedTuple):
+    """Outcome of validating `.brcached` coverage for a candidate set.
+
+    ``predicates`` is None when the cached artifact cannot execute every
+    requested id; ``reason`` then names the failing precondition. Both the
+    FILTER phase, the concrete verifier, the BINRADAR tracer selection, and
+    the `--target-patches all` expansion share this one check so they can
+    never disagree about which artifact owns which candidate id.
+    """
+    predicates: Optional[Dict[int, ParsedPredicate]]
+    family: Optional[PredicateFamily]
+    reason: str
+
+
+def load_cached_predicate_set(manifest: Path, cached_binary: Path,
+                              patch_kind: str, brcache_stack_size: int,
+                              patches: List[int]) -> CachedPredicateSet:
+    """Validate that `.brcached` + `brpatches.json` cover ``patches``.
+
+    ``patches`` are the runtime candidate ids that must be executable on the
+    cached artifact. Returns the parsed manifest on success, otherwise an
+    explanation of the first failing precondition.
+    """
+    if not patches:
+        return CachedPredicateSet(None, None, "no candidate patches")
+    if not manifest.is_file():
+        return CachedPredicateSet(None, None, "brpatches.json missing")
+    if not cached_binary.is_file():
+        return CachedPredicateSet(
+            None, None, f"{cached_binary.name} missing")
+    try:
+        family, predicates = load_runtime_predicates(manifest)
+    except ValueError as e:
+        return CachedPredicateSet(None, None, str(e))
+    if patch_kind and patch_kind != family.value:
+        return CachedPredicateSet(
+            None, None,
+            f"manifest family {family.value} != configured family "
+            f"{patch_kind}")
+    missing = [patch for patch in patches if patch not in predicates]
+    if missing:
+        return CachedPredicateSet(
+            None, None,
+            f"missing runtime patch ids {missing[:8]}"
+            + (" (truncated)" if len(missing) > 8 else ""))
+    if family == PredicateFamily.CWE805_ERM and brcache_stack_size <= 0:
+        return CachedPredicateSet(None, None,
+                                  "missing CWE-805 cache stack size")
+    return CachedPredicateSet(predicates, family, "")
 
 
 class BinRadarProbeResult:
@@ -770,6 +823,64 @@ class BinRadarConcreteVerifierResult:
             return None
         return cls(result)
 
+    @classmethod
+    def from_file(
+            cls, result_file: str
+    ) -> Optional["BinRadarConcreteVerifierResult"]:
+        """Load compact verifier evidence or a legacy SBSV result."""
+        if not result_file.endswith(".br"):
+            return cls.from_sbsv(result_file)
+        evidence = binradar_evidence.read_verifier(result_file)
+        instance = cls.__new__(cls)
+        instance.patch_verified = {}
+        instance.patch_verdict_counts = {}
+        instance.patch_confidence = {}
+        instance.accept_evidences = {}
+        instance.total_evidences = {}
+        instance.feedback = {}
+        instance.feedback_counts = {}
+        instance.stop_reason = evidence.stop_reason
+        for patch, record in evidence.patches.items():
+            instance.patch_verified[patch] = record.verified
+            instance.patch_verdict_counts[patch] = 1
+            instance.accept_evidences[patch] = record.accept_evidences
+            instance.total_evidences[patch] = record.total_evidences
+            instance.patch_confidence[patch] = (
+                record.accept_evidences / record.total_evidences
+                if record.total_evidences else 0.0)
+            if record.has_feedback:
+                counts = record.observations
+                if counts.get("patch-crashed", 0):
+                    reason = "patch-crashed"
+                elif counts.get("no-crash-fail", 0):
+                    reason = "no-crash-fail"
+                elif counts.get("crash-fail", 0):
+                    reason = "crash-fail-security-rejection"
+                else:
+                    reason = "eligible"
+                instance.feedback_counts[patch] = 1
+                instance.feedback[patch] = {
+                    "patch": patch,
+                    "feedback-res": (
+                        "accepted" if record.feedback_accepted
+                        else "rejected"),
+                    "feedback-reason": reason,
+                    "security-res": (
+                        "rejected" if record.security_rejected
+                        else "verified"),
+                    "patch-crashed": counts.get("patch-crashed", 0),
+                    "crash-fail": counts.get("crash-fail", 0),
+                    "crash-pass": counts.get("crash-pass", 0),
+                    "no-crash-fail": counts.get("no-crash-fail", 0),
+                    "no-crash-pass-same-br": counts.get(
+                        "no-crash-pass-same-br", 0),
+                    "behavior-diff": counts.get(
+                        "no-crash-confidence-diff-br", 0),
+                    "accept-evidences": record.accept_evidences,
+                    "total-evidences": record.total_evidences,
+                }
+        return instance
+
 
 class _VerifierTimeout(TimeoutError):
     """The verifier's own wall-clock evidence budget was exhausted."""
@@ -795,7 +906,7 @@ class BinRadarConcreteVerifier:
     security_rejected: Set[int]
     feedback_hard_rejected: Set[int]
     wall_time_reached_logged: bool
-    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False):
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False, patched_binary_patches: Optional[List[int]] = None):
         self.dir = dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -811,10 +922,14 @@ class BinRadarConcreteVerifier:
         self.security_rejected = set()
         self.feedback_hard_rejected = set()
         self.wall_time_reached_logged = False
+        self.stop_reason: Optional[str] = None
+        self.verdicts: Dict[int, Tuple[str, str]] = {}
+        self.result_file = os.path.join(run_dir, "verifier.br")
+        Path(self.result_file).unlink(missing_ok=True)
         self.start_time = time.time()
-        # Setup logger
-        log_file = os.path.join(run_dir, "verifier.sbsv")
-        self.logger = logging.getLogger(__name__)
+        # Human diagnostics stay separate from the compact canonical result.
+        log_file = os.path.join(run_dir, "verifier.log")
+        self.logger = logging.getLogger(f"{__name__}.{id(self)}")
         self.logger.propagate = False
         self.logger.setLevel(logging.DEBUG)
         fh = logging.FileHandler(log_file, mode="w")
@@ -825,27 +940,35 @@ class BinRadarConcreteVerifier:
 
         self.cached_predicates = {}
         self.cache_family = None
-        manifest = Path(dir) / "brpatches.json"
-        cached_binary = Path(runner.cached_binary())
-        if len(patches) > 1 and manifest.is_file() and cached_binary.is_file():
-            try:
-                family, predicates = load_runtime_predicates(manifest)
-                if runner.patch_kind and runner.patch_kind != family.value:
-                    raise ValueError(
-                        f"manifest family {family.value} != "
-                        f"configured family {runner.patch_kind}")
-                missing = [patch for patch in patches
-                           if patch not in predicates]
-                if missing:
-                    raise ValueError(f"missing runtime patch ids {missing}")
-                if family == PredicateFamily.CWE805_ERM \
-                        and runner.brcache_stack_size <= 0:
-                    raise ValueError("missing CWE-805 cache stack size")
-                self.cache_family = family
-                self.cached_predicates = predicates
-            except ValueError as e:
+        # Candidate ids compiled into ``patched_binary`` (.brpatched). Ids
+        # outside this set have no table entry there and would silently
+        # evaluate as the false predicate, so they may only ever run on the
+        # cached artifact. ``None`` means every patch is executable there
+        # (single-candidate and specialized runs, and a plain top-30 run).
+        self.patched_binary_patches = (
+            None if patched_binary_patches is None
+            else set(patched_binary_patches))
+        # Run the cached path for a single surviving candidate too when it is
+        # not compiled into .brpatched; otherwise there is no artifact that
+        # can execute it at all.
+        cache_needed = len(patches) > 1 or any(
+            not self._patched_executable(patch) for patch in patches)
+        if cache_needed:
+            coverage = load_cached_predicate_set(
+                Path(dir) / "brpatches.json",
+                Path(runner.cached_binary()), runner.patch_kind,
+                runner.brcache_stack_size, patches)
+            if coverage.predicates is None:
                 self.logger.warning(
-                    f"[verifier-cache] [disabled] [reason {e}]")
+                    f"[verifier-cache] [disabled] [reason {coverage.reason}]")
+            else:
+                self.cache_family = coverage.family
+                self.cached_predicates = coverage.predicates
+
+    def _patched_executable(self, patch: int) -> bool:
+        """True when ``patch`` may run on the .brpatched artifact."""
+        return (self.patched_binary_patches is None
+                or patch in self.patched_binary_patches)
     
     def _testcase_from_result_row(self, row: Dict[str, Any]) -> Optional[Testcase]:
         id = row["id"]
@@ -893,119 +1016,157 @@ class BinRadarConcreteVerifier:
         """
         if self.wall_time_reached_logged:
             return
+        self.stop_reason = binradar_utils.WALL_TIME_REACHED
         self.logger.info(
-            f"[verifier] [stopped] [reason {binradar_utils.WALL_TIME_REACHED}]")
+            f"[verifier] [stopped] [reason {self.stop_reason}]")
         self.wall_time_reached_logged = True
+        # The verifier may have finished early after rejecting every patch
+        # while its paired minimizer kept running until the shared deadline.
+        # Replace the already-complete artifact so resumed FINAL observes the
+        # late cutoff too. During an in-verifier timeout, pending verdicts are
+        # filled immediately after this call and the normal terminal write
+        # handles serialization.
+        if set(self.verdicts) == set(self.patches):
+            self._write_results()
 
     def _log_result(self, patch: int, result: str, testcase: str) -> None:
-        self.logger.info(
-            f"[verifier-result] [res {result}] [patch {patch}] "
-            f"[testcase {testcase}]")
-        self.logger.info(
-            f"[verifier-confidence] [patch {patch}] "
-            f"[score {self.confidence(patch):.6f}] "
-            f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
-            f"[total-evidences {self.total_evidences.get(patch, 0)}]")
+        if patch in self.verdicts:
+            raise ValueError(f"duplicate verifier verdict for patch {patch}")
+        self.verdicts[patch] = (result, testcase)
 
-
-    def _log_feedback_summary(self, patch: int) -> None:
-        if not self.feedback_mode:
-            return
-        counts = self.observation_counts.get(patch, {})
-        hard_reason = ""
-        if counts.get("patch-crashed", 0):
-            hard_reason = "patch-crashed"
-        elif counts.get("no-crash-fail", 0):
-            hard_reason = "no-crash-fail"
-        elif counts.get("crash-fail", 0):
-            hard_reason = "crash-fail-security-rejection"
-        else:
-            hard_reason = "eligible"
-        feedback_res = (
-            "rejected" if patch in self.feedback_hard_rejected else "accepted")
-        security_res = (
-            "rejected" if patch in self.security_rejected else "verified")
-        self.logger.info(
-            f"[verifier-feedback] [patch {patch}] "
-            f"[feedback-res {feedback_res}] [feedback-reason {hard_reason}] "
-            f"[security-res {security_res}] "
-            f"[patch-crashed {counts.get('patch-crashed', 0)}] "
-            f"[crash-fail {counts.get('crash-fail', 0)}] "
-            f"[crash-pass {counts.get('crash-pass', 0)}] "
-            f"[no-crash-fail {counts.get('no-crash-fail', 0)}] "
-            f"[no-crash-pass-same-br {counts.get('no-crash-pass-same-br', 0)}] "
-            f"[behavior-diff {counts.get('no-crash-confidence-diff-br', 0)}] "
-            f"[accept-evidences {self.accept_evidences.get(patch, 0)}] "
-            f"[total-evidences {self.total_evidences.get(patch, 0)}]")
-
-    def _log_all_feedback_summaries(self) -> None:
+    def _write_results(self) -> None:
+        expected = set(self.patches)
+        actual = set(self.verdicts)
+        if actual != expected:
+            raise ValueError(
+                "verifier verdict coverage mismatch before serialization: "
+                f"missing {sorted(expected - actual)}; "
+                f"unexpected {sorted(actual - expected)}")
+        records = []
         for patch in self.patches:
-            self._log_feedback_summary(patch)
+            verdict, testcase = self.verdicts[patch]
+            records.append(binradar_evidence.VerifierPatchResult(
+                patch=patch,
+                verified=(verdict == "verified"),
+                accept_evidences=self.accept_evidences.get(patch, 0),
+                total_evidences=self.total_evidences.get(patch, 0),
+                observations=dict(self.observation_counts.get(patch, {})),
+                testcase=testcase,
+                has_feedback=self.feedback_mode,
+                feedback_accepted=(
+                    self.feedback_mode
+                    and patch not in self.feedback_hard_rejected),
+                security_rejected=(patch in self.security_rejected),
+            ))
+        binradar_evidence.write_verifier(
+            self.result_file, records, self.stop_reason)
+        self.logger.info(
+            f"[verifier] [summary] [patches {len(records)}] "
+            f"[verified {sum(record.verified for record in records)}] "
+            f"[rejected {sum(not record.verified for record in records)}] "
+            f"[result verifier.br]")
 
     def _test_result(
         self, patch: int, testcase: Testcase, result: BinRadarProbeResult,
         patch_result: Optional[BinRadarPatchResult],
+        log_detail: bool = True,
     ) -> bool:
         """Return whether one observed execution rejects the candidate.
 
-        Conclusive pass/fail observations count as evidence. Observations at
-        unrelated fault addresses and timeouts are ignored. A normal-to-normal
-        branch-vector difference is negative evidence, but is not a hard
-        rejection.
+        Cached equivalence members update the same counters without emitting
+        one diagnostic line each; the representative line plus the compact
+        terminal summaries preserve the observable evidence.
         """
+        def detail(message: str) -> None:
+            if log_detail:
+                self.logger.info(message)
+
         if patch_result is not None and patch_result.crashed():
             self._record_observation(patch, "patch-crashed")
             self._record_evidence(patch, False)
-            self.logger.info(f"[verifier] [patch-crashed] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+            detail(f"[verifier] [patch-crashed] [patch {patch}] "
+                   f"[id {testcase.id}] [file {testcase.filename}]")
             self.security_rejected.add(patch)
             self.feedback_hard_rejected.add(patch)
             return True
         if testcase.exit == "crash":
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
-                    self.logger.info(f"[verifier] [crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    self._record_observation(patch, "crash-skip-diff-addr")
+                    detail(
+                        f"[verifier] [crash-skip-diff-addr] [patch {patch}] "
+                        f"[id {testcase.id}] [file {testcase.filename}] "
+                        f"[fault-addr {result.fault_addr:x}] "
+                        f"[original-fault-addr "
+                        f"{self.probe_result.fault_addr:x}]")
                     return False
                 self.security_rejected.add(patch)
                 self._record_observation(patch, "crash-fail")
                 self._record_evidence(patch, False)
-                self.logger.info(f"[verifier] [crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
-                return not self.feedback_mode # In feedback mode, do not immediately reject
+                detail(f"[verifier] [crash-fail] [patch {patch}] "
+                       f"[id {testcase.id}] [file {testcase.filename}] "
+                       f"[fault-addr {result.fault_addr:x}]")
+                return not self.feedback_mode
             if result.is_normal_exit():
                 self._record_observation(patch, "crash-pass")
                 self._record_evidence(patch, True)
-                self.logger.info(f"[verifier] [crash-pass] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                detail(f"[verifier] [crash-pass] [patch {patch}] "
+                       f"[id {testcase.id}] [file {testcase.filename}]")
                 return False
             if result.is_timeout():
                 self._record_observation(patch, "crash-timeout")
-                self.logger.info(f"[verifier] [crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                detail(f"[verifier] [crash-timeout] [patch {patch}] "
+                       f"[id {testcase.id}] [file {testcase.filename}]")
                 return False
         else:
             if result.is_crash():
                 if result.fault_addr != self.probe_result.fault_addr:
-                    self.logger.info(f"[verifier] [no-crash-skip-diff-addr] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
+                    self._record_observation(
+                        patch, "no-crash-skip-diff-addr")
+                    detail(
+                        f"[verifier] [no-crash-skip-diff-addr] "
+                        f"[patch {patch}] [id {testcase.id}] "
+                        f"[file {testcase.filename}] "
+                        f"[fault-addr {result.fault_addr:x}] "
+                        f"[original-fault-addr "
+                        f"{self.probe_result.fault_addr:x}]")
                     return False
                 self.security_rejected.add(patch)
                 self.feedback_hard_rejected.add(patch)
                 self._record_observation(patch, "no-crash-fail")
                 self._record_evidence(patch, False)
-                self.logger.info(f"[verifier] [no-crash-fail] [patch {patch}] [id {testcase.id}] [file {testcase.filename}] [fault-addr {result.fault_addr:x}]")
+                detail(f"[verifier] [no-crash-fail] [patch {patch}] "
+                       f"[id {testcase.id}] [file {testcase.filename}] "
+                       f"[fault-addr {result.fault_addr:x}]")
                 return True
             if result.is_normal_exit():
                 if patch_result is None:
-                    self.logger.error(f"Failed to get patch result for {testcase.filename} with patch {patch}.")
+                    if log_detail:
+                        self.logger.error(
+                            f"Failed to get patch result for "
+                            f"{testcase.filename} with patch {patch}.")
                     return False
                 if testcase.br == patch_result.br_selection:
-                    self._record_observation(patch, "no-crash-pass-same-br")
+                    self._record_observation(
+                        patch, "no-crash-pass-same-br")
                     self._record_evidence(patch, True)
-                    self.logger.info(f"[verifier] [no-crash-pass-same-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                    detail(
+                        f"[verifier] [no-crash-pass-same-br] "
+                        f"[patch {patch}] [id {testcase.id}] "
+                        f"[file {testcase.filename}]")
                     return False
-                self._record_observation(patch, "no-crash-confidence-diff-br")
+                self._record_observation(
+                    patch, "no-crash-confidence-diff-br")
                 self._record_evidence(patch, False)
-                self.logger.info(f"[verifier] [no-crash-confidence-diff-br] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                detail(
+                    f"[verifier] [no-crash-confidence-diff-br] "
+                    f"[patch {patch}] [id {testcase.id}] "
+                    f"[file {testcase.filename}]")
                 return False
             if result.is_timeout():
                 self._record_observation(patch, "no-crash-timeout")
-                self.logger.info(f"[verifier] [no-crash-timeout] [patch {patch}] [id {testcase.id}] [file {testcase.filename}]")
+                detail(f"[verifier] [no-crash-timeout] [patch {patch}] "
+                       f"[id {testcase.id}] [file {testcase.filename}]")
                 return False
         return False
 
@@ -1053,7 +1214,7 @@ class BinRadarConcreteVerifier:
             if on_rejected is not None:
                 on_rejected(patch)
 
-        if self.cache_family is None or len(patches) <= 1:
+        if self.cache_family is None:
             for patch in patches:
                 if self._test_testcase(patch, testcase, deadline):
                     record_rejection(patch)
@@ -1062,12 +1223,6 @@ class BinRadarConcreteVerifier:
         remaining = list(patches)
         while remaining:
             self._raise_if_timed_out(deadline)
-            if len(remaining) == 1:
-                patch = remaining.pop()
-                if self._test_testcase(patch, testcase, deadline):
-                    record_rejection(patch)
-                continue
-
             representative = remaining.pop(0)
             self.logger.info(
                 f"[verifier-cache] [miss] [patch {representative}] "
@@ -1106,19 +1261,33 @@ class BinRadarConcreteVerifier:
                 branches = self._cached_branches(patch, cached.snapshots)
                 if branches is not None and branches == observed:
                     equivalent.append((patch, branches))
+            if equivalent:
+                self.logger.info(
+                    f"[verifier-cache] [group] "
+                    f"[representative {representative}] "
+                    f"[members {len(equivalent) + 1}] "
+                    f"[id {testcase.id}]")
             for patch, branches in equivalent:
                 remaining.remove(patch)
-                self.logger.info(
-                    f"[verifier-cache] [hit] [patch {patch}] "
-                    f"[representative {representative}] "
-                    f"[id {testcase.id}]")
                 if self._test_result(
                         patch, testcase, result,
-                        BinRadarPatchResult(patch, branches)):
+                        BinRadarPatchResult(patch, branches),
+                        log_detail=False):
                     record_rejection(patch)
         return rejected
 
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
+        if not self._patched_executable(patch_id):
+            # An id past the .brpatched compile cap has no predicate table
+            # entry there and would evaluate as the false predicate, which is
+            # a rejection for a reason unrelated to the candidate's
+            # semantics. Never execute it on that artifact: an unusable
+            # execution records no evidence and does not reject.
+            self.logger.error(
+                f"[verifier-cache] [fallback-unavailable] [patch {patch_id}] "
+                f"[id {testcase.id}] not compiled into .brpatched and no "
+                f"usable cached capture; no evidence recorded")
+            return None, None
         result, patch_result = self.runner.test_with_patched(str(patch_id), os.path.join(self.minimized_dir, testcase.filename))
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
@@ -1217,6 +1386,7 @@ class BinRadarConcreteVerifier:
                                 record_rejection(patch, testcase)
                             if (not pending_patches
                                     and minimizer_thread is not None):
+                                self._write_results()
                                 return False
                         elif row.schema_name == "minimizer$done":
                             done_seen = True
@@ -1273,6 +1443,5 @@ class BinRadarConcreteVerifier:
             self.mark_wall_time_reached()
         for patch in pending_patches:
             self._log_result(patch, "verified", "")
-        if self.feedback_mode:
-            self._log_all_feedback_summaries()
+        self._write_results()
         return timed_out

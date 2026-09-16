@@ -10,6 +10,7 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import binradar_evidence
 import binradar_minimizer
 import binradar_utils
 import binradar_verifier
@@ -32,9 +33,9 @@ concrete-verifier pipeline from binradar:
 
 Output layout (relative to --workdir):
     <workdir>/<fuzzer>/probe-results.sbsv  probe result (reused if rerun)
-    <workdir>/<fuzzer>/filter.sbsv         filter result (reused if rerun)
+    <workdir>/<fuzzer>/filter.br           compact filter result (reused if rerun)
     <workdir>/<fuzzer>/minimizer/          minimizer run dir (minimized/, minimizer.sbsv)
-    <workdir>/<fuzzer>/verified.sbsv       verifier result
+    <workdir>/<fuzzer>/verified.br         compact verifier result
     <workdir>/<fuzzer>/final.sbsv          final remaining patches
     <workdir>/<fuzzer>/evaluation.log      debug log
 
@@ -61,17 +62,20 @@ def find_latest_probe_results(out_dir: str) -> Optional[str]:
 
 
 def find_latest_filter_results(out_dir: str) -> Optional[str]:
-    """Find the most recent filter.sbsv under <out_dir>/run-*/."""
+    """Find the newest compact filter, falling back to legacy results."""
     if not os.path.isdir(out_dir):
         return None
-    candidates = []
+    compact_candidates = []
+    legacy_candidates = []
     for name in os.listdir(out_dir):
-        path = os.path.join(out_dir, name, "filter.sbsv")
-        if os.path.isfile(path):
-            candidates.append(path)
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
+        compact = os.path.join(out_dir, name, "filter.br")
+        legacy = os.path.join(out_dir, name, "filter.sbsv")
+        if os.path.isfile(compact):
+            compact_candidates.append(compact)
+        elif os.path.isfile(legacy):
+            legacy_candidates.append(legacy)
+    candidates = compact_candidates or legacy_candidates
+    return max(candidates, key=os.path.getmtime) if candidates else None
 
 
 def run_probe(workdir: str, env: Dict[str, str], save_file: str) -> binradar_verifier.BinRadarProbeResult:
@@ -108,8 +112,9 @@ def run_probe(workdir: str, env: Dict[str, str], save_file: str) -> binradar_ver
 
 
 def load_filter_result(filter_file: str) -> List[int]:
-    """Load survived patch ids from a filter.sbsv file (mirrors
-    binradar.BinRadarExecutor.load_filter_result)."""
+    """Load compact filter evidence or a legacy SBSV result."""
+    if filter_file.endswith(".br"):
+        return binradar_evidence.read_filter(filter_file).passed
     survived_patches: List[int] = []
     with open(filter_file, encoding="utf-8") as f:
         parser = sbsv.parser()
@@ -127,9 +132,8 @@ def run_filter(workdir: str, env: Dict[str, str],
     """Run the filter phase on the patched binary (mirrors
     binradar.BinRadarExecutor.run_filter).
 
-    Keeps only patches that do not crash at the original fault address with
-    the POC input, and writes per-patch [patch] [id N] [pass True/False] rows
-    to save_file.
+    Keeps only patches that do not crash at the original fault address and
+    writes one compact survivor bitmap to ``save_file``.
     """
     runner = binradar_verifier.BinRadarQemuRunner.from_env(workdir, env)
     poc_input = env["POC_INPUT"]
@@ -140,35 +144,33 @@ def run_filter(workdir: str, env: Dict[str, str],
 
     logger.info(f"[FILTER] Running filter with poc: {testcase}")
     survived_patches: List[int] = []
-    with open(save_file, "w", encoding="utf-8") as f:
-        for patch_id in range(1, total_patches + 1):
-            result, patch_result = runner.test_with_patched(str(patch_id), testcase)
-            if result is None:
-                logger.warning(
-                    f"[FILTER] [patch {patch_id}] Failed to run patched binary "
-                    "with the poc input. Keeping the patch.")
-                passed = True
-            elif patch_result is not None and patch_result.crashed():
-                passed = False
-                logger.info(
-                    f"[FILTER] [patch {patch_id}] Patch itself crashed "
-                    "(division/modulo by zero). Filtered out.")
-            elif result.is_crash() and result.fault_addr == probe_result.fault_addr:
-                passed = False
-                logger.info(
-                    f"[FILTER] [patch {patch_id}] Still crashes at the original "
-                    f"fault address {result.fault_addr:#x}. Filtered out.")
-            else:
-                passed = True
-                logger.info(
-                    f"[FILTER] [patch {patch_id}] Does not crash at the original "
-                    f"fault address {probe_result.fault_addr:#x} "
-                    f"(exit {result.exit_info}, fault-addr {result.fault_addr:#x}). "
-                    "Survived.")
-            f.write(f"[patch] [id {patch_id}] [pass {passed}]\n")
-            if passed:
-                survived_patches.append(patch_id)
-    logger.info(f"[FILTER] [survived {survived_patches}] [saved {save_file}]")
+    for patch_id in range(1, total_patches + 1):
+        result, patch_result = runner.test_with_patched(
+            str(patch_id), testcase)
+        if result is None:
+            logger.warning(
+                f"[FILTER] [patch {patch_id}] Failed to run patched binary "
+                "with the poc input. Keeping the patch.")
+            passed = True
+        elif patch_result is not None and patch_result.crashed():
+            passed = False
+            logger.info(
+                f"[FILTER] [patch {patch_id}] Patch itself crashed "
+                "(division/modulo by zero). Filtered out.")
+        elif result.is_crash() \
+                and result.fault_addr == probe_result.fault_addr:
+            passed = False
+            logger.info(
+                f"[FILTER] [patch {patch_id}] Still crashes at the original "
+                f"fault address {result.fault_addr:#x}. Filtered out.")
+        else:
+            passed = True
+        if passed:
+            survived_patches.append(patch_id)
+    binradar_evidence.write_filter(
+        save_file, total_patches, survived_patches)
+    logger.info(
+        f"[FILTER] [survived {len(survived_patches)}] [saved {save_file}]")
     return survived_patches
 
 
@@ -180,7 +182,7 @@ def write_final(final_file: str, verified_file: str, survived: List[int],
     file must contain exactly one verdict for every filter survivor; an absent
     verdict is incomplete evidence, never implicit acceptance.
     """
-    verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_sbsv(verified_file)
+    verifier_result = binradar_verifier.BinRadarConcreteVerifierResult.from_file(verified_file)
     if verifier_result is None:
         sys.exit(f"ERROR: failed to parse verifier result: {verified_file}")
     verifier_result.require_complete_verdicts(survived)
@@ -221,8 +223,9 @@ def main():
              "workdir/out if present, otherwise run the probe)")
     parser.add_argument(
         "--filter-results", default="",
-        help="use an existing filter.sbsv file (default: reuse from "
-             "workdir/out if present, otherwise run the filter)")
+        help="use an existing filter.br or legacy filter.sbsv file "
+             "(default: reuse from workdir/out if present, otherwise run "
+             "the filter)")
     args = parser.parse_args()
 
     workdir = os.path.abspath(args.workdir)
@@ -275,7 +278,9 @@ def main():
     if not filter_file:
         filter_file = find_latest_filter_results(os.path.join(workdir, "out"))
     if not filter_file:
-        filter_file = os.path.join(eval_dir, "filter.sbsv")
+        filter_file = os.path.join(eval_dir, "filter.br")
+    generated_filter_file = (filter_file if filter_file.endswith(".br")
+                             else os.path.join(eval_dir, "filter.br"))
     if os.path.isfile(filter_file):
         try:
             survived = load_filter_result(filter_file)
@@ -283,12 +288,14 @@ def main():
             logger.warning(
                 f"[FILTER] Failed to load existing filter result: {e}. "
                 "Re-running the filter phase.")
-            survived = run_filter(workdir, env, probe_result, filter_file)
+            survived = run_filter(
+                workdir, env, probe_result, generated_filter_file)
         else:
             logger.info(
                 f"[FILTER] Loaded existing filter result: {filter_file} -> {survived}")
     else:
-        survived = run_filter(workdir, env, probe_result, filter_file)
+        survived = run_filter(
+            workdir, env, probe_result, generated_filter_file)
     logger.info(f"[FILTER] Survived patches: {survived}")
 
     if not survived:
@@ -331,8 +338,8 @@ def main():
                 "[VERIFIER] No testcases survived minimization/fault-addr filtering; "
                 "all patches will be reported as remaining (nothing to reject them).")
 
-        verified_file = os.path.join(eval_dir, "verified.sbsv")
-        shutil.copyfile(os.path.join(minimizer_dir, "verifier.sbsv"), verified_file)
+        verified_file = os.path.join(eval_dir, "verified.br")
+        shutil.copyfile(os.path.join(minimizer_dir, "verifier.br"), verified_file)
         logger.info(f"[VERIFIER] Saved verified result: {verified_file}")
 
         # 4. Final analysis

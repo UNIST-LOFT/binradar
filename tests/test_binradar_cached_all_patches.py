@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""`--target-patches all` expands past the .brpatched compile cap only when
+the .brcached artifact and its runtime manifest can execute every survivor.
+
+.brpatched compiles a static predicate table capped at the setup-time top 30,
+so an id past that cap has no entry there and silently evaluates as the false
+predicate. The cached artifact resolves its predicate per run from
+brpatches.json, which exports every prefilter survivor. These tests pin the
+boundary between the two artifacts: the expansion, the artifact selection that
+must follow it, and the refusal to run such an id on .brpatched.
+"""
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "fuzzolic"))
+
+_spec = importlib.util.spec_from_file_location(
+    "binradar", ROOT / "fuzzolic" / "binradar.py")
+assert _spec is not None and _spec.loader is not None
+binradar = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(binradar)
+binradar_verifier = binradar.binradar_verifier
+
+
+def _write_manifest(workdir, descriptors, kind="generic-erm"):
+    (workdir / "brpatches.json").write_text(json.dumps({
+        "version": 1,
+        "kind": kind,
+        "predicates": [
+            {"id": idx, "source_line": idx, "descriptor": descriptor}
+            for idx, descriptor in enumerate(descriptors, start=1)
+        ],
+    }))
+
+
+def _run_main(monkeypatch, tmp_path, extra_args, env_lines, prepare=None):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / "binradar.env").write_text("".join(env_lines))
+    if prepare is not None:
+        prepare(workdir)
+    captured = {}
+
+    class FakeExecutor:
+        def run_multithreaded(self, prefix):
+            captured["run_prefix"] = prefix
+
+    def fake_from_env(workdir_arg, env):
+        captured.update(env)
+        return FakeExecutor()
+
+    monkeypatch.setattr(binradar, "setlimits", lambda: None)
+    monkeypatch.setattr(binradar.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(binradar.os, "chdir", lambda path: None)
+    monkeypatch.setattr(
+        binradar.BinRadarExecutor, "from_env", staticmethod(fake_from_env))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["binradar.py", "--workdir", str(workdir)] + list(extra_args))
+    binradar.main()
+    return workdir, captured
+
+
+_BASE_ENV = [
+    'BINARY="bin"\n',
+    'POC_INPUT="poc"\n',
+    'TEST_CMD="./bin @@"\n',
+    'PATCH_LOC="0x1234"\n',
+    'TOTAL_PATCHES="30"\n',
+]
+
+
+def _cover_all(descriptors, kind="generic-erm"):
+    def prepare(workdir):
+        (workdir / "bin.brcached").write_bytes(b"cached")
+        _write_manifest(workdir, descriptors, kind=kind)
+    return prepare
+
+
+def test_target_patches_all_expands_when_brcached_covers_every_survivor(
+        tmp_path, monkeypatch):
+    """32 prefilter survivors with a covering .brcached must all run."""
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "all"],
+        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+                     'BINRADAR_PATCH_KIND="generic-erm"\n',
+                     'BRCACHE_STACK_SIZE="0"\n'],
+        prepare=_cover_all(["=p0p0"] * 32))
+
+    assert captured["TOTAL_PATCHES"] == "32"
+    # The compiled cap stays visible so no phase runs an id past it on
+    # .brpatched.
+    assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+
+
+def test_target_patches_all_clamps_without_a_covering_cache(
+        tmp_path, monkeypatch):
+    """Without .brcached the run stays clamped to the compiled set."""
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "all"],
+        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+                     'BINRADAR_PATCH_KIND="generic-erm"\n',
+                     'BRCACHE_STACK_SIZE="0"\n'])
+
+    assert captured["TOTAL_PATCHES"] == "30"
+    assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+
+
+def test_target_patches_all_clamps_when_manifest_is_short(
+        tmp_path, monkeypatch):
+    """A manifest missing past-cap ids cannot cover the survivor list."""
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "all"],
+        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+                     'BINRADAR_PATCH_KIND="generic-erm"\n',
+                     'BRCACHE_STACK_SIZE="0"\n'],
+        prepare=_cover_all(["=p0p0"] * 30))
+
+    assert captured["TOTAL_PATCHES"] == "30"
+
+
+def test_target_patches_top_30_records_the_compiled_cap(
+        tmp_path, monkeypatch):
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "top-30"],
+        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n'])
+
+    assert captured["TOTAL_PATCHES"] == "30"
+    assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+
+
+def test_target_patches_all_expands_under_the_smaller_compiled_set(
+        tmp_path, monkeypatch):
+    """The cap is whatever setup compiled, not a hard-coded 30."""
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "all"],
+        ['BINARY="bin"\n', 'POC_INPUT="poc"\n', 'TEST_CMD="./bin @@"\n',
+         'PATCH_LOC="0x1234"\n', 'TOTAL_PATCHES="9"\n',
+         'PREFILTER_TOTAL_PATCHES="12"\n',
+         'BINRADAR_PATCH_KIND="CWE805-erm"\n',
+         'BRCACHE_STACK_SIZE="64"\n'],
+        prepare=_cover_all(["c1p0"] * 12, kind="CWE805-erm"))
+
+    assert captured["TOTAL_PATCHES"] == "12"
+    assert captured["BRPATCHED_TOTAL_PATCHES"] == "9"
+
+
+@pytest.mark.parametrize("stack_size,expected", [("0", None), ("64", "CWE805-erm")])
+def test_cwe805_coverage_requires_a_valid_stack_size(
+        tmp_path, stack_size, expected):
+    """A CWE-805 cached artifact without its stack size is unusable."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir(parents=True)
+    (workdir / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(workdir, ["c1p0"], kind="CWE805-erm")
+
+    coverage = binradar_verifier.load_cached_predicate_set(
+        workdir / "brpatches.json", workdir / "bin.brcached",
+        "CWE805-erm", int(stack_size), [1])
+
+    assert (coverage.family.value if coverage.family else None) == expected
+    assert (coverage.reason == "") if expected else bool(coverage.reason)
+
+
+def test_artifact_selection_prefers_brcached_for_a_cached_only_survivor(
+        tmp_path):
+    """A lone survivor past the compile cap can only run on .brcached."""
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.workdir = str(tmp_path)
+    executor.binary = "bin"
+    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
+                       "BRCACHE_STACK_SIZE": "0"}
+    executor.brpatched_total_patches = 30
+    (tmp_path / "bin.brpatched").write_bytes(b"patched")
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, ["=p0p0"] * 31)
+
+    executor.filter_result = [31]
+    assert executor.cached_needed() is True
+    assert executor.verifier_binary() == str(tmp_path / "bin.brcached")
+    assert executor.binradar_binary() == str(tmp_path / "bin.brcached")
+
+    # A compiled survivor keeps the previous behaviour.
+    executor.filter_result = [5]
+    assert executor.cached_needed() is False
+    assert executor.verifier_binary() == str(tmp_path / "bin.brpatched")
+
+
+def test_artifact_selection_refuses_an_uncovered_survivor(tmp_path):
+    """Above-cap survivors without manifest coverage fall back to .brpatched
+    rather than selecting a cache that cannot serve them."""
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.workdir = str(tmp_path)
+    executor.binary = "bin"
+    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
+                       "BRCACHE_STACK_SIZE": "0"}
+    executor.brpatched_total_patches = 30
+    (tmp_path / "bin.brpatched").write_bytes(b"patched")
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, ["=p0p0"] * 30)
+
+    executor.filter_result = [31]
+    assert executor.binradar_binary() == str(tmp_path / "bin.brpatched")
+
+
+def test_filter_keeps_an_uncompiled_candidate_instead_of_running_it(tmp_path):
+    """.brpatched would evaluate an uncompiled id as the false predicate and
+    drop the candidate; the filter keeps it instead."""
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.probe_result = SimpleNamespace(fault_addr=0xDEAD)
+    executor.brpatched_total_patches = 30
+
+    class NoRunRunner:
+        def test_with_patched(self, patch_id, testcase):
+            raise AssertionError("uncompiled id must not run on .brpatched")
+
+    assert executor._filter_patch(31, NoRunRunner(), "poc") is True
+
+
+def test_filter_requires_cached_coverage_for_uncompiled_survivors(tmp_path):
+    """A run that cannot execute an uncompiled survivor fails closed."""
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.workdir = str(tmp_path)
+    executor.binary = "bin"
+    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
+                       "BRCACHE_STACK_SIZE": "0"}
+    executor.brpatched_total_patches = 30
+
+    with pytest.raises(RuntimeError, match="not compiled into .brpatched"):
+        executor._require_cached_coverage([1, 31])
+
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, ["=p0p0"] * 31)
+    executor._require_cached_coverage([1, 31])
+
+
+def test_verifier_never_runs_an_uncompiled_id_on_brpatched(tmp_path):
+    """The verifier records no evidence for an id .brpatched cannot express."""
+    runner = binradar_verifier.BinRadarQemuRunner(
+        dir=str(tmp_path), binary="bin", test_cmd="-l @@", patch_loc="0x1000")
+    runner.test_with_patched = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("uncompiled id must not run on .brpatched"))
+
+    def _probe():
+        return binradar_verifier.BinRadarProbeResult(
+            0x1000, 0x1000, [], "ok", 1, 1, 0, [])
+
+    (tmp_path / "run").mkdir(exist_ok=True)
+    verifier = binradar_verifier.BinRadarConcreteVerifier(
+        str(tmp_path), str(tmp_path / "run"), runner, _probe(),
+        str(tmp_path / "bin.brpatched"), [31],
+        patched_binary_patches=list(range(1, 31)))
+
+    testcase = binradar_verifier.Testcase(0, "input", "ok", 0, [0])
+    result, patch_result = verifier.run_testcase_patched(31, testcase)
+
+    assert result is None and patch_result is None
+    assert verifier.accept_evidences == {31: 0}
+    assert verifier.total_evidences == {31: 0}
