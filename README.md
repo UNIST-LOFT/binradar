@@ -161,7 +161,7 @@ Verdicts:
 ### Orchestrator
 - `fuzzolic/binradar.py`: main entry point for the verification process
 - `fuzzolic/binradar_verifier.py`: implementation of the verification logic.
-- `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c`: experimental in-process OSPREY path. Stages 0–8 are accepted and BinRadar enables it; ranking and evaluation remain Stage 9 work. See `agent-docs/info/OSPREY_IMPLEMENTATION_PLAN.md` §0.
+- `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c`: experimental in-process OSPREY path.
 
 These are main phases:
 1. PROBE: run the test cases with original binary to confirm the crash and collect information about the crash (e.g., fault address, patch function entrypoint, patch function hit count, etc.)
@@ -177,7 +177,7 @@ These are main phases:
 Among these phases, `FUZZOLIC`, `DIRECTED`, `FUZZER` and `BINRADAR` are run in parallel by default, and `MINIMIZER`/`VERIFIER` run concurrently with each other — and concurrently with the testcase producers: the verifier consumes the minimizer's test cases as they are produced instead of waiting for the minimizer to finish first, and the minimizer discovers testcase files incrementally while `FUZZOLIC`/`DIRECTED`/`FUZZER` are still running instead of waiting for them to finish. Testcase writers publish atomically: the solver and AFL++ write `<final>.binradar-part`, close it, and rename/link it to the final name, and the minimizer ignores partial names; it also executes and stores the immutable bytes it captured at discovery time. The minimizer writes its `[minimizer] [done]` marker only after every producer phase has ended and a final scan has consumed every published testcase. Producer failures (tracer timeout, solver timeout/nonzero exit, unexpected early AFL++ exit; reaching the configured AFL++ phase deadline is normal) abort the minimizer and the verifier instead of silently verifying a truncated testcase set, and a verifier failure cooperatively cancels the minimizer. You can run the phases sequentially by specifying `--seq` option (minimizer and verifier remain concurrent with each other, and the minimizer uses snapshot mode since the producers have already finished). Also, you can specify which phases to run by using `--run-single-phase` option (`minimizer` and `verifier` are valid; `verifier` as a single phase replays a completed `minimizer.sbsv` and requires its done marker).
 
 ### tracer
-Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QEMU `4.1.1` with modifications for symbolic execution, memcheck/provenance, and type inference. See `agent-docs/TRACER.md` for the full source map, modes, forkserver protocol, environment variables, and build instructions.
+Used for concolic execution (`fuzzolic`, `directed`) and `binradar`. Based on QEMU `4.1.1` with modifications for symbolic execution, memcheck/provenance, and type inference.
 
 Main modified files:
 - `tracer/linux-user/snapshot.c, h` — snapshot, forkserver, memory-region tracking (heap/stack/global), memcheck, syscall hooks, binradar patch manager
@@ -193,10 +193,10 @@ Main modified files:
 - `tracer/target/i386/translate.c` — provenance helper emission (`gen_prov_*`), call/ret instrumentation
 - `tracer/tcg/tcg.c` — `enable_symbolic_mode()`; `parse_translation_block` (symbolic) / `memcheck_instrument_tb` (memcheck-only)
 - `tracer/linux-user/syscall.c` — `snapshot_syscall` + `qemu_syscall_helper` on every syscall
-- `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c` — experimental in-process OSPREY path; Stages 0–8 are accepted and the orchestrator enables it only in BinRadar mode over forkserver protocol v2, while other orchestrated modes and the standalone probe force it off; ranking/evaluation remains out of scope until Stage 9 (`agent-docs/info/OSPREY_IMPLEMENTATION_PLAN.md` §0)
+- `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c` — experimental in-process OSPREY path;
 
 - Forkserver: implemented (`snapshot_forkserver` in `snapshot.c`)
-- Type analyzer: OSPREY-style in-process type inference (`tracer/linux-user/osprey-*.c`, `BINRADAR_OSPREY_ENABLE=1`, BinRadar-only; the external Python analyzer and the analysis trace artifact were removed with protocol v2)
+- Type analyzer: OSPREY-style in-process type inference (`tracer/linux-user/osprey-*.c`, `BINRADAR_OSPREY_ENABLE=1`, BinRadar-only; the external Python analyzer and the analysis trace artifact were removed with the protocol v2/v3 cutover)
 - Memory modification: implemented in `tracer/tcg`
 
 ### solver

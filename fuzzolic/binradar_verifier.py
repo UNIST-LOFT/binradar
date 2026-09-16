@@ -454,8 +454,7 @@ class BinRadarQemuRunner:
         # artifact's E9 pages via QEMU's partial-instrumentation ranges (the
         # E9_EXCLUDE_RANGES hex-interval syntax is exactly what the
         # AFL_QEMU_INST_RANGES parser expects).  The original binary has no
-        # E9 metadata and is left untouched.  See
-        # agent-docs/problem/QASAN_E9_TRAMPOLINE_UNINSTRUMENTED.md.
+        # E9 metadata and is left untouched.
         ranges, _ = self.e9_metadata_for_binary(
             binary if binary is not None else self.patched_binary())
         if ranges:
