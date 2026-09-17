@@ -63,8 +63,20 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
     mutation_feedback.mkdir()
     (mutation_feedback / "iteration-00000002-patch-00000001.brch").write_bytes(
         b"BRCH-snapshot")
+    # A realistic symbolic-advisor pair: the sidecar carries the complete
+    # applied plan, including the synthesized value, so the copy must preserve
+    # every mutation row byte for byte and not just the header.
+    symbolic_sidecar = (
+        "[binradar-feedback] [version 1] [iteration 2] [patch 1] "
+        "[snapshot-file iteration-00000002-patch-00000001.brch] "
+        "[snapshot-count 1] [branches 1] [outcome normal] [fault-addr 0] "
+        "[poc-fault-addr 1234] [same-fault false] [result benign] "
+        "[mutation-writes 1]\n"
+        "[binradar-mutation] [index 0] [kind bytes] [addr 404080] [size 4] "
+        "[value 00100000] [target-extent 0]\n"
+    )
     (mutation_feedback / "iteration-00000002-patch-00000001.sbsv").write_text(
-        "[binradar-feedback] [version 1] [iteration 2] [patch 1]\n")
+        symbolic_sidecar)
 
     (run_dir / "minimizer.sbsv").write_text(
         _full_row(0, "0_benign", "ok", 0)
@@ -100,9 +112,11 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
     assert (Path(benign) / "feedback" / "binradar" /
             "iteration-00000002-patch-00000001.brch").read_bytes() == \
         b"BRCH-snapshot"
-    assert "[iteration 2] [patch 1]" in (
-        Path(benign) / "feedback" / "binradar" /
-        "iteration-00000002-patch-00000001.sbsv").read_text()
+    copied_sidecar = (Path(benign) / "feedback" / "binradar" /
+                      "iteration-00000002-patch-00000001.sbsv").read_text()
+    assert copied_sidecar == symbolic_sidecar
+    assert "[binradar-mutation] [index 0] [kind bytes] [addr 404080] " \
+        "[size 4] [value 00100000]" in copied_sidecar
     assert progress == [
         "[feedback] [start] [prefix run] [id 0]",
         "[feedback] [done] [prefix run] [id 0]",

@@ -134,3 +134,56 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     assert captured["BINRADAR_FORKSERVER_ENABLE"] == "0"
     assert captured["BINRADAR_OSPREY_ENABLE"] == "0"
     assert captured["BINRADAR_TRACE_FILE"] == "none"
+
+
+def test_get_env_gates_symbolic_advisor_by_mode(monkeypatch, executor):
+    instance, run_dir = executor
+    monkeypatch.setenv("BINRADAR_SYMBOLIC_MUTATION_MODE", "boundary")
+
+    env = instance.get_env("binradar", str(run_dir))
+    assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
+
+    for index, mode in enumerate(
+            ["fuzzolic", "directed", "probe", "minimizer", "verifier"]):
+        forced = instance.get_env(mode, str(run_dir / f"m{index}"))
+        assert forced["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off", mode
+
+
+def test_feedback_and_symbolic_advisor_are_independent(monkeypatch, executor):
+    instance, run_dir = executor
+    monkeypatch.setenv("BINRADAR_SYMBOLIC_MUTATION_MODE", "boundary")
+
+    # Feedback on does not turn the advisor on, and the advisor being on does
+    # not turn feedback on: each feature reads only its own configuration.
+    instance.feedback_mode = True
+    feedback_on = instance.get_env("binradar", str(run_dir))
+    instance.feedback_mode = False
+    feedback_off = instance.get_env("binradar", str(run_dir / "off"))
+
+    assert feedback_on["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
+    assert feedback_off["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
+    # get_env is not the place that arms feedback; it must not inject the
+    # staging directory in either case.
+    for env in (feedback_on, feedback_off):
+        assert "BINRADAR_FEEDBACK_DIR" not in env
+
+
+def test_symbolic_mode_defaults_off_without_environment(monkeypatch, executor):
+    instance, run_dir = executor
+    monkeypatch.delenv("BINRADAR_SYMBOLIC_MUTATION_MODE", raising=False)
+    env = instance.get_env("binradar", str(run_dir))
+    assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off"
+
+
+def test_config_overrides_inherited_symbolic_mode(monkeypatch, executor):
+    instance, run_dir = executor
+    monkeypatch.setenv("BINRADAR_SYMBOLIC_MUTATION_MODE", "shadow")
+    instance.config["BINRADAR_SYMBOLIC_MUTATION_MODE"] = "boundary"
+    env = instance.get_env("binradar", str(run_dir))
+    assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
+
+
+def test_symbolic_mode_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        binradar.validate_symbolic_mutation_mode("aggressive")
+    assert binradar.validate_symbolic_mutation_mode(" Boundary ") == "boundary"

@@ -57,6 +57,31 @@ SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
 HANDSHAKE_EXPECTED = 0x41464C02
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 
+# Symbolic boundary advisor (OSPREY Stage 7).  The advisor lands default-off;
+# ``shadow`` measures candidate utility and cost without proposing anything,
+# and ``boundary`` submits advisor-ID-2 families.  Only the BinRadar tracer
+# phase may run it, so the mode is always set explicitly in the phase
+# environment rather than inherited from the caller.
+SYMBOLIC_MUTATION_MODE_DEFAULT = "off"
+SYMBOLIC_MUTATION_MODES = ("off", "shadow", "boundary")
+# Advisor resource defaults, matching the tracer's own compiled defaults in
+# tracer/linux-user/snapshot-mutation-symbolic.c.  BinRadar publishes them
+# explicitly so an operator can tighten them per subject without editing the
+# tracer.
+SYMBOLIC_MAX_WORK_DEFAULT = 1000000
+SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
+SYMBOLIC_DEADLINE_MS_DEFAULT = 100
+
+
+def validate_symbolic_mutation_mode(value: str) -> str:
+    """Normalize and validate a symbolic advisor mode name."""
+    normalized = str(value).strip().lower()
+    if normalized not in SYMBOLIC_MUTATION_MODES:
+        raise ValueError(
+            f"invalid symbolic mutation mode {value!r}; expected one of "
+            f"{', '.join(SYMBOLIC_MUTATION_MODES)}")
+    return normalized
+
 
 def parse_bool(value):
     """Parse a boolean CLI value while retaining bare-flag compatibility."""
@@ -787,6 +812,10 @@ class BinRadarExecutor:
     # tracked separately from ``phase_failures`` throughout.
     wall_time_reached: bool
     feedback_mode: bool
+    # Symbolic boundary advisor mode for the BinRadar tracer phase only:
+    # "off" | "shadow" | "boundary".  Always explicit so an inherited CLI
+    # environment cannot enable it in another phase.
+    symbolic_mutation_mode: str
     # Control
     phase_failures: Dict[str, str]
     phase_failure_lock: threading.Lock
@@ -800,7 +829,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT, brpatched_total_patches: Optional[int] = None):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT, brpatched_total_patches: Optional[int] = None, symbolic_mutation_mode: str = SYMBOLIC_MUTATION_MODE_DEFAULT):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -816,6 +845,8 @@ class BinRadarExecutor:
         self.disable_binradar = disable_binradar
         self.less_strict = less_strict
         self.feedback_mode = feedback_mode
+        self.symbolic_mutation_mode = validate_symbolic_mutation_mode(
+            symbolic_mutation_mode)
         self.binradar_failed = False
         self.wall_time_reached = False
         self._fuzzer_output_prepared = False
@@ -883,6 +914,9 @@ class BinRadarExecutor:
             disable_binradar=env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1",
             less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
             feedback_mode=env.get("BINRADAR_FEEDBACK_MODE", "0") == "1",
+            symbolic_mutation_mode=env.get(
+                "BINRADAR_SYMBOLIC_MUTATION_MODE",
+                SYMBOLIC_MUTATION_MODE_DEFAULT),
             forkserver_child_timeout=forkserver_child_timeout,
             brpatched_total_patches=int(env.get(
                 "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])))
@@ -1131,6 +1165,17 @@ class BinRadarExecutor:
         # TODO: implement stdin
         self.set_config("BINRADAR_TIMEOUT", str(self.timeout))
         self.set_config("SYMBOLIC_INJECT_INPUT_MODE", "FROM_FILE")
+        # Explicit advisor defaults for the tracer phase.  These are also set
+        # per-phase in get_env(); publishing them here keeps the resolved
+        # values visible in binradar.env and makes an operator edit authoritative.
+        self.set_config("BINRADAR_SYMBOLIC_MUTATION_MODE",
+                        self.symbolic_mutation_mode)
+        self.set_config("BINRADAR_SYMBOLIC_MAX_WORK",
+                        str(SYMBOLIC_MAX_WORK_DEFAULT))
+        self.set_config("BINRADAR_SYMBOLIC_MAX_BYTES",
+                        str(SYMBOLIC_MAX_BYTES_DEFAULT))
+        self.set_config("BINRADAR_SYMBOLIC_DEADLINE_MS",
+                        str(SYMBOLIC_DEADLINE_MS_DEFAULT))
         testcase = self.resolved_poc_input()
         self.set_config("SYMBOLIC_TESTCASE_NAME", testcase)
         if self.timeout > 0:
@@ -1143,6 +1188,21 @@ class BinRadarExecutor:
         if self.probe_result is None:
             raise RuntimeError("Probe result is not available. Cannot set environment for tracer and solver.")
         env["BINRADAR_OSPREY_ENABLE"] = "1" if mode == "binradar" else "0"
+        # The symbolic boundary advisor is a BinRadar-only mutation source, and
+        # it stays off unless the operator opts in.  Every other mode runs the
+        # original binary or a probe/minimizer/verifier pass where a mutated
+        # scalar would change what that phase observes, so the mode is forced
+        # off there instead of being inherited from the CLI environment.
+        # Read the requested mode before overwriting it: get_env is the only
+        # place that decides which phases may see it.
+        requested_mode = validate_symbolic_mutation_mode(
+            self.config.get(
+                "BINRADAR_SYMBOLIC_MUTATION_MODE",
+                env.get("BINRADAR_SYMBOLIC_MUTATION_MODE",
+                        SYMBOLIC_MUTATION_MODE_DEFAULT)))
+        env["BINRADAR_SYMBOLIC_MUTATION_MODE"] = "off"
+        if mode == "binradar":
+            env["BINRADAR_SYMBOLIC_MUTATION_MODE"] = requested_mode
         log_file = os.path.join(run_dir, f"{mode}-tracer-msg.log")
         if os.path.exists(log_file):
             open(log_file, "w").close()
@@ -1245,6 +1305,9 @@ class BinRadarExecutor:
         tracer_env = os.environ.copy()
         tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
         tracer_env["BINRADAR_OSPREY_ENABLE"] = "0"
+        # The probe runs the unpatched original binary; a mutated scalar would
+        # corrupt the fault-address observation this path exists to produce.
+        tracer_env["BINRADAR_SYMBOLIC_MUTATION_MODE"] = "off"
         tracer_env["BINRADAR_TRACE_FILE"] = "none"
         # The original binary has no E9 mappings and no relocated calls.
         tracer_env["E9_EXCLUDE_RANGES"] = ""
@@ -2561,6 +2624,15 @@ def main():
         help="prioritize directed candidates from the end of the forward trace (Z3 only); optionally pass true/false")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
+    parser.add_argument(
+        "--symbolic-mutation-mode", dest="symbolic_mutation_mode",
+        choices=SYMBOLIC_MUTATION_MODES,
+        default=None,
+        help=("symbolic boundary advisor mode for the BinRadar tracer phase "
+              "(default: off, or BINRADAR_SYMBOLIC_MUTATION_MODE from "
+              "binradar.env); 'shadow' ranks and reports without proposing, "
+              "'boundary' proposes comparison-guided values.  Every other "
+              "phase always runs with the advisor off"))
     parser.add_argument("--less-strict", action="store_true",
         help=("continue when optional evidence phases (fuzzolic, directed, "
               "fuzzer, binradar, or feedback) fail; final output records the "
@@ -2603,6 +2675,15 @@ def main():
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if (args.disable_binradar or args.fuzzer_only) else "0"
     env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
     env["BINRADAR_FEEDBACK_MODE"] = "1" if args.feedback_mode else "0"
+    # The advisor is independent of feedback: enabling one never enables the
+    # other.  Precedence is CLI flag, then binradar.env, then the off default,
+    # so a rollout can pin a subject in binradar.env without a flag and a flag
+    # still overrides it.
+    env["BINRADAR_SYMBOLIC_MUTATION_MODE"] = validate_symbolic_mutation_mode(
+        args.symbolic_mutation_mode
+        if args.symbolic_mutation_mode is not None
+        else env.get("BINRADAR_SYMBOLIC_MUTATION_MODE",
+                     SYMBOLIC_MUTATION_MODE_DEFAULT))
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     # .brpatched compiles only the setup-time top-30 prefilter survivors into
     # its static predicate table. Record that cap explicitly so no phase can
