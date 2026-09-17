@@ -1777,6 +1777,8 @@ class BinRadarExecutor:
             return
         testcase = self.resolved_poc_input()
         self.check_requirements()
+        if self.probe_result is None:
+            raise RuntimeError("Probe result is not available for BinRadar")
         
         exec_mode = "binradar"
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
@@ -1784,6 +1786,9 @@ class BinRadarExecutor:
         
         tracer_binary = self.binradar_binary()
         binradar_env = self.get_env(exec_mode, self.run_dir)
+        feedback_staging = os.path.join(self.run_dir, "binradar-feedback")
+        if self.feedback_mode and os.path.exists(feedback_staging):
+            shutil.rmtree(feedback_staging)
         if tracer_binary == self.cached_binary():
             binradar_env["BINRADAR_PATCH_CACHE_ENABLE"] = "1"
             binradar_env["BINRADAR_PATCH_MANIFEST"] = str(
@@ -1792,7 +1797,16 @@ class BinRadarExecutor:
                 "BRCACHED_E9_EXCLUDE_RANGES", "")
             binradar_env["E9_RELOCATED_CALL_JUMPS"] = self.config.get(
                 "BRCACHED_E9_RELOCATED_CALL_JUMPS", "")
+            if self.feedback_mode:
+                os.makedirs(feedback_staging)
+                binradar_env["BINRADAR_FEEDBACK_DIR"] = feedback_staging
+                binradar_env["BINRADAR_POC_FAULT_ADDR"] = hex(
+                    self.probe_result.fault_addr)
         else:
+            if self.feedback_mode:
+                logger.warning(
+                    "[BINRADAR] Mutation feedback requires .brcached; "
+                    "the selected artifact has no snapshot channel")
             binradar_env.pop("BINRADAR_PATCH_CACHE_ENABLE", None)
             binradar_env.pop("BINRADAR_PATCH_MANIFEST", None)
         shm = SharedMemoryManager(binradar_env)
@@ -1871,6 +1885,10 @@ class BinRadarExecutor:
             shutil.copyfile(
                 os.path.join(self.workdir, "brpatches.json"),
                 os.path.join(feedback_dir, "brpatches.json"))
+        mutation_feedback = os.path.join(self.run_dir, "binradar-feedback")
+        if os.path.isdir(mutation_feedback):
+            shutil.copytree(
+                mutation_feedback, os.path.join(feedback_dir, "binradar"))
         concrete_dir = os.path.join(feedback_dir, "concrete")
         benign_dir = os.path.join(concrete_dir, "benign")
         malicious_dir = os.path.join(concrete_dir, "malicious")

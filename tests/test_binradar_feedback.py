@@ -59,6 +59,13 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
     (minimized / "5_timeout").write_bytes(b"timeout")
     (minimized / "6_legacy").write_bytes(b"legacy")
 
+    mutation_feedback = run_dir / "binradar-feedback"
+    mutation_feedback.mkdir()
+    (mutation_feedback / "iteration-00000002-patch-00000001.brch").write_bytes(
+        b"BRCH-snapshot")
+    (mutation_feedback / "iteration-00000002-patch-00000001.sbsv").write_text(
+        "[binradar-feedback] [version 1] [iteration 2] [patch 1]\n")
+
     (run_dir / "minimizer.sbsv").write_text(
         _full_row(0, "0_benign", "ok", 0)
         + _full_row(1, "1_malicious", "crash", 0x1234)
@@ -90,6 +97,12 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
         (Path(benign) / "feedback" / "concrete" / "malicious").iterdir()
     ) == ["1_malicious"]
     assert (Path(benign) / "feedback" / "poc" / "input").read_bytes() == b"poc"
+    assert (Path(benign) / "feedback" / "binradar" /
+            "iteration-00000002-patch-00000001.brch").read_bytes() == \
+        b"BRCH-snapshot"
+    assert "[iteration 2] [patch 1]" in (
+        Path(benign) / "feedback" / "binradar" /
+        "iteration-00000002-patch-00000001.sbsv").read_text()
     assert progress == [
         "[feedback] [start] [prefix run] [id 0]",
         "[feedback] [done] [prefix run] [id 0]",

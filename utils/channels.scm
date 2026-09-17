@@ -1,7 +1,7 @@
 (cons* (channel
         (name 'loftix)
         (url "https://github.com/UNIST-LOFT/loftix")
-        (branch "ktl")
+        (branch "main")
         (introduction
             (make-channel-introduction
             "1b5437ce217590545f7a7319a5c62b6300aee6c4"
