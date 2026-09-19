@@ -49,13 +49,16 @@ Subcommands:
         skipped filter status.
 
     binradar-stats
-        Collect per-patch verifier evidence-class statistics for the top
-        --top patches ranked by confidence (from final.sbsv). Counts the
-        aggregate observation counters in <run>/verifier.br (or legacy
-        [verifier] [...] rows in verifier.sbsv): pc (patch-crashed), csda
-        (crash-skip-diff-addr), cf (crash-fail), cp (crash-pass), ct
-        (crash-timeout), ncsda (no-crash-skip-diff-addr), ncf
-        (no-crash-fail), ncpsb (no-crash-pass-same-br), nccdb
+        Collect verifier representative-run and per-patch evidence-class
+        statistics for the top --top patches ranked by confidence (from
+        final.sbsv). Representative runs, represented patch runs, savings,
+        testcase counts, and fallbacks come from <run>/verifier.log (or
+        legacy verifier.sbsv). Aggregate observation counters come from
+        <run>/verifier.br (or legacy [verifier] [...] rows): pc
+        (patch-crashed), csda (crash-skip-diff-addr), cf (crash-fail), cp
+        (crash-pass), ct (crash-timeout), ncsda
+        (no-crash-skip-diff-addr), ncf (no-crash-fail), ncpsb
+        (no-crash-pass-same-br), nccdb
         (no-crash-confidence-diff-br), and nct (no-crash-timeout).
 
 Output is saved to logs/binradar-<datetime>.log / logs/sdfuzz-<datetime>.log /
@@ -289,18 +292,18 @@ class TaoscResult:
 # name maps to exactly one class; note that a naive substring match is unsafe (e.g. "crash-fail" is
 # a substring of "no-crash-fail"), so the row action is matched exactly.
 VERIFIER_RESULT_ROW_KEYS = {
-    "patch-crashed": "pc",
-    "crash-skip-diff-addr": "csda",
-    "crash-fail": "cf",
-    "crash-pass": "cp",
-    "crash-timeout": "ct",
-    "no-crash-skip-diff-addr": "ncsda",
-    "no-crash-fail": "ncf",
-    "no-crash-pass-same-br": "ncpsb",
-    "no-crash-confidence-diff-br": "nccdb",
-    "no-crash-timeout": "nct",
+    "patch-crashed": "patch-crashed",
+    "crash-skip-diff-addr": "crash-skip-diff-addr",
+    "crash-fail": "crash-fail",
+    "crash-pass": "crash-pass",
+    "crash-timeout": "crash-timeout",
+    "no-crash-skip-diff-addr": "no-crash-skip-diff-addr",
+    "no-crash-fail": "no-crash-fail",
+    "no-crash-pass-same-br": "no-crash-pass-same-br",
+    "no-crash-confidence-diff-br": "no-crash-confidence-diff-br",
+    "no-crash-timeout": "no-crash-timeout",
 }
-STATS_KEYS = ["pc", "csda", "cf", "cp", "ct", "ncsda", "ncf", "ncpsb", "nccdb", "nct"]
+STATS_KEYS = ["patch-crashed", "crash-skip-diff-addr", "crash-fail", "crash-pass", "crash-timeout", "no-crash-skip-diff-addr", "no-crash-fail", "no-crash-pass-same-br", "no-crash-confidence-diff-br", "no-crash-timeout"]
 
 
 @dataclass
@@ -312,6 +315,20 @@ class PatchStats:
 
 
 @dataclass
+class RepresentativeStats:
+    """Observed verifier branch-cache representative-run statistics.
+
+    Values remain -1 when the human verifier log is unavailable: compact
+    verifier.br evidence retains per-patch outcomes, but not cache groups.
+    """
+    source: str = ""
+    testcases: int = -1
+    runs: int = -1
+    represented_patch_runs: int = -1
+    fallbacks: int = -1
+
+
+@dataclass
 class StatsRunResult:
     """Verifier stats for a single run within an experiment."""
     run_name: str
@@ -319,6 +336,9 @@ class StatsRunResult:
     has_final: bool = False
     top_shown: int = 0  # patches shown
     total_ranked: int = 0  # total patches in the ranking universe
+    verifier_observations: int = 0
+    representatives: RepresentativeStats = field(
+        default_factory=RepresentativeStats)
     patches: List[PatchStats] = field(default_factory=list)
 
 
@@ -534,6 +554,62 @@ def parse_verifier_test_result_stats(sbsv_path: str) -> Dict[int, Dict[str, int]
                                       dict.fromkeys(STATS_KEYS, 0))
             entry[key] += 1
     return counts
+
+
+_VERIFIER_CACHE_MISS_RE = re.compile(
+    r"^\[verifier-cache\] \[miss\] \[patch (\d+)\] \[id (\d+)\]")
+_VERIFIER_CACHE_GROUP_RE = re.compile(
+    r"^\[verifier-cache\] \[group\] \[representative (\d+)\] "
+    r"\[members (\d+)\] \[id (\d+)\]")
+_VERIFIER_CACHE_FALLBACK_RE = re.compile(
+    r"^\[verifier-cache\] \[(?:fallback|runtime-mismatch)\] "
+    r"\[patch (\d+)\] \[id (\d+)\]")
+
+
+def parse_verifier_representative_stats(log_path: str) -> RepresentativeStats:
+    """Count cache representatives and the patch runs they stand for.
+
+    Every ``[verifier-cache] [miss]`` starts one cached representative run.
+    A matching ``[group]`` row records the complete group size, including the
+    representative; a miss without a group is a singleton. ``fallback`` and
+    ``runtime-mismatch`` rows count representative attempts that required a
+    second, uncached execution.
+
+    Compact ``verifier.br`` does not retain these cache events. Callers must
+    therefore pass ``verifier.log`` or a legacy ``verifier.sbsv`` containing
+    the diagnostic rows. Missing files return unavailable (-1) counters.
+    """
+    if not os.path.isfile(log_path) or log_path.endswith(".br"):
+        return RepresentativeStats()
+
+    misses: List[Tuple[int, int]] = []
+    group_sizes: Dict[Tuple[int, int], int] = {}
+    fallbacks = 0
+    with open(log_path, "r") as f:
+        for line in f:
+            if "[verifier-cache] [" not in line:
+                continue
+            payload = _strip_log_prefix(line.strip())
+            match = _VERIFIER_CACHE_MISS_RE.match(payload)
+            if match is not None:
+                misses.append((int(match.group(2)), int(match.group(1))))
+                continue
+            match = _VERIFIER_CACHE_GROUP_RE.match(payload)
+            if match is not None:
+                key = (int(match.group(3)), int(match.group(1)))
+                group_sizes[key] = int(match.group(2))
+                continue
+            if _VERIFIER_CACHE_FALLBACK_RE.match(payload) is not None:
+                fallbacks += 1
+
+    testcases = {testcase for testcase, _ in misses}
+    represented_patch_runs = sum(group_sizes.get(key, 1) for key in misses)
+    return RepresentativeStats(
+        source=os.path.basename(log_path),
+        testcases=len(testcases),
+        runs=len(misses),
+        represented_patch_runs=represented_patch_runs,
+        fallbacks=fallbacks)
 
 
 def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
@@ -1300,8 +1376,17 @@ def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
             os.path.join(run_dir, "final.sbsv"))
         filter_results = parse_filter_sbsv(
             _result_artifact(run_dir, "filter"))
-        stats = parse_verifier_test_result_stats(
-            _result_artifact(run_dir, "verifier"))
+        verifier_artifact = _result_artifact(run_dir, "verifier")
+        stats = parse_verifier_test_result_stats(verifier_artifact)
+        verifier_observations = sum(
+            sum(counts.values()) for counts in stats.values())
+        verifier_log = os.path.join(run_dir, "verifier.log")
+        if not os.path.isfile(verifier_log) \
+                and verifier_artifact.endswith(".sbsv"):
+            # Before compact evidence split diagnostics from results, the
+            # cache events and terminal verifier rows shared verifier.sbsv.
+            verifier_log = verifier_artifact
+        representatives = parse_verifier_representative_stats(verifier_log)
 
         if confidence_data:
             top, total = top_patches_by_confidence(confidence_data,
@@ -1322,7 +1407,9 @@ def collect_stats_experiment(exp_dir: str, workdir_name: str, run_prefix: str,
         result.runs.append(StatsRunResult(
             run_name=run_name, status=status,
             has_final=(final_entry is not None),
-            top_shown=len(top), total_ranked=total, patches=patches))
+            top_shown=len(top), total_ranked=total,
+            verifier_observations=verifier_observations,
+            representatives=representatives, patches=patches))
 
     if not overall_ok:
         result.overall_status = "issues"
@@ -1565,6 +1652,32 @@ def format_stats_result_log(result: StatsExperimentResult) -> str:
 
     for run in result.runs:
         lines.append(f"  [{run.run_name}] {run.status}")
+        representatives = run.representatives
+        lines.append(
+            f"    [verifier] observations: {run.verifier_observations}")
+        if representatives.runs >= 0:
+            saved = (representatives.represented_patch_runs
+                     - representatives.runs)
+            reduction = (
+                saved * 100.0 / representatives.represented_patch_runs
+                if representatives.represented_patch_runs > 0 else 0.0)
+            average = (
+                representatives.runs / representatives.testcases
+                if representatives.testcases > 0 else 0.0)
+            lines.append(
+                f"    [representatives] runs: {representatives.runs}  "
+                f"testcases: {representatives.testcases}  "
+                f"runs/testcase: {average:.2f}  "
+                f"represented patch runs: "
+                f"{representatives.represented_patch_runs}  "
+                f"representative runs avoided: {saved} ({reduction:.2f}%)  "
+                f"fallbacks: {representatives.fallbacks}  "
+                f"source: {representatives.source}")
+        else:
+            lines.append(
+                "    [representatives] runs: N/A "
+                "(requires verifier.log or legacy verifier.sbsv; "
+                "verifier.br does not encode cache groups)")
         if run.total_ranked > run.top_shown:
             lines.append(f"    [stats] (top {run.top_shown} of "
                          f"{run.total_ranked} patches by confidence)")
@@ -1590,6 +1703,15 @@ STATS_CSV_COLUMNS = [
     "experiment",
     "run",
     "status",
+    "verifier_observations",
+    "representative_source",
+    "representative_testcases",
+    "representative_runs",
+    "representative_runs_per_testcase",
+    "represented_patch_runs",
+    "representative_saved_runs",
+    "representative_reduction_pct",
+    "representative_fallbacks",
     "patch",
     "score",
 ] + STATS_KEYS
@@ -1608,10 +1730,42 @@ def format_stats_results_csv(all_results: List[StatsExperimentResult],
             rows.append(row)
             continue
         for run in result.runs:
+            representatives = run.representatives
+            available = representatives.runs >= 0
+            saved = (representatives.represented_patch_runs
+                     - representatives.runs) if available else -1
+            reduction = (
+                saved * 100.0 / representatives.represented_patch_runs
+                if available and representatives.represented_patch_runs > 0
+                else 0.0)
+            average = (
+                representatives.runs / representatives.testcases
+                if available and representatives.testcases > 0 else 0.0)
+            representative_columns = {
+                "verifier_observations": str(run.verifier_observations),
+                "representative_source": (representatives.source
+                                          if available else ""),
+                "representative_testcases": (str(representatives.testcases)
+                                             if available else ""),
+                "representative_runs": (str(representatives.runs)
+                                        if available else ""),
+                "representative_runs_per_testcase": (
+                    f"{average:.2f}" if available else ""),
+                "represented_patch_runs": (
+                    str(representatives.represented_patch_runs)
+                    if available else ""),
+                "representative_saved_runs": (str(saved)
+                                              if available else ""),
+                "representative_reduction_pct": (
+                    f"{reduction:.2f}" if available else ""),
+                "representative_fallbacks": (str(representatives.fallbacks)
+                                             if available else ""),
+            }
             for patch in run.patches:
                 row = {
                     "run": run.run_name,
                     "status": run.status,
+                    **representative_columns,
                     "patch": str(patch.patch),
                     "score": (_format_confidence_score(patch.score)
                               if patch.score else ""),
@@ -2197,8 +2351,8 @@ def main():
 
     sub.add_parser(
         "binradar-stats", parents=[shared],
-        help="collect per-patch verifier _test_result case counts for the "
-             "top-N confidence patches")
+        help="collect verifier representative-run statistics and per-patch "
+             "_test_result counts for the top-N confidence patches")
 
     args = parser.parse_args()
 

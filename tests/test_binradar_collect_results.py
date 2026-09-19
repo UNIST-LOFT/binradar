@@ -33,6 +33,72 @@ def test_parse_compact_filter_and_verifier_artifacts(tmp_path):
     stats = collector.parse_verifier_test_result_stats(str(verifier_path))
     assert stats[1]["cf"] == 1
     assert stats[1]["cp"] == 1
+    representatives = collector.parse_verifier_representative_stats(
+        str(verifier_path))
+    assert representatives.runs == -1
+
+
+def test_collect_verifier_representative_runs(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[verifier] [start] [prefix run] [id 0]\n"
+        "[verifier] [done] [prefix run] [id 0]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1, 2]] "
+        "[binradar_remaining_patches [1, 2]]\n")
+    collector.binradar_evidence.write_verifier(
+        run_dir / "verifier.br",
+        [
+            collector.binradar_evidence.VerifierPatchResult(
+                patch=1, verified=True, accept_evidences=2,
+                total_evidences=2, observations={"crash-pass": 2}),
+            collector.binradar_evidence.VerifierPatchResult(
+                patch=2, verified=True, accept_evidences=2,
+                total_evidences=2, observations={"crash-pass": 2}),
+            collector.binradar_evidence.VerifierPatchResult(
+                patch=3, verified=False, accept_evidences=0,
+                total_evidences=1, observations={"crash-fail": 1}),
+            collector.binradar_evidence.VerifierPatchResult(
+                patch=4, verified=False, accept_evidences=0,
+                total_evidences=1, observations={"crash-fail": 1}),
+        ])
+    (run_dir / "verifier.log").write_text(
+        "2026-09-15 00:00:00,000 - "
+        "[verifier-cache] [miss] [patch 1] [id 0] [file first]\n"
+        "2026-09-15 00:00:00,001 - "
+        "[verifier-cache] [group] [representative 1] [members 3] [id 0]\n"
+        "[verifier-cache] [miss] [patch 4] [id 0] [file first]\n"
+        "[verifier-cache] [fallback] [patch 4] [id 0]\n"
+        "[verifier-cache] [miss] [patch 1] [id 1] [file second]\n"
+        "[verifier-cache] [group] [representative 1] [members 2] [id 1]\n")
+
+    result = collector.collect_stats_experiment(
+        str(tmp_path), "workdir", "run")
+
+    run = result.runs[0]
+    assert run.verifier_observations == 6
+    assert run.representatives.source == "verifier.log"
+    assert run.representatives.testcases == 2
+    assert run.representatives.runs == 3
+    assert run.representatives.represented_patch_runs == 6
+    assert run.representatives.fallbacks == 1
+
+    log = collector.format_stats_result_log(result)
+    assert "[representatives] runs: 3" in log
+    assert "runs/testcase: 1.50" in log
+    assert "representative runs avoided: 3 (50.00%)" in log
+
+    csv_row = collector.format_stats_results_csv([result])[0]
+    assert csv_row["verifier_observations"] == "6"
+    assert csv_row["representative_runs"] == "3"
+    assert csv_row["representative_runs_per_testcase"] == "1.50"
+    assert csv_row["represented_patch_runs"] == "6"
+    assert csv_row["representative_saved_runs"] == "3"
+    assert csv_row["representative_reduction_pct"] == "50.00"
+    assert csv_row["representative_fallbacks"] == "1"
 
 
 def test_parse_filter_new_id_rows(tmp_path):
