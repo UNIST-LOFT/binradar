@@ -3,19 +3,15 @@ import argparse
 import enum
 import os
 import re
-import sbsv
-import shlex
 import shutil
-import signal
 import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
@@ -23,82 +19,60 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import binradar_taosc_predicates
 import binradar_utils
+import binradar_verifier
 from binradar_taosc_predicates import (
     AllocatorTrace,
     CWE805PointerPredicate,
     CWE805SizePredicate,
-    CWE805Snapshot,
+    CWE805_branch_taken,
     InstrumentationSpec,
-    INT64_MIN,
-    PREFILTER_SNAPSHOT_HEADER,
-    PREFILTER_SNAPSHOT_MAGIC,
-    PREFILTER_SNAPSHOT_VERSION,
     PredicateFamily,
     PredicateRecord,
-    PrefilterTrap,
     RegisterCell,
     StackCell,
-    _MASK64,
     _emit_brpatches_inc,
     _parse_predicate_records,
     build_instrumentation_spec,
-    CWE805_branch_taken,
-    CWE805_snapshot_branch_taken,
     detect_predicate_family,
     e9tool_command,
-    evaluate_predicate,
-    load_prefilter_passed_ids,
     load_predicates,
-    parse_allocator_trace,
+    load_filter_passed_ids,
     parse_CWE805_predicate,
-    parse_CWE805_snapshots,
-    parse_state_lines,
+    parse_allocator_trace,
     predicate_to_branch_patch_str,
     predicates_sha256,
     read_patch_format,
     tokenize_generic,
-    write_prefilter,
+    write_filter,
     write_runtime_predicates,
 )
 
 ROOT_DIR = SCRIPT_DIR.parent
 BENCHMARK_SCRIPTS = ROOT_DIR / "benchmarks" / "scripts"
 BRPATCH_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch.c"
-BRPATCH_PREFILTER_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-prefilter.c"
 BRPATCH_CACHED_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-cached.c"
-QEMU_STACKTRACE_RELEASE = ROOT_DIR / "utils" / "binradar-aflplusplus" / "afl-qemu-trace"
 
 
-"""BinRadar workdir setup (includes the patch prefilter, one entry point).
+"""Build BinRadar artifacts and filter candidates against the POC.
 
-`setup` does everything in one step:
-  1. offline prefilter: run the POC once against a capture-instrumented
-     binary (<BINARY>.brprefilter, built from
-     benchmarks/loftix/brpatch-prefilter.c) under the same QEMU
-     configuration used by the FILTER phase, collect the patch-site STATE
-     vectors, evaluate every candidate predicate offline (mirroring
-     taosc's i64 semantics and its false-means-jump branch polarity), and
-     write workdir/prefilter.sbsv listing which predicates branch on the
-     POC.  Fail-open: any capture/parse problem keeps all predicates.
-     A valid existing prefilter.sbsv (matching family + predicates-file
-     SHA-256) is reused; delete it to force a re-run.
-  2. patch preparation: generate <BINARY>.brpatched and binradar.env from
-     config.env (previously benchmarks/scripts/binradar_setup.py), keeping
-     only the surviving predicates before applying the top-30 cap, so the
-     expensive binradar pipeline never runs on predicates that the FILTER
-     phase would reject anyway.
+`setup` first builds `.brpatched` and, for multi-candidate ERM workdirs,
+`.brcached` with every Taosc predicate.  It probes the original binary to
+establish the POC fault, runs the behavioral filter through `.brcached`
+(with `.brpatched` fallback when no cache exists or a cached observation is
+unusable), writes `filter.sbsv`, then rebuilds the artifacts from the
+compact survivor set.  The verification pipeline therefore starts with only
+POC-surviving candidates and has no separate FILTER phase.
 
 Usage:
   uv run fuzzolic/binradar-setup.py setup -w <workdir>
 
-The compiled binaries always contain at most the top-30 prefilter
-survivors; brpatches.json (the verifier-cache manifest) exports every
-survivor so the full candidate set stays loadable and auditable.
+The compiled `.brpatched` table contains at most the top 30 setup-filter
+survivors.  `brpatches.json` and `.brcached` cover every survivor so
+`--target-patches all` remains loadable and auditable.
 """
 
 
 PAGE_SIZE = 0x1000
-PREFILTER_QEMU_TIMEOUT = 60.0  # same as BinRadarQemuRunner.test_with_patched
 
 
 def load_env(file: Path) -> Dict[str, str]:
@@ -126,33 +100,10 @@ def save_env(env: Dict[str, str], file: Path):
             f.write(f"{key}=\"{value}\"\n")
 
 
-def _pipe_reader(rfd: int, chunks: List[bytes]):
-    try:
-        while True:
-            chunk = os.read(rfd, 4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    except OSError:
-        pass
-    finally:
-        try:
-            os.close(rfd)
-        except OSError:
-            pass
-
-
-def _kill_process_group(proc: subprocess.Popen):
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
 def ensure_original_binary(workdir: Path, configdir: Path, config: dict) -> Path:
     """Return the original binary path, copying it into the workdir from
-    the guix store (mirroring the `setup` recipe) when missing, so the
-    prefilter can run on a fresh subject before `setup`."""
+    the guix store (mirroring the `setup` recipe) when missing, so artifact
+    preparation can start from a fresh workdir."""
     binary = config["BINARY"]
     original_binary = workdir / f"{binary}.orig"
     if original_binary.exists():
@@ -181,60 +132,6 @@ def resolve_poc(configdir: Path, workdir: Path, poc_input: str) -> Optional[Path
         if candidate.exists():
             return candidate
     return None
-
-
-def compile_capture_plugin(workdir: Path,
-                           allocator: Optional[AllocatorTrace] = None) -> None:
-    """Copy and compile brpatch-prefilter.c in the workdir (e9compile).
-
-    CWE-805 families compile the allocation tracker and binary snapshot
-    capture in (BRPATCH_CWE805 + the allocator kind define); generic
-    families keep the sbsv register capture.
-    """
-    shutil.copy(BRPATCH_PREFILTER_SOURCE, workdir / "brpatch-prefilter.c")
-    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
-           "e9compile", "brpatch-prefilter.c", "-DTAOSC_DEST=0"]
-    if allocator is not None:
-        cmd += ["-DBRPATCH_CWE805",
-                f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
-    print(" ".join(cmd))
-    result = subprocess.run(cmd, cwd=workdir)
-    if result.returncode != 0:
-        raise RuntimeError(f"e9compile failed with exit code {result.returncode}")
-
-
-def build_capture_binary(workdir: Path, configdir: Path, config: dict,
-                         patch_loc: str,
-                         allocator: Optional[AllocatorTrace] = None) -> Path:
-    """Instrument the original binary with the capture plugin.
-
-    CWE-805 families use the same ordered multipoint instrumentation spec
-    as the final binary (allocator hooks then the patch site, plan §8);
-    generic families patch the single PATCH_LOC site.
-
-    Returns the path of <BINARY>.brprefilter.  Also dumps e9tool JSON
-    metadata (needed by extract_e9_runtime_metadata) as
-    <BINARY>.brprefilter.json.
-    """
-    original_binary = ensure_original_binary(workdir, configdir, config)
-    brprefilter = workdir / f"{config['BINARY']}.brprefilter"
-    metadata = workdir / f"{config['BINARY']}.brprefilter.json"
-    if allocator is not None:
-        spec = build_instrumentation_spec(
-            allocator, patch_loc, "if dest(state)@brpatch-prefilter goto",
-            plugin_name="brpatch-prefilter")
-    else:
-        spec = InstrumentationSpec(
-            ((patch_loc, "if dest(state)@brpatch-prefilter goto"),))
-    for output, fmt in ((metadata, "json"), (brprefilter, None)):
-        cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
-        print(" ".join(cmd))
-        result = subprocess.run(cmd, cwd=workdir)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"e9tool failed with exit code {result.returncode}: "
-                f"cannot create {output.name}")
-    return brprefilter
 
 
 def build_cached_binary(
@@ -345,11 +242,10 @@ def build_cached_artifact(
     """Build .brcached only when branch-equivalence can skip executions.
 
     The runtime-id manifest (brpatches.json) exports ``survived`` — every
-    predicate that survived the offline prefilter — not just the top-30
-    ``selected`` subset compiled into the binaries.  The manifest consumers
-    (FILTER cache and concrete verifier) only look up candidate ids up to
-    TOTAL_PATCHES, so the extra ids are harmless and keep the prefilter
-    survivors fully auditable.
+    predicate that survived setup filtering — not just the top-30
+    ``selected`` subset compiled into the binaries.  Cache consumers look up
+    only configured candidate ids, so the extra ids are harmless during the
+    bootstrap build and keep the survivor set fully auditable.
     """
     _remove_cached_artifact(workdir, binradar_env)
     if family not in (PredicateFamily.GENERIC_ERM,
@@ -383,110 +279,6 @@ def build_cached_artifact(
     binradar_utils.set_e9_metadata(
         binradar_env, "brcached",
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
-
-
-def capture_states(workdir: Path, configdir: Path, config: dict,
-                   patch_loc: str,
-                   allocator: Optional[AllocatorTrace] = None,
-                   stack_size: Optional[int] = None,
-                   ) -> Optional[Union[List[List[int]], List[CWE805Snapshot]]]:
-    """Run the POC once against <BINARY>.brprefilter and return the
-    captured patch-site states.
-
-    Generic families return a list of 16-slot STATE vectors; CWE-805
-    families return a list of CWE805Snapshot records (clamps + registers +
-    stack).  Returns None if the run failed (timeout / subprocess error) so
-    the caller can fail open.
-    """
-    if not QEMU_STACKTRACE_RELEASE.exists():
-        print(f"Warning: {QEMU_STACKTRACE_RELEASE} not found")
-        return None
-
-    compile_capture_plugin(workdir, allocator)
-    brprefilter = build_capture_binary(workdir, configdir, config, patch_loc,
-                                       allocator)
-
-    metadata = extract_e9_runtime_metadata(
-        brprefilter,
-        workdir / f"{config['BINARY']}.brprefilter.json",
-        ensure_original_binary(workdir, configdir, config),
-        int(patch_loc, 0),
-    )
-    # Persist the prefilter artifact's metadata under its own prefix so
-    # later phases never borrow .brpatched layout values.
-    persist_e9_metadata(workdir, "prefilter", metadata)
-    e9_relocated_calls: List[str] = []
-    for record in metadata.relocated_calls_str().split(","):
-        record = record.strip()
-        if record:
-            fields = [f"0x{int(field, 0):x}" for field in record.split(":")]
-            e9_relocated_calls.append(":".join(fields))
-
-    poc = resolve_poc(configdir, workdir, config["POC_INPUT"])
-    if poc is None:
-        print(f"Warning: POC input {config['POC_INPUT']} not found in "
-              f"{workdir} or {configdir}")
-        return None
-    test_cmd = config["TEST_CMD"]
-
-    command = [str(QEMU_STACKTRACE_RELEASE), "--input", str(poc),
-               "--patch-loc", patch_loc, "--asan", "host"]
-    # --asan-exclude is explicitly ignored by the local afl-qemu-trace
-    # compatibility runner; only the active --e9-relocated-call records
-    # are passed.
-    for record in e9_relocated_calls:
-        command += ["--e9-relocated-call", record]
-    command += [str(brprefilter), "--"] + shlex.split(test_cmd)
-
-    rfd, wfd = os.pipe()
-    env = os.environ.copy()
-    env["AFL_USE_QASAN"] = "1"
-    env["PATCH_ID"] = "0"
-    env["PATCH_FD"] = str(wfd)
-    if allocator is not None:
-        if stack_size is None:
-            print("Warning: CWE-805 prefilter requires stack-size; "
-                  "failing open")
-            os.close(rfd)
-            os.close(wfd)
-            return None
-        env["PREFILTER_STACK_SIZE"] = str(stack_size)
-    # The run is expected to crash: the capture plugin never jumps, so the
-    # program follows the original buggy path.  We only need the pipe data.
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, cwd=workdir,
-                            start_new_session=True, pass_fds=(wfd,), env=env)
-    os.close(wfd)
-    chunks: List[bytes] = []
-    thread = threading.Thread(target=_pipe_reader, args=(rfd, chunks))
-    thread.start()
-    try:
-        proc.communicate(timeout=PREFILTER_QEMU_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        print("Warning: QEMU prefilter run timed out")
-        _kill_process_group(proc)
-        try:
-            proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            proc.communicate()
-        return None
-    except Exception as e:
-        print(f"Warning: QEMU prefilter run failed: {e}")
-        _kill_process_group(proc)
-        return None
-    finally:
-        thread.join()
-
-    data = b"".join(chunks)
-    if allocator is not None:
-        snapshots, truncated = parse_CWE805_snapshots(data)
-        if truncated:
-            print("Warning: CWE-805 prefilter capture truncated; "
-                  "failing open (partial history is not complete evidence)")
-            return None
-        return snapshots
-    return parse_state_lines(data.decode(errors="ignore"))
 
 
 class E9MapType(enum.IntEnum):
@@ -1036,7 +828,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         assert allocator is not None
         binradar_env["PATCH_TYPE"] = family.value
         binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
-        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
+        binradar_env["FILTER_TOTAL_PATCHES"] = "1"
         # The direct call-site metapatch has no predicate list: the E9
         # jnz($mem0,mem[0].size,dest) decision evaluates the complete access
         # against the allocation clamps.  A leftover predicates file is stale Taosc
@@ -1125,7 +917,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         # patch.  Reuse the prebuilt binary when present.
         binradar_env["PATCH_TYPE"] = family.value
         binradar_env["TAOSC_TOTAL_PATCHES"] = "1"
-        binradar_env["PREFILTER_TOTAL_PATCHES"] = "1"
+        binradar_env["FILTER_TOTAL_PATCHES"] = "1"
         if brpatched_binary.exists():
             metadata_path = workdir / f"{binradar_env['BINARY']}.brpatched.json"
             patch_addr = int(binradar_env["PATCH_LOC"], 0)
@@ -1147,7 +939,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         # zero candidates (TOTAL_PATCHES=0); binradar.py handles the
         # no-patch case.
         binradar_env["TAOSC_TOTAL_PATCHES"] = "0"
-        binradar_env["PREFILTER_TOTAL_PATCHES"] = "0"
+        binradar_env["FILTER_TOTAL_PATCHES"] = "0"
         print(f"Warning: no {predicates_file.name} and no prebuilt "
               f"brpatched binary in {workdir}; building with zero "
               f"candidate patches")
@@ -1171,33 +963,33 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
 
     # PATCH_TYPE and the patch counters describe the pipeline inputs:
     # TAOSC_TOTAL_PATCHES counts the predicates Taosc generated, and
-    # PREFILTER_TOTAL_PATCHES the ones that survive the offline prefilter
-    # (or all of them when no prefilter ran or it failed open).
+    # FILTER_TOTAL_PATCHES the ones that survive setup filtering.  During
+    # the bootstrap build they are equal; the second build applies the fresh
+    # filter.sbsv mapping.
     binradar_env["PATCH_TYPE"] = family.value
     binradar_env["TAOSC_TOTAL_PATCHES"] = str(len(predicate_records))
-    binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(predicate_records))
+    binradar_env["FILTER_TOTAL_PATCHES"] = str(len(predicate_records))
 
     patch_records = [
         PredicateRecord(patch_id, record.source_line, record.source_text,
                         record.parsed)
         for patch_id, record in enumerate(predicate_records, start=1)
     ]
-    # Apply the offline prefilter results, if any (see the `prefilter`
-    # subcommand).  Predicates whose prefilter row evaluates to true
-    # survive; the rest are discarded before the top-30 cap, so the
-    # binradar pipeline never runs on patches that would be filtered out
-    # anyway.  Fail open on any parse trouble.  The prefilter metadata
-    # (family + predicates-file SHA-256) must match, so a stale prefilter
+    # Apply the setup filter results, if any.  Predicates whose row evaluates
+    # to true survive; the rest are discarded before the top-30 cap, so the
+    # verification pipeline only sees candidates that passed the POC.  Fail
+    # open on parse trouble.  The filter metadata
+    # (family + predicates-file SHA-256) must match, so a stale filter
     # from a different predicate file or family is never applied.
-    prefilter_file = workdir / "prefilter.sbsv"
-    if prefilter_file.exists():
-        passed_ids = load_prefilter_passed_ids(
-            prefilter_file,
+    filter_file = workdir / "filter.sbsv"
+    if filter_file.exists():
+        passed_ids = load_filter_passed_ids(
+            filter_file,
             expected_kind=family.value,
             expected_sha256=predicates_sha256(predicates_file),
         )
         if passed_ids is None:
-            print(f"Warning: failed to parse {prefilter_file.name} "
+            print(f"Warning: failed to parse {filter_file.name} "
                   f"(or metadata mismatch); using all predicates (fail-open)")
         else:
             predicate_by_id = {record.source_line: record
@@ -1210,9 +1002,9 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
                     survived.append(PredicateRecord(
                         new_id, record.source_line, record.source_text,
                         record.parsed))
-            print(f"[prefilter] loaded {len(predicate_records)} predicates, "
+            print(f"[filter] loaded {len(predicate_records)} predicates, "
                   f"{len(survived)} survived")
-            binradar_env["PREFILTER_TOTAL_PATCHES"] = str(len(survived))
+            binradar_env["FILTER_TOTAL_PATCHES"] = str(len(survived))
             patch_records = survived
 
     # Get patch destination
@@ -1238,12 +1030,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     # Generate brpatches.inc
     # Runtime patch IDs are compact and start at 1.  Each selected record
     # retains the original predicate source line for traceability.
-    # The compiled candidates are capped at the top 30 prefilter survivors
+    # The compiled candidates are capped at the top 30 filter survivors
     # (keeps the binaries small); brpatches.json still exports every
     # survivor past the cap.
     selected_patch_records = patch_records[:30]
     print(f"Targeting top {len(selected_patch_records)} of "
-          f"{len(patch_records)} prefilter survivor(s)")
+          f"{len(patch_records)} filter survivor(s)")
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
@@ -1316,16 +1108,18 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
 
 
 def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
-    # Start from the workdir's existing binradar.env (e.g. PREFILTER_* keys
-    # persisted by the prefilter phase) so setup's save_env never clobbers
-    # other artifacts' metadata; config.env overlays the subject fields.
+    # Start from the workdir's existing binradar.env so setup preserves
+    # unrelated generated settings; config.env overlays the subject fields.
     env = dict()
     env_path = workdir / "binradar.env"
     if env_path.exists():
         env = load_env(env_path)
-        # The removed unprefixed E9 storage keys must not survive.
+        # Removed metadata keys must not survive a clean setup cutover.
         env.pop("E9_EXCLUDE_RANGES", None)
         env.pop("E9_RELOCATED_CALL_JUMPS", None)
+        for key in tuple(env):
+            if key.startswith("PREFILTER_"):
+                env.pop(key)
     env.update(load_env(config_path))
     if "POC_INPUT" not in env:
         print("Error: POC_INPUT not found in config.env")
@@ -1346,6 +1140,176 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
     return env
 
 
+def _setup_filter_decision(
+    patch_id: int,
+    result,
+    patch_result: Optional[binradar_verifier.BinRadarPatchResult],
+    original_fault_addr: int,
+) -> Tuple[bool, str]:
+    """Apply the POC filter policy to one concrete candidate observation."""
+    if result is None:
+        note = "runtime execution failed (kept fail-open)"
+        print(f"[filter] [patch {patch_id}] {note}")
+        return True, note
+    if patch_result is not None and patch_result.crashed():
+        note = "patch expression trapped"
+        print(f"[filter] [patch {patch_id}] {note}; filtered out")
+        return False, note
+    if result.is_crash() and result.fault_addr == original_fault_addr:
+        note = f"still crashes at original fault address {result.fault_addr:#x}"
+        print(f"[filter] [patch {patch_id}] {note}; filtered out")
+        return False, note
+    return True, ""
+
+
+def run_setup_filter(
+    configdir: Path,
+    workdir: Path,
+    binradar_env: Dict[str, str],
+) -> List[int]:
+    """Filter prepared candidates by executing the POC.
+
+    A probe of the original binary is required because the filter rejects only
+    crashes at the original fault address.  Multi-candidate ERM workdirs run
+    representatives through `.brcached` and reuse complete branch vectors;
+    singleton and non-ERM families use `.brpatched`.  Unusable executions are
+    kept fail-open, matching the former pipeline FILTER policy.
+    """
+    start = time.time()
+    family = PredicateFamily(binradar_env["BINRADAR_PATCH_KIND"])
+    predicates_file = workdir / "predicates"
+    runtime_records: List[PredicateRecord] = []
+    if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        if predicates_file.exists():
+            runtime_records = [
+                PredicateRecord(runtime_id, record.source_line,
+                                record.source_text, record.parsed)
+                for runtime_id, record in enumerate(
+                    _parse_predicate_records(predicates_file, family), start=1)
+            ]
+    else:
+        runtime_records = [
+            PredicateRecord(patch_id, patch_id, family.value, family.value)
+            for patch_id in range(1, int(binradar_env["TOTAL_PATCHES"]) + 1)
+        ]
+
+    filter_file = workdir / "filter.sbsv"
+    if not runtime_records:
+        write_filter(
+            filter_file, [], time.time() - start,
+            kind=family.value,
+            sha256=(predicates_sha256(predicates_file)
+                    if predicates_file.exists() else None),
+        )
+        binradar_env["FILTER_TOTAL_PATCHES"] = "0"
+        return []
+
+    poc = resolve_poc(configdir, workdir, binradar_env["POC_INPUT"])
+    if poc is None:
+        raise RuntimeError(
+            f"POC input {binradar_env['POC_INPUT']} not found in "
+            f"{workdir} or {configdir}")
+    runner = binradar_verifier.BinRadarQemuRunner.from_env(
+        str(workdir), binradar_env)
+    probe = runner.test_with_original(str(poc))
+    if probe is None:
+        raise RuntimeError("setup filter could not probe the original binary")
+    if not probe.patch_hit():
+        raise RuntimeError("setup filter probe did not reach PATCH_LOC")
+    if not probe.is_crash():
+        raise RuntimeError("setup filter POC did not crash the original binary")
+    if not probe.patch_func_hit():
+        raise RuntimeError("setup filter probe did not reach the patch function")
+    if probe.multi_patch_func():
+        raise RuntimeError(
+            "setup filter does not support multiple patch-function hits")
+
+    compiled_total = int(binradar_env["TOTAL_PATCHES"])
+    all_ids = [record.runtime_id for record in runtime_records]
+    cached_predicates = None
+    if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM) \
+            and len(runtime_records) > 1:
+        coverage = binradar_verifier.load_cached_predicate_set(
+            workdir / "brpatches.json",
+            workdir / f"{binradar_env['BINARY']}.brcached",
+            family.value,
+            int(binradar_env.get("BRCACHE_STACK_SIZE", "0"), 0),
+            all_ids,
+        )
+        if coverage.predicates is None:
+            print(f"Warning: setup predicate cache disabled: {coverage.reason}")
+        else:
+            cached_predicates = coverage.predicates
+
+    decisions: Dict[int, Tuple[bool, str]] = {}
+
+    def run_individual(patch_id: int) -> Tuple[bool, str]:
+        if patch_id > compiled_total:
+            note = "cached execution unusable and candidate is not compiled (kept fail-open)"
+            print(f"[filter] [patch {patch_id}] {note}")
+            return True, note
+        result, patch_result = runner.test_with_patched(str(patch_id), str(poc))
+        return _setup_filter_decision(
+            patch_id, result, patch_result, probe.fault_addr)
+
+    if cached_predicates is None:
+        for patch_id in all_ids:
+            decisions[patch_id] = run_individual(patch_id)
+    else:
+        remaining = all_ids.copy()
+        while remaining:
+            representative = remaining.pop(0)
+            print(f"[filter] [cache-run] [patch {representative}]")
+            result, cached = runner.test_with_cached(
+                representative, cached_predicates[representative], str(poc))
+            if result is None or cached is None:
+                decisions[representative] = run_individual(representative)
+                continue
+            observed = cached.br_selection
+            try:
+                evaluated = binradar_verifier.evaluate_cached_predicate(
+                    cached_predicates[representative], cached.snapshots)
+            except (IndexError, ValueError):
+                evaluated = None
+            if evaluated is None or evaluated != observed:
+                print(f"Warning: setup cached branch mismatch for patch "
+                      f"{representative}; using individual execution")
+                decisions[representative] = run_individual(representative)
+                continue
+
+            equivalent = [representative]
+            for patch_id in remaining:
+                try:
+                    branches = binradar_verifier.evaluate_cached_predicate(
+                        cached_predicates[patch_id], cached.snapshots)
+                except (IndexError, ValueError):
+                    branches = None
+                if branches is not None and branches == observed:
+                    equivalent.append(patch_id)
+            for patch_id in equivalent[1:]:
+                remaining.remove(patch_id)
+            for patch_id in equivalent:
+                decisions[patch_id] = _setup_filter_decision(
+                    patch_id, result,
+                    binradar_verifier.BinRadarPatchResult(patch_id, observed),
+                    probe.fault_addr)
+
+    results = [
+        (record.source_line, decisions[record.runtime_id][0],
+         decisions[record.runtime_id][1], record.source_text)
+        for record in runtime_records
+    ]
+    write_filter(
+        filter_file, results, time.time() - start,
+        kind=family.value,
+        sha256=(predicates_sha256(predicates_file)
+                if predicates_file.exists() else None),
+    )
+    survivors = [patch_id for patch_id in all_ids if decisions[patch_id][0]]
+    binradar_env["FILTER_TOTAL_PATCHES"] = str(len(survivors))
+    return survivors
+
+
 def cmd_setup(configdir: Path, workdir: Path):
     configdir = configdir.resolve()
     config_path = configdir / "config.env"
@@ -1361,203 +1325,39 @@ def cmd_setup(configdir: Path, workdir: Path):
 
     workdir = workdir.resolve()
     binradar_env = create_binradar_env(configdir, config_path, workdir)
-    # Offline prefilter first: it writes workdir/prefilter.sbsv, which
-    # prepare_patch applies before the top-30 cap.  Fail-open: on any
-    # prefilter problem prepare_patch keeps all predicates.
-    run_prefilter(configdir, workdir)
-    # run_prefilter persists capture-artifact E9 metadata directly to the
-    # environment file.  Refresh those keys before prepare_patch's final
-    # save, otherwise the stale in-memory dict erases them.
     binradar_env_path = workdir / "binradar.env"
-    if binradar_env_path.exists():
-        persisted_env = load_env(binradar_env_path)
-        for key in binradar_utils.e9_metadata_keys("prefilter"):
-            if key in persisted_env:
-                binradar_env[key] = persisted_env[key]
+
+    # The first build must contain every Taosc candidate. Never let a stale
+    # setup-filter result narrow the bootstrap artifact.
+    (workdir / "filter.sbsv").unlink(missing_ok=True)
     prepare_patch(configdir, workdir, binradar_env)
+    survivors = run_setup_filter(configdir, workdir, binradar_env)
+
+    family = PredicateFamily(binradar_env["BINRADAR_PATCH_KIND"])
+    if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        # Apply the newly written source-id -> compact-id mapping and rebuild
+        # both artifacts from the actual POC survivor set.
+        prepare_patch(configdir, workdir, binradar_env)
+    else:
+        # Direct and specialized singleton artifacts have no predicate table
+        # to rebuild; the persisted count alone hides a rejected candidate.
+        binradar_env["TOTAL_PATCHES"] = str(len(survivors))
+        binradar_env["FILTER_TOTAL_PATCHES"] = str(len(survivors))
+
     save_env(binradar_env, binradar_env_path)
     print(f"binradar environment variables saved to {binradar_env_path}")
 
 
-def run_prefilter(configdir: Path, workdir: Path):
-    """Offline prefilter run inside `setup` (fail-open, never exits).
-
-    Runs the POC once against the capture-instrumented binary and writes
-    workdir/prefilter.sbsv.  Any problem (missing files, family-detection
-    failure, capture failure) skips the prefilter or fails open so
-    prepare_patch continues with all predicates.  A prefilter.sbsv whose
-    metadata (family + predicates-file SHA-256) still matches is reused
-    instead of re-running the capture.
-    """
-    prefilter_file = workdir / "prefilter.sbsv"
-    start = time.time()
-
-    config_path = configdir / "config.env"
-    if not config_path.exists():
-        print(f"Warning: config.env not found in {configdir}; "
-              "skipping prefilter")
-        return
-    config = load_env(config_path)
-
-    predicates_file = workdir / "predicates"
-    if not predicates_file.exists():
-        # No predicates (CWE synth path); nothing to prefilter.
-        print(f"No {predicates_file.name} file in {workdir}; skipping prefilter.")
-        return
-
-    # Classify the workdir first (plan §6.1): the CWE-805 direct family
-    # has no predicate list to compact, so the prefilter is a no-op and
-    # FILTER remains the behavioral gate.
-    try:
-        family, allocator = detect_predicate_family(workdir)
-    except ValueError as e:
-        print(f"Warning: prefilter family detection failed ({e}); "
-              "skipping prefilter")
-        return
-    if family == PredicateFamily.CWE805_DIRECT:
-        print(f"Workdir is {family.value}; prefilter is a no-op "
-              "(FILTER is the behavioral gate).")
-        return
-
-    # Reuse a prefilter.sbsv that still matches this family and the exact
-    # predicates-file bytes (load_prefilter_passed_ids returns None on any
-    # metadata mismatch, so a stale prefilter is never reused).
-    if prefilter_file.exists():
-        passed_ids = load_prefilter_passed_ids(
-            prefilter_file,
-            expected_kind=family.value,
-            expected_sha256=predicates_sha256(predicates_file),
-        )
-        if passed_ids is not None:
-            print(f"[prefilter] reusing {prefilter_file.name} "
-                  f"({len(passed_ids)} survivors); delete it to re-run")
-            return
-
-    predicate_records = load_predicates(predicates_file)
-    if not predicate_records:
-        write_prefilter(prefilter_file, [], time.time() - start,
-                        kind=family.value,
-                        sha256=predicates_sha256(predicates_file))
-        print("No predicates; prefilter is a no-op.")
-        return
-
-    for key in ("BINARY", "POC_INPUT", "TEST_CMD"):
-        if key not in config:
-            print(f"Warning: {key} not found in config.env; "
-                  "skipping prefilter")
-            return
-    patch_location_file = workdir / "patch-location"
-    if not patch_location_file.exists():
-        print(f"Warning: {patch_location_file.name} file not found in "
-              f"{workdir}; skipping prefilter")
-        return
-    patch_loc = f"0x{patch_location_file.read_text().strip()}"
-
-    if family == PredicateFamily.CWE805_ERM:
-        # Full-context prefilter (plan §8): the capture binary carries the
-        # same allocator hooks as the final binary and dumps binary
-        # snapshots (clamps + registers + stack) at the patch site.  A
-        # candidate passes iff it branches on at least one complete
-        # captured state.  Truncation fails open (never rejects).
-        assert allocator is not None
-        stack_size_file = workdir / "stack-size"
-        if not stack_size_file.exists():
-            print(f"Warning: {stack_size_file.name} file not found in "
-                  f"{workdir} (CWE-805 prefilter needs the stack size); "
-                  "keeping all predicates (fail-open)")
-            return
-        stack_size = int(stack_size_file.read_text().strip())
-        snapshots = capture_states(workdir, configdir, config, patch_loc,
-                                   allocator, stack_size)
-        if snapshots is None:
-            print("Warning: CWE-805 prefilter capture failed; keeping all "
-                  "predicates (fail-open)")
-            results = [(source_id, True, "capture failed (fail-open)",
-                        predicate)
-                       for source_id, predicate in predicate_records]
-            write_prefilter(prefilter_file, results, time.time() - start,
-                            kind=family.value,
-                            sha256=predicates_sha256(predicates_file))
-            return
-        if not snapshots:
-            print("Warning: patch site never hit on the POC; discarding "
-                  "all predicates")
-            results = [(source_id, False, "patch site never hit",
-                        predicate)
-                       for source_id, predicate in predicate_records]
-            write_prefilter(prefilter_file, results, time.time() - start,
-                            kind=family.value,
-                            sha256=predicates_sha256(predicates_file))
-            return
-
-        print(f"Captured {len(snapshots)} CWE-805 snapshot(s)")
-        results = []
-        for source_id, predicate in predicate_records:
-            parsed = parse_CWE805_predicate(predicate)
-            passed = any(
-                CWE805_snapshot_branch_taken(parsed, snapshot) == 1
-                for snapshot in snapshots)
-            note = "" if passed else \
-                "evaluates to 0 on all captured snapshots"
-            results.append((source_id, passed, note, predicate))
-        write_prefilter(prefilter_file, results, time.time() - start,
-                        kind=family.value,
-                        sha256=predicates_sha256(predicates_file))
-        return
-
-    states = capture_states(workdir, configdir, config, patch_loc)
-    if states is None:
-        # Fail open, matching run_filter's `result is None -> passed=True`.
-        print("Warning: prefilter capture failed; keeping all predicates "
-              "(fail-open)")
-        results = [(source_id, True, "capture failed (fail-open)", predicate)
-                   for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start,
-                        kind=family.value,
-                        sha256=predicates_sha256(predicates_file))
-        return
-    if not states:
-        # The patch site is never hit on the POC, so every predicate would
-        # be filtered out by the FILTER phase anyway (the patch never
-        # activates and the POC still crashes at the original fault).
-        print("Warning: patch site never hit on the POC; discarding all "
-              "predicates")
-        results = [(source_id, False, "patch site never hit", predicate)
-                   for source_id, predicate in predicate_records]
-        write_prefilter(prefilter_file, results, time.time() - start,
-                        kind=family.value,
-                        sha256=predicates_sha256(predicates_file))
-        return
-
-    print(f"Captured {len(states)} patch-site state vector(s)")
-    results = []
-    next_new_id = 0
-    for source_id, predicate in predicate_records:
-        passed, note = evaluate_predicate(predicate, states)
-        if passed:
-            next_new_id += 1
-        if note:
-            new_id = next_new_id if passed else -1
-            print(f"[prefilter] [res] [id {source_id}] "
-                  f"[pass {str(passed).lower()}] [new-id {new_id}] "
-                  f"{predicate!r}: {note}")
-        results.append((source_id, passed, note, predicate))
-    write_prefilter(prefilter_file, results, time.time() - start,
-                    kind=family.value,
-                    sha256=predicates_sha256(predicates_file))
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="binradar-setup: setup the binradar workdir "
-                    "(runs the patch prefilter and prepares the patched "
-                    "binaries)")
+        description="binradar-setup: build patched artifacts and filter "
+                    "candidate patches against the POC")
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="setup")
 
     setup_parser = subparsers.add_parser(
-        "setup", help="prefilter candidate predicates and generate "
-                      "<BINARY>.brpatched and binradar.env")
+        "setup", help="filter candidate patches and generate "
+                      "<BINARY>.brpatched, .brcached, and binradar.env")
     setup_parser.add_argument("-c", "--configdir", type=Path, required=False,
                               default=Path.cwd(),
                               help="Config directory (default: current directory)")

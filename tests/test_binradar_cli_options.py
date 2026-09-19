@@ -26,7 +26,7 @@ def _run_main(monkeypatch, tmp_path, extra_args):
         'TEST_CMD="./bin @@"\n'
         'PATCH_LOC="0x1234"\n'
         'TOTAL_PATCHES="30"\n'
-        'PREFILTER_TOTAL_PATCHES="32"\n')
+        'FILTER_TOTAL_PATCHES="32"\n')
     captured = {}
 
     class FakeExecutor:

@@ -27,7 +27,7 @@ Subcommands:
              confidence rows) have no ranking to order by: their filter
              survivors are capped at the top --top patches in patch-id
              order instead of being printed in full.
-          5. Shows the patch prefilter context from <workdir>/prefilter.sbsv
+          5. Shows the patch filter context from <workdir>/filter.sbsv
              (predicates evaluated/survived) when present
 
     sdfuzz
@@ -36,17 +36,17 @@ Subcommands:
           1. Checks <workdir>/<fuzzer> exists
           2. Parses final.sbsv for remaining_patches and per-patch verdicts
           3. Parses evaluation.log for minimized/verifier testcase counts and errors
-          4. Reports the patch prefilter context from <workdir>/prefilter.sbsv
+          4. Reports the patch filter context from <workdir>/filter.sbsv
              when present
 
     taosc
         Collect predicate counts from <workdir>/predicates and
-        <workdir>/prefilter.sbsv.  The latter contains the predicates that
-        survived BinRadar's prefilter.  The Taosc family is read from
+        <workdir>/filter.sbsv.  The latter contains the predicates that
+        survived BinRadar's filter.  The Taosc family is read from
         <workdir>/patch-format: Single CWE-* workdirs have no predicate list
-        and are reported with zero counts and a skipped prefilter status.
+        and are reported with zero counts and a skipped filter status.
         Workdirs with no predicates are reported with zero counts and a
-        skipped prefilter status.
+        skipped filter status.
 
     binradar-stats
         Collect per-patch verifier evidence-class statistics for the top
@@ -116,7 +116,7 @@ class DoneStatus(enum.Enum):
 
 
 # Taosc patch-format families that carry no predicate list and therefore do
-# not run BinRadar's predicate prefilter (Single CWE-* synth paths).
+# not run BinRadar's predicate filter (Single CWE-* synth paths).
 PATCH_FORMAT_SINGLE = frozenset({
     "Single CWE-369", "Single CWE-617", "Single CWE-823", "Single CWE-805",
 })
@@ -197,19 +197,13 @@ def _strip_log_prefix(line: str) -> str:
 
 
 SBSV_PARSER = _build_sbsv_parser()
-PREFILTER_SBSV_PARSER = sbsv.parser()
-PREFILTER_SBSV_PARSER.add_schema(
-    "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
-PREFILTER_SBSV_PARSER.add_schema(
-    "[prefilter] [done] [total: int] [survived: int] [time: float]")
-PREFILTER_SBSV_PARSER.add_schema(
-    "[prefilter] [meta] [version: int] [kind: str] [sha256: str]")
-LEGACY_PREFILTER_SBSV_PARSER = sbsv.parser()
-LEGACY_PREFILTER_SBSV_PARSER.add_schema(
-    "[prefilter] [id: int] [pass: bool]")
-LEGACY_RES_PREFILTER_SBSV_PARSER = sbsv.parser()
-LEGACY_RES_PREFILTER_SBSV_PARSER.add_schema(
-    "[prefilter] [res] [id: int] [pass: bool]")
+SETUP_FILTER_SBSV_PARSER = sbsv.parser()
+SETUP_FILTER_SBSV_PARSER.add_schema(
+    "[filter] [res] [id: int] [pass: bool] [new-id: int]")
+SETUP_FILTER_SBSV_PARSER.add_schema(
+    "[filter] [done] [total: int] [survived: int] [time: float]")
+SETUP_FILTER_SBSV_PARSER.add_schema(
+    "[filter] [meta] [version: int] [kind: str] [sha256: str]")
 
 
 @dataclass
@@ -240,9 +234,9 @@ class RunResult:
     # Planned graceful cutoff: a phase (or the concrete minimizer/verifier
     # pair) reached its configured wall-clock budget. Informational only.
     wall_time_reached: bool = False
-    prefilter_total: int = -1  # predicates evaluated by the prefilter
-    prefilter_survived: int = -1  # predicates kept (pass=true)
-    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
+    setup_filter_total: int = -1  # predicates evaluated by the filter
+    setup_filter_survived: int = -1  # predicates kept (pass=true)
+    setup_filter_done: DoneStatus = DoneStatus.INCOMPLETE
     log_errors: List[str] = field(default_factory=list)
     tracer_errors: List[str] = field(default_factory=list)
 
@@ -270,9 +264,9 @@ class SdfuzzResult:
     minimizer_unique: int = -1  # unique testcases loaded by the minimizer
     minimized: int = -1  # testcases that hit the patch
     verifier_testcases: int = -1  # testcases used by the verifier
-    prefilter_total: int = -1  # predicates evaluated by the prefilter
-    prefilter_survived: int = -1  # predicates kept (pass=true)
-    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
+    setup_filter_total: int = -1  # predicates evaluated by the filter
+    setup_filter_survived: int = -1  # predicates kept (pass=true)
+    setup_filter_done: DoneStatus = DoneStatus.INCOMPLETE
     log_errors: List[str] = field(default_factory=list)
 
 
@@ -284,9 +278,9 @@ class TaoscResult:
     error_message: str = ""  # for workdir-not-found, etc.
     patch_format: str = ""  # Taosc workdir/patch-format, when present
     original_predicates: int = -1
-    prefiltered_predicates: int = -1
-    prefilter_total: int = -1
-    prefilter_done: DoneStatus = DoneStatus.INCOMPLETE
+    filtered_predicates: int = -1
+    setup_filter_total: int = -1
+    setup_filter_done: DoneStatus = DoneStatus.INCOMPLETE
 
 
 # Observation classes of BinRadarConcreteVerifier._test_result
@@ -472,7 +466,7 @@ def parse_verifier_sbsv(sbsv_path: str) -> Dict[int, List[str]]:
 
     with open(sbsv_path, "r") as f:
         for line in f:
-            # Cheap prefilter: verifier.sbsv can be tens of GB of per-testcase
+            # Cheap filter: verifier.sbsv can be tens of GB of per-testcase
             # rows ([verifier] [crash-pass], [verifier-cache] [hit], ...), and
             # the sbsv tokenizer is ~85x slower than this substring check.
             # Any line parsing to schema "verifier-result" must contain the
@@ -603,13 +597,8 @@ def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str
     return verifier_verdicts, binradar_verdicts, confidence_data
 
 
-def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
-    """Parse prefilter result and done rows with ``sbsv``.
-
-    Current rows contain ``[new-id]``; legacy rows are accepted only as a
-    compatibility fallback for existing workdirs.  The done marker remains
-    authoritative for total/survived counts.
-    """
+def parse_setup_filter_sbsv(sbsv_path: str) -> Dict[str, int]:
+    """Parse current setup-filter result and done rows."""
     result = {"total": -1, "survived": -1, "done": 0}
     if not os.path.isfile(sbsv_path):
         return result
@@ -617,20 +606,16 @@ def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
     survived = 0
     with open(sbsv_path, "r") as f:
         for line in f:
-            row = _parse_row_with_fallback(
-                line, PREFILTER_SBSV_PARSER, LEGACY_RES_PREFILTER_SBSV_PARSER)
-            if row is None:
-                row = _parse_row_with_fallback(
-                    line, LEGACY_PREFILTER_SBSV_PARSER)
+            row = _parse_row_with_fallback(line, SETUP_FILTER_SBSV_PARSER)
             if row is None:
                 continue
-            if row.schema_name == "prefilter$done":
+            if row.schema_name == "filter$done":
                 result["total"] = int(row["total"])
                 result["survived"] = int(row["survived"])
                 result["done"] = 1
-            elif row.schema_name == "prefilter$meta":
-                continue  # versioned kind/hash metadata; no result columns
-            elif row.schema_name in ("prefilter$res", "prefilter"):
+            elif row.schema_name == "filter$meta":
+                continue
+            elif row.schema_name == "filter$res":
                 total += 1
                 if bool(row["pass"]):
                     survived += 1
@@ -640,20 +625,14 @@ def parse_prefilter_sbsv(sbsv_path: str) -> Dict[str, int]:
     return result
 
 
-def prefilter_done_status(workdir: str,
-                          prefilter: Dict[str, int]) -> DoneStatus:
-    """Return the prefilter state represented by a workdir.
-
-    A Single CWE-* taosc workdir (per workdir/patch-format) has no predicate
-    list and no prefilter to run.  A setup workdir with an existing patched
-    binary but no ``predicates`` file uses the prebuilt patch path, so there
-    is no prefilter to run either.
-    """
-    if prefilter["done"]:
+def setup_filter_done_status(workdir: str,
+                             setup_filter: Dict[str, int]) -> DoneStatus:
+    """Return the setup-filter state represented by a workdir."""
+    if setup_filter["done"]:
         return DoneStatus.OK
     if read_patch_format(workdir) in PATCH_FORMAT_SINGLE:
         return DoneStatus.SKIPPED
-    if (prefilter["total"] < 0
+    if (setup_filter["total"] < 0
             and not os.path.isfile(os.path.join(workdir, "predicates"))
             and any(path.is_file()
                     for path in Path(workdir).glob("*.brpatched"))):
@@ -869,9 +848,9 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         if safe_int(key[1]) == latest_run_id
     }
 
-    # Workdir-level patch prefilter context (setup-time artifact shared by
+    # Workdir-level patch filter context (setup-time artifact shared by
     # all runs of this experiment).
-    prefilter = parse_prefilter_sbsv(os.path.join(workdir, "prefilter.sbsv"))
+    filter = parse_setup_filter_sbsv(os.path.join(workdir, "filter.sbsv"))
 
     overall_ok = True
     has_any_final = False
@@ -993,9 +972,9 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             issues=issues,
             failed_phases=failed_phases,
             wall_time_reached=wall_time_reached,
-            prefilter_total=prefilter["total"],
-            prefilter_survived=prefilter["survived"],
-            prefilter_done=prefilter_done_status(workdir, prefilter),
+            setup_filter_total=filter["total"],
+            setup_filter_survived=filter["survived"],
+            setup_filter_done=setup_filter_done_status(workdir, filter),
             log_errors=log_errors,
             tracer_errors=tracer_errors,
         )
@@ -1031,7 +1010,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             # an incomplete run has no confidence ranking to order by, so its
             # patch lists (e.g. [filter] survived) are capped at the top-N
             # patches in patch-id order like a completed run, instead of
-            # printing e.g. the whole prefilter survivor list.
+            # printing e.g. the whole filter survivor list.
             all_patches = sorted(
                 set(run_res.verifier_data) | set(run_res.binradar_data))
             if final_entry is None and not all_patches:
@@ -1155,20 +1134,20 @@ def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
     result.verifier_testcases = extract_count(
         eval_log, r"\[VERIFIER\] Loaded (\d+) testcases")
 
-    # Patch prefilter context: the evaluated binary's patch candidates were
-    # capped from workdir/prefilter.sbsv survivors (when it existed at
+    # Patch filter context: the evaluated binary's patch candidates were
+    # capped from workdir/filter.sbsv survivors (when it existed at
     # setup time).
-    prefilter = parse_prefilter_sbsv(os.path.join(workdir, "prefilter.sbsv"))
-    result.prefilter_total = prefilter["total"]
-    result.prefilter_survived = prefilter["survived"]
-    result.prefilter_done = prefilter_done_status(workdir, prefilter)
+    filter = parse_setup_filter_sbsv(os.path.join(workdir, "filter.sbsv"))
+    result.setup_filter_total = filter["total"]
+    result.setup_filter_survived = filter["survived"]
+    result.setup_filter_done = setup_filter_done_status(workdir, filter)
 
     result.status = "ok" if not result.log_errors else "issues"
     return result
 
 
 def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
-    """Collect original and prefiltered predicate counts from one workdir."""
+    """Collect original and filtered predicate counts from one workdir."""
     workdir = os.path.join(exp_dir, workdir_name)
     result = TaoscResult(exp_dir=exp_dir, status="no_data")
 
@@ -1182,26 +1161,26 @@ def collect_taosc_experiment(exp_dir: str, workdir_name: str) -> TaoscResult:
     original = count_predicates(os.path.join(workdir, "predicates"))
     result.original_predicates = max(original, 0)
 
-    prefilter_path = os.path.join(workdir, "prefilter.sbsv")
-    prefilter = parse_prefilter_sbsv(prefilter_path)
-    result.prefilter_total = prefilter["total"]
-    if prefilter["survived"] >= 0:
-        result.prefiltered_predicates = prefilter["survived"]
+    filter_path = os.path.join(workdir, "filter.sbsv")
+    filter = parse_setup_filter_sbsv(filter_path)
+    result.setup_filter_total = filter["total"]
+    if filter["survived"] >= 0:
+        result.filtered_predicates = filter["survived"]
 
-    if prefilter["done"]:
-        result.prefilter_done = DoneStatus.OK
+    if filter["done"]:
+        result.setup_filter_done = DoneStatus.OK
     elif patch_format in PATCH_FORMAT_SINGLE:
         # Single CWE-* taosc patches have no predicate file and do not run
-        # BinRadar's predicate prefilter.
-        result.prefiltered_predicates = 0
-        result.prefilter_done = DoneStatus.SKIPPED
-    elif not os.path.isfile(prefilter_path) and result.original_predicates == 0:
+        # BinRadar's predicate filter.
+        result.filtered_predicates = 0
+        result.setup_filter_done = DoneStatus.SKIPPED
+    elif not os.path.isfile(filter_path) and result.original_predicates == 0:
         # Direct-call and specialized taosc patches have no predicate file and
-        # do not run BinRadar's predicate prefilter.
-        result.prefiltered_predicates = 0
-        result.prefilter_done = DoneStatus.SKIPPED
+        # do not run BinRadar's predicate filter.
+        result.filtered_predicates = 0
+        result.setup_filter_done = DoneStatus.SKIPPED
 
-    result.status = ("ok" if result.prefilter_done in
+    result.status = ("ok" if result.setup_filter_done in
                      (DoneStatus.OK, DoneStatus.SKIPPED) else "issues")
     return result
 
@@ -1423,17 +1402,17 @@ def format_result_log(result: ExperimentResult) -> str:
                 f"rejected: "
                 f"{_truncate_patch_list(run_res.filter_rejected or 'none', run_res.top_patches)}")
 
-        if run_res.prefilter_total >= 0:
+        if run_res.setup_filter_total >= 0:
             pct = ""
-            if run_res.prefilter_total > 0:
-                pct = f" ({run_res.prefilter_survived * 100 // run_res.prefilter_total}%)"
+            if run_res.setup_filter_total > 0:
+                pct = f" ({run_res.setup_filter_survived * 100 // run_res.setup_filter_total}%)"
             lines.append(
-                f"    [prefilter] total: {run_res.prefilter_total}  "
-                f"survived: {run_res.prefilter_survived}{pct}  "
-                f"status: {run_res.prefilter_done.value}")
+                f"    [filter] total: {run_res.setup_filter_total}  "
+                f"survived: {run_res.setup_filter_survived}{pct}  "
+                f"status: {run_res.setup_filter_done.value}")
         else:
             lines.append(
-                f"    [prefilter] status: {run_res.prefilter_done.value}")
+                f"    [filter] status: {run_res.setup_filter_done.value}")
 
         if run_res.log_errors:
             lines.append("    [errors from binradar.log]:")
@@ -1472,9 +1451,9 @@ CSV_COLUMNS = [
     "binradar_remaining_patches",
     "filter_survived_patches",
     "filter_rejected_patches",
-    "prefilter_total",
-    "prefilter_survived",
-    "prefilter_done",
+    "setup_filter_total",
+    "setup_filter_survived",
+    "setup_filter_done",
     "verifier_rejected_patches",
     "binradar_rejected_patches",
     "binradar_reject_reasons",
@@ -1499,9 +1478,9 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "binradar_remaining_patches": "",
                 "filter_survived_patches": "",
                 "filter_rejected_patches": "",
-                "prefilter_total": "",
-                "prefilter_survived": "",
-                "prefilter_done": "",
+                "setup_filter_total": "",
+                "setup_filter_survived": "",
+                "setup_filter_done": "",
                 "verifier_rejected_patches": "",
                 "binradar_rejected_patches": "",
                 "binradar_reject_reasons": "",
@@ -1536,11 +1515,11 @@ def format_results_csv(all_results: List[ExperimentResult],
                     run_res.filter_survived, run_res.top_patches),
                 "filter_rejected_patches": _truncate_patch_list(
                     run_res.filter_rejected, run_res.top_patches),
-                "prefilter_total": str(run_res.prefilter_total)
-                if run_res.prefilter_total >= 0 else "",
-                "prefilter_survived": str(run_res.prefilter_survived)
-                if run_res.prefilter_survived >= 0 else "",
-                "prefilter_done": run_res.prefilter_done.value,
+                "setup_filter_total": str(run_res.setup_filter_total)
+                if run_res.setup_filter_total >= 0 else "",
+                "setup_filter_survived": str(run_res.setup_filter_survived)
+                if run_res.setup_filter_survived >= 0 else "",
+                "setup_filter_done": run_res.setup_filter_done.value,
                 "verifier_rejected_patches": run_res.verifier_rejected,
                 "binradar_rejected_patches": run_res.binradar_rejected,
                 "binradar_reject_reasons": run_res.binradar_reject_reasons,
@@ -1672,14 +1651,14 @@ def format_sdfuzz_result_log(result: SdfuzzResult) -> str:
             f"minimized: {result.minimized}  verifier testcases: "
             f"{result.verifier_testcases}")
 
-    if result.prefilter_total >= 0:
+    if result.setup_filter_total >= 0:
         lines.append(
-            f"  [prefilter] total: {result.prefilter_total}  "
-            f"survived: {result.prefilter_survived}  "
-            f"status: {result.prefilter_done.value}")
+            f"  [filter] total: {result.setup_filter_total}  "
+            f"survived: {result.setup_filter_survived}  "
+            f"status: {result.setup_filter_done.value}")
     else:
         lines.append(
-            f"  [prefilter] status: {result.prefilter_done.value}")
+            f"  [filter] status: {result.setup_filter_done.value}")
 
     if result.log_errors:
         lines.append("    [errors from evaluation.log]:")
@@ -1703,22 +1682,22 @@ def format_taosc_result_log(result: TaoscResult) -> str:
 
     original = (str(result.original_predicates)
                 if result.original_predicates >= 0 else "N/A")
-    prefiltered = (str(result.prefiltered_predicates)
-                   if result.prefiltered_predicates >= 0 else "N/A")
+    filtered = (str(result.filtered_predicates)
+                   if result.filtered_predicates >= 0 else "N/A")
     lines.append(f"  [taosc] patch-format: {result.patch_format or 'N/A'}")
     lines.append(f"  [taosc] original predicates: {original}")
-    lines.append(f"  [taosc] prefiltered predicates: {prefiltered}")
+    lines.append(f"  [taosc] filtered predicates: {filtered}")
 
-    if result.prefilter_total >= 0:
+    if result.setup_filter_total >= 0:
         pct = ""
-        if result.prefilter_total > 0:
-            pct = (f" ({result.prefiltered_predicates * 100 // result.prefilter_total}%)")
+        if result.setup_filter_total > 0:
+            pct = (f" ({result.filtered_predicates * 100 // result.setup_filter_total}%)")
         lines.append(
-            f"  [prefilter] total: {result.prefilter_total}  "
-            f"survived: {prefiltered}{pct}  "
-            f"status: {result.prefilter_done.value}")
+            f"  [filter] total: {result.setup_filter_total}  "
+            f"survived: {filtered}{pct}  "
+            f"status: {result.setup_filter_done.value}")
     else:
-        lines.append(f"  [prefilter] status: {result.prefilter_done.value}")
+        lines.append(f"  [filter] status: {result.setup_filter_done.value}")
 
     overall = "OK" if result.status == "ok" else "HAS ISSUES"
     lines.append(f"  [OVERALL] {overall}")
@@ -1736,9 +1715,9 @@ SDFUZZ_CSV_COLUMNS = [
     "minimizer_unique",
     "minimized",
     "verifier_testcases",
-    "prefilter_total",
-    "prefilter_survived",
-    "prefilter_done",
+    "setup_filter_total",
+    "setup_filter_survived",
+    "setup_filter_done",
     "log_errors_count",
     "error_preview",
 ]
@@ -1761,11 +1740,11 @@ def format_sdfuzz_results_csv(all_results: List[SdfuzzResult],
             "minimizer_unique": str(result.minimizer_unique),
             "minimized": str(result.minimized),
             "verifier_testcases": str(result.verifier_testcases),
-            "prefilter_total": str(result.prefilter_total)
-            if result.prefilter_total >= 0 else "",
-            "prefilter_survived": str(result.prefilter_survived)
-            if result.prefilter_survived >= 0 else "",
-            "prefilter_done": result.prefilter_done.value,
+            "setup_filter_total": str(result.setup_filter_total)
+            if result.setup_filter_total >= 0 else "",
+            "setup_filter_survived": str(result.setup_filter_survived)
+            if result.setup_filter_survived >= 0 else "",
+            "setup_filter_done": result.setup_filter_done.value,
             "log_errors_count": str(len(result.log_errors)),
             "error_preview": error_preview,
         }
@@ -1780,9 +1759,9 @@ TAOSC_CSV_COLUMNS = [
     "status",
     "patch_format",
     "original_predicates",
-    "prefiltered_predicates",
-    "prefilter_total",
-    "prefilter_done",
+    "filtered_predicates",
+    "setup_filter_total",
+    "setup_filter_done",
     "error_preview",
 ]
 
@@ -1799,11 +1778,11 @@ def format_taosc_results_csv(all_results: List[TaoscResult],
                              if not result.error_message else ""),
             "original_predicates": (str(result.original_predicates)
                                      if not result.error_message else ""),
-            "prefiltered_predicates": (str(result.prefiltered_predicates)
+            "filtered_predicates": (str(result.filtered_predicates)
                                         if not result.error_message else ""),
-            "prefilter_total": (str(result.prefilter_total)
-                                 if result.prefilter_total >= 0 else ""),
-            "prefilter_done": (result.prefilter_done.value
+            "setup_filter_total": (str(result.setup_filter_total)
+                                 if result.setup_filter_total >= 0 else ""),
+            "setup_filter_done": (result.setup_filter_done.value
                                if not result.error_message else ""),
             "error_preview": result.error_message,
         }
@@ -2214,7 +2193,7 @@ def main():
 
     sub.add_parser(
         "taosc", parents=[shared],
-        help="collect original and prefiltered taosc predicate counts")
+        help="collect original and filtered taosc predicate counts")
 
     sub.add_parser(
         "binradar-stats", parents=[shared],

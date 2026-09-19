@@ -35,38 +35,38 @@ def test_parse_compact_filter_and_verifier_artifacts(tmp_path):
     assert stats[1]["cp"] == 1
 
 
-def test_parse_prefilter_new_id_rows(tmp_path):
-    path = tmp_path / "prefilter.sbsv"
+def test_parse_filter_new_id_rows(tmp_path):
+    path = tmp_path / "filter.sbsv"
     path.write_text(
-        "[prefilter] [res] [id 1] [pass false] [new-id -1]\n"
-        "[prefilter] [res] [id 4] [pass true] [new-id 1]\n"
-        "[prefilter] [done] [total 2] [survived 1] [time 0.1]\n"
+        "[filter] [res] [id 1] [pass false] [new-id -1]\n"
+        "[filter] [res] [id 4] [pass true] [new-id 1]\n"
+        "[filter] [done] [total 2] [survived 1] [time 0.1]\n"
     )
-    assert collector.parse_prefilter_sbsv(str(path)) == {
+    assert collector.parse_setup_filter_sbsv(str(path)) == {
         "total": 2,
         "survived": 1,
         "done": 1,
     }
 
 
-def test_parse_prefilter_meta_row(tmp_path):
-    """The versioned [prefilter] [meta] row is accepted and ignored."""
-    path = tmp_path / "prefilter.sbsv"
+def test_parse_filter_meta_row(tmp_path):
+    """The versioned [filter] [meta] row is accepted and ignored."""
+    path = tmp_path / "filter.sbsv"
     path.write_text(
-        "[prefilter] [meta] [version 1] [kind generic-erm] "
+        "[filter] [meta] [version 1] [kind generic-erm] "
         "[sha256 0123456789abcdef]\n"
-        "[prefilter] [res] [id 1] [pass false] [new-id -1]\n"
-        "[prefilter] [res] [id 4] [pass true] [new-id 1]\n"
-        "[prefilter] [done] [total 2] [survived 1] [time 0.1]\n"
+        "[filter] [res] [id 1] [pass false] [new-id -1]\n"
+        "[filter] [res] [id 4] [pass true] [new-id 1]\n"
+        "[filter] [done] [total 2] [survived 1] [time 0.1]\n"
     )
-    assert collector.parse_prefilter_sbsv(str(path)) == {
+    assert collector.parse_setup_filter_sbsv(str(path)) == {
         "total": 2,
         "survived": 1,
         "done": 1,
     }
 
 
-def test_prefilter_skipped_for_existing_brpatched_without_predicates(tmp_path):
+def test_filter_skipped_for_existing_brpatched_without_predicates(tmp_path):
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"
     out_dir.mkdir(parents=True)
@@ -79,10 +79,10 @@ def test_prefilter_skipped_for_existing_brpatched_without_predicates(tmp_path):
     result = collector.collect_experiment_result(
         str(tmp_path), "workdir", "run")
 
-    assert result.runs[0].prefilter_done is collector.DoneStatus.SKIPPED
+    assert result.runs[0].setup_filter_done is collector.DoneStatus.SKIPPED
     assert "status: SKIPPED" in collector.format_result_log(result)
     csv_row = collector.format_results_csv([result])[0]
-    assert csv_row["prefilter_done"] == "SKIPPED"
+    assert csv_row["setup_filter_done"] == "SKIPPED"
 
 
 def test_parse_timestamped_progress_with_sbsv(tmp_path):
@@ -384,33 +384,33 @@ def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     assert "(+2 more)" in csv_row["remaining_patches"]
 
 
-def test_collect_taosc_counts_original_and_prefiltered_predicates(tmp_path):
+def test_collect_taosc_counts_original_and_filtered_predicates(tmp_path):
     workdir = tmp_path / "workdir-013"
     workdir.mkdir()
     (workdir / "predicates").write_text("first\n\nsecond\n")
-    (workdir / "prefilter.sbsv").write_text(
-        "[prefilter] [meta] [version 1] [kind generic-erm] [sha256 abc]\n"
-        "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
-        "[prefilter] [res] [id 2] [pass false] [new-id -1]\n"
-        "[prefilter] [done] [total 2] [survived 1] [time 0.1]\n"
+    (workdir / "filter.sbsv").write_text(
+        "[filter] [meta] [version 1] [kind generic-erm] [sha256 abc]\n"
+        "[filter] [res] [id 1] [pass true] [new-id 1]\n"
+        "[filter] [res] [id 2] [pass false] [new-id -1]\n"
+        "[filter] [done] [total 2] [survived 1] [time 0.1]\n"
     )
 
     result = collector.collect_taosc_experiment(str(tmp_path), "workdir-013")
 
     assert result.status == "ok"
     assert result.original_predicates == 2
-    assert result.prefiltered_predicates == 1
-    assert result.prefilter_total == 2
-    assert result.prefilter_done is collector.DoneStatus.OK
+    assert result.filtered_predicates == 1
+    assert result.setup_filter_total == 2
+    assert result.setup_filter_done is collector.DoneStatus.OK
     assert "original predicates: 2" in collector.format_taosc_result_log(result)
-    assert "prefiltered predicates: 1" in collector.format_taosc_result_log(result)
+    assert "filtered predicates: 1" in collector.format_taosc_result_log(result)
 
     row = collector.format_taosc_results_csv([result])[0]
     assert row["original_predicates"] == "2"
-    assert row["prefiltered_predicates"] == "1"
+    assert row["filtered_predicates"] == "1"
 
 
-def test_collect_taosc_skips_prefilter_without_predicates(tmp_path):
+def test_collect_taosc_skips_filter_without_predicates(tmp_path):
     workdir = tmp_path / "workdir-013"
     workdir.mkdir()
 
@@ -418,12 +418,12 @@ def test_collect_taosc_skips_prefilter_without_predicates(tmp_path):
 
     assert result.status == "ok"
     assert result.original_predicates == 0
-    assert result.prefiltered_predicates == 0
-    assert result.prefilter_done is collector.DoneStatus.SKIPPED
+    assert result.filtered_predicates == 0
+    assert result.setup_filter_done is collector.DoneStatus.SKIPPED
 
 
-def test_collect_taosc_skips_prefilter_with_single_patch_format(tmp_path):
-    """A Single CWE-* patch-format skips the prefilter even with a brpatched."""
+def test_collect_taosc_skips_filter_with_single_patch_format(tmp_path):
+    """A Single CWE-* patch-format skips the filter even with a brpatched."""
     workdir = tmp_path / "workdir-013"
     workdir.mkdir()
     (workdir / "patch-format").write_text("Single CWE-617\n")
@@ -434,15 +434,15 @@ def test_collect_taosc_skips_prefilter_with_single_patch_format(tmp_path):
     assert result.status == "ok"
     assert result.patch_format == "Single CWE-617"
     assert result.original_predicates == 0
-    assert result.prefiltered_predicates == 0
-    assert result.prefilter_done is collector.DoneStatus.SKIPPED
+    assert result.filtered_predicates == 0
+    assert result.setup_filter_done is collector.DoneStatus.SKIPPED
     assert "patch-format: Single CWE-617" in collector.format_taosc_result_log(result)
     row = collector.format_taosc_results_csv([result])[0]
     assert row["patch_format"] == "Single CWE-617"
 
 
-def test_collect_taosc_erm_patch_format_without_prefilter_is_incomplete(tmp_path):
-    """An ERM patch-format with no prefilter.sbsv is INCOMPLETE, not skipped."""
+def test_collect_taosc_erm_patch_format_without_filter_is_incomplete(tmp_path):
+    """An ERM patch-format with no filter.sbsv is INCOMPLETE, not skipped."""
     workdir = tmp_path / "workdir-013"
     workdir.mkdir()
     (workdir / "patch-format").write_text("ERM generic\n")
@@ -452,12 +452,12 @@ def test_collect_taosc_erm_patch_format_without_prefilter_is_incomplete(tmp_path
 
     assert result.patch_format == "ERM generic"
     assert result.original_predicates == 1
-    assert result.prefilter_done is collector.DoneStatus.INCOMPLETE
+    assert result.setup_filter_done is collector.DoneStatus.INCOMPLETE
     assert result.status == "issues"
 
 
-def test_prefilter_skipped_for_single_patch_format(tmp_path):
-    """A Single CWE-* patch-format marks the binradar prefilter as skipped."""
+def test_filter_skipped_for_single_patch_format(tmp_path):
+    """A Single CWE-* patch-format marks the binradar filter as skipped."""
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"
     out_dir.mkdir(parents=True)
@@ -471,5 +471,5 @@ def test_prefilter_skipped_for_single_patch_format(tmp_path):
     result = collector.collect_experiment_result(
         str(tmp_path), "workdir", "run")
 
-    assert result.runs[0].prefilter_done is collector.DoneStatus.SKIPPED
+    assert result.runs[0].setup_filter_done is collector.DoneStatus.SKIPPED
     assert "status: SKIPPED" in collector.format_result_log(result)

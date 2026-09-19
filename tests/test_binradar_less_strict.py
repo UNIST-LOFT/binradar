@@ -30,6 +30,7 @@ def _policy_executor(tmp_path, less_strict):
     executor.run_prefix = "run"
     executor.run_id = 0
     executor.run_dir = str(tmp_path)
+    executor.filter_result = [1]
     executor.start_time = time.time()
     executor.progress_filename = str(tmp_path / "progress.sbsv")
     return executor
@@ -104,7 +105,6 @@ def test_fuzzer_only_streams_fuzzer_into_concrete_pipeline(
 
     executor.set_run_dir = set_run_dir
     executor.run_probe = lambda: events.append("probe")
-    executor.run_filter = lambda: (events.append("filter") or [1])
     executor.prepare_fuzzer_output = lambda: events.append("prepare-fuzzer")
     executor.run_fuzzer = run_fuzzer
     executor.run_minimizer_and_verifier = run_minimizer_and_verifier
@@ -121,7 +121,7 @@ def test_fuzzer_only_streams_fuzzer_into_concrete_pipeline(
 
     assert executor.disable_binradar is True
     assert events == [
-        "set-run-dir", "probe", "filter", "prepare-fuzzer",
+        "set-run-dir", "probe", "prepare-fuzzer",
         "fuzzer-start", "minimizer-verifier-concurrent", "fuzzer-done",
         "final", "done"]
 
@@ -153,7 +153,6 @@ def test_fuzzer_only_less_strict_failure_finishes_concrete_pipeline(
 
     executor.set_run_dir = set_run_dir
     executor.run_probe = lambda: None
-    executor.run_filter = lambda: [1]
     executor.prepare_fuzzer_output = lambda: None
     executor.run_fuzzer = fail_fuzzer
     executor.run_minimizer_and_verifier = run_minimizer_and_verifier
@@ -183,7 +182,6 @@ def test_multithreaded_less_strict_fuzzer_failure_reaches_final(
     executor.set_run_dir = set_run_dir
     executor.save_progress = progress.append
     executor.run_probe = lambda: events.append("probe")
-    executor.run_filter = lambda: [1]
     executor.prepare_fuzzer_output = lambda: events.append("prepare-fuzzer")
     executor.run_fuzzolic = lambda: events.append("fuzzolic")
     executor.run_directed = lambda: events.append("directed")

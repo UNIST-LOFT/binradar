@@ -897,7 +897,6 @@ def test_run_multithreaded_starts_minimizer_while_producers_run(
     executor = _stub_executor(tmp_path)
     events = []
     executor.run_probe = lambda: None
-    executor.run_filter = lambda: [1]
     executor.check_requirements = lambda: None
     executor.run_directed = lambda: None
     executor.run_fuzzer = lambda: None

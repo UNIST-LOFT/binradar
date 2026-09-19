@@ -3,8 +3,7 @@
 Taosc predicate management for BinRadar workdir setup.
 Parsing, classification, evaluation, and lowering of the Taosc predicate
 families (generic ERM, CWE-805 ERM, CWE-805 direct, taosc-specialized),
-plus the allocator-trace instrumentation spec shared by the prefilter
-and final binaries.  Split out of fuzzolic/binradar-setup.py.
+plus the allocator-trace instrumentation spec shared by patched artifacts.  Split out of fuzzolic/binradar-setup.py.
 """
 
 import enum
@@ -19,15 +18,6 @@ from typing import Dict, List, Optional, Tuple, Union, cast
 
 INT64_MIN = -(1 << 63)
 _MASK64 = (1 << 64) - 1
-
-# sbsv schemas for the rows this module parses:
-#   [prefilter-state] [v0 N] [v1 N] ... [v15 N]  (written by
-#     brpatch-prefilter.c::dest to the PATCH_FD pipe)
-#   [prefilter] [res] [id N] [pass true|false] [new-id N|-1] (prefilter.sbsv)
-#   [prefilter] [done] [total N] [survived N] [time T]  (prefilter.sbsv marker)
-PREFILTER_STATE_SCHEMA = (
-    "[prefilter-state] " + " ".join(f"[v{i}: int]" for i in range(16))
-)
 
 CONSTANTS: Dict[str, int] = {
     "max1": 0,
@@ -209,7 +199,7 @@ def classify_predicate_line(line: str) -> Optional[str]:
 
 
 def predicates_sha256(predicates_file: Path) -> str:
-    """SHA-256 of the exact predicates file bytes (prefilter identity)."""
+    """SHA-256 of the exact predicates file bytes (filter identity)."""
     return hashlib.sha256(predicates_file.read_bytes()).hexdigest()
 
 # Strict generic lexer: every input byte must be consumed as a token or
@@ -463,8 +453,7 @@ def build_instrumentation_spec(allocator: AllocatorTrace, patch_loc: str,
     first return address receives set_base(rax), then the patch site.
 
     The allocator hooks and the patch action all use the same e9compile
-    plugin (``plugin_name``); the prefilter uses ``brpatch-prefilter`` so
-    its capture plugin is not confused with the final binary's brpatch.
+    plugin (``plugin_name``), preserving one ordered instrumentation spec.
     """
     entries = [(f"0x{allocator.calls[0][1]}", f"set_size(rdi,rsi)@{plugin_name}")]
     for bit, address in allocator.calls[1:]:
@@ -673,7 +662,7 @@ def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[Al
     return PredicateFamily.GENERIC_ERM, None
 
 
-def load_prefilter_passed_ids(prefilter_file: Path,
+def load_filter_passed_ids(filter_file: Path,
                               expected_kind: Optional[str] = None,
                               expected_sha256: Optional[str] = None,
                               ) -> Optional[Dict[int, int]]:
@@ -683,23 +672,23 @@ def load_prefilter_passed_ids(prefilter_file: Path,
     row must contain ``new-id -1``.  Returns ``None`` on malformed input so
     setup fails open and keeps every predicate.
 
-    A ``[prefilter] [meta]`` row (written by write_prefilter) pins the
+    A ``[filter] [meta]`` row (written by write_filter) pins the
     predicate family and the exact predicates-file SHA-256.  When
     ``expected_kind``/``expected_sha256`` are given, a mismatching or
-    missing metadata row fails open (returns None) so a stale prefilter
+    missing metadata row fails open (returns None) so a stale filter
     from a different predicate file or family is never applied.
     """
     parser = sbsv.parser()
     parser.add_schema(
-        "[prefilter] [res] [id: int] [pass: bool] [new-id: int]")
+        "[filter] [res] [id: int] [pass: bool] [new-id: int]")
     parser.add_schema(
-        "[prefilter] [done] [total: int] [survived: int] [time: float]")
+        "[filter] [done] [total: int] [survived: int] [time: float]")
     parser.add_schema(
-        "[prefilter] [meta] [version: int] [kind: str] [sha256: str]")
+        "[filter] [meta] [version: int] [kind: str] [sha256: str]")
     passed_ids: Dict[int, int] = dict()
     used_new_ids = set()
     meta_seen = False
-    with prefilter_file.open("r") as f:
+    with filter_file.open("r") as f:
         for line_number, line in enumerate(f, start=1):
             if not line.strip():
                 continue
@@ -709,9 +698,9 @@ def load_prefilter_passed_ids(prefilter_file: Path,
                 return None
             if row is None:
                 return None
-            if row.schema_name == "prefilter$done":
+            if row.schema_name == "filter$done":
                 continue
-            if row.schema_name == "prefilter$meta":
+            if row.schema_name == "filter$meta":
                 if meta_seen or row["version"] != 1:
                     return None
                 meta_seen = True
@@ -721,7 +710,7 @@ def load_prefilter_passed_ids(prefilter_file: Path,
                         and row["sha256"] != expected_sha256:
                     return None
                 continue
-            if row.schema_name != "prefilter$res":
+            if row.schema_name != "filter$res":
                 return None
             source_id = row["id"]
             new_id = row["new-id"]
@@ -741,7 +730,7 @@ def load_prefilter_passed_ids(prefilter_file: Path,
     return passed_ids
 
 
-class PrefilterTrap(Exception):
+class PredicateTrap(Exception):
     """Arithmetic that would raise SIGFPE in C (div/mod by zero, INT64_MIN / -1)."""
 
 
@@ -798,7 +787,7 @@ def eval_patch_str(s: str, env: List[int]) -> int:
     operators + - * / % & | ^ l r = ! > >= < <=.  env must have at least
     16 entries.
 
-    Raises PrefilterTrap on arithmetic that would SIGFPE in C.
+    Raises PredicateTrap on arithmetic that would SIGFPE in C.
     """
     pos = [0]
 
@@ -847,50 +836,20 @@ def eval_patch_str(s: str, env: List[int]) -> int:
             return _shift_right(a, b)
         if op == "/":
             if b == 0:
-                raise PrefilterTrap("division by zero")
+                raise PredicateTrap("division by zero")
             if a == INT64_MIN and b == -1:
-                raise PrefilterTrap("INT64_MIN / -1")
+                raise PredicateTrap("INT64_MIN / -1")
             return _trunc_div(a, b)
         if op == "%":
             if b == 0:
-                raise PrefilterTrap("modulo by zero")
+                raise PredicateTrap("modulo by zero")
             if a == INT64_MIN and b == -1:
-                raise PrefilterTrap("INT64_MIN % -1")
+                raise PredicateTrap("INT64_MIN % -1")
             q = _trunc_div(a, b)
             return wrap64(a - q * b)
         raise ValueError(f"unknown patch operator {op!r}")
 
     return ev()
-
-
-def evaluate_predicate(predicate: str, states: List[List[int]]) -> Tuple[bool, str]:
-    """Return (keep, note) for one predicate line.
-
-    Taosc's generic patch jumps when a generated predicate evaluates to zero.
-    The predicate is encoded as ``predicate == 0`` for brpatch.c, then kept
-    iff that branch condition is non-zero on at least one captured state.
-
-    A predicate that would trap in C on any captured state (division or
-    modulo by zero, INT64_MIN / -1) is rejected: brpatch.c reports it as
-    `br 2` and returns NULL, so the patch follows the original path and is
-    filtered out by the FILTER phase.
-    """
-    try:
-        patch_str = predicate_to_branch_patch_str(predicate)
-    except Exception as e:
-        # prepare_patch would crash on this predicate anyway; keep it so
-        # the existing pipeline surfaces the error.
-        return True, f"unparseable predicate kept ({e})"
-    # Reject on any trap first, regardless of what other states evaluate to.
-    for state in states:
-        try:
-            eval_patch_str(patch_str, state)
-        except PrefilterTrap as e:
-            return False, f"patch would trap in C ({e})"
-    for state in states:
-        if eval_patch_str(patch_str, state) != 0:
-            return True, ""
-    return False, "evaluates to 0 on all captured states"
 
 
 def CWE805_branch_taken(predicate: CWE805Predicate,
@@ -926,82 +885,6 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
     return 1
 
 
-# ---------------------------------------------------------------------------
-# CWE-805 full-context prefilter snapshots (plan §8)
-# ---------------------------------------------------------------------------
-
-# Binary record written by brpatch-prefilter.c::capture_snapshot:
-#   header:  magic u32, version u32, stack_size u64, flags u64
-#   clamps:  256 * {begin u64, end u64}
-#   regs:    16 * u64 (rax..r15)
-#   stack:   stack_size bytes starting at state->rsp
-PREFILTER_SNAPSHOT_MAGIC = 0x42525046  # "BRPF"
-PREFILTER_SNAPSHOT_VERSION = 1
-PREFILTER_SNAPSHOT_FLAG_TRUNCATED = 1
-PREFILTER_SNAPSHOT_HEADER = struct.Struct("<IIQQ")
-PREFILTER_SNAPSHOT_CLAMPS = struct.Struct("<" + "QQ" * 256)
-PREFILTER_SNAPSHOT_REGS = struct.Struct("<" + "Q" * 16)
-
-
-@dataclass(frozen=True)
-class CWE805Snapshot:
-    """One captured patch-site full context (plan §8)."""
-    clamps: Tuple[Tuple[int, int], ...]  # 256 (begin, end) pairs
-    registers: Tuple[int, ...]           # 16 u64 bit patterns, rax..r15
-    stack: bytes                         # exactly stack-size bytes
-    truncated: bool = False              # capture hit the bound
-
-
-def parse_CWE805_snapshots(data: bytes) -> Tuple[List[CWE805Snapshot], bool]:
-    """Parse the binary snapshot stream from the capture pipe.
-
-    Returns (snapshots, truncated).  A header-only record with the
-    truncation flag set marks the end of complete evidence; any trailing
-    partial record is dropped.  Malformed records (bad magic/version,
-    truncated body) stop parsing at the first bad record.
-    """
-    snapshots: List[CWE805Snapshot] = []
-    truncated = False
-    offset = 0
-    while offset + PREFILTER_SNAPSHOT_HEADER.size <= len(data):
-        magic, version, stack_size, flags = \
-            PREFILTER_SNAPSHOT_HEADER.unpack_from(data, offset)
-        if magic != PREFILTER_SNAPSHOT_MAGIC or version != \
-                PREFILTER_SNAPSHOT_VERSION:
-            break
-        offset += PREFILTER_SNAPSHOT_HEADER.size
-        if flags & PREFILTER_SNAPSHOT_FLAG_TRUNCATED:
-            truncated = True
-            break
-        body = PREFILTER_SNAPSHOT_CLAMPS.size + PREFILTER_SNAPSHOT_REGS.size \
-            + stack_size
-        if offset + body > len(data):
-            break  # partial trailing record: not complete evidence
-        clamps_raw = PREFILTER_SNAPSHOT_CLAMPS.unpack_from(data, offset)
-        offset += PREFILTER_SNAPSHOT_CLAMPS.size
-        regs = PREFILTER_SNAPSHOT_REGS.unpack_from(data, offset)
-        offset += PREFILTER_SNAPSHOT_REGS.size
-        stack = data[offset:offset + stack_size]
-        offset += stack_size
-        snapshots.append(CWE805Snapshot(
-            tuple((clamps_raw[i], clamps_raw[i + 1])
-                  for i in range(0, len(clamps_raw), 2)),
-            regs, stack))
-    return snapshots, truncated
-
-
-def CWE805_snapshot_branch_taken(predicate: CWE805Predicate,
-                                snapshot: CWE805Snapshot) -> int:
-    """Evaluate one CWE-805 descriptor against one captured snapshot.
-
-    Same cell, unsigned comparison, checked-multiply, and !any_match rules
-    as brpatch.c::CWE805_branch_taken (plan §8): 0 = no jump, 1 = jump,
-    2 = checked-multiply overflow (conservative no-jump).
-    """
-    return CWE805_branch_taken(predicate, list(snapshot.registers),
-                               snapshot.stack, list(snapshot.clamps))
-
-
 # Binary records emitted by brpatch-cached.c.  Each record contains the
 # selected predicate's branch plus enough pre-branch state to evaluate every
 # other predicate offline.  CWE-805 records additionally contain all clamps
@@ -1012,8 +895,8 @@ CACHED_SNAPSHOT_FLAG_TRUNCATED = 1
 CACHED_SNAPSHOT_FLAG_CWE805 = 2
 CACHED_SNAPSHOT_FLAG_INVALID = 4
 CACHED_SNAPSHOT_HEADER = struct.Struct("<IIIIQQ")
-CACHED_SNAPSHOT_CLAMPS = PREFILTER_SNAPSHOT_CLAMPS
-CACHED_SNAPSHOT_REGS = PREFILTER_SNAPSHOT_REGS
+CACHED_SNAPSHOT_CLAMPS = struct.Struct("<" + "QQ" * 256)
+CACHED_SNAPSHOT_REGS = struct.Struct("<" + "Q" * 16)
 
 
 @dataclass(frozen=True)
@@ -1023,7 +906,7 @@ class CachedSnapshot:
     branch: int
     registers: Tuple[int, ...]
     clamps: Tuple[Tuple[int, int], ...] = ()
-    stack: bytes = ""
+    stack: bytes = b""
 
     @property
     def is_CWE805(self) -> bool:
@@ -1111,7 +994,7 @@ def evaluate_cached_predicate(
             env = [wrap64(value) for value in snapshot.registers]
             try:
                 branch = int(eval_patch_str(predicate, env) != 0)
-            except PrefilterTrap:
+            except PredicateTrap:
                 branch = 2
         else:
             if not snapshot.is_CWE805:
@@ -1126,27 +1009,7 @@ def evaluate_cached_predicate(
     return branches
 
 
-def parse_state_lines(data: str) -> List[List[int]]:
-    """Parse [prefilter-state] sbsv lines from the capture pipe, one 16-slot
-    STATE vector per line.  Non-state and malformed lines are skipped."""
-    parser = sbsv.parser()
-    parser.add_schema(PREFILTER_STATE_SCHEMA)
-    states: List[List[int]] = []
-    for line in data.splitlines():
-        line = line.strip()
-        if not line.startswith("[prefilter-state]"):
-            continue
-        try:
-            row = parser.parse_line_detached(line)
-        except ValueError:
-            continue
-        if row is None:
-            continue
-        states.append([row[f"v{i}"] for i in range(16)])
-    return states
-
-
-def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, str]],
+def write_filter(filter_file: Path, results: List[Tuple[int, bool, str, str]],
                     elapsed: float, kind: Optional[str] = None,
                     sha256: Optional[str] = None) -> None:
     """Write source predicate IDs and compact runtime patch IDs.
@@ -1156,25 +1019,25 @@ def write_prefilter(prefilter_file: Path, results: List[Tuple[int, bool, str, st
     remain compatible with ``range(1, TOTAL_PATCHES + 1)`` while ``id``
     preserves the predicate source line.
 
-    A ``[prefilter] [meta]`` row pins the predicate family and the exact
-    predicates-file SHA-256 so a stale prefilter can never be applied to a
+    A ``[filter] [meta]`` row pins the predicate family and the exact
+    predicates-file SHA-256 so a stale filter can never be applied to a
     different predicate file or family (plan §6.2).
     """
     survived = 0
-    with prefilter_file.open("w", encoding="utf-8") as f:
+    with filter_file.open("w", encoding="utf-8") as f:
         if kind is not None and sha256 is not None:
-            f.write(f"[prefilter] [meta] [version 1] [kind {kind}] "
+            f.write(f"[filter] [meta] [version 1] [kind {kind}] "
                     f"[sha256 {sha256}]\n")
         for idx, passed, note, predicate in results:
             new_id = survived + 1 if passed else -1
-            f.write(f"[prefilter] [res] [id {idx}] "
+            f.write(f"[filter] [res] [id {idx}] "
                     f"[pass {str(passed).lower()}] [new-id {new_id}] "
                     f"{predicate} ({(' ' + note) if note else ''})\n")
             if passed:
                 survived += 1
-        f.write(f"[prefilter] [done] [total {len(results)}] "
+        f.write(f"[filter] [done] [total {len(results)}] "
                 f"[survived {survived}] [time {elapsed:.2f}]\n")
-    print(f"[prefilter] [done] [total {len(results)}] "
+    print(f"[filter] [done] [total {len(results)}] "
           f"[survived {survived}] [time {elapsed:.2f}]")
 
 

@@ -13,7 +13,6 @@ import logger
 # shared; selection is by prefix at load time.
 E9_METADATA_PREFIXES = {
     "brpatched": "BRPATCHED",
-    "prefilter": "PREFILTER",
     "brcached": "BRCACHED",
 }
 
@@ -24,7 +23,7 @@ WALL_TIME_REACHED = "wall-time-reached"
 def e9_metadata_keys(prefix: str) -> Tuple[str, str]:
     """Return (exclude-ranges key, relocated-calls key) for an artifact.
 
-    `prefix` is the artifact name ("brpatched", "prefilter", "brcached");
+    `prefix` is the artifact name ("brpatched" or "brcached");
     the stored keys carry the uppercase prefix.
     """
     upper = E9_METADATA_PREFIXES[prefix]

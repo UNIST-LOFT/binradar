@@ -81,9 +81,8 @@ def stub_runner_env(monkeypatch):
 
 
 def _make_workdir(tmp_path):
-    """Workdir with artifacts, poc, and a pre-populated run directory whose
-    probe/filter results already exist (the --run-id resume scenario: the
-    probe and filter phases only load their saved results)."""
+    """Workdir with artifacts, POC, and a pre-populated run directory whose
+    probe result already exists (the --run-id resume scenario)."""
     workdir = tmp_path / "workdir"
     rundir = workdir / "out" / "run-00000"
     rundir.mkdir(parents=True)
@@ -98,9 +97,6 @@ def _make_workdir(tmp_path):
         "[patch-hit 1] [func-hit 1] [fault-addr 1234] [tracer-fault-addr 1234] "
         "[patch-func-candidates []] [stacktrace []]\n"
         "[file-trace] [need-file-hook false]\n")
-    (rundir / "filter.sbsv").write_text(
-        "[patch] [id 1] [pass true]\n"
-        "[patch] [id 2] [pass true]\n")
     # Already-produced testcases (as the fuzzolic producer phase would leave).
     testcases = rundir / "fuzzolic-tests"
     testcases.mkdir()
@@ -131,7 +127,7 @@ def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
     executor.previous_progress = None
     executor.start_time = time.time()
     executor.probe_result = None
-    executor.filter_result = []
+    executor.filter_result = [1, 2]
     executor.run_id = -1
     executor.run_prefix = ""
     executor.run_dir = ""
@@ -153,6 +149,7 @@ def test_phase_name_mapping_accepts_dashed_names():
 
 def test_single_phase_names_include_minimizer_verifier():
     assert "minimizer-verifier" in binradar.SINGLE_PHASE_NAMES
+    assert "filter" not in binradar.SINGLE_PHASE_NAMES
 
 
 def test_minimizer_verifier_timeout_is_one_and_a_half_times_configured():

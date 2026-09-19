@@ -52,9 +52,9 @@ class CachedPredicateSet(NamedTuple):
     """Outcome of validating `.brcached` coverage for a candidate set.
 
     ``predicates`` is None when the cached artifact cannot execute every
-    requested id; ``reason`` then names the failing precondition. Both the
-    FILTER phase, the concrete verifier, the BINRADAR tracer selection, and
-    the `--target-patches all` expansion share this one check so they can
+    requested id; ``reason`` then names the failing precondition. The
+    setup filter, concrete verifier, BINRADAR tracer selection, and
+    `--target-patches all` expansion share this one check so they can
     never disagree about which artifact owns which candidate id.
     """
     predicates: Optional[Dict[int, ParsedPredicate]]
@@ -221,6 +221,8 @@ class BinRadarProbeResult:
         patch_func_entry = probe_info["func-entry"]
         stacktrace = list()
         for entry in probe_info["stacktrace"]:
+            if not entry:
+                continue
             addr, symbol = entry.split(":", 1)
             stacktrace.append((int(addr, 16), symbol))
         
@@ -231,6 +233,8 @@ class BinRadarProbeResult:
         tracer_fault_addr = probe_info["tracer-fault-addr"]
         patch_func_candidates = list()
         for func in probe_info["patch-func-candidates"]:
+            if not func:
+                continue
             entry, hits = func.split(":", 1)
             patch_func_candidates.append((int(entry, 16), int(hits)))
         need_file_hook = result["file-trace"][-1]["need-file-hook"]
@@ -430,7 +434,7 @@ class BinRadarQemuRunner:
     binary: str
     test_cmd: str
     patch_loc: str
-    # E9 metadata per artifact ("brpatched", "prefilter", "brcached"):
+    # E9 metadata per artifact ("brpatched", "brcached"):
     # (exclude_ranges, [relocated-call records]).  All prefixed values are
     # stored; the executed binary's path selects the proper one.
     e9_metadata: Dict[str, Tuple[str, List[str]]]
@@ -481,10 +485,9 @@ class BinRadarQemuRunner:
     def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
         """(exclude_ranges, relocated-call records) of the artifact the
         given binary path belongs to.  Original binaries have no E9
-        metadata; .brpatched/.brprefilter/.brcached each select their own
-        prefixed values."""
+        metadata; .brpatched and .brcached each select their own prefixed
+        values."""
         for artifact, suffix in (("brpatched", ".brpatched"),
-                                 ("prefilter", ".brprefilter"),
                                  ("brcached", ".brcached")):
             if binary_path.endswith(suffix):
                 return self.e9_metadata.get(artifact, ("", []))

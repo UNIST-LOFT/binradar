@@ -48,7 +48,7 @@ Subcommands:
         QASAN detects the same crash (same fault address) on the patched
         binary as on the original one.  When the workdir also contains a
         <binary>.brcached artifact (built by binradar-setup.py when more
-        than one predicate survived the prefilter), the same PATCH_ID=0
+        than one predicate survived the filter), the same PATCH_ID=0
         probe is run against it too and its crash must match .orig as
         well (with TAOSC_PRED unset the cached plugin takes the no-branch
         fallback, so .brcached must behave like the original binary).

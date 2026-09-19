@@ -112,19 +112,18 @@ def positive_int(value):
 class BinRadarPhase(enum.IntEnum):
     ALL = 0
     PROBE = 1
-    FILTER = 2
-    FUZZOLIC = 3
-    DIRECTED = 4
-    FUZZER = 5
-    MINIMIZER = 6
-    VERIFIER = 7
-    BINRADAR = 8
-    FINAL = 9
-    FEEDBACK = 10
+    FUZZOLIC = 2
+    DIRECTED = 3
+    FUZZER = 4
+    MINIMIZER = 5
+    VERIFIER = 6
+    BINRADAR = 7
+    FINAL = 8
+    FEEDBACK = 9
     # Combined single phase: minimizer + concrete verifier running
     # concurrently over already-produced testcases (same as their part of
     # --seq). CLI name: "minimizer-verifier".
-    MINIMIZER_VERIFIER = 11
+    MINIMIZER_VERIFIER = 10
 
 
 def phase_from_name(name: str) -> BinRadarPhase:
@@ -137,7 +136,7 @@ def phase_from_name(name: str) -> BinRadarPhase:
 
 
 # Valid --run-single-phase names; each must map through phase_from_name.
-SINGLE_PHASE_NAMES = ["probe", "filter", "fuzzolic", "directed", "fuzzer",
+SINGLE_PHASE_NAMES = ["probe", "fuzzolic", "directed", "fuzzer",
                       "minimizer", "verifier", "minimizer-verifier",
                       "binradar", "feedback", "final"]
 
@@ -690,18 +689,16 @@ class BinRadarProgress:
     run_id: int
     run_dir: str
     probe_done: bool
-    filter_done: bool
     fuzzolic_done: bool
     directed_done: bool
     fuzzer_done: bool
     minimizer_done: bool
     verifier_done: bool
     done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, filter_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
+    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
         self.run_id = run_id
         self.run_dir = run_dir
         self.probe_done = probe_done
-        self.filter_done = filter_done
         self.fuzzolic_done = fuzzolic_done
         self.directed_done = directed_done
         self.fuzzer_done = fuzzer_done
@@ -717,7 +714,6 @@ class BinRadarProgress:
         parser.add_schema("[rundir] [set] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[rundir] [done] [prefix: str] [id: int] [dir: str]")
         parser.add_schema("[probe] [done] [prefix: str] [id: int]")
-        parser.add_schema("[filter] [done] [prefix: str] [id: int]")
         parser.add_schema("[fuzzolic] [done] [prefix: str] [id: int]")
         parser.add_schema("[directed] [done] [prefix: str] [id: int]")
         parser.add_schema("[fuzzer] [done] [prefix: str] [id: int]")
@@ -743,7 +739,6 @@ class BinRadarProgress:
             return None
 
         probe_done = False
-        filter_done = False
         fuzzolic_done = False
         directed_done = False
         fuzzer_done = False
@@ -753,10 +748,6 @@ class BinRadarProgress:
         for probe in parser.get_result()["probe"]["done"]:
             if int(probe["id"]) == run_id and probe["prefix"] == run_prefix:
                 probe_done = True
-                break
-        for filter in parser.get_result()["filter"]["done"]:
-            if int(filter["id"]) == run_id and filter["prefix"] == run_prefix:
-                filter_done = True
                 break
         for fuzzolic in parser.get_result()["fuzzolic"]["done"]:
             if int(fuzzolic["id"]) == run_id and fuzzolic["prefix"] == run_prefix:
@@ -782,7 +773,7 @@ class BinRadarProgress:
             if int(verifier["id"]) == run_id and verifier["prefix"] == run_prefix:
                 verifier_done = True
                 break
-        return BinRadarProgress(run_id, run_dir, probe_done, filter_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
+        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
     # Config from binradar.env and command line arguments
@@ -793,13 +784,13 @@ class BinRadarExecutor:
     poc_input: str
     test_cmd: str
     patch_loc: str
-    # E9 metadata for each binaries: "brpatched", "prefilter", or "brcached".
+    # E9 metadata for each artifact: "brpatched" or "brcached".
     e9_metadata_prefix: str
     e9_exclude_ranges: str
     e9_relocated_calls: str
     total_patches: int
     # Candidate ids compiled into the .brpatched predicate table. With
-    # --target-patches all and a cached artifact covering the full prefilter
+    # --target-patches all and a cached artifact covering the full setup-filter
     # survivor list, total_patches exceeds this cap.
     brpatched_total_patches: int
     fuzzy: bool
@@ -959,7 +950,7 @@ class BinRadarExecutor:
             self, phase: str, exc: BaseException) -> None:
         """Record an optional evidence phase that failed under --less-strict.
 
-        Required phases (probe, filter, minimizer, verifier, and final) never
+        Required phases (probe, minimizer, verifier, and final) never
         call this helper. Keeping the failure separate from a successful
         ``[phase] [done]`` marker prevents a run with failed optional phases
         from masquerading as a complete run in progress logs.
@@ -1258,12 +1249,6 @@ class BinRadarExecutor:
                 env["BINRADAR_PATCH_CNT"] = str(len(self.filter_result))
                 env["BINRADAR_EVIDENCE_FILE"] = os.path.join(
                     run_dir, "binradar.br")
-                filter_file = os.path.join(run_dir, "filter.br")
-                legacy_filter_file = os.path.join(run_dir, "filter.sbsv")
-                if os.path.exists(filter_file):
-                    env["BINRADAR_PATCH_FILTER_FILE"] = filter_file
-                elif os.path.exists(legacy_filter_file):
-                    env["BINRADAR_PATCH_FILTER_FILE"] = legacy_filter_file
         return env
     
     def run_probe(self):
@@ -1341,214 +1326,17 @@ class BinRadarExecutor:
             f.write(f"[probe-info] {probe_result.serialize()}\n")
             f.write(f"[file-trace] {file_trace_result.serialize_file_trace_result()}\n")
     
-    def load_filter_result(self, filter_result_file: str) -> List[int]:
-        """Load compact filter evidence, with read-only legacy SBSV support."""
-        if filter_result_file.endswith(".br"):
-            result = binradar_evidence.read_filter(filter_result_file)
-            if result.total != self.total_patches:
-                raise ValueError(
-                    f"filter candidate count {result.total} does not match "
-                    f"configured TOTAL_PATCHES {self.total_patches}")
-            return result.passed
-        survived_patches: List[int] = list()
-        with open(filter_result_file, encoding="utf-8") as f:
-            parser = sbsv.parser()
-            parser.add_schema("[patch] [id: int] [pass: bool]")
-            rows = parser.load(f)
-        for row in rows["patch"]:
-            if row["pass"]:
-                survived_patches.append(row["id"])
-        return survived_patches
+    
 
-    def _load_cached_predicates(self) -> Optional[Dict[int, binradar_verifier.ParsedPredicate]]:
-        """Load the runtime predicate manifest for cached filter execution.
+    
 
-        Returns None when the cache is unavailable (single candidate with no
-        uncompiled survivor, missing manifest or .brcached, family mismatch,
-        or missing CWE-805 stack size), so the filter falls back to
-        individual execution.
-        """
-        if self.total_patches <= 1 and not self.cached_needed():
-            return None
-        coverage = self._cached_predicate_set(
-            list(range(1, self.total_patches + 1)))
-        if coverage.predicates is None:
-            logger.warning(
-                f"[FILTER] Predicate cache disabled: {coverage.reason}")
-            return None
-        return coverage.predicates
+    
 
-    def _require_cached_coverage(self, survived_patches: List[int]) -> None:
-        """Fail closed when a survivor has no artifact that can execute it.
+    
 
-        Every candidate past the .brpatched compile cap must have a live
-        .brcached coverage set.  Otherwise the concrete verifier would either
-        run those ids on an artifact that cannot express them or record no
-        evidence at all, and the run would silently lose candidates.
-        """
-        uncompiled = [patch for patch in survived_patches
-                      if patch > self.brpatched_total_patches]
-        if not uncompiled:
-            return
-        coverage = self._cached_predicate_set(survived_patches)
-        if coverage.predicates is None:
-            raise RuntimeError(
-                f"{len(uncompiled)} surviving candidate(s) "
-                f"(e.g. {uncompiled[:8]}) are not compiled into .brpatched "
-                f"and the cached artifact cannot execute them either: "
-                f"{coverage.reason}")
+    
 
-    def _filter_decision(
-            self, patch_id: int, result,
-            patch_result: Optional[
-                binradar_verifier.BinRadarPatchResult]) -> bool:
-        """Evaluate one filter observation."""
-        assert self.probe_result is not None
-        if result is None:
-            logger.warning(
-                f"[FILTER] [patch {patch_id}] Failed to run patched binary "
-                f"with the poc input. Keeping the patch.")
-            return True
-        if patch_result is not None and patch_result.crashed():
-            logger.info(
-                f"[FILTER] [patch {patch_id}] Patch itself crashed "
-                f"(division/modulo by zero). Filtered out.")
-            return False
-        if result.is_crash() \
-                and result.fault_addr == self.probe_result.fault_addr:
-            logger.info(
-                f"[FILTER] [patch {patch_id}] Still crashes at the original "
-                f"fault address {result.fault_addr:#x}. Filtered out.")
-            return False
-        return True
-
-    def _filter_patch(self, patch_id: int, runner,
-                      testcase: str) -> bool:
-        """Run one candidate individually on .brpatched and evaluate it.
-
-        A candidate that was never compiled into .brpatched has no predicate
-        table entry there, so it would evaluate as the false predicate and be
-        dropped for a reason unrelated to its semantics. Those candidates are
-        kept instead, mirroring the unusable-execution rule above.
-        """
-        if patch_id > self.brpatched_total_patches:
-            logger.warning(
-                f"[FILTER] [patch {patch_id}] Cached run unusable and the id "
-                f"is not compiled into .brpatched; keeping the patch.")
-            return True
-        result, patch_result = runner.test_with_patched(
-            str(patch_id), testcase)
-        return self._filter_decision(patch_id, result, patch_result)
-
-    def run_filter(self) -> List[int]:
-        self.check_requirements()
-        if self.probe_result is None:
-            logger.error("Probe result not found. Cannot run filter.")
-            raise RuntimeError("Probe result not found.")
-        filter_result_file = os.path.join(self.run_dir, "filter.br")
-        legacy_filter_file = os.path.join(self.run_dir, "filter.sbsv")
-        reusable_filter = (filter_result_file
-                           if os.path.exists(filter_result_file)
-                           else legacy_filter_file)
-        if os.path.exists(reusable_filter):
-            try:
-                survived_patches = self.load_filter_result(reusable_filter)
-            except Exception:
-                logger.warning(
-                    "[FILTER] Failed to load the existing filter result. "
-                    "Re-running the filter phase.")
-            else:
-                logger.info(
-                    f"[FILTER] Loaded existing filter result: "
-                    f"{len(survived_patches)} survivor(s)")
-                self.filter_result = survived_patches
-                self._require_cached_coverage(survived_patches)
-                return survived_patches
-        self.save_progress(
-            f"[filter] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        config = self.extract_config()
-        runner = binradar_verifier.BinRadarQemuRunner.from_env(
-            self.workdir, config)
-        testcase = self.resolved_poc_input()
-        survived_patches: List[int] = list()
-        cached_predicates = self._load_cached_predicates()
-        if cached_predicates is None:
-            for patch_id in range(1, self.total_patches + 1):
-                if self._filter_patch(patch_id, runner, testcase):
-                    survived_patches.append(patch_id)
-        else:
-            # Cached execution: run one representative per distinct complete
-            # branch vector and persist only the final survivor bitmap.
-            remaining = list(range(1, self.total_patches + 1))
-            while remaining:
-                representative = remaining.pop(0)
-                logger.info(
-                    f"[FILTER] [cache-run] [patch {representative}]")
-                result, cached = runner.test_with_cached(
-                    representative, cached_predicates[representative],
-                    testcase)
-                if result is None or cached is None:
-                    logger.warning(
-                        f"[FILTER] [patch {representative}] Cached run "
-                        f"failed; falling back to individual execution.")
-                    if self._filter_patch(
-                            representative, runner, testcase):
-                        survived_patches.append(representative)
-                    continue
-                observed = cached.br_selection
-                try:
-                    evaluated = binradar_verifier.evaluate_cached_predicate(
-                        cached_predicates[representative], cached.snapshots)
-                except (IndexError, ValueError) as e:
-                    logger.warning(
-                        f"[FILTER] [patch {representative}] Predicate "
-                        f"evaluation failed ({e}); falling back to "
-                        f"individual execution.")
-                    evaluated = None
-                if evaluated is None or evaluated != observed:
-                    logger.warning(
-                        f"[FILTER] [patch {representative}] Cached branch "
-                        f"vector mismatch; falling back to individual "
-                        f"execution.")
-                    if self._filter_patch(
-                            representative, runner, testcase):
-                        survived_patches.append(representative)
-                    continue
-                equivalent = [representative]
-                for patch in remaining:
-                    try:
-                        branches = \
-                            binradar_verifier.evaluate_cached_predicate(
-                                cached_predicates[patch], cached.snapshots)
-                    except (IndexError, ValueError):
-                        branches = None
-                    if branches is not None and branches == observed:
-                        equivalent.append(patch)
-                for patch in equivalent[1:]:
-                    remaining.remove(patch)
-                if len(equivalent) > 1:
-                    logger.info(
-                        f"[FILTER] [cache-reuse] [representative "
-                        f"{representative}] [members {len(equivalent)}]")
-                for patch in equivalent:
-                    if self._filter_decision(
-                            patch, result,
-                            binradar_verifier.BinRadarPatchResult(
-                                patch, observed)):
-                        survived_patches.append(patch)
-        binradar_evidence.write_filter(
-            filter_result_file, self.total_patches, survived_patches)
-        logger.info(
-            f"[FILTER] [summary] [total {self.total_patches}] "
-            f"[survived {len(survived_patches)}] "
-            f"[filtered {self.total_patches - len(survived_patches)}] "
-            f"[result filter.br]")
-        self.filter_result = survived_patches
-        self._require_cached_coverage(survived_patches)
-        self.save_progress(
-            f"[filter] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
-            f"[survived-count {len(survived_patches)}] [result filter.br]")
-        return survived_patches
+    
 
     def check_requirements(self):
         if not os.path.exists(self.original_binary()):
@@ -2393,18 +2181,17 @@ class BinRadarExecutor:
     def run_fuzzer_only(self, run_prefix: str = "run"):
         """Run the AFL++ producer and concrete verification pipeline only.
 
-        PROBE and FILTER remain mandatory prerequisites. FUZZOLIC, DIRECTED,
-        and BINRADAR are skipped; FINAL therefore uses concrete-verifier
-        evidence only. AFL++, the streaming minimizer, and the verifier run
-        concurrently.
+        PROBE remains mandatory; setup already filtered the candidates.
+        FUZZOLIC, DIRECTED, and BINRADAR are skipped; FINAL therefore uses
+        concrete-verifier evidence only. AFL++, the streaming minimizer, and
+        the verifier run concurrently.
         """
         self.disable_binradar = True
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
-        survived_patches = self.run_filter()
-        if len(survived_patches) == 0:
-            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+        if not self.filter_result:
+            logger.info("[BINRADAR] No patch survived setup filtering. Skipping the remaining phases.")
             self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
             self.done()
             return
@@ -2425,9 +2212,8 @@ class BinRadarExecutor:
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
-        survived_patches = self.run_filter()
-        if len(survived_patches) == 0:
-            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+        if not self.filter_result:
+            logger.info("[BINRADAR] No patch survived setup filtering. Skipping the remaining phases.")
             self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
             self.done()
             return
@@ -2458,9 +2244,6 @@ class BinRadarExecutor:
         self.run_probe()
         if phase == BinRadarPhase.PROBE:
             return
-        self.run_filter()
-        if phase == BinRadarPhase.FILTER:
-            return
         if phase == BinRadarPhase.FUZZOLIC:
             self._run_optional_phase("fuzzolic", self.run_fuzzolic)
         elif phase == BinRadarPhase.DIRECTED:
@@ -2488,9 +2271,8 @@ class BinRadarExecutor:
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         self.run_probe()
 
-        survived_patches = self.run_filter()
-        if len(survived_patches) == 0:
-            logger.info("[BINRADAR] No patch survived the filter phase. Skipping the remaining phases.")
+        if not self.filter_result:
+            logger.info("[BINRADAR] No patch survived setup filtering. Skipping the remaining phases.")
             self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches []] [binradar_remaining_patches []]")
             self.done()
             return
@@ -2638,7 +2420,7 @@ def main():
               "fuzzer, binradar, or feedback) fail; final output records the "
               "failed phases as issues"))
     parser.add_argument("--fuzzer-only", action="store_true",
-        help=("run probe/filter, AFL++ fuzzer, minimizer/verifier, and final; "
+        help=("run probe, AFL++ fuzzer, minimizer/verifier, and final; "
               "skip fuzzolic, directed, and binradar"))
     parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
     parser.add_argument("--forkserver-child-timeout", type=positive_int,
@@ -2685,13 +2467,13 @@ def main():
         else env.get("BINRADAR_SYMBOLIC_MUTATION_MODE",
                      SYMBOLIC_MUTATION_MODE_DEFAULT))
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
-    # .brpatched compiles only the setup-time top-30 prefilter survivors into
+    # .brpatched compiles only the top 30 setup-filter survivors into
     # its static predicate table. Record that cap explicitly so no phase can
     # execute an uncompiled id on it, even when the effective candidate set is
-    # expanded to the full prefilter survivor list below.
+    # expanded to the full setup-filter survivor list below.
     env["BRPATCHED_TOTAL_PATCHES"] = env["TOTAL_PATCHES"]
     if args.target_patches == "all":
-        # Run every predicate that survived the offline prefilter instead of
+        # Run every predicate that survived setup filtering instead of
         # the top-30 subset.  Two artifacts can execute candidates:
         #   * .brpatched compiles at most the top-30 survivors into a static
         #     predicate table, so ids past the cap are not executable there;
@@ -2701,31 +2483,31 @@ def main():
         # Expand only when the cached artifact and manifest cover every
         # survivor; otherwise clamp to the compiled set.
         compiled_total = int(env["TOTAL_PATCHES"])
-        pref_total = int(env.get("PREFILTER_TOTAL_PATCHES",
+        filter_total = int(env.get("FILTER_TOTAL_PATCHES",
                                  env["TOTAL_PATCHES"]))
-        if pref_total <= compiled_total:
-            env["TOTAL_PATCHES"] = str(pref_total)
+        if filter_total <= compiled_total:
+            env["TOTAL_PATCHES"] = str(filter_total)
         else:
             coverage = binradar_verifier.load_cached_predicate_set(
                 Path(workdir) / "brpatches.json",
                 Path(workdir) / f"{env['BINARY']}.brcached",
                 env.get("BINRADAR_PATCH_KIND", ""),
                 int(env.get("BRCACHE_STACK_SIZE", "0"), 0),
-                list(range(1, pref_total + 1)))
+                list(range(1, filter_total + 1)))
             if coverage.predicates is None:
                 logger.warning(
                     f"--target-patches all: only the top {compiled_total} "
-                    f"prefilter survivors are compiled into the binaries "
-                    f"(PREFILTER_TOTAL_PATCHES={pref_total}); candidates past "
+                    f"setup-filter survivors are compiled into the binaries "
+                    f"(FILTER_TOTAL_PATCHES={filter_total}); candidates past "
                     f"the compiled cap cannot be run ({coverage.reason})")
                 env["TOTAL_PATCHES"] = str(compiled_total)
             else:
                 logger.info(
                     f"--target-patches all: the .brcached artifact and "
-                    f"brpatches.json cover all {pref_total} prefilter "
+                    f"brpatches.json cover all {filter_total} setup-filter "
                     f"survivors; running the full set (the .brpatched "
                     f"artifact compiles only the top {compiled_total})")
-                env["TOTAL_PATCHES"] = str(pref_total)
+                env["TOTAL_PATCHES"] = str(filter_total)
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

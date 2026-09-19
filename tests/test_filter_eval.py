@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the Python mirror of brpatch.c::eval
-(fuzzolic/binradar_taosc_predicates.py, used by the `prefilter`
-subcommand of fuzzolic/binradar-setup.py).  Run with pytest or directly:
-
-    uv run pytest tests/test_prefilter_eval.py
-    uv run python tests/test_prefilter_eval.py
-"""
+"""Unit tests for Taosc predicate parsing, evaluation, and filter mapping."""
 
 import importlib.util
 import subprocess
@@ -20,14 +14,13 @@ binradar_taosc_predicates = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar_taosc_predicates)
 
 eval_patch_str = binradar_taosc_predicates.eval_patch_str
-evaluate_predicate = binradar_taosc_predicates.evaluate_predicate
 predicate_to_patch_str = binradar_taosc_predicates.predicate_to_patch_str
 predicate_to_branch_patch_str = \
     binradar_taosc_predicates.predicate_to_branch_patch_str
 load_predicates = binradar_taosc_predicates.load_predicates
-load_prefilter_passed_ids = binradar_taosc_predicates.load_prefilter_passed_ids
-write_prefilter = binradar_taosc_predicates.write_prefilter
-PrefilterTrap = binradar_taosc_predicates.PrefilterTrap
+load_filter_passed_ids = binradar_taosc_predicates.load_filter_passed_ids
+write_filter = binradar_taosc_predicates.write_filter
+PredicateTrap = binradar_taosc_predicates.PredicateTrap
 INT64_MIN = binradar_taosc_predicates.INT64_MIN
 INT64_MAX = (1 << 63) - 1
 
@@ -82,20 +75,20 @@ def test_division_by_zero_traps():
     for s in ("/p1p0", "%p1p0"):
         try:
             eval_patch_str(s, ZERO_ENV)
-        except PrefilterTrap:
+        except PredicateTrap:
             pass
         else:
-            raise AssertionError(f"{s!r} should raise PrefilterTrap")
+            raise AssertionError(f"{s!r} should raise PredicateTrap")
 
 
 def test_int64_min_div_minus1_traps():
     for s in ("/n9223372036854775808n1", "%n9223372036854775808n1"):
         try:
             eval_patch_str(s, ZERO_ENV)
-        except PrefilterTrap:
+        except PredicateTrap:
             pass
         else:
-            raise AssertionError(f"{s!r} should raise PrefilterTrap")
+            raise AssertionError(f"{s!r} should raise PredicateTrap")
 
 
 def test_wraparound():
@@ -150,82 +143,56 @@ def test_predicate_conversion_and_branch_polarity():
     assert predicate_to_branch_patch_str(predicate) == f"={patch_str}p0"
 
 
-def test_evaluate_predicate_keep_discard():
-    # DSL predicate "max1 + r10 <= +max1" (max1 == 0); r10 is variable 10,
-    # which reads canonical register slot 10.  Taosc jumps when the predicate
-    # is false, so slot 10 == 1 takes the branch (1 <= 0 is false) -> kept.
-    predicate = "max1 + r10 <= +max1"
-    assert evaluate_predicate(predicate, [[1] * 16]) == (True, "")
-    # With slot 10 == -1 the predicate is true, so no branch is taken.
-    assert evaluate_predicate(predicate, [[-1] * 16]) == (
-        False, "evaluates to 0 on all captured states")
 
-
-def test_evaluate_predicate_trap_rejected():
-    # Division/modulo by zero (or INT64_MIN / -1) would trap the patch at
-    # runtime (reported as `br 2`), so the predicate is rejected.
-    for predicate in ("1 / rax", "1 % rax"):
-        passed, note = evaluate_predicate(predicate, [[0] * 16])
-        assert passed is False
-        assert "trap" in note
-
-
-def test_evaluate_predicate_unparseable_fail_open():
-    # Unparseable predicate -> kept (the existing pipeline surfaces the
-    # error, same as prepare_patch would).
-    passed, _ = evaluate_predicate("??garbage??", [[0] * 16])
-    assert passed is True
-
-
-def test_load_prefilter_passed_ids():
+def test_load_filter_passed_ids():
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory() as tmp:
-        sbsv = Path(tmp) / "prefilter.sbsv"
+        sbsv = Path(tmp) / "filter.sbsv"
 
         # Done marker must be skipped, not treated as a parse error.
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass false] [new-id -1]\n"
-            "[prefilter] [res] [id 2] [pass true] [new-id 1]\n"
-            "[prefilter] [res] [id 3] [pass true] [new-id 2]\n"
-            "[prefilter] [done] [total 3] [survived 2] [time 0.01]\n")
-        assert load_prefilter_passed_ids(sbsv) == {2: 1, 3: 2}
+            "[filter] [res] [id 1] [pass false] [new-id -1]\n"
+            "[filter] [res] [id 2] [pass true] [new-id 1]\n"
+            "[filter] [res] [id 3] [pass true] [new-id 2]\n"
+            "[filter] [done] [total 3] [survived 2] [time 0.01]\n")
+        assert load_filter_passed_ids(sbsv) == {2: 1, 3: 2}
 
         # Blank lines are fine.
         sbsv.write_text(
-            "\n[prefilter] [res] [id 7] [pass true] [new-id 1]\n\n")
-        assert load_prefilter_passed_ids(sbsv) == {7: 1}
+            "\n[filter] [res] [id 7] [pass true] [new-id 1]\n\n")
+        assert load_filter_passed_ids(sbsv) == {7: 1}
 
         # A malformed row fails open (None).
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
+            "[filter] [res] [id 1] [pass true] [new-id 1]\n"
             "garbage\n")
-        assert load_prefilter_passed_ids(sbsv) is None
+        assert load_filter_passed_ids(sbsv) is None
 
         # An unknown-schema row fails open (None).
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass true] [new-id 1]\n"
-            "[prefiltter] [id 2] [pass true]\n")
-        assert load_prefilter_passed_ids(sbsv) is None
+            "[filter] [res] [id 1] [pass true] [new-id 1]\n"
+            "[prefilter] [res] [id 2] [pass true] [new-id 2]\n")
+        assert load_filter_passed_ids(sbsv) is None
 
         # The pre-[res] row format remains invalid.
-        sbsv.write_text("[prefilter] [id 1] [pass true]\n")
-        assert load_prefilter_passed_ids(sbsv) is None
+        sbsv.write_text("[filter] [id 1] [pass true]\n")
+        assert load_filter_passed_ids(sbsv) is None
 
         # A passing row must have a positive new-id.
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass true] [new-id -1]\n")
-        assert load_prefilter_passed_ids(sbsv) is None
+            "[filter] [res] [id 1] [pass true] [new-id -1]\n")
+        assert load_filter_passed_ids(sbsv) is None
 
         # A rejected row must have new-id -1.
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass false] [new-id 1]\n")
-        assert load_prefilter_passed_ids(sbsv) is None
+            "[filter] [res] [id 1] [pass false] [new-id 1]\n")
+        assert load_filter_passed_ids(sbsv) is None
 
         # An all-false file yields no survivors.
         sbsv.write_text(
-            "[prefilter] [res] [id 1] [pass false] [new-id -1]\n")
-        assert load_prefilter_passed_ids(sbsv) == {}
+            "[filter] [res] [id 1] [pass false] [new-id -1]\n")
+        assert load_filter_passed_ids(sbsv) == {}
 
 
 def test_predicate_source_and_runtime_ids():
@@ -236,33 +203,16 @@ def test_predicate_source_and_runtime_ids():
         predicates.write_text("first\n\nthird\n")
         assert load_predicates(predicates) == [(1, "first"), (3, "third")]
 
-        sbsv = Path(tmp) / "prefilter.sbsv"
-        write_prefilter(sbsv, [(1, False, "", "first"), (3, True, "", "third"),
+        sbsv = Path(tmp) / "filter.sbsv"
+        write_filter(sbsv, [(1, False, "", "first"), (3, True, "", "third"),
                                (8, True, "", "eighth")], 0.0)
-        assert "[prefilter] [res] [id 1] [pass false] [new-id -1]" \
+        assert "[filter] [res] [id 1] [pass false] [new-id -1]" \
             in sbsv.read_text()
-        assert "[prefilter] [res] [id 3] [pass true] [new-id 1]" \
+        assert "[filter] [res] [id 3] [pass true] [new-id 1]" \
             in sbsv.read_text()
-        assert "[prefilter] [res] [id 8] [pass true] [new-id 2]" \
+        assert "[filter] [res] [id 8] [pass true] [new-id 2]" \
             in sbsv.read_text()
-        assert load_prefilter_passed_ids(sbsv) == {3: 1, 8: 2}
-
-
-def test_parse_state_lines():
-    parse_state_lines = binradar_taosc_predicates.parse_state_lines
-    # A full 16-slot line (negative and > 2^31 values) parses; stray,
-    # truncated, and non-state lines are skipped.
-    data = (
-        "[prefilter-state] [v0 512] [v1 0] [v2 8835212096] [v3 -1] "
-        "[v4 0] [v5 18] [v6 0] [v7 1] [v8 4667520] [v9 0] [v10 8835335040] "
-        "[v11 0] [v12 0] [v13 2] [v14 32] [v15 4]\n"
-        "stray output line\n"
-        "[prefilter-state] [v0 1] [v1 2]\n"
-        "[other] [v0 1]\n"
-    )
-    assert parse_state_lines(data) == [
-        [512, 0, 8835212096, -1, 0, 18, 0, 1, 4667520, 0,
-         8835335040, 0, 0, 2, 32, 4]]
+        assert load_filter_passed_ids(sbsv) == {3: 1, 8: 2}
 
 
 def _main():

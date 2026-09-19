@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""PATCH_TYPE / TAOSC_TOTAL_PATCHES / PREFILTER_TOTAL_PATCHES in binradar.env."""
+"""PATCH_TYPE / TAOSC_TOTAL_PATCHES / FILTER_TOTAL_PATCHES in binradar.env."""
 
 import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
@@ -50,7 +51,7 @@ def _prepare_workdir(tmp_path, predicates_text="", extra=None):
     return workdir, env
 
 
-def test_generic_env_counters_without_prefilter(tmp_path, monkeypatch):
+def test_generic_env_counters_without_filter(tmp_path, monkeypatch):
     workdir, env = _prepare_workdir(
         tmp_path, "max1 - rax == ~max1\nmax1 / rax < +max1\n")
     monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
@@ -59,51 +60,135 @@ def test_generic_env_counters_without_prefilter(tmp_path, monkeypatch):
     binradar_setup.prepare_patch(tmp_path, workdir, env)
     assert env["PATCH_TYPE"] == "generic-erm"
     assert env["TAOSC_TOTAL_PATCHES"] == "2"
-    assert env["PREFILTER_TOTAL_PATCHES"] == "2"
+    assert env["FILTER_TOTAL_PATCHES"] == "2"
     assert env["TOTAL_PATCHES"] == "2"
 
 
-def test_generic_env_counters_with_prefilter(tmp_path, monkeypatch):
+def test_generic_env_counters_with_filter(tmp_path, monkeypatch):
     workdir, env = _prepare_workdir(
         tmp_path, "max1 - rax == ~max1\nmax1 / rax < +max1\n")
-    # Prefilter: line 1 branches, line 2 does not.
+    # Setup filter: line 1 branches, line 2 does not.
     sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
-    (workdir / "prefilter.sbsv").write_text(
-        f"[prefilter] [meta] [version 1] [kind generic-erm] "
+    (workdir / "filter.sbsv").write_text(
+        f"[filter] [meta] [version 1] [kind generic-erm] "
         f"[sha256 {sha256}]\n"
-        "[prefilter] [res] [id 1] [pass true] [new-id 1] x\n"
-        "[prefilter] [res] [id 2] [pass false] [new-id -1] y\n"
-        "[prefilter] [done] [total 2] [survived 1] [time 0.00]\n")
+        "[filter] [res] [id 1] [pass true] [new-id 1] x\n"
+        "[filter] [res] [id 2] [pass false] [new-id -1] y\n"
+        "[filter] [done] [total 2] [survived 1] [time 0.00]\n")
     monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
     _patch_extract(monkeypatch)
 
     binradar_setup.prepare_patch(tmp_path, workdir, env)
     assert env["PATCH_TYPE"] == "generic-erm"
     assert env["TAOSC_TOTAL_PATCHES"] == "2"
-    assert env["PREFILTER_TOTAL_PATCHES"] == "1"
+    assert env["FILTER_TOTAL_PATCHES"] == "1"
     assert env["TOTAL_PATCHES"] == "1"
 
 
-def test_brpatches_json_exports_all_prefilter_survivors(tmp_path, monkeypatch):
-    """brpatches.json keeps every prefilter survivor past the top-30 cap."""
+def test_setup_filter_probes_original_and_uses_cached_representatives(
+        tmp_path, monkeypatch):
+    """Setup filters real POC outcomes and reuses equivalent cache vectors."""
+    workdir, env = _prepare_workdir(
+        tmp_path,
+        "max1 - rax == ~max1\nmax1 / rax < +max1\n"
+        "max1 - rax == ~max1\n",
+        extra={
+            "POC_INPUT": "poc/input",
+            "TEST_CMD": "-l @@",
+            "BINRADAR_PATCH_KIND": "generic-erm",
+            "TOTAL_PATCHES": "3",
+            "BRCACHE_STACK_SIZE": "0",
+        },
+    )
+    poc = workdir / "poc" / "input"
+    poc.parent.mkdir()
+    poc.write_bytes(b"poc")
+
+    predicates = {1: "=p1p0", 2: "=p0p0", 3: "=p2p0"}
+    monkeypatch.setattr(
+        binradar_setup.binradar_verifier,
+        "load_cached_predicate_set",
+        lambda *args, **kwargs: SimpleNamespace(
+            predicates=predicates, reason=""),
+    )
+
+    class FakeProbe:
+        fault_addr = 0xDEAD
+
+        def patch_hit(self):
+            return True
+
+        def is_crash(self):
+            return True
+
+        def patch_func_hit(self):
+            return True
+
+        def multi_patch_func(self):
+            return False
+
+    class FakeRunner:
+        def __init__(self):
+            self.cached_calls = []
+
+        def test_with_original(self, testcase):
+            assert testcase == str(poc)
+            return FakeProbe()
+
+        def test_with_cached(self, patch_id, predicate, testcase):
+            self.cached_calls.append((patch_id, predicate))
+            branch = 1 if predicate == "=p0p0" else 0
+            snapshot = binradar_setup.binradar_verifier.CachedSnapshot(
+                patch_id=0, branch=branch, registers=(0,) * 16)
+            result = SimpleNamespace(
+                fault_addr=(0 if branch else 0xDEAD),
+                is_crash=lambda: not branch,
+            )
+            cached = binradar_setup.binradar_verifier.BinRadarCachedRun(
+                patch_id, [snapshot])
+            return result, cached
+
+        def test_with_patched(self, patch_id, testcase):
+            raise AssertionError("valid cached observations must not fall back")
+
+    runner = FakeRunner()
+    monkeypatch.setattr(
+        binradar_setup.binradar_verifier.BinRadarQemuRunner,
+        "from_env", staticmethod(lambda *args, **kwargs: runner))
+
+    survived = binradar_setup.run_setup_filter(tmp_path, workdir, env)
+
+    assert survived == [2]
+    assert runner.cached_calls == [(1, "=p1p0"), (2, "=p0p0")]
+    assert env["FILTER_TOTAL_PATCHES"] == "1"
+    assert binradar_setup.load_filter_passed_ids(
+        workdir / "filter.sbsv",
+        expected_kind="generic-erm",
+        expected_sha256=binradar_setup.predicates_sha256(
+            workdir / "predicates"),
+    ) == {2: 1}
+
+
+def test_brpatches_json_exports_all_filter_survivors(tmp_path, monkeypatch):
+    """brpatches.json keeps every filter survivor past the top-30 cap."""
     predicates = "\n".join("max1 - rax == ~max1" for _ in range(32)) + "\n"
     workdir, env = _prepare_workdir(tmp_path, predicates)
     sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
-    lines = [f"[prefilter] [meta] [version 1] [kind generic-erm] "
+    lines = [f"[filter] [meta] [version 1] [kind generic-erm] "
              f"[sha256 {sha256}]"]
     for i in range(1, 33):
-        lines.append(f"[prefilter] [res] [id {i}] [pass true] "
+        lines.append(f"[filter] [res] [id {i}] [pass true] "
                      f"[new-id {i}] x")
-    lines.append("[prefilter] [done] [total 32] [survived 32] [time 0.00]")
-    (workdir / "prefilter.sbsv").write_text("\n".join(lines) + "\n")
+    lines.append("[filter] [done] [total 32] [survived 32] [time 0.00]")
+    (workdir / "filter.sbsv").write_text("\n".join(lines) + "\n")
     monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
     _patch_extract(monkeypatch)
 
     binradar_setup.prepare_patch(tmp_path, workdir, env)
     # The binaries and TOTAL_PATCHES stay capped at the top 30...
-    assert env["PREFILTER_TOTAL_PATCHES"] == "32"
+    assert env["FILTER_TOTAL_PATCHES"] == "32"
     assert env["TOTAL_PATCHES"] == "30"
-    # ...but the manifest exports all 32 prefilter survivors, consecutively
+    # ...but the manifest exports all 32 filter survivors, consecutively
     # from id 1 so load_runtime_predicates still accepts it.
     import json
     manifest = json.loads((workdir / "brpatches.json").read_text())
@@ -117,23 +202,23 @@ def test_brpatches_json_exports_all_prefilter_survivors(tmp_path, monkeypatch):
 
 def test_target_patches_always_caps_at_top_30(tmp_path, monkeypatch):
     """The compiled binaries stay capped at the top-30 survivors even when
-    more survive the prefilter; brpatches.json exports them all."""
+    more survive the filter; brpatches.json exports them all."""
     predicates = "\n".join("max1 - rax == ~max1" for _ in range(32)) + "\n"
     workdir, env = _prepare_workdir(tmp_path, predicates)
     sha256 = binradar_setup.predicates_sha256(workdir / "predicates")
-    lines = [f"[prefilter] [meta] [version 1] [kind generic-erm] "
+    lines = [f"[filter] [meta] [version 1] [kind generic-erm] "
              f"[sha256 {sha256}]"]
     for i in range(1, 33):
-        lines.append(f"[prefilter] [res] [id {i}] [pass true] "
+        lines.append(f"[filter] [res] [id {i}] [pass true] "
                      f"[new-id {i}] x")
-    lines.append("[prefilter] [done] [total 32] [survived 32] [time 0.00]")
-    (workdir / "prefilter.sbsv").write_text("\n".join(lines) + "\n")
+    lines.append("[filter] [done] [total 32] [survived 32] [time 0.00]")
+    (workdir / "filter.sbsv").write_text("\n".join(lines) + "\n")
     monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run([]))
     _patch_extract(monkeypatch)
 
     binradar_setup.prepare_patch(tmp_path, workdir, env)
     assert env["TOTAL_PATCHES"] == "30"
-    assert env["PREFILTER_TOTAL_PATCHES"] == "32"
+    assert env["FILTER_TOTAL_PATCHES"] == "32"
     # brpatches.inc stays capped at the top 30 (keeps the binaries small).
     inc = (workdir / "brpatches.inc").read_text()
     assert "case 32:" not in inc
@@ -159,7 +244,7 @@ def test_cwe805_direct_env_counters(tmp_path, monkeypatch):
     binradar_setup.prepare_patch(tmp_path, workdir, env)
     assert env["PATCH_TYPE"] == "CWE805-direct"
     assert env["TAOSC_TOTAL_PATCHES"] == "1"
-    assert env["PREFILTER_TOTAL_PATCHES"] == "1"
+    assert env["FILTER_TOTAL_PATCHES"] == "1"
     assert env["TOTAL_PATCHES"] == "1"
     assert not (workdir / "brpatches.json").exists()
 
@@ -173,7 +258,7 @@ def test_specialized_env_counters(tmp_path, monkeypatch):
     assert env["PATCH_TYPE"] == "taosc-specialized"
     # No prebuilt .brpatched and no predicates: the zero-candidate build.
     assert env["TAOSC_TOTAL_PATCHES"] == "0"
-    assert env["PREFILTER_TOTAL_PATCHES"] == "0"
+    assert env["FILTER_TOTAL_PATCHES"] == "0"
     assert env["TOTAL_PATCHES"] == "0"
 
 
@@ -198,7 +283,7 @@ def test_setup_persists_new_env_keys(tmp_path, monkeypatch):
     saved = binradar_setup.load_env(workdir / "binradar.env")
     assert saved["PATCH_TYPE"] == "generic-erm"
     assert saved["TAOSC_TOTAL_PATCHES"] == "2"
-    assert saved["PREFILTER_TOTAL_PATCHES"] == "2"
+    assert saved["FILTER_TOTAL_PATCHES"] == "2"
     assert saved["TOTAL_PATCHES"] == "2"
 
 

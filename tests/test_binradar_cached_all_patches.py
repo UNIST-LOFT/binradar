@@ -5,7 +5,7 @@ the .brcached artifact and its runtime manifest can execute every survivor.
 .brpatched compiles a static predicate table capped at the setup-time top 30,
 so an id past that cap has no entry there and silently evaluates as the false
 predicate. The cached artifact resolves its predicate per run from
-brpatches.json, which exports every prefilter survivor. These tests pin the
+brpatches.json, which exports every filter survivor. These tests pin the
 boundary between the two artifacts: the expansion, the artifact selection that
 must follow it, and the refusal to run such an id on .brpatched.
 """
@@ -86,10 +86,10 @@ def _cover_all(descriptors, kind="generic-erm"):
 
 def test_target_patches_all_expands_when_brcached_covers_every_survivor(
         tmp_path, monkeypatch):
-    """32 prefilter survivors with a covering .brcached must all run."""
+    """32 filter survivors with a covering .brcached must all run."""
     _, captured = _run_main(
         monkeypatch, tmp_path, ["--target-patches", "all"],
-        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+        _BASE_ENV + ['FILTER_TOTAL_PATCHES="32"\n',
                      'BINRADAR_PATCH_KIND="generic-erm"\n',
                      'BRCACHE_STACK_SIZE="0"\n'],
         prepare=_cover_all(["=p0p0"] * 32))
@@ -105,7 +105,7 @@ def test_target_patches_all_clamps_without_a_covering_cache(
     """Without .brcached the run stays clamped to the compiled set."""
     _, captured = _run_main(
         monkeypatch, tmp_path, ["--target-patches", "all"],
-        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+        _BASE_ENV + ['FILTER_TOTAL_PATCHES="32"\n',
                      'BINRADAR_PATCH_KIND="generic-erm"\n',
                      'BRCACHE_STACK_SIZE="0"\n'])
 
@@ -118,7 +118,7 @@ def test_target_patches_all_clamps_when_manifest_is_short(
     """A manifest missing past-cap ids cannot cover the survivor list."""
     _, captured = _run_main(
         monkeypatch, tmp_path, ["--target-patches", "all"],
-        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n',
+        _BASE_ENV + ['FILTER_TOTAL_PATCHES="32"\n',
                      'BINRADAR_PATCH_KIND="generic-erm"\n',
                      'BRCACHE_STACK_SIZE="0"\n'],
         prepare=_cover_all(["=p0p0"] * 30))
@@ -130,7 +130,7 @@ def test_target_patches_top_30_records_the_compiled_cap(
         tmp_path, monkeypatch):
     _, captured = _run_main(
         monkeypatch, tmp_path, ["--target-patches", "top-30"],
-        _BASE_ENV + ['PREFILTER_TOTAL_PATCHES="32"\n'])
+        _BASE_ENV + ['FILTER_TOTAL_PATCHES="32"\n'])
 
     assert captured["TOTAL_PATCHES"] == "30"
     assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
@@ -143,7 +143,7 @@ def test_target_patches_all_expands_under_the_smaller_compiled_set(
         monkeypatch, tmp_path, ["--target-patches", "all"],
         ['BINARY="bin"\n', 'POC_INPUT="poc"\n', 'TEST_CMD="./bin @@"\n',
          'PATCH_LOC="0x1234"\n', 'TOTAL_PATCHES="9"\n',
-         'PREFILTER_TOTAL_PATCHES="12"\n',
+         'FILTER_TOTAL_PATCHES="12"\n',
          'BINRADAR_PATCH_KIND="CWE805-erm"\n',
          'BRCACHE_STACK_SIZE="64"\n'],
         prepare=_cover_all(["c1p0"] * 12, kind="CWE805-erm"))
@@ -210,35 +210,10 @@ def test_artifact_selection_refuses_an_uncovered_survivor(tmp_path):
     assert executor.binradar_binary() == str(tmp_path / "bin.brpatched")
 
 
-def test_filter_keeps_an_uncompiled_candidate_instead_of_running_it(tmp_path):
-    """.brpatched would evaluate an uncompiled id as the false predicate and
-    drop the candidate; the filter keeps it instead."""
-    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.probe_result = SimpleNamespace(fault_addr=0xDEAD)
-    executor.brpatched_total_patches = 30
-
-    class NoRunRunner:
-        def test_with_patched(self, patch_id, testcase):
-            raise AssertionError("uncompiled id must not run on .brpatched")
-
-    assert executor._filter_patch(31, NoRunRunner(), "poc") is True
 
 
-def test_filter_requires_cached_coverage_for_uncompiled_survivors(tmp_path):
-    """A run that cannot execute an uncompiled survivor fails closed."""
-    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.workdir = str(tmp_path)
-    executor.binary = "bin"
-    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
-                       "BRCACHE_STACK_SIZE": "0"}
-    executor.brpatched_total_patches = 30
 
-    with pytest.raises(RuntimeError, match="not compiled into .brpatched"):
-        executor._require_cached_coverage([1, 31])
 
-    (tmp_path / "bin.brcached").write_bytes(b"cached")
-    _write_manifest(tmp_path, ["=p0p0"] * 31)
-    executor._require_cached_coverage([1, 31])
 
 
 def test_verifier_never_runs_an_uncompiled_id_on_brpatched(tmp_path):

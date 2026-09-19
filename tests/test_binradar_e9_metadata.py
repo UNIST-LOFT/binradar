@@ -279,14 +279,15 @@ def test_e9_metadata_helpers_roundtrip():
     binradar_utils.set_e9_metadata(
         env, "brpatched", "0x54b000-0x54c000", RECORDS)
     binradar_utils.set_e9_metadata(
-        env, "prefilter", "0x7c254000-0x7c255000", "")
+        env, "brcached", "0x7c254000-0x7c255000", "")
     assert env["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == RECORDS
-    assert env["PREFILTER_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
-    assert env["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == ""
+    assert env["BRCACHED_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert env["BRCACHED_E9_RELOCATED_CALL_JUMPS"] == ""
     assert binradar_utils.get_e9_metadata(env, "brpatched") == \
         ("0x54b000-0x54c000", RECORDS)
-    assert binradar_utils.get_e9_metadata(env, "brcached") == ("", "")
+    assert binradar_utils.get_e9_metadata(env, "brcached") == \
+        ("0x7c254000-0x7c255000", "")
 
 
 def test_persist_e9_metadata_preserves_subject_fields(tmp_path):
@@ -295,7 +296,7 @@ def test_persist_e9_metadata_preserves_subject_fields(tmp_path):
     env_path.write_text('BINARY="nm"\nPATCH_LOC="0x4585dd"\n')
     metadata = binradar_setup.E9RuntimeMetadata(
         (binradar_setup.AddressRange(0x54b000, 0x54c000),), ())
-    binradar_setup.persist_e9_metadata(tmp_path, "prefilter", metadata)
+    binradar_setup.persist_e9_metadata(tmp_path, "brcached", metadata)
     binradar_setup.persist_e9_metadata(
         tmp_path, "brpatched",
         binradar_setup.E9RuntimeMetadata(
@@ -304,7 +305,7 @@ def test_persist_e9_metadata_preserves_subject_fields(tmp_path):
     env = binradar_setup.load_env(env_path)
     assert env["BINARY"] == "nm"
     assert env["PATCH_LOC"] == "0x4585dd"
-    assert env["PREFILTER_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
+    assert env["BRCACHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
     assert env["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
@@ -321,23 +322,22 @@ def test_verifier_from_env_stores_all_prefixed_metadata(tmp_path):
         "PATCH_LOC": "0x4585dd",
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
-        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
-        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
     }
     runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
         str(tmp_path), env)
     # All prefixed values are stored.
     assert runner.e9_metadata["brpatched"] == (
         "0x54b000-0x54c000", ["0x54b091:0x4d60a5:0x4d60aa"])
-    assert runner.e9_metadata["prefilter"] == (
+    assert runner.e9_metadata["brcached"] == (
         "0x7c254000-0x7c255000", ["0x7c254091:0x4d60a5:0x4d60aa"])
-    assert runner.e9_metadata["brcached"] == ("", [])
     # Selection follows the executed binary path.
     assert runner.e9_metadata_for_binary(
         str(tmp_path / "nm.brpatched")) == (
             "0x54b000-0x54c000", ["0x54b091:0x4d60a5:0x4d60aa"])
     assert runner.e9_metadata_for_binary(
-        str(tmp_path / "nm.brprefilter")) == (
+        str(tmp_path / "nm.brcached")) == (
             "0x7c254000-0x7c255000", ["0x7c254091:0x4d60a5:0x4d60aa"])
     # Original binaries have no E9 metadata.
     assert runner.e9_metadata_for_binary(
@@ -351,7 +351,7 @@ def test_verifier_command_selects_records_by_binary(tmp_path):
         "TEST_CMD": "-l @@",
         "PATCH_LOC": "0x4585dd",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
-        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
     }
     runner = binradar.binradar_verifier.BinRadarQemuRunner.from_env(
         str(tmp_path), env)
@@ -377,16 +377,16 @@ def test_executor_retains_all_prefixed_metadata(tmp_path):
         "BINRADAR_TIMEOUT": "60",
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
-        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
-        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
     }
     executor = binradar.BinRadarExecutor.from_env(str(tmp_path), env)
     config = executor.extract_config()
     assert config["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert config["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
-    assert config["PREFILTER_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
-    assert config["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == \
+    assert config["BRCACHED_E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
+    assert config["BRCACHED_E9_RELOCATED_CALL_JUMPS"] == \
         "0x7c254091:0x4d60a5:0x4d60aa"
     assert config["BINRADAR_PATCH_KIND"] == "CWE805-erm"
     assert config["BRCACHE_STACK_SIZE"] == "256"
@@ -735,9 +735,8 @@ def test_prepare_patch_empty_predicates_builds_zero_candidates(
     assert (workdir / "brpatches.inc").exists()
 
 
-def test_cmd_setup_merges_prefilter_metadata_before_final_save(
-        tmp_path, monkeypatch):
-    """Prefilter E9 metadata must survive setup's final environment save."""
+def test_cmd_setup_builds_filters_then_rebuilds_erm(tmp_path, monkeypatch):
+    """The cache-capable bootstrap build precedes filtering and compaction."""
     configdir = tmp_path / "config"
     workdir = tmp_path / "workdir"
     (configdir / "poc").mkdir(parents=True)
@@ -748,25 +747,35 @@ def test_cmd_setup_merges_prefilter_metadata_before_final_save(
         'POC_DIR="poc"\n'
         'TEST_CMD="./imginfo @@"\n')
     (workdir / "patch-location").write_text("410735\n")
+    (workdir / "binradar.env").write_text(
+        'PREFILTER_TOTAL_PATCHES="stale"\n'
+        'PREFILTER_E9_EXCLUDE_RANGES="stale"\n'
+        'PREFILTER_E9_RELOCATED_CALL_JUMPS="stale"\n')
 
-    metadata = binradar_setup.E9RuntimeMetadata(
-        (binradar_setup.AddressRange(0x7C254000, 0x7C255000),),
-        ((0x7C254091, 0x410735, 0x410737),))
+    events = []
 
-    def fake_prefilter(configdir_arg, workdir_arg):
-        binradar_setup.persist_e9_metadata(workdir_arg, "prefilter", metadata)
+    def fake_prepare(configdir_arg, workdir_arg, env_arg):
+        events.append("prepare")
+        env_arg["BINRADAR_PATCH_KIND"] = "generic-erm"
+        env_arg["TAOSC_TOTAL_PATCHES"] = "2"
+        env_arg["FILTER_TOTAL_PATCHES"] = "2"
+        env_arg["TOTAL_PATCHES"] = "2"
 
-    monkeypatch.setattr(binradar_setup, "run_prefilter", fake_prefilter)
-    monkeypatch.setattr(
-        binradar_setup, "prepare_patch",
-        lambda configdir_arg, workdir_arg, env_arg: None)
+    def fake_filter(configdir_arg, workdir_arg, env_arg):
+        events.append("filter")
+        env_arg["FILTER_TOTAL_PATCHES"] = "1"
+        return [1]
+
+    monkeypatch.setattr(binradar_setup, "prepare_patch", fake_prepare)
+    monkeypatch.setattr(binradar_setup, "run_setup_filter", fake_filter)
 
     binradar_setup.cmd_setup(configdir, workdir)
+
+    assert events == ["prepare", "filter", "prepare"]
     saved = binradar_setup.load_env(workdir / "binradar.env")
-    assert saved["PREFILTER_E9_EXCLUDE_RANGES"] == \
-        "0x7c254000-0x7c255000"
-    assert saved["PREFILTER_E9_RELOCATED_CALL_JUMPS"] == \
-        "0x7c254091:0x410735:0x410737"
+    assert "PREFILTER_TOTAL_PATCHES" not in saved
+    assert "PREFILTER_E9_EXCLUDE_RANGES" not in saved
+    assert "PREFILTER_E9_RELOCATED_CALL_JUMPS" not in saved
 
 
 # ---------------------------------------------------------------------------
@@ -826,20 +835,20 @@ def test_metadata_selection_is_artifact_scoped(tmp_path):
     """Selecting an artifact selects only its own prefixed metadata.
 
     Two artifacts with intentionally different ranges and jumps: the
-    brpatched run must never receive the prefilter values and vice versa.
+    brpatched run must never receive the brcached values and vice versa.
     """
     config = {
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": "0x54b091:0x4d60a5:0x4d60aa",
-        "PREFILTER_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
-        "PREFILTER_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000",
+        "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
     }
     brpatched = _stub_executor(tmp_path, e9_metadata_prefix="brpatched",
                                config=config)
-    prefilter = _stub_executor(tmp_path, e9_metadata_prefix="prefilter",
-                               config=config)
+    brcached = _stub_executor(tmp_path, e9_metadata_prefix="brcached",
+                              config=config)
     env_b = brpatched.get_env("binradar", str(tmp_path))
-    env_p = prefilter.get_env("binradar", str(tmp_path))
+    env_p = brcached.get_env("binradar", str(tmp_path))
     assert env_b["E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env_b["E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
