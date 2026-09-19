@@ -534,6 +534,41 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
         assert "if dest(state)@brpatch-cached goto" in joined
 
 
+def test_cwe805_cached_build_accepts_zero_for_register_predicates(
+        tmp_path, monkeypatch):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "stack-size").write_text("0\n")
+    env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
+    predicates = [
+        binradar_setup.PredicateRecord(
+            1, 1, "pointer",
+            binradar_setup.CWE805PointerPredicate(
+                binradar_setup.RegisterCell(0))),
+        binradar_setup.PredicateRecord(
+            2, 2, "size",
+            binradar_setup.CWE805SizePredicate(
+                4, binradar_setup.RegisterCell(1))),
+    ]
+    monkeypatch.setattr(
+        binradar_setup, "build_cached_binary",
+        lambda *args, **kwargs: binradar_setup.E9RuntimeMetadata((), ()))
+
+    binradar_setup.build_cached_artifact(
+        workdir, tmp_path, env,
+        binradar_setup.PredicateFamily.CWE805_ERM,
+        binradar_setup.AllocatorTrace("malloc", [(0, "40661c")], ["406621"]),
+        predicates,
+    )
+
+    assert env["BRCACHE_STACK_SIZE"] == "0"
+    family, loaded = (
+        binradar_setup.binradar_taosc_predicates.load_runtime_predicates(
+            workdir / "brpatches.json"))
+    assert family is binradar_setup.PredicateFamily.CWE805_ERM
+    assert set(loaded) == {1, 2}
+
+
 def test_verifier_capture_drains_text_and_cached_channels(tmp_path, monkeypatch):
     helper = tmp_path / "emit-cached-capture.py"
     helper.write_text(

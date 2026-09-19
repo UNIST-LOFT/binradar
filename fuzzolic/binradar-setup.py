@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import enum
+import multiprocessing
 import os
 import re
 import shutil
@@ -39,6 +40,7 @@ from binradar_taosc_predicates import (
     load_filter_passed_ids,
     parse_CWE805_predicate,
     parse_allocator_trace,
+    predicate_stack_bytes,
     predicate_to_branch_patch_str,
     predicates_sha256,
     read_patch_format,
@@ -252,6 +254,7 @@ def build_cached_artifact(
                       PredicateFamily.CWE805_ERM) or len(selected) <= 1:
         return
 
+    manifest_records = survived if survived is not None else selected
     if family == PredicateFamily.CWE805_ERM:
         stack_size_file = workdir / "stack-size"
         try:
@@ -260,14 +263,18 @@ def build_cached_artifact(
             print(f"Error: CWE-805 cache needs a valid {stack_size_file.name}: "
                   f"{e}")
             exit(1)
-        if stack_size <= 0 or stack_size > 0x100000:
-            print(f"Error: invalid CWE-805 cache stack size {stack_size}")
+        required_stack_size = max(
+            (predicate_stack_bytes(record.parsed)
+             for record in manifest_records),
+            default=0,
+        )
+        if stack_size < required_stack_size or stack_size > 0x100000:
+            print(f"Error: invalid CWE-805 cache stack size {stack_size}; "
+                  f"predicates require {required_stack_size} byte(s)")
             exit(1)
         binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
     else:
         binradar_env["BRCACHE_STACK_SIZE"] = "0"
-
-    manifest_records = survived if survived is not None else selected
     write_runtime_predicates(
         workdir / "brpatches.json", family, manifest_records)
     try:
@@ -1257,6 +1264,20 @@ def run_setup_filter(
             decisions[patch_id] = run_individual(patch_id)
     else:
         remaining = all_ids.copy()
+        first_branches: Optional[Dict[int, int]] = {}
+        match_pool = None
+        match_workers = 0
+        if (family == PredicateFamily.GENERIC_ERM
+                and len(all_ids) >= 10_000):
+            binradar_taosc_predicates.precompile_generic_predicates(
+                cached_predicates)
+            match_workers = min(8, os.cpu_count() or 1)
+            match_pool = multiprocessing.get_context("fork").Pool(
+                match_workers,
+                initializer=(binradar_taosc_predicates
+                             .initialize_predicate_match_worker),
+                initargs=(cached_predicates,))
+            print(f"[filter] [parallel-match] [workers {match_workers}]")
         while remaining:
             representative = remaining.pop(0)
             print(f"[filter] [cache-run] [patch {representative}]")
@@ -1266,9 +1287,12 @@ def run_setup_filter(
                 decisions[representative] = run_individual(representative)
                 continue
             observed = cached.br_selection
+            environments = binradar_verifier.prepare_generic_environments(
+                cached.snapshots)
             try:
                 evaluated = binradar_verifier.evaluate_cached_predicate(
-                    cached_predicates[representative], cached.snapshots)
+                    cached_predicates[representative], cached.snapshots,
+                    environments)
             except (IndexError, ValueError):
                 evaluated = None
             if evaluated is None or evaluated != observed:
@@ -1277,22 +1301,74 @@ def run_setup_filter(
                 decisions[representative] = run_individual(representative)
                 continue
 
+            if observed and first_branches is not None:
+                known_first = first_branches.get(representative)
+                if known_first is not None and known_first != observed[0]:
+                    print("Warning: setup first-hit state changed; disabling "
+                          "branch-signature cache")
+                    first_branches = None
+                else:
+                    first_branches[representative] = observed[0]
+
             equivalent = [representative]
-            for patch_id in remaining:
-                try:
-                    branches = binradar_verifier.evaluate_cached_predicate(
-                        cached_predicates[patch_id], cached.snapshots)
-                except (IndexError, ValueError):
-                    branches = None
-                if branches is not None and branches == observed:
-                    equivalent.append(patch_id)
-            for patch_id in equivalent[1:]:
-                remaining.remove(patch_id)
+            matched = set()
+            eligible = []
+            start_index = 0
+            if observed and first_branches is not None:
+                start_index = 1
+                for patch_id in remaining:
+                    try:
+                        first_branch = first_branches.get(patch_id)
+                        if first_branch is None:
+                            environment = (environments[0]
+                                           if environments else None)
+                            first_branch = binradar_verifier.evaluate_cached_branch(
+                                cached_predicates[patch_id],
+                                cached.snapshots[0], environment)
+                            first_branches[patch_id] = first_branch
+                    except (IndexError, ValueError):
+                        continue
+                    if first_branch == observed[0]:
+                        eligible.append(patch_id)
+            else:
+                eligible = remaining
+
+            if match_pool is not None and len(eligible) >= match_workers * 32:
+                chunk_size = (len(eligible) + match_workers - 1) // match_workers
+                tasks = [
+                    (eligible[offset:offset + chunk_size], cached.snapshots,
+                     observed, environments, start_index)
+                    for offset in range(0, len(eligible), chunk_size)
+                ]
+                for worker_matches in match_pool.map(
+                        binradar_taosc_predicates.match_cached_predicate_ids,
+                        tasks):
+                    matched.update(worker_matches)
+            else:
+                for patch_id in eligible:
+                    try:
+                        matches = binradar_verifier.cached_predicate_matches(
+                            cached_predicates[patch_id], cached.snapshots,
+                            observed, environments, start_index)
+                    except (IndexError, ValueError):
+                        matches = False
+                    if matches:
+                        matched.add(patch_id)
+            equivalent.extend(
+                patch_id for patch_id in remaining if patch_id in matched)
+            remaining = [
+                patch_id for patch_id in remaining if patch_id not in matched
+            ]
+            decision = _setup_filter_decision(
+                representative, result,
+                binradar_verifier.BinRadarPatchResult(
+                    representative, observed),
+                probe.fault_addr)
             for patch_id in equivalent:
-                decisions[patch_id] = _setup_filter_decision(
-                    patch_id, result,
-                    binradar_verifier.BinRadarPatchResult(patch_id, observed),
-                    probe.fault_addr)
+                decisions[patch_id] = decision
+        if match_pool is not None:
+            match_pool.close()
+            match_pool.join()
 
     results = [
         (record.source_line, decisions[record.runtime_id][0],

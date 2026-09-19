@@ -87,6 +87,20 @@ static uint32_t selected_patch_id;
 static uint32_t selected_iteration;
 static struct br_predicate selected_predicate;
 
+static uint64_t predicate_stack_bytes(const struct br_predicate *predicate)
+{
+	uint64_t width;
+	switch (predicate->cell_kind) {
+	case BR_CELL_REGISTER: return 0;
+	case BR_CELL_STACK8: width = 1; break;
+	case BR_CELL_STACK16: width = 2; break;
+	case BR_CELL_STACK32: width = 4; break;
+	case BR_CELL_STACK64: width = 8; break;
+	default: return ~(uint64_t)0;
+	}
+	return ((uint64_t)predicate->cell_index + 1) * width;
+}
+
 static void attach_cache_selector(void)
 {
 	if (env_patch_id != MAGIC_VALUE_PATCH || patch_shm == NULL)
@@ -165,8 +179,6 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 	uint64_t flags = 0;
 #ifdef BRPATCH_CWE805
 	flags |= BRCACHE_FLAG_CWE805;
-	if (cache_stack_size == 0)
-		invalid = 1;
 #endif
 	if (invalid) {
 		write_marker(patch_id, branch, flags | BRCACHE_FLAG_INVALID);
@@ -303,6 +315,9 @@ const void *dest(const struct STATE *state)
 		if (!selected_invalid &&
 		    (encoded == NULL ||
 		     parse_predicate(encoded, &selected_predicate) < 0))
+			selected_invalid = 1;
+		if (!selected_invalid &&
+		    predicate_stack_bytes(&selected_predicate) > cache_stack_size)
 			selected_invalid = 1;
 		selected_initialized = 1;
 	}

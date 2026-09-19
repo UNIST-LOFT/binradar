@@ -791,7 +791,8 @@ def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
     ]
     assert all(snapshot.is_CWE805 for snapshot in snapshots)
     assert all(len(snapshot.clamps) == 256 for snapshot in snapshots)
-    assert all(len(snapshot.stack) == 8 for snapshot in snapshots)
+    assert all(snapshot.stack == b"" for snapshot in snapshots)
+    assert all(snapshot.stack == b"" for snapshot in dynamic_snapshots)
     assert snapshots[0].clamps[0] == (0x1000, 0x2000)
 
 

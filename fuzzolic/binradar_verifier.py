@@ -7,8 +7,8 @@ import time
 import threading
 import fcntl
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Set,
-                    TextIO, Tuple)
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Set, TextIO, Tuple)
 
 import sbsv
 
@@ -18,12 +18,17 @@ import binradar_evidence
 import binradar_utils
 from binradar_taosc_predicates import (
     CachedSnapshot,
+    GenericEnvironments,
     ParsedPredicate,
     PredicateFamily,
+    cached_predicate_matches,
+    evaluate_cached_branch,
     evaluate_cached_predicate,
     load_runtime_predicates,
     parse_cached_snapshots,
     predicate_descriptor,
+    prepare_generic_environments,
+    predicate_stack_bytes,
 )
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,9 +98,17 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
             None, None,
             f"missing runtime patch ids {missing[:8]}"
             + (" (truncated)" if len(missing) > 8 else ""))
-    if family == PredicateFamily.CWE805_ERM and brcache_stack_size <= 0:
-        return CachedPredicateSet(None, None,
-                                  "missing CWE-805 cache stack size")
+    if family == PredicateFamily.CWE805_ERM:
+        required_stack_size = max(
+            (predicate_stack_bytes(predicates[patch]) for patch in patches),
+            default=0,
+        )
+        if brcache_stack_size < required_stack_size \
+                or brcache_stack_size > 0x100000:
+            return CachedPredicateSet(
+                None, None,
+                f"CWE-805 cache stack size {brcache_stack_size} does not "
+                f"cover required {required_stack_size} byte(s)")
     return CachedPredicateSet(predicates, family, "")
 
 
@@ -1187,12 +1200,46 @@ class BinRadarConcreteVerifier:
 
     def _cached_branches(
         self, patch: int, snapshots: List[CachedSnapshot],
+        environments: Optional[GenericEnvironments] = None,
     ) -> Optional[List[int]]:
         predicate = self.cached_predicates.get(patch)
         if predicate is None:
             return None
         try:
-            return evaluate_cached_predicate(predicate, snapshots)
+            return evaluate_cached_predicate(
+                predicate, snapshots, environments)
+        except (IndexError, ValueError) as e:
+            self.logger.warning(
+                f"[verifier-cache] [predicate-error] [patch {patch}] "
+                f"[reason {e}]")
+            return None
+
+    def _cached_matches(
+        self, patch: int, snapshots: List[CachedSnapshot], expected: List[int],
+        environments: Optional[GenericEnvironments] = None,
+        start_index: int = 0,
+    ) -> Optional[bool]:
+        predicate = self.cached_predicates.get(patch)
+        if predicate is None:
+            return None
+        try:
+            return cached_predicate_matches(
+                predicate, snapshots, expected, environments, start_index)
+        except (IndexError, ValueError) as e:
+            self.logger.warning(
+                f"[verifier-cache] [predicate-error] [patch {patch}] "
+                f"[reason {e}]")
+            return None
+
+    def _cached_first_branch(
+        self, patch: int, snapshot: CachedSnapshot,
+        environment: Optional[Sequence[int]] = None,
+    ) -> Optional[int]:
+        predicate = self.cached_predicates.get(patch)
+        if predicate is None:
+            return None
+        try:
+            return evaluate_cached_branch(predicate, snapshot, environment)
         except (IndexError, ValueError) as e:
             self.logger.warning(
                 f"[verifier-cache] [predicate-error] [patch {patch}] "
@@ -1224,6 +1271,7 @@ class BinRadarConcreteVerifier:
             return rejected
 
         remaining = list(patches)
+        first_branches: Optional[Dict[int, int]] = {}
         while remaining:
             self._raise_if_timed_out(deadline)
             representative = remaining.pop(0)
@@ -1242,8 +1290,9 @@ class BinRadarConcreteVerifier:
                 continue
 
             observed = cached.br_selection
+            environments = prepare_generic_environments(cached.snapshots)
             evaluated = self._cached_branches(
-                representative, cached.snapshots)
+                representative, cached.snapshots, environments)
             if evaluated is None or evaluated != observed:
                 self.logger.warning(
                     f"[verifier-cache] [runtime-mismatch] "
@@ -1251,6 +1300,17 @@ class BinRadarConcreteVerifier:
                 if self._test_testcase(representative, testcase, deadline):
                     record_rejection(representative)
                 continue
+
+            if observed and first_branches is not None:
+                known_first = first_branches.get(representative)
+                if known_first is not None and known_first != observed[0]:
+                    self.logger.warning(
+                        "[verifier-cache] [first-hit-changed] "
+                        f"[patch {representative}] [id {testcase.id}] "
+                        "disabling branch-signature cache")
+                    first_branches = None
+                else:
+                    first_branches[representative] = observed[0]
 
             representative_result = BinRadarPatchResult(
                 representative, observed)
@@ -1260,10 +1320,31 @@ class BinRadarConcreteVerifier:
                 record_rejection(representative)
 
             equivalent: List[Tuple[int, List[int]]] = []
+            unmatched = []
             for patch in remaining:
-                branches = self._cached_branches(patch, cached.snapshots)
-                if branches is not None and branches == observed:
-                    equivalent.append((patch, branches))
+                start_index = 0
+                if observed and first_branches is not None:
+                    first_branch = first_branches.get(patch)
+                    if first_branch is None:
+                        environment = (environments[0]
+                                       if environments else None)
+                        first_branch = self._cached_first_branch(
+                            patch, cached.snapshots[0], environment)
+                        if first_branch is not None:
+                            first_branches[patch] = first_branch
+                    if first_branch is not None:
+                        if first_branch != observed[0]:
+                            unmatched.append(patch)
+                            continue
+                        start_index = 1
+                matches = self._cached_matches(
+                    patch, cached.snapshots, observed, environments,
+                    start_index)
+                if matches:
+                    equivalent.append((patch, observed))
+                else:
+                    unmatched.append(patch)
+            remaining = unmatched
             if equivalent:
                 self.logger.info(
                     f"[verifier-cache] [group] "
@@ -1271,7 +1352,6 @@ class BinRadarConcreteVerifier:
                     f"[members {len(equivalent) + 1}] "
                     f"[id {testcase.id}]")
             for patch, branches in equivalent:
-                remaining.remove(patch)
                 if self._test_result(
                         patch, testcase, result,
                         BinRadarPatchResult(patch, branches),

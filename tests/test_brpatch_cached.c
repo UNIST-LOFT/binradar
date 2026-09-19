@@ -76,7 +76,7 @@ int main(void)
 #ifdef BRPATCH_CWE805
 	if (setenv_checked("TAOSC_PRED", "c1p0") < 0)
 		return 2;
-	cache_stack_size = sizeof(stack);
+	cache_stack_size = 0;
 	memset(buffers, 0, sizeof(buffers));
 	buffers[0].begin = 0x1000;
 	buffers[0].end = 0x2000;

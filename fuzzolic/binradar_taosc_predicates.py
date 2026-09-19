@@ -7,6 +7,7 @@ plus the allocator-trace instrumentation spec shared by patched artifacts.  Spli
 """
 
 import enum
+import functools
 import hashlib
 import json
 import re
@@ -14,7 +15,7 @@ import struct
 import sbsv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 INT64_MIN = -(1 << 63)
 _MASK64 = (1 << 64) - 1
@@ -133,6 +134,13 @@ class CWE805SizePredicate:
 
 CWE805Predicate = Union[CWE805PointerPredicate, CWE805SizePredicate]
 ParsedPredicate = Union[str, CWE805Predicate]
+
+
+def predicate_stack_bytes(predicate: ParsedPredicate) -> int:
+    """Minimum captured stack bytes needed to evaluate ``predicate``."""
+    if isinstance(predicate, str) or isinstance(predicate.cell, RegisterCell):
+        return 0
+    return (predicate.cell.index + 1) * (predicate.cell.width_bits // 8)
 
 
 @dataclass(frozen=True)
@@ -779,77 +787,84 @@ def _shift_right(a: int, b: int) -> int:
     return wrap64(a << -b)
 
 
-def eval_patch_str(s: str, env: List[int]) -> int:
-    """Evaluate a prefix-Polish patch string with taosc's i64 semantics.
+PatchEvaluator = Callable[[Sequence[int]], int]
 
-    Mirrors brpatch.c::eval exactly: constants p<N>/n<N>, variable lookup
-    v<N> into env (16 captured STATE slots), unary ~, and the binary prefix
-    operators + - * / % & | ^ l r = ! > >= < <=.  env must have at least
-    16 entries.
 
-    Raises PredicateTrap on arithmetic that would SIGFPE in C.
-    """
+def _checked_div(a: int, b: int) -> int:
+    if b == 0:
+        raise PredicateTrap("division by zero")
+    if a == INT64_MIN and b == -1:
+        raise PredicateTrap("INT64_MIN / -1")
+    return _trunc_div(a, b)
+
+
+def _checked_mod(a: int, b: int) -> int:
+    if b == 0:
+        raise PredicateTrap("modulo by zero")
+    if a == INT64_MIN and b == -1:
+        raise PredicateTrap("INT64_MIN % -1")
+    return wrap64(a - _trunc_div(a, b) * b)
+
+
+_PATCH_EVAL_GLOBALS = {
+    "__builtins__": {},
+    "_w": wrap64,
+    "_sl": _shift_left,
+    "_sr": _shift_right,
+    "_div": _checked_div,
+    "_mod": _checked_mod,
+    "int": int,
+}
+
+
+@functools.cache
+def _compile_patch_str(s: str) -> PatchEvaluator:
+    """Compile one validated prefix predicate for repeated evaluation."""
     pos = [0]
 
-    def ev() -> int:
+    def parse() -> str:
+        if pos[0] >= len(s):
+            raise ValueError("unexpected end of encoded predicate")
         op = s[pos[0]]
         pos[0] += 1
-        if op == "n":  # negative integer
-            return wrap64(-_parse_int(s, pos))
-        if op == "p":  # positive integer
-            return _parse_int(s, pos)
-        if op == "v":  # variable lookup
-            return env[_parse_int(s, pos)]
-        if op == "~":  # bitwise not
-            return wrap64(~ev())
-
-        eq = pos[0] < len(s) and s[pos[0]] == "=" and op in "<>"
-        if eq:
+        if op == "n":
+            return str(wrap64(-_parse_int(s, pos)))
+        if op == "p":
+            return str(_parse_int(s, pos))
+        if op == "v":
+            return f"env[{_parse_int(s, pos)}]"
+        if op == "~":
+            return f"_w(~({parse()}))"
+        if op in "<>" and pos[0] < len(s) and s[pos[0]] == "=":
             pos[0] += 1
+            op += "="
 
-        a = ev()
-        b = ev()
-
-        if op == "=":
-            return 1 if a == b else 0
-        if op == "!":
-            return 1 if a != b else 0
-        if op == ">":
-            return 1 if (a >= b if eq else a > b) else 0
-        if op == "<":
-            return 1 if (a <= b if eq else a < b) else 0
-        if op == "+":
-            return wrap64(a + b)
-        if op == "-":
-            return wrap64(a - b)
-        if op == "*":
-            return wrap64(a * b)
-        if op == "&":
-            return wrap64(a & b)
-        if op == "|":
-            return wrap64(a | b)
-        if op == "^":
-            return wrap64(a ^ b)
-        if op == "l":  # Zig std.math.shl
-            return _shift_left(a, b)
-        if op == "r":  # Zig std.math.shr
-            return _shift_right(a, b)
-        if op == "/":
-            if b == 0:
-                raise PredicateTrap("division by zero")
-            if a == INT64_MIN and b == -1:
-                raise PredicateTrap("INT64_MIN / -1")
-            return _trunc_div(a, b)
-        if op == "%":
-            if b == 0:
-                raise PredicateTrap("modulo by zero")
-            if a == INT64_MIN and b == -1:
-                raise PredicateTrap("INT64_MIN % -1")
-            q = _trunc_div(a, b)
-            return wrap64(a - q * b)
+        left = parse()
+        right = parse()
+        comparison = {
+            "=": "==", "!": "!=", ">": ">", ">=": ">=",
+            "<": "<", "<=": "<=",
+        }.get(op)
+        if comparison is not None:
+            return f"int(({left}) {comparison} ({right}))"
+        if op in "+-*&|^":
+            return f"_w(({left}) {op} ({right}))"
+        helper = {"l": "_sl", "r": "_sr", "/": "_div", "%": "_mod"}.get(op)
+        if helper is not None:
+            return f"{helper}(({left}), ({right}))"
         raise ValueError(f"unknown patch operator {op!r}")
 
-    return ev()
+    expression = parse()
+    if pos[0] != len(s):
+        raise ValueError(f"trailing data in encoded predicate {s!r}")
+    code = compile(f"lambda env: {expression}", "<taosc-predicate>", "eval",
+                   optimize=2)
+    return cast(PatchEvaluator, eval(code, _PATCH_EVAL_GLOBALS))
+
+
+def eval_patch_str(s: str, env: Sequence[int]) -> int:
+    """Evaluate a cached prefix predicate with Taosc's i64 semantics."""
+    return _compile_patch_str(s)(env)
 
 
 def CWE805_branch_taken(predicate: CWE805Predicate,
@@ -981,32 +996,152 @@ def parse_cached_snapshots(
     return snapshots, None
 
 
+GenericEnvironments = List[Tuple[int, ...]]
+
+
+def prepare_generic_environments(
+    snapshots: List[CachedSnapshot],
+) -> Optional[GenericEnvironments]:
+    """Normalize immutable generic registers once per captured execution."""
+    if any(snapshot.is_CWE805 for snapshot in snapshots):
+        return None
+    return [tuple(wrap64(value) for value in snapshot.registers)
+            for snapshot in snapshots]
+
+
+def _evaluate_CWE805_snapshot(
+    predicate: CWE805Predicate,
+    snapshot: CachedSnapshot,
+) -> int:
+    if not snapshot.is_CWE805:
+        raise ValueError("CWE-805 predicate with a generic snapshot")
+    return CWE805_branch_taken(
+        predicate,
+        list(snapshot.registers),
+        snapshot.stack,
+        list(snapshot.clamps),
+    )
+
+
+def evaluate_cached_branch(
+    predicate: ParsedPredicate,
+    snapshot: CachedSnapshot,
+    generic_environment: Optional[Sequence[int]] = None,
+) -> int:
+    """Evaluate one predicate at one captured pre-branch state."""
+    if isinstance(predicate, str):
+        if snapshot.is_CWE805:
+            raise ValueError("generic predicate with a CWE-805 snapshot")
+        environment = generic_environment
+        if environment is None:
+            environment = tuple(wrap64(value) for value in snapshot.registers)
+        evaluator = _compile_patch_str(predicate)
+        try:
+            return int(evaluator(environment) != 0)
+        except PredicateTrap:
+            return 2
+    return _evaluate_CWE805_snapshot(predicate, snapshot)
+
+
 def evaluate_cached_predicate(
     predicate: ParsedPredicate,
     snapshots: List[CachedSnapshot],
+    generic_environments: Optional[GenericEnvironments] = None,
 ) -> List[int]:
     """Evaluate one runtime predicate over every captured pre-branch state."""
-    branches: List[int] = []
-    for snapshot in snapshots:
-        if isinstance(predicate, str):
-            if snapshot.is_CWE805:
-                raise ValueError("generic predicate with a CWE-805 snapshot")
-            env = [wrap64(value) for value in snapshot.registers]
+    if isinstance(predicate, str):
+        environments = generic_environments
+        if environments is None:
+            environments = prepare_generic_environments(snapshots)
+        if environments is None:
+            raise ValueError("generic predicate with a CWE-805 snapshot")
+        if len(environments) != len(snapshots):
+            raise ValueError("generic environment count does not match snapshots")
+        evaluator = _compile_patch_str(predicate)
+        branches = []
+        for environment in environments:
             try:
-                branch = int(eval_patch_str(predicate, env) != 0)
+                branches.append(int(evaluator(environment) != 0))
             except PredicateTrap:
-                branch = 2
-        else:
-            if not snapshot.is_CWE805:
-                raise ValueError("CWE-805 predicate with a generic snapshot")
-            branch = CWE805_branch_taken(
-                predicate,
-                list(snapshot.registers),
-                snapshot.stack,
-                list(snapshot.clamps),
-            )
-        branches.append(branch)
-    return branches
+                branches.append(2)
+        return branches
+    return [_evaluate_CWE805_snapshot(predicate, snapshot)
+            for snapshot in snapshots]
+
+
+def cached_predicate_matches(
+    predicate: ParsedPredicate,
+    snapshots: List[CachedSnapshot],
+    expected: List[int],
+    generic_environments: Optional[GenericEnvironments] = None,
+    start_index: int = 0,
+) -> bool:
+    """Test a branch-vector suffix, stopping at the first difference."""
+    if len(snapshots) != len(expected):
+        return False
+    if not 0 <= start_index <= len(snapshots):
+        raise ValueError("cached predicate start index is out of range")
+    if isinstance(predicate, str):
+        environments = generic_environments
+        if environments is None:
+            environments = prepare_generic_environments(snapshots)
+        if environments is None:
+            raise ValueError("generic predicate with a CWE-805 snapshot")
+        if len(environments) != len(snapshots):
+            raise ValueError("generic environment count does not match snapshots")
+        evaluator = _compile_patch_str(predicate)
+        for environment, branch in zip(
+                environments[start_index:], expected[start_index:]):
+            try:
+                actual = int(evaluator(environment) != 0)
+            except PredicateTrap:
+                actual = 2
+            if actual != branch:
+                return False
+        return True
+    return all(
+        _evaluate_CWE805_snapshot(predicate, snapshot) == branch
+        for snapshot, branch in zip(
+            snapshots[start_index:], expected[start_index:])
+    )
+
+
+_WORKER_PREDICATES: Dict[int, ParsedPredicate] = {}
+
+
+def precompile_generic_predicates(
+    predicates: Dict[int, ParsedPredicate],
+) -> None:
+    """Compile generic predicates before forking match workers."""
+    for predicate in predicates.values():
+        if isinstance(predicate, str):
+            _compile_patch_str(predicate)
+
+
+def initialize_predicate_match_worker(
+    predicates: Dict[int, ParsedPredicate],
+) -> None:
+    global _WORKER_PREDICATES
+    _WORKER_PREDICATES = predicates
+
+
+def match_cached_predicate_ids(
+    task: Tuple[List[int], List[CachedSnapshot], List[int],
+                Optional[GenericEnvironments], int],
+) -> List[int]:
+    """Return ids whose full cached branch-vector suffix matches."""
+    patch_ids, snapshots, expected, environments, start_index = task
+    matches = []
+    for patch_id in patch_ids:
+        predicate = _WORKER_PREDICATES[patch_id]
+        try:
+            if cached_predicate_matches(
+                    predicate, snapshots, expected, environments,
+                    start_index):
+                matches.append(patch_id)
+        except (IndexError, ValueError):
+            pass
+    return matches
 
 
 def write_filter(filter_file: Path, results: List[Tuple[int, bool, str, str]],

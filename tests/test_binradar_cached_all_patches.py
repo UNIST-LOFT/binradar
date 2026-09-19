@@ -152,18 +152,28 @@ def test_target_patches_all_expands_under_the_smaller_compiled_set(
     assert captured["BRPATCHED_TOTAL_PATCHES"] == "9"
 
 
-@pytest.mark.parametrize("stack_size,expected", [("0", None), ("64", "CWE805-erm")])
-def test_cwe805_coverage_requires_a_valid_stack_size(
-        tmp_path, stack_size, expected):
-    """A CWE-805 cached artifact without its stack size is unusable."""
+@pytest.mark.parametrize(
+    "descriptor,stack_size,expected",
+    [
+        ("c1p0", 0, "CWE805-erm"),
+        ("c1s64i0", 0, None),
+        ("c1s64i0", 7, None),
+        ("c1s64i0", 8, "CWE805-erm"),
+        ("c2s32i2q1", 11, None),
+        ("c2s32i2q1", 12, "CWE805-erm"),
+    ],
+)
+def test_cwe805_coverage_requires_only_the_used_stack_bytes(
+        tmp_path, descriptor, stack_size, expected):
+    """Register-only CWE-805 caches need no stack payload."""
     workdir = tmp_path / "workdir"
     workdir.mkdir(parents=True)
     (workdir / "bin.brcached").write_bytes(b"cached")
-    _write_manifest(workdir, ["c1p0"], kind="CWE805-erm")
+    _write_manifest(workdir, [descriptor], kind="CWE805-erm")
 
     coverage = binradar_verifier.load_cached_predicate_set(
         workdir / "brpatches.json", workdir / "bin.brcached",
-        "CWE805-erm", int(stack_size), [1])
+        "CWE805-erm", stack_size, [1])
 
     assert (coverage.family.value if coverage.family else None) == expected
     assert (coverage.reason == "") if expected else bool(coverage.reason)
