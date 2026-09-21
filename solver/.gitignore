@@ -5,3 +5,4 @@ cmake_install.cmake
 Makefile
 test.c
 .env
+.cache

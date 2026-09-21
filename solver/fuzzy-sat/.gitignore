@@ -1,0 +1,16 @@
+.vscode/
+query_db/
+exp_logs/
+
+build/bin/*
+!build/bin/.gitkeep
+build/lib/*
+!build/lib/.gitkeep
+build/include/*
+!build/include/.gitkeep
+
+build-cmake/
+
+*.o
+*.pyc
+*.z3-trace
