@@ -1,8 +1,12 @@
-solver
-CMakeCache.txt
-CMakeFiles
-cmake_install.cmake
-Makefile
-test.c
-.env
-.cache
+# Build artifacts directly under solver/ only. These MUST stay anchored with a
+# leading "/": an unanchored pattern such as `solver` or `Makefile` also matches
+# paths inside the vendored z3 fork (solver/fuzzy-sat/fuzzolic-z3/src/solver/,
+# .../contrib/qprofdiff/Makefile) and silently drops those sources from git.
+/solver
+/CMakeCache.txt
+/CMakeFiles
+/cmake_install.cmake
+/Makefile
+/test.c
+/.env
+/.cache
