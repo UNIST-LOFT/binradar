@@ -100,10 +100,6 @@ def setlimits():
         resource.RLIMIT_AS, (MAX_VIRTUAL_MEMORY, MAX_VIRTUAL_MEMORY))
 
 
-
-
-
-
 class BinRadarExecutor:
     # Config from binradar.env and command line arguments
     workdir: str
@@ -275,13 +271,7 @@ class BinRadarExecutor:
 
     def _record_wall_time_reached(self, phases: List[str]) -> None:
         """Record the planned concrete-evidence wall-clock cutoff.
-
-        Reaching the configured budget is a graceful, expected stop: no new
-        concrete work is started, already-observed hard failures stay
-        rejected, and the remaining verdicts are finalized from the evidence
-        consumed so far. It is deliberately **not** a phase failure, so it is
-        never added to ``phase_failures`` and never reported as an issue by
-        ``binradar-collect-results.py``.
+        Reaching the configured budget is a graceful, expected stop.
         """
         self.wall_time_reached = True
         logger.warning(
@@ -706,15 +696,7 @@ class BinRadarExecutor:
     def run_minimizer_and_verifier(self,
                                    producer_threads: Optional[List[threading.Thread]] = None,
                                    producer_exc_queue: Optional["queue.Queue[BaseException]"] = None) -> bool:
-        """Run the minimizer and the concrete verifier together.
-
-        With ``producer_threads`` (the fuzzolic/directed/fuzzer threads), the
-        minimizer discovers testcase files incrementally while those phases
-        still run and finishes only after all of them have ended; the verifier
-        consumes the [testcase] rows as they appear. Without them (e.g.
-        --seq), it behaves like a standalone snapshot run over the already
-        complete testcase dirs.
-        """
+        # Run the minimizer and the concrete verifier together.
         self.check_requirements()
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run minimizer and verifier.")
@@ -843,10 +825,6 @@ class BinRadarExecutor:
                 save_progress=self.save_progress,
             )
         )
-
-    
-
-    
 
     def run_final(self):
         if self.probe_result is None:
