@@ -14,14 +14,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import TracebackType
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import binradar_artifacts
 import binradar_config
 import binradar_evidence
 import binradar_fuzzer
 import binradar_minimizer
+import binradar_pipeline
 import binradar_runtime
 import binradar_utils
 import binradar_verifier
@@ -33,13 +33,6 @@ TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
-# Security boundary for --less-strict: only independent evidence producers
-# may fail open. Phases needed to establish or serialize a verdict are never
-# members of this set.
-OPTIONAL_EVIDENCE_PHASES = frozenset({
-    "fuzzolic", "directed", "fuzzer", "binradar", "feedback",
-})
-
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 
 
@@ -328,7 +321,7 @@ class BinRadarExecutor:
         ``[phase] [done]`` marker prevents a run with failed optional phases
         from masquerading as a complete run in progress logs.
         """
-        if phase not in OPTIONAL_EVIDENCE_PHASES:
+        if phase not in binradar_pipeline.OPTIONAL_EVIDENCE_PHASES:
             raise ValueError(
                 f"Required phase {phase!r} cannot be tolerated")
         if not hasattr(self, "phase_failure_lock"):
@@ -350,7 +343,7 @@ class BinRadarExecutor:
 
     def _run_optional_phase(self, phase: str, target) -> bool:
         """Run an evidence-producing phase, optionally tolerating failure."""
-        if phase not in OPTIONAL_EVIDENCE_PHASES:
+        if phase not in binradar_pipeline.OPTIONAL_EVIDENCE_PHASES:
             raise ValueError(f"Phase {phase!r} is not optional")
         try:
             target()
@@ -779,60 +772,54 @@ class BinRadarExecutor:
                 f"Fuzzer exited unexpectedly with status {result.exit_code}")
         self.save_progress(f"[fuzzer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
     
+    def _concrete_worker_factory(
+            self, require_verifier: bool) -> binradar_pipeline.ConcreteWorkerFactory:
+        verifier_binary = None
+        if require_verifier:
+            verifier_binary = self.artifacts.select_verifier(
+                self.filter_result).path
+        return binradar_pipeline.ConcreteWorkerFactory.create(
+            workdir=self.workdir,
+            run_dir=self.run_dir,
+            probe_result=self.probe_result,
+            config=self._worker_environment(),
+            fuzzer_outdir=self.fuzzer_outdir(),
+            patches=self.filter_result,
+            verifier_binary=verifier_binary,
+            patched_binary_patches=range(
+                1, self.brpatched_total_patches + 1))
+
     def run_minimizer(self):
         self.check_requirements()
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run minimizer.")
             raise RuntimeError("Probe result not found.")
-        exec_mode = "minimizer"
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
-        config = self._worker_environment()
-        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
-        testcase_dirs.extend(
-            binradar_fuzzer.AFLppFuzzer.testcase_dirs_for_outdir(
-                self.fuzzer_outdir()))
-        benign_inputs = os.path.join(self.workdir, "input", "benign")
-        malicious_inputs = os.path.join(self.workdir, "input", "malicious")
-        if os.path.exists(benign_inputs):
-            testcase_dirs.append(benign_inputs)
-        if os.path.exists(malicious_inputs):
-            testcase_dirs.append(malicious_inputs)
-        print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
-        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
+        minimizer = self._concrete_worker_factory(
+            require_verifier=False).build_minimizer()
         minimizer.load_testcases()
         timed_out = minimizer.run_testcases(
             timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
             self._record_wall_time_reached(["minimizer"])
         self.save_progress(f"[minimizer] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
-    
+
     def run_verifier(self):
         self.check_requirements()
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run verifier.")
             raise RuntimeError("Probe result not found.")
-        exec_mode = "verifier"
         minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
         if not os.path.exists(minimizer_result_file):
             logger.info("[VERIFIER] Minimizer results not found. Please run the minimizer phase first.")
             sys.exit(1)
-        
-        config = self._worker_environment()
+
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
-        # Implementation for concrete verifier
-        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        logger.info(
-            f"[VERIFIER] Verifying {len(self.filter_result)} patch(es)")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(
-            self.workdir, self.run_dir, runner, self.probe_result,
-            self.artifacts.select_verifier(self.filter_result).path,
-            self.filter_result,
-            patched_binary_patches=list(
-                range(1, self.brpatched_total_patches + 1)))
-        timed_out = verifier.run_verification_streaming(
-            minimizer_result_file,
+        factory = self._concrete_worker_factory(require_verifier=True)
+        timed_out = factory.build_verifier().run_verification_streaming(
+            factory.minimizer_result_file,
             timeout=self.remaining_concrete_timeout(deadline))
         if timed_out:
             self._record_wall_time_reached(["verifier"])
@@ -857,31 +844,10 @@ class BinRadarExecutor:
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
-        config = self._worker_environment()
-        testcase_dirs = [os.path.join(self.run_dir, f"{mode}-tests") for mode in ["fuzzolic", "directed"]]
-        testcase_dirs.extend(
-            binradar_fuzzer.AFLppFuzzer.testcase_dirs_for_outdir(
-                self.fuzzer_outdir()))
-        benign_inputs = os.path.join(self.workdir, "input", "benign")
-        malicious_inputs = os.path.join(self.workdir, "input", "malicious")
-        if os.path.exists(benign_inputs):
-            testcase_dirs.append(benign_inputs)
-        if os.path.exists(malicious_inputs):
-            testcase_dirs.append(malicious_inputs)
-        print("TESTCASE_DIRS: " + ", ".join(testcase_dirs))
-        minimizer = binradar_minimizer.BinRadarMinimizer(self.workdir, self.run_dir, self.probe_result, testcase_dirs, config)
-        runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        logger.info(
-            f"[VERIFIER] Verifying {len(self.filter_result)} patch(es)")
-        verifier = binradar_verifier.BinRadarConcreteVerifier(
-            self.workdir, self.run_dir, runner, self.probe_result,
-            self.artifacts.select_verifier(self.filter_result).path,
-            self.filter_result,
-            patched_binary_patches=list(
-                range(1, self.brpatched_total_patches + 1)))
-        minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
+        factory = self._concrete_worker_factory(require_verifier=True)
         timed_out = binradar_minimizer.run_minimizer_and_verifier(
-            minimizer, verifier, minimizer_result_file,
+            factory.build_minimizer(), factory.build_verifier(),
+            factory.minimizer_result_file,
             producer_threads=producer_threads,
             producer_exc_queue=producer_exc_queue,
             timeout=self.remaining_concrete_timeout(deadline))
@@ -1406,64 +1372,6 @@ class BinRadarExecutor:
     def done(self):
         self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")
     
-    def _run_streaming_concrete_producers(
-            self,
-            producers: List[Tuple[str, Callable[[], None]]]) -> None:
-        """Run concrete producers with the streaming minimizer/verifier.
-
-        Every producer is an optional evidence phase. In strict mode, a
-        producer exception is sent to the minimizer so an incomplete testcase
-        stream cannot produce a verdict. Under --less-strict, the failure is
-        recorded and the minimizer drains the outputs from the producers that
-        remain.
-        """
-        thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
-        producer_exc_queue: "queue.Queue[BaseException]" = queue.Queue()
-
-        def run_producer_captured(
-                name: str, target: Callable[[], None]) -> None:
-            try:
-                target()
-            except BaseException as exc:
-                if (name in OPTIONAL_EVIDENCE_PHASES
-                        and self.less_strict
-                        and isinstance(exc, Exception)):
-                    self._record_tolerated_phase_failure(name, exc)
-                    return
-                producer_exc_queue.put(exc)
-                thread_errors.put((name, exc, exc.__traceback__))
-                logger.error(f"[{name}] failed: {exc}")
-
-        producer_threads = [
-            threading.Thread(
-                target=run_producer_captured, args=(name, target), name=name)
-            for name, target in producers
-        ]
-        for thread in producer_threads:
-            thread.start()
-
-        try:
-            self.run_minimizer_and_verifier(
-                producer_threads=producer_threads,
-                producer_exc_queue=producer_exc_queue)
-        except BaseException:
-            # A producer, the minimizer, or the verifier failed. Stop external
-            # processes and wait for every producer wrapper before surfacing
-            # the authoritative exception.
-            binradar_runtime.PROCESS_REGISTRY.stop_all()
-            for thread in producer_threads:
-                thread.join(timeout=60)
-            raise
-
-        for thread in producer_threads:
-            thread.join()
-        if not thread_errors.empty():
-            _, exc, tb = thread_errors.get()
-            binradar_runtime.PROCESS_REGISTRY.stop_all()
-            if tb is not None:
-                raise exc.with_traceback(tb)
-            raise exc
-
     def run_fuzzer_only(self, run_prefix: str = "run"):
         """Run the AFL++ producer and concrete verification pipeline only.
 
@@ -1487,8 +1395,12 @@ class BinRadarExecutor:
         # minimizer can observe it. run_fuzzer consumes this prepared marker
         # instead of deleting the directory after discovery has started.
         self.prepare_fuzzer_output()
-        self._run_streaming_concrete_producers([
-            ("fuzzer", self.run_fuzzer),
+        binradar_pipeline.PipelineCoordinator(
+            less_strict=self.less_strict,
+            record_tolerated_failure=self._record_tolerated_phase_failure,
+            stream_concrete=self.run_minimizer_and_verifier,
+        ).run([
+            binradar_pipeline.Producer("fuzzer", self.run_fuzzer),
         ])
         if self.feedback_mode:
             self._run_optional_phase("feedback", self.run_feedback)
@@ -1572,98 +1484,23 @@ class BinRadarExecutor:
         # Queue paths are derived without constructing another fuzzer object.
         self.prepare_fuzzer_output()
 
-        thread_errors: "queue.Queue[Tuple[str, BaseException, Optional[TracebackType]]]" = queue.Queue()
-        producer_exc_queue: "queue.Queue[BaseException]" = queue.Queue()
-        binradar_thread: Optional[threading.Thread] = None
-        
-        def tolerate_thread_failure(name: str, exc: BaseException) -> bool:
-            # Do not swallow process-control exceptions such as SystemExit or
-            # KeyboardInterrupt. Ordinary optional-phase failures are the only
-            # failures relaxed by --less-strict.
-            if (name not in OPTIONAL_EVIDENCE_PHASES
-                    or not self.less_strict
-                    or not isinstance(exc, Exception)):
-                return False
-            self._record_tolerated_phase_failure(name, exc)
-            return True
-
-        def run_captured(name: str, target):
-            try:
-                target()
-            except BaseException as exc:
-                if tolerate_thread_failure(name, exc):
-                    return
-                thread_errors.put((name, exc, exc.__traceback__))
-                logger.error(f"[{name}] failed: {exc}")
-
-        # In strict mode, concrete testcase producers additionally re-raise
-        # into producer_exc_queue so the concurrently running minimizer aborts
-        # instead of silently verifying a truncated testcase set. Less-strict
-        # failures are recorded above and deliberately do not enter the queue.
-        def run_producer_captured(name: str, target):
-            try:
-                target()
-            except BaseException as exc:
-                if tolerate_thread_failure(name, exc):
-                    return
-                producer_exc_queue.put(exc)
-                thread_errors.put((name, exc, exc.__traceback__))
-                logger.error(f"[{name}] failed: {exc}")
-
-        def raise_thread_error_if_any(wait_for_binradar: bool = False):
-            if thread_errors.empty():
-                return
-            _, exc, tb = thread_errors.get()
-            binradar_runtime.PROCESS_REGISTRY.stop_all()
-            if wait_for_binradar and binradar_thread is not None:
-                binradar_thread.join()
-            if tb is not None:
-                raise exc.with_traceback(tb)
-            raise exc
-
+        independent = None
         if not self.disable_binradar:
-            binradar_thread = threading.Thread(target=run_captured, args=("binradar", self.run_binradar))
-            binradar_thread.start()
+            independent = binradar_pipeline.IndependentWorker(
+                "binradar", self.run_binradar)
         else:
-            logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
+            logger.info(
+                "[BINRADAR] BinRadar phase disabled; skipping execution.")
 
-        fuzzolic_thread = threading.Thread(target=run_producer_captured, args=("fuzzolic", self.run_fuzzolic))
-        directed_thread = threading.Thread(target=run_producer_captured, args=("directed", self.run_directed))
-        fuzzer_thread = threading.Thread(target=run_producer_captured, args=("fuzzer", self.run_fuzzer))
-        threads_concrete = [fuzzolic_thread, directed_thread, fuzzer_thread]
-        for thread in threads_concrete:
-            thread.start()
-
-        # The minimizer+verifier no longer wait for the producers: the
-        # minimizer discovers testcase files incrementally while
-        # fuzzolic/directed/fuzzer are still running and logs its done marker
-        # only after all three have ended, and the verifier consumes the
-        # [testcase] rows as they appear.
-        try:
-            self.run_minimizer_and_verifier(
-                producer_threads=threads_concrete,
-                producer_exc_queue=producer_exc_queue)
-        except BaseException:
-            # A producer, the minimizer, or the verifier failed: stop the
-            # remaining phases before surfacing the error.
-            binradar_runtime.PROCESS_REGISTRY.stop_all()
-            for thread in threads_concrete:
-                thread.join(timeout=60)
-            if binradar_thread is not None:
-                binradar_thread.join(timeout=10)
-            raise
-        for thread in threads_concrete:
-            thread.join()
-
-        raise_thread_error_if_any(wait_for_binradar=True)
-
-        if binradar_thread is not None:
-            binradar_thread.join(timeout=60)
-            if binradar_thread.is_alive():
-                logger.error("[BINRADAR] binradar thread did not finish within 60s after minimizer/verifier - stopping remaining processes")
-                binradar_runtime.PROCESS_REGISTRY.stop_all()
-                binradar_thread.join(timeout=10)
-        raise_thread_error_if_any()
+        binradar_pipeline.PipelineCoordinator(
+            less_strict=self.less_strict,
+            record_tolerated_failure=self._record_tolerated_phase_failure,
+            stream_concrete=self.run_minimizer_and_verifier,
+        ).run([
+            binradar_pipeline.Producer("fuzzolic", self.run_fuzzolic),
+            binradar_pipeline.Producer("directed", self.run_directed),
+            binradar_pipeline.Producer("fuzzer", self.run_fuzzer),
+        ], independent=independent)
         if self.feedback_mode:
             self._run_optional_phase("feedback", self.run_feedback)
         self.run_final()

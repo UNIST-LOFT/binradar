@@ -225,6 +225,45 @@ def test_multithreaded_less_strict_fuzzer_failure_reaches_final(
     assert events[-2:] == ["final", "done"]
 
 
+@pytest.mark.parametrize("method_name", [
+    "run_fuzzer_only",
+    "run_multithreaded",
+])
+def test_streaming_modes_finish_empty_candidate_runs_without_workers(
+        tmp_path, monkeypatch, method_name):
+    executor = _policy_executor(tmp_path, less_strict=False)
+    executor.filter_result = []
+    events = []
+    progress = []
+    monkeypatch.setattr(binradar.logger, "set_file", lambda _: None)
+
+    def set_run_dir(run_prefix="run"):
+        executor.run_prefix = run_prefix
+        executor.run_id = 0
+        executor.run_dir = str(tmp_path / "run-00000")
+        Path(executor.run_dir).mkdir()
+        events.append("set-run-dir")
+
+    executor.set_run_dir = set_run_dir
+    executor.save_progress = progress.append
+    executor.run_probe = lambda: events.append("probe")
+    executor.done = lambda: events.append("done")
+    executor.prepare_fuzzer_output = lambda: (_ for _ in ()).throw(
+        AssertionError("empty runs must not prepare producer output"))
+    executor.run_minimizer_and_verifier = lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("empty runs must not start concrete workers"))
+    executor.run_final = lambda: (_ for _ in ()).throw(
+        AssertionError("empty runs use the explicit empty final row"))
+
+    getattr(executor, method_name)()
+
+    assert events == ["set-run-dir", "probe", "done"]
+    assert progress == [
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches []] [binradar_remaining_patches []]",
+    ]
+
+
 def test_failed_binradar_trace_is_ignored_and_final_reports_failed_phase(
         tmp_path):
     (tmp_path / "verifier.sbsv").write_text(
