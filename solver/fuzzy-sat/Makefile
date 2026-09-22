@@ -2,7 +2,7 @@ CC=gcc #clang
 CFLAGS=-Wall -s -O3 -fPIC #-O3 -g -fsanitize=address -fno-omit-frame-pointer -fPIC
 CLIBS=-lz3
 CLIB_PATHS=-L./fuzzolic-z3/build
-CINCLUDE=-I./fuzzolic-z3/src/api -I./lib
+CINCLUDE=-I./fuzzolic-z3/src/api -I./lib -I../xxHash
 
 SRC_LIB_DIR=./lib
 SRC_TOOLS_DIR=./tools

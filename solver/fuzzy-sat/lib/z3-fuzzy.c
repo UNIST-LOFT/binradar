@@ -92,7 +92,7 @@ static int performing_aggressive_optimistic = 0;
 #ifdef USE_MD5_HASH
 #include "md5.h"
 #else
-#include "xxhash/xxh3.h"
+#include "xxh3.h"
 #endif
 
 // generate parametric data structures
