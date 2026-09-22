@@ -2,8 +2,6 @@
 
 import argparse
 import enum
-import fcntl
-import hashlib
 import os
 import queue
 import resource
@@ -14,14 +12,16 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 
 import binradar_artifacts
 import binradar_config
-import binradar_evidence
+import binradar_feedback
 import binradar_fuzzer
 import binradar_minimizer
 import binradar_pipeline
+import binradar_results
+import binradar_run_records
 import binradar_runtime
 import binradar_utils
 import binradar_verifier
@@ -102,95 +102,7 @@ def setlimits():
 
 
 
-class BinRadarProgress:
-    run_id: int
-    run_dir: str
-    probe_done: bool
-    fuzzolic_done: bool
-    directed_done: bool
-    fuzzer_done: bool
-    minimizer_done: bool
-    verifier_done: bool
-    done: bool
-    def __init__(self, run_id: int, run_dir: str, probe_done: bool, fuzzolic_done: bool, directed_done: bool, fuzzer_done: bool, minimizer_done: bool, verifier_done: bool, done: bool):
-        self.run_id = run_id
-        self.run_dir = run_dir
-        self.probe_done = probe_done
-        self.fuzzolic_done = fuzzolic_done
-        self.directed_done = directed_done
-        self.fuzzer_done = fuzzer_done
-        self.minimizer_done = minimizer_done
-        self.verifier_done = verifier_done
-        self.done = done
-    
-    @staticmethod
-    def from_progress_file(run_prefix: str, file: str) -> Optional["BinRadarProgress"]:
-        if not os.path.exists(file):
-            return None
-        parser = sbsv.parser()
-        parser.add_schema("[rundir] [set] [prefix: str] [id: int] [dir: str]")
-        parser.add_schema("[rundir] [done] [prefix: str] [id: int] [dir: str]")
-        parser.add_schema("[probe] [done] [prefix: str] [id: int]")
-        parser.add_schema("[fuzzolic] [done] [prefix: str] [id: int]")
-        parser.add_schema("[directed] [done] [prefix: str] [id: int]")
-        parser.add_schema("[fuzzer] [done] [prefix: str] [id: int]")
-        parser.add_schema("[minimizer] [done] [prefix: str] [id: int]")
-        parser.add_schema("[verifier] [done] [prefix: str] [id: int]")
-        parser.add_schema("[final] [done] [prefix: str] [id: int] [remaining_patches: str] [binradar_remaining_patches: str]")
-        with open(file, "r", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            parser.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
-        rundir_log = parser.get_result()["rundir"]["set"]
-        if len(rundir_log) == 0:
-            return None
-        run_id = -1
-        run_dir = ""
-        for item in rundir_log:
-            if item["prefix"] != run_prefix:
-                continue
-            if item["id"] > run_id:
-                run_id = int(item["id"])
-                run_dir = item["dir"]
-        if run_dir == "":
-            return None
 
-        probe_done = False
-        fuzzolic_done = False
-        directed_done = False
-        fuzzer_done = False
-        minimizer_done = False
-        verifier_done = False
-        done = False
-        for probe in parser.get_result()["probe"]["done"]:
-            if int(probe["id"]) == run_id and probe["prefix"] == run_prefix:
-                probe_done = True
-                break
-        for fuzzolic in parser.get_result()["fuzzolic"]["done"]:
-            if int(fuzzolic["id"]) == run_id and fuzzolic["prefix"] == run_prefix:
-                fuzzolic_done = True
-                break
-        for directed in parser.get_result()["directed"]["done"]:
-            if int(directed["id"]) == run_id and directed["prefix"] == run_prefix:
-                directed_done = True
-                break
-        for fuzzer in parser.get_result()["fuzzer"]["done"]:
-            if int(fuzzer["id"]) == run_id and fuzzer["prefix"] == run_prefix:
-                fuzzer_done = True
-                break
-        for done_item in parser.get_result()["rundir"]["done"]:
-            if int(done_item["id"]) == run_id and done_item["prefix"] == run_prefix:
-                done = True
-                break
-        for minimizer in parser.get_result()["minimizer"]["done"]:
-            if int(minimizer["id"]) == run_id and minimizer["prefix"] == run_prefix:
-                minimizer_done = True
-                break
-        for verifier in parser.get_result()["verifier"]["done"]:
-            if int(verifier["id"]) == run_id and verifier["prefix"] == run_prefix:
-                verifier_done = True
-                break
-        return BinRadarProgress(run_id, run_dir, probe_done, fuzzolic_done, directed_done, fuzzer_done, minimizer_done, verifier_done, done)
 
 class BinRadarExecutor:
     # Config from binradar.env and command line arguments
@@ -233,7 +145,8 @@ class BinRadarExecutor:
     # Data
     config: Dict[str, str]
     progress_filename: str
-    previous_progress: Optional[BinRadarProgress]
+    previous_progress: Optional[binradar_run_records.BinRadarProgress]
+    run_records: binradar_run_records.RunRecordStore
     run_prefix: str
     run_id: int
     run_dir: str
@@ -274,6 +187,8 @@ class BinRadarExecutor:
         self.progress_filename = os.path.join(self.outdir, "progress.sbsv")
         self.previous_progress = None
         self.start_time = time.time()
+        self.run_records = binradar_run_records.RunRecordStore(
+            self.outdir, self.progress_filename, self.start_time)
 
         retained = dict(config.retained_environment)
         self.artifacts = binradar_artifacts.ArtifactSet(
@@ -308,9 +223,6 @@ class BinRadarExecutor:
     def _worker_environment(self) -> Dict[str, str]:
         return binradar_config.build_worker_environment(
             self.run_config, self.config)
-
-    def elapsed_time_ms(self) -> int:
-        return int((time.time() - self.start_time) * 1000)
 
     def _record_tolerated_phase_failure(
             self, phase: str, exc: BaseException) -> None:
@@ -403,14 +315,19 @@ class BinRadarExecutor:
             return None
         return self.timeout * MINIMIZER_VERIFIER_TIMEOUT_FACTOR
 
+    def _run_record_store(self) -> binradar_run_records.RunRecordStore:
+        store = getattr(self, "run_records", None)
+        if (store is None
+                or store.outdir != self.outdir
+                or store.progress_filename != self.progress_filename
+                or store.start_time != self.start_time):
+            store = binradar_run_records.RunRecordStore(
+                self.outdir, self.progress_filename, self.start_time)
+            self.run_records = store
+        return store
+
     def save_progress(self, data: str):
-        time = self.elapsed_time_ms()
-        logger.info(f"[PROGRESS] {data} [time {time}]")
-        with open(self.progress_filename, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(f"{data} [time {time}]\n")
-            f.flush()
-            fcntl.flock(f, fcntl.LOCK_UN)
+        self._run_record_store().save_progress(data)
 
     def set_plt_info(self, plt_info: str) -> str:
         if os.path.exists(plt_info):
@@ -429,66 +346,39 @@ class BinRadarExecutor:
         return os.path.join(self.workdir, self.poc_input)
 
     def set_run_dir(self, run_prefix: str = "run", use_last_run_id: bool = False, resume_phase: BinRadarPhase = BinRadarPhase.ALL):
-        run_id = 0
-        # Currently, start a new run if the previous run exists.
-        # Can resume in more fine-grained way if needed.
-        self.previous_progress = BinRadarProgress.from_progress_file(run_prefix, self.progress_filename)
-        if self.previous_progress is not None:
-            run_id = self.previous_progress.run_id
-            if not use_last_run_id:
-                run_id += 1
-        run_dir = os.path.join(self.outdir, f"{run_prefix}-{run_id:05d}")
-        os.makedirs(run_dir, exist_ok=True)
-        self.save_progress(f"[rundir] [set] [prefix {run_prefix}] [id {run_id}] [dir {run_dir}]")
+        del resume_phase
+        previous, run_id, run_dir = self._run_record_store().select_run_directory(run_prefix, use_last_run_id)
+        self.previous_progress = previous
         self.run_id = run_id
         self.run_dir = run_dir
         self.run_prefix = run_prefix
 
     def write_run_settings(self, execution_mode: str) -> None:
-        """Append the resolved invocation before any phase starts."""
-        def field(name: str, value: object) -> str:
-            if isinstance(value, bool):
-                rendered = "true" if value else "false"
-            else:
-                rendered = str(value)
-            return f"[{name} {sbsv.escape_str(rendered, quote=True)}]"
-
-        settings = [
-            "[binradar-setting]",
-            "[version 1]",
-            field("invocation", self.invocation),
-            field("execution-mode", execution_mode),
-            field("workdir", self.workdir),
-            field("outdir", self.outdir),
-            field("run-prefix", self.run_prefix),
-            field("run-id", self.run_id),
-            field("timeout", self.timeout),
-            field("target-patches", self.requested_candidate_scope),
-            field("target-patches-status", self.candidate_scope_status),
-            field("target-patches-reason", self.candidate_scope_reason),
-            field("compiled-patches", self.brpatched_total_patches),
-            field("filtered-patches", self.filter_total_patches),
-            field("effective-patches", self.total_patches),
-            field("disable-binradar", self.disable_binradar),
-            field("feedback", self.feedback_mode),
-            field("symbolic-mutation-mode", self.symbolic_mutation_mode),
-            field("fuzzy", self.fuzzy),
-            field("reverse-directed", self.reverse_directed),
-            field("less-strict", self.less_strict),
-            field("forkserver-child-timeout", self.forkserver_child_timeout),
-        ]
-        output = os.path.join(self.run_dir, "binradar-setting.sbsv")
-        previous = ""
-        if os.path.exists(output):
-            with open(output, "r", encoding="utf-8") as settings_file:
-                previous = settings_file.read()
-            if previous and not previous.endswith("\n"):
-                previous += "\n"
-        temporary = f"{output}.tmp"
-        with open(temporary, "w", encoding="utf-8") as settings_file:
-            settings_file.write(previous)
-            settings_file.write(" ".join(settings) + "\n")
-        os.replace(temporary, output)
+        binradar_run_records.RunRecordStore.write_settings(
+            self.run_dir,
+            binradar_run_records.RunSettings(
+                invocation=self.invocation,
+                execution_mode=execution_mode,
+                workdir=self.workdir,
+                outdir=self.outdir,
+                run_prefix=self.run_prefix,
+                run_id=self.run_id,
+                timeout=self.timeout,
+                target_patches=self.requested_candidate_scope,
+                target_patches_status=self.candidate_scope_status,
+                target_patches_reason=self.candidate_scope_reason,
+                compiled_patches=self.brpatched_total_patches,
+                filtered_patches=self.filter_total_patches,
+                effective_patches=self.total_patches,
+                disable_binradar=self.disable_binradar,
+                feedback=self.feedback_mode,
+                symbolic_mutation_mode=self.symbolic_mutation_mode,
+                fuzzy=self.fuzzy,
+                reverse_directed=self.reverse_directed,
+                less_strict=self.less_strict,
+                forkserver_child_timeout=self.forkserver_child_timeout,
+            ),
+        )
 
     def set_config(self, key: str, value: str):
         self.config[key] = value
@@ -607,18 +497,6 @@ class BinRadarExecutor:
         with open(os.path.join(self.run_dir, "probe-results.sbsv"), "w", encoding="utf-8") as f:
             f.write(f"[probe-info] {probe_result.serialize()}\n")
             f.write(f"[file-trace] {file_trace_result.serialize_file_trace_result()}\n")
-    
-    
-
-    
-
-    
-
-    
-
-    
-
-    
 
     def check_requirements(self):
         if not os.path.exists(self.artifacts.original):
@@ -950,424 +828,49 @@ class BinRadarExecutor:
             f"[id {self.run_id}]")
     
     def run_feedback(self):
-        # Generate feedback for taosc
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run feedback analysis.")
             raise RuntimeError("Probe result not found.")
+        binradar_feedback.export_feedback(
+            binradar_feedback.FeedbackExportRequest(
+                workdir=self.workdir,
+                run_dir=self.run_dir,
+                original_binary=self.artifacts.original,
+                poc_source=self.resolved_poc_input(),
+                poc_fault_addr=self.probe_result.fault_addr,
+                run_prefix=self.run_prefix,
+                run_id=self.run_id,
+                save_progress=self.save_progress,
+            )
+        )
 
-        minimizer_result_file = os.path.join(self.run_dir, "minimizer.sbsv")
-        if not os.path.exists(minimizer_result_file):
-            raise FileNotFoundError(
-                f"Minimizer result file not found: {minimizer_result_file}")
+    
 
-        self.save_progress(
-            f"[feedback] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-
-        feedback_dir = os.path.join(self.run_dir, "feedback")
-        if os.path.exists(feedback_dir):
-            shutil.rmtree(feedback_dir)
-        os.makedirs(feedback_dir)
-
-        # Required files for the feedback analysis.
-        shutil.copyfile(
-            os.path.join(self.workdir, "binradar.env"),
-            os.path.join(feedback_dir, "binradar.env"))
-        shutil.copyfile(
-            self.artifacts.original,
-            os.path.join(feedback_dir, os.path.basename(self.artifacts.original)))
-
-        poc_source = self.resolved_poc_input()
-        poc_relative = os.path.relpath(poc_source, self.workdir)
-        if poc_relative == os.pardir or poc_relative.startswith(
-                os.pardir + os.sep):
-            poc_relative = os.path.join("poc", os.path.basename(poc_source))
-        poc_destination = os.path.join(feedback_dir, poc_relative)
-        os.makedirs(os.path.dirname(poc_destination), exist_ok=True)
-        shutil.copyfile(poc_source, poc_destination)
-        if os.path.exists(os.path.join(self.workdir, "brpatches.json")):
-            shutil.copyfile(
-                os.path.join(self.workdir, "brpatches.json"),
-                os.path.join(feedback_dir, "brpatches.json"))
-        mutation_feedback = os.path.join(self.run_dir, "binradar-feedback")
-        if os.path.isdir(mutation_feedback):
-            shutil.copytree(
-                mutation_feedback, os.path.join(feedback_dir, "binradar"))
-        concrete_dir = os.path.join(feedback_dir, "concrete")
-        benign_dir = os.path.join(concrete_dir, "benign")
-        malicious_dir = os.path.join(concrete_dir, "malicious")
-        os.makedirs(benign_dir, exist_ok=True)
-        os.makedirs(malicious_dir, exist_ok=True)
-
-        # The full minimizer row is emitted by BinRadarMinimizer.  The
-        # fallback schema keeps feedback usable with older minimizer logs,
-        # whose rows contain only the fields consumed by the verifier.
-        full_parser = sbsv.parser()
-        full_parser.add_schema(
-            "[testcase] [result] [id: int] [file: str] [exit: str] "
-            "[patch-loc: hex] [func-entry: hex] [patch-hit: int] "
-            "[func-hit: int] [fault-addr: hex] "
-            "[tracer-fault-addr: hex] "
-            "[patch-func-candidates: list[str]] [stacktrace: list[str]] "
-            "[pid: int] [br: list[int]]")
-        legacy_parser = sbsv.parser()
-        legacy_parser.add_schema(
-            "[testcase] [result] [id: int] [file: str] [exit: str] "
-            "[fault-addr: hex] [pid: int] [br: list[int]]")
-        minimal_parser = sbsv.parser()
-        minimal_parser.add_schema(
-            "[testcase] [result] [id: int] [file: str] [exit: str] "
-            "[fault-addr: hex]")
-
-        def parse_result_row(line: str):
-            for parser in (full_parser, legacy_parser, minimal_parser):
-                try:
-                    row = parser.parse_line_detached(line)
-                except ValueError:
-                    continue
-                if row is not None and row.schema_name == "testcase$result":
-                    return row
-            return None
-
-        copied_hashes: Set[str] = set()
-        copied_counts = {"benign": 0, "malicious": 0}
-        minimized_dir = os.path.join(self.run_dir, "minimized")
-        with open(minimizer_result_file, "r", encoding="utf-8") as result_file:
-            for line_number, line in enumerate(result_file, start=1):
-                row = parse_result_row(line)
-                if row is None:
-                    continue
-
-                patch_hit = row.data.get("patch-hit")
-                if patch_hit is not None and patch_hit <= 0:
-                    continue
-
-                exit_info = row["exit"]
-                if exit_info == "ok":
-                    category = "benign"
-                elif (exit_info == "crash"
-                      and row["fault-addr"] == self.probe_result.fault_addr):
-                    category = "malicious"
-                else:
-                    # Timeouts, unrelated crashes, and malformed baseline
-                    # outcomes are not useful concrete feedback.
-                    continue
-
-                filename = os.path.basename(row["file"])
-                source = os.path.join(minimized_dir, filename)
-                try:
-                    with open(source, "rb") as source_file:
-                        data = source_file.read()
-                except OSError as exc:
-                    logger.warning(
-                        f"[FEEDBACK] Skipping missing testcase {source} "
-                        f"from minimizer line {line_number}: {exc}")
-                    continue
-
-                digest = hashlib.sha256(data).hexdigest()
-                if digest in copied_hashes:
-                    continue
-
-                destination_dir = benign_dir if category == "benign" \
-                    else malicious_dir
-                destination = os.path.join(destination_dir, filename)
-                if os.path.exists(destination):
-                    destination = os.path.join(
-                        destination_dir, f"{row['id']}_{filename}")
-                shutil.copyfile(source, destination)
-                copied_hashes.add(digest)
-                copied_counts[category] += 1
-
-        logger.info(
-            f"[FEEDBACK] Copied concrete inputs: "
-            f"benign {copied_counts['benign']}, "
-            f"malicious {copied_counts['malicious']}")
-        self.save_progress(
-            f"[feedback] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
-
-    @staticmethod
-    def _iter_legacy_binradar_results(trace_file: str):
-        """Stream old per-patch SBSV traces one iteration at a time."""
-        parser = sbsv.parser()
-        parser.add_schema(
-            "[binradar] [crash] [iter: int] [patch: int] "
-            "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
-            "[host_fault_addr: hex]")
-        parser.add_schema(
-            "[binradar] [normal] [iter: int] [patch: int]")
-        parser.add_schema(
-            "[binradar] [commit] [iter: int] [patch: int] [br: str]")
-        current_iteration: Optional[int] = None
-        current: Dict[int, dict] = {}
-        with open(trace_file, "r", encoding="utf-8") as stream:
-            for line in stream:
-                result = parser.parse_line_detached(line)
-                if result is None:
-                    continue
-                iteration = result["iter"]
-                if current_iteration is None:
-                    current_iteration = iteration
-                elif iteration != current_iteration:
-                    if iteration < current_iteration:
-                        raise ValueError(
-                            "legacy BINRADAR trace iterations are unordered")
-                    yield current_iteration, current
-                    current_iteration = iteration
-                    current = {}
-                patch = result["patch"]
-                patch_result = current.setdefault(patch, {})
-                if result.schema_name == "binradar$crash":
-                    patch_result["result"] = "crash"
-                    patch_result["fault_addr"] = result["fault_addr"]
-                elif result.schema_name == "binradar$normal":
-                    patch_result["result"] = "normal"
-                else:
-                    patch_result["br"] = result["br"]
-        if current_iteration is not None:
-            yield current_iteration, current
-
-    @staticmethod
-    def _iter_binary_binradar_results(evidence_file: str):
-        """Expand one compact equivalence-class frame at a time."""
-        for iteration in binradar_evidence.read_binradar(evidence_file):
-            results: Dict[int, dict] = {}
-            for group in iteration.groups:
-                branch = ("null" if group.branches is None else
-                          "".join(str(value) for value in group.branches))
-                for patch in group.members:
-                    result = {"result": group.outcome, "br": branch}
-                    if group.outcome == "crash":
-                        result["fault_addr"] = group.fault_addr
-                    results[patch] = result
-            yield iteration.iteration, results
+    
 
     def run_final(self):
-        # Read compact verifier and BINRADAR evidence and save final results.
-        # Legacy SBSV artifacts remain readable for completed old workdirs.
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run final analysis.")
             raise RuntimeError("Probe result not found.")
-        verifier_result_file = os.path.join(self.run_dir, "verifier.br")
-        legacy_verifier_file = os.path.join(self.run_dir, "verifier.sbsv")
-        if not os.path.exists(verifier_result_file):
-            verifier_result_file = legacy_verifier_file
-        binradar_evidence_file = os.path.join(self.run_dir, "binradar.br")
-        trace_msg_log_file = os.path.join(
-            self.run_dir, "binradar-tracer-msg.log")
-        self.save_progress(
-            f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        if not os.path.exists(verifier_result_file):
-            logger.error(
-                "Verifier result file not found. BinRadar results might be "
-                "incomplete.")
-            raise FileNotFoundError(
-                f"Verifier result file not found: {verifier_result_file}")
-        remaining_patches = set(self.filter_result)
-        concrete_verifier_result = \
-            binradar_verifier.BinRadarConcreteVerifierResult.from_file(
-                verifier_result_file)
-        if concrete_verifier_result is None:
-            logger.error("Failed to parse verifier result. BinRadar results might be incomplete.")
-            raise ValueError("Failed to parse verifier result.")
-        if (concrete_verifier_result.stop_reason == "wall-time-reached"
-                and not self.wall_time_reached):
-            # Preserve the cutoff marker when FINAL is resumed in a fresh
-            # process after graceful timeout finalization already produced a
-            # complete verifier result file.
-            self._record_wall_time_reached([])
-        try:
-            concrete_verifier_result.require_complete_verdicts(
-                self.filter_result)
-        except ValueError as exc:
-            # Missing verdicts previously defaulted to verified here, which
-            # could silently retain patches after an incomplete verifier run.
-            logger.error(f"Incomplete verifier result: {exc}")
-            raise
-        # FINAL combines concrete-verifier and BinRadar observations into one
-        # confidence score per patch. Older verifier files have no evidence
-        # rows and therefore start at 0/0 (score 0.0).
-        accept_evidences = {
-            patch: concrete_verifier_result.accept_evidences.get(patch, 0)
-            for patch in self.filter_result
-        }
-        total_evidences = {
-            patch: concrete_verifier_result.total_evidences.get(patch, 0)
-            for patch in self.filter_result
-        }
-
-        def record_evidence(patch: int, accepted: bool) -> None:
-            total_evidences[patch] = total_evidences.get(patch, 0) + 1
-            if accepted:
-                accept_evidences[patch] = accept_evidences.get(patch, 0) + 1
-
-        binradar_failed = self.binradar_failed
-        skip_binradar_analysis = self.disable_binradar or binradar_failed
-        compact_binradar = False
-        if self.disable_binradar:
-            logger.info(
-                "[FINAL] BinRadar phase disabled; skipping evidence analysis.")
-            binradar_iterations = iter(())
-        elif binradar_failed:
-            logger.warning(
-                "[FINAL] BinRadar phase failed under --less-strict; ignoring "
-                "its potentially incomplete evidence and using concrete "
-                "verifier evidence only.")
-            binradar_iterations = iter(())
-        elif os.path.exists(binradar_evidence_file):
-            compact_binradar = True
-            binradar_iterations = self._iter_binary_binradar_results(
-                binradar_evidence_file)
-        elif os.path.exists(trace_msg_log_file):
-            binradar_iterations = self._iter_legacy_binradar_results(
-                trace_msg_log_file)
-        else:
-            logger.error(
-                "BINRADAR evidence file not found. Results might be "
-                "incomplete.")
-            raise FileNotFoundError(
-                f"BINRADAR evidence file not found: {binradar_evidence_file}")
-        for patch_id in self.filter_result:
-            if not concrete_verifier_result.patch_verified[patch_id]:
-                remaining_patches.discard(patch_id)
-        binradar_remaining_patches = remaining_patches.copy()
-        binradar_reject_reasons: Dict[int, Tuple[str, int]] = dict()
-        poc_fault_loc = (0 if skip_binradar_analysis
-                         else self.probe_result.tracer_fault_addr)
-        if not skip_binradar_analysis and poc_fault_loc == 0:
-            logger.warning(
-                "[FINAL] tracer_fault_addr is 0; binradar crash comparison "
-                "will not match any fault address.")
-
-        expected_candidates = set(self.filter_result)
-        processed_iterations = 0
-        for iteration, iteration_results in binradar_iterations:
-            actual = set(iteration_results)
-            expected = {0} if iteration == 1 \
-                else expected_candidates | {0}
-            if compact_binradar and actual != expected:
-                raise ValueError(
-                    f"BINRADAR iteration {iteration} coverage mismatch: "
-                    f"missing {sorted(expected - actual)}; "
-                    f"unexpected {sorted(actual - expected)}")
-            # A legacy timeout tail may have only one half of an outcome.
-            # Compact frames are committed atomically and were checked above.
-            original = iteration_results.get(0)
-            if original is None or "result" not in original \
-                    or "br" not in original or original["br"] == "null":
-                continue
-            processed_iterations += 1
-            for patch in remaining_patches:
-                patch_result = iteration_results.get(patch)
-                if patch_result is None or "result" not in patch_result \
-                        or "br" not in patch_result:
-                    continue
-                if original["result"] == "crash" \
-                        and patch_result["result"] == "crash":
-                    if original.get("fault_addr") == poc_fault_loc \
-                            and patch_result.get("fault_addr") == \
-                            poc_fault_loc:
-                        record_evidence(patch, False)
-                        binradar_remaining_patches.discard(patch)
-                        binradar_reject_reasons[patch] = (
-                            "same-crash", iteration)
-                elif original["result"] == "crash" \
-                        and patch_result["result"] == "normal":
-                    record_evidence(patch, True)
-                elif original["result"] == "normal" \
-                        and patch_result["result"] == "crash":
-                    if patch_result.get("fault_addr") == poc_fault_loc:
-                        record_evidence(patch, False)
-                        binradar_remaining_patches.discard(patch)
-                        binradar_reject_reasons[patch] = (
-                            "introduced-crash", iteration)
-                elif original["result"] == "normal" \
-                        and patch_result["result"] == "normal":
-                    record_evidence(
-                        patch, original["br"] == patch_result["br"])
-        if not skip_binradar_analysis:
-            logger.info(
-                f"[FINAL] Processed {processed_iterations} complete "
-                f"BINRADAR evidence iteration(s); rejected "
-                f"{len(remaining_patches - binradar_remaining_patches)} "
-                f"patch(es).")
-        # Two orthogonal status concepts, kept distinct in every output row:
-        #   * failed phases (--less-strict) are real issues;
-        #   * a reached wall-clock budget is a planned graceful cutoff.
-        failed_phases = self.failed_phase_names()
-        issues_suffix = (
-            f" [issues true] [failed-phases {','.join(failed_phases)}]"
-            if failed_phases else " [issues false] [failed-phases none]")
-        wall_time_suffix = (
-            " [wall-time-reached true]" if self.wall_time_reached
-            else " [wall-time-reached false]")
-        if failed_phases:
-            self.save_progress(
-                f"[final] [failed-phases] [prefix {self.run_prefix}] "
-                f"[id {self.run_id}] "
-                f"[failed-phases {','.join(failed_phases)}]")
-        if self.wall_time_reached:
-            self.save_progress(
-                f"[final] [wall-time-reached] [prefix {self.run_prefix}] "
-                f"[id {self.run_id}]")
-        self.save_progress(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] [remaining_patches {sorted(remaining_patches)}] [binradar_remaining_patches {sorted(binradar_remaining_patches)}]{issues_suffix}{wall_time_suffix}")
-
-        # Write a self-contained final.sbsv with per-patch verdicts from the
-        # concrete verifier and, when enabled, the binradar analysis.
-        final_result_file = os.path.join(self.run_dir, "final.sbsv")
-        if self.disable_binradar:
-            trace_metadata = "[binradar disabled]"
-        elif binradar_failed:
-            trace_metadata = "[binradar failed]"
-        elif compact_binradar:
-            trace_metadata = (
-                f"[evidence {os.path.basename(binradar_evidence_file)}]")
-        else:
-            trace_metadata = f"[trace {os.path.basename(trace_msg_log_file)}]"
-        with open(final_result_file, "w", encoding="utf-8") as f:
-            f.write(f"[final] [start] [prefix {self.run_prefix}] [id {self.run_id}] "
-                    f"[verifier {os.path.basename(verifier_result_file)}] "
-                    f"{trace_metadata}\n")
-            if failed_phases:
-                f.write(f"[final] [failed-phases] [prefix {self.run_prefix}] "
-                        f"[id {self.run_id}] "
-                        f"[failed-phases {','.join(failed_phases)}]\n")
-            if self.wall_time_reached:
-                f.write(f"[final] [wall-time-reached] "
-                        f"[prefix {self.run_prefix}] [id {self.run_id}]\n")
-            for patch_id in sorted(self.filter_result):
-                verified = concrete_verifier_result.patch_verified[patch_id]
-                res = "verified" if verified else "rejected"
-                f.write(f"[final] [verifier] [patch {patch_id}] [res {res}]\n")
-            # Confidence rows cover only patches accepted by the concrete
-            # verifier, ranked by score (highest first). Ties keep the
-            # original patch-id order (stable sort).
-            confidence_rows = []
-            for patch_id in sorted(self.filter_result):
-                if not concrete_verifier_result.patch_verified[patch_id]:
-                    continue
-                accepted = accept_evidences.get(patch_id, 0)
-                total = total_evidences.get(patch_id, 0)
-                confidence = accepted / total if total > 0 else 0.0
-                confidence_rows.append((patch_id, confidence, accepted, total))
-            confidence_rows.sort(key=lambda row: row[1], reverse=True)
-            for patch_id, confidence, accepted, total in confidence_rows:
-                f.write(f"[final] [confidence] [patch {patch_id}] "
-                        f"[score {confidence:.6f}] "
-                        f"[accept-evidences {accepted}] "
-                        f"[total-evidences {total}]\n")
-            if not skip_binradar_analysis:
-                for patch_id in sorted(remaining_patches):
-                    if patch_id in binradar_remaining_patches:
-                        f.write(f"[final] [binradar] [patch {patch_id}] [res verified] "
-                                f"[reason none] [iter -1]\n")
-                    else:
-                        reason, reject_iter = binradar_reject_reasons.get(patch_id, ("unknown", -1))
-                        f.write(f"[final] [binradar] [patch {patch_id}] [res rejected] "
-                                f"[reason {reason}] [iter {reject_iter}]\n")
-            f.write(f"[final] [done] [prefix {self.run_prefix}] [id {self.run_id}] "
-                    f"[remaining_patches {sorted(remaining_patches)}] "
-                    f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]"
-                    f"{issues_suffix}{wall_time_suffix}\n")
-        logger.info(f"[FINAL] Saved final result: {final_result_file}")
+        skip_binradar = self.disable_binradar or self.binradar_failed
+        binradar_results.write_final_result(
+            binradar_results.FinalResultRequest(
+                run_dir=self.run_dir,
+                run_prefix=self.run_prefix,
+                run_id=self.run_id,
+                candidates=self.filter_result,
+                tracer_fault_addr=(
+                    0 if skip_binradar
+                    else self.probe_result.tracer_fault_addr),
+                disable_binradar=self.disable_binradar,
+                binradar_failed=self.binradar_failed,
+                wall_time_reached=self.wall_time_reached,
+                failed_phases=self.failed_phase_names(),
+                save_progress=self.save_progress,
+                record_wall_time_reached=lambda: (
+                    self._record_wall_time_reached([])),
+            )
+        )
 
     def done(self):
         self.save_progress(f"[rundir] [done] [prefix {self.run_prefix}] [id {self.run_id}] [dir {self.run_dir}]")
