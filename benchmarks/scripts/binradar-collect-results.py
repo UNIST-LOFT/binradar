@@ -27,7 +27,10 @@ Subcommands:
              confidence rows) have no ranking to order by: their filter
              survivors are capped at the top --top patches in patch-id
              order instead of being printed in full.
-          5. Shows the patch filter context from <workdir>/filter.sbsv
+          5. Shows exact, untruncated verifier candidate/remaining counts and
+             BinRadar complete-iteration/rejected/remaining counts. Patch-id
+             lists remain limited by --top.
+          6. Shows the patch filter context from <workdir>/filter.sbsv
              (predicates evaluated/survived) when present
 
     sdfuzz
@@ -218,6 +221,13 @@ class RunResult:
     # True when the run reached FINAL with a non-empty remaining_patches
     # list (at least one remaining patch).
     at_least_one_remaining_patches: bool = False
+    # Exact counts remain untruncated even when the displayed patch lists are
+    # limited to --top.  -1 means the run did not produce that result.
+    verifier_candidate_count: int = -1
+    remaining_patches_count: int = -1
+    binradar_evidence_iterations: int = -1
+    binradar_rejected_count: int = -1
+    binradar_remaining_patches_count: int = -1
     remaining_patches: str = ""  # e.g. "[1, 2, 3]" or "[]"
     binradar_remaining_patches: str = ""
     verifier_rejected: str = ""  # e.g. "2,4,6"
@@ -1060,13 +1070,25 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             br_remaining = final_entry.get("binradar_remaining_patches", "N/A")
             run_res.remaining_patches = _fix_bracket_value(remaining)
             run_res.binradar_remaining_patches = _fix_bracket_value(br_remaining)
-            run_res.at_least_one_remaining_patches = bool(
-                _parse_patch_list(run_res.remaining_patches))
+            remaining_ids = set(_parse_patch_list(run_res.remaining_patches))
+            binradar_remaining_ids = set(
+                _parse_patch_list(run_res.binradar_remaining_patches))
+            run_res.at_least_one_remaining_patches = bool(remaining_ids)
+            run_res.remaining_patches_count = len(remaining_ids)
+            run_res.binradar_remaining_patches_count = len(
+                binradar_remaining_ids)
+            run_res.binradar_rejected_count = len(
+                remaining_ids - binradar_remaining_ids)
 
             verifier_path = _result_artifact(run_dir, "verifier")
             verifier_results = parse_verifier_sbsv(verifier_path)
             if verifier_results:
                 run_res.verifier_data = verifier_results
+                run_res.verifier_candidate_count = len(verifier_results)
+
+        run_res.binradar_evidence_iterations = extract_count(
+            binradar_log,
+            r"Processed (\d+) complete BINRADAR evidence iteration")
 
         # Per-patch binradar verdicts and confidence from final.sbsv (written
         # by the FINAL phase). The confidence rows rank the accepted patches;
@@ -1444,6 +1466,17 @@ def format_result_log(result: ExperimentResult) -> str:
             lines.append(
                 f"    [final] binradar_remaining_patches: "
                 f"{_truncate_patch_list(run_res.binradar_remaining_patches, run_res.top_patches, run_res.confidence_data)}")
+            if run_res.verifier_candidate_count >= 0:
+                lines.append(
+                    f"    [verifier] candidates: "
+                    f"{run_res.verifier_candidate_count}  remaining: "
+                    f"{run_res.remaining_patches_count}")
+            if run_res.binradar_evidence_iterations >= 0:
+                lines.append(
+                    f"    [binradar] complete iterations: "
+                    f"{run_res.binradar_evidence_iterations}  rejected: "
+                    f"{run_res.binradar_rejected_count}  remaining: "
+                    f"{run_res.binradar_remaining_patches_count}")
 
             if run_res.verifier_data and run_res.top_patches:
                 header = "    [verifier] summary:"
@@ -1534,6 +1567,11 @@ CSV_COLUMNS = [
     "status",
     "has_final",
     "at_least_one_remaining_patches",
+    "verifier_candidate_count",
+    "remaining_patches_count",
+    "binradar_evidence_iterations",
+    "binradar_rejected_count",
+    "binradar_remaining_patches_count",
     "remaining_patches",
     "binradar_remaining_patches",
     "filter_survived_patches",
@@ -1561,6 +1599,11 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "status": f"ERROR: {result.error_message}",
                 "has_final": "",
                 "at_least_one_remaining_patches": "",
+                "verifier_candidate_count": "",
+                "remaining_patches_count": "",
+                "binradar_evidence_iterations": "",
+                "binradar_rejected_count": "",
+                "binradar_remaining_patches_count": "",
                 "remaining_patches": "",
                 "binradar_remaining_patches": "",
                 "filter_survived_patches": "",
@@ -1592,6 +1635,21 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "has_final": str(run_res.has_final),
                 "at_least_one_remaining_patches":
                     str(run_res.at_least_one_remaining_patches),
+                "verifier_candidate_count": (
+                    str(run_res.verifier_candidate_count)
+                    if run_res.verifier_candidate_count >= 0 else ""),
+                "remaining_patches_count": (
+                    str(run_res.remaining_patches_count)
+                    if run_res.remaining_patches_count >= 0 else ""),
+                "binradar_evidence_iterations": (
+                    str(run_res.binradar_evidence_iterations)
+                    if run_res.binradar_evidence_iterations >= 0 else ""),
+                "binradar_rejected_count": (
+                    str(run_res.binradar_rejected_count)
+                    if run_res.binradar_rejected_count >= 0 else ""),
+                "binradar_remaining_patches_count": (
+                    str(run_res.binradar_remaining_patches_count)
+                    if run_res.binradar_remaining_patches_count >= 0 else ""),
                 "remaining_patches": _truncate_patch_list(
                     run_res.remaining_patches, run_res.top_patches,
                     run_res.confidence_data),

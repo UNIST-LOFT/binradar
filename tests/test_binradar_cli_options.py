@@ -75,3 +75,67 @@ def test_reverse_directed_bare_flag_and_explicit_disable(tmp_path, monkeypatch):
 def test_target_patches_all_stays_within_compiled_count(tmp_path, monkeypatch):
     captured = _run_main(monkeypatch, tmp_path, ["--target-patches", "all"])
     assert captured["TOTAL_PATCHES"] == "30"
+    assert captured["BINRADAR_TARGET_PATCHES_STATUS"] == "all-clamped"
+
+
+def test_run_settings_records_resolved_candidate_scope(tmp_path):
+    run_dir = tmp_path / "out" / "br-off-no-feedback-00000"
+    run_dir.mkdir(parents=True)
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.invocation = "binradar.py --label '[debug]' --target-patches all"
+    executor.workdir = str(tmp_path)
+    executor.outdir = str(tmp_path / "out")
+    executor.run_dir = str(run_dir)
+    executor.run_prefix = "br-off-no-feedback"
+    executor.run_id = 0
+    executor.timeout = 7200
+    executor.requested_candidate_scope = "all"
+    executor.candidate_scope_status = "all-expanded"
+    executor.candidate_scope_reason = (
+        "cached artifact and manifest cover every filtered patch")
+    executor.brpatched_total_patches = 30
+    executor.filter_total_patches = 41
+    executor.total_patches = 41
+    executor.disable_binradar = False
+    executor.feedback_mode = False
+    executor.symbolic_mutation_mode = "off"
+    executor.fuzzy = False
+    executor.reverse_directed = True
+    executor.less_strict = False
+    executor.forkserver_child_timeout = 900
+
+    executor.write_run_settings("multithreaded")
+
+    parser = binradar.sbsv.parser()
+    parser.add_schema(
+        "[binradar-setting] [version: int] [invocation: str] "
+        "[execution-mode: str] [workdir: str] [outdir: str] "
+        "[run-prefix: str] [run-id: int] [timeout: int] "
+        "[target-patches: str] [target-patches-status: str] "
+        "[target-patches-reason: str] [compiled-patches: int] "
+        "[filtered-patches: int] [effective-patches: int] "
+        "[disable-binradar: bool] [feedback: bool] "
+        "[symbolic-mutation-mode: str] [fuzzy: bool] "
+        "[reverse-directed: bool] [less-strict: bool] "
+        "[forkserver-child-timeout: int]")
+    with (run_dir / "binradar-setting.sbsv").open() as settings_file:
+        row = parser.load(settings_file)["binradar-setting"][0]
+
+    assert row["invocation"] == executor.invocation
+    assert row["target-patches"] == "all"
+    assert row["target-patches-status"] == "all-expanded"
+    assert row["compiled-patches"] == 30
+    assert row["filtered-patches"] == 41
+    assert row["effective-patches"] == 41
+    assert row["disable-binradar"] is False
+    assert row["symbolic-mutation-mode"] == "off"
+
+    executor.invocation = "binradar.py --run-single-phase final --run-id 0"
+    executor.write_run_settings("single-phase-final")
+    with (run_dir / "binradar-setting.sbsv").open() as settings_file:
+        rows = parser.load(settings_file)["binradar-setting"]
+
+    assert len(rows) == 2
+    assert rows[0]["target-patches-status"] == "all-expanded"
+    assert rows[1]["invocation"] == executor.invocation
+    assert rows[1]["execution-mode"] == "single-phase-final"

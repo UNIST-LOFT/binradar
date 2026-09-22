@@ -807,6 +807,11 @@ class BinRadarExecutor:
     # "off" | "shadow" | "boundary".  Always explicit so an inherited CLI
     # environment cannot enable it in another phase.
     symbolic_mutation_mode: str
+    requested_candidate_scope: str
+    candidate_scope_status: str
+    candidate_scope_reason: str
+    filter_total_patches: int
+    invocation: str
     # Control
     phase_failures: Dict[str, str]
     phase_failure_lock: threading.Lock
@@ -820,7 +825,7 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT, brpatched_total_patches: Optional[int] = None, symbolic_mutation_mode: str = SYMBOLIC_MUTATION_MODE_DEFAULT):
+    def __init__(self, workdir: str, outdir: str, timeout: int, binary: str, poc_input: str, test_cmd: str, patch_loc: str, e9_metadata_prefix: str = "brpatched", e9_exclude_ranges: str = "", e9_relocated_calls: str = "", total_patches: int = 1, fuzzy: bool = False, reverse_directed: bool = False, disable_binradar: bool = False, less_strict: bool = False, feedback_mode: bool = False, forkserver_child_timeout: int = FORKSERVER_CHILD_TIMEOUT_DEFAULT, brpatched_total_patches: Optional[int] = None, symbolic_mutation_mode: str = SYMBOLIC_MUTATION_MODE_DEFAULT, requested_candidate_scope: str = "configured", candidate_scope_status: str = "configured", candidate_scope_reason: str = "not-recorded", filter_total_patches: Optional[int] = None, invocation: str = ""):
         self.workdir = os.path.abspath(workdir)
         self.outdir = os.path.abspath(outdir)
         self.timeout = timeout
@@ -838,6 +843,13 @@ class BinRadarExecutor:
         self.feedback_mode = feedback_mode
         self.symbolic_mutation_mode = validate_symbolic_mutation_mode(
             symbolic_mutation_mode)
+        self.requested_candidate_scope = requested_candidate_scope
+        self.candidate_scope_status = candidate_scope_status
+        self.candidate_scope_reason = candidate_scope_reason
+        self.filter_total_patches = (
+            total_patches if filter_total_patches is None
+            else filter_total_patches)
+        self.invocation = invocation
         self.binradar_failed = False
         self.wall_time_reached = False
         self._fuzzer_output_prepared = False
@@ -908,6 +920,15 @@ class BinRadarExecutor:
             symbolic_mutation_mode=env.get(
                 "BINRADAR_SYMBOLIC_MUTATION_MODE",
                 SYMBOLIC_MUTATION_MODE_DEFAULT),
+            requested_candidate_scope=env.get(
+                "BINRADAR_TARGET_PATCHES", "configured"),
+            candidate_scope_status=env.get(
+                "BINRADAR_TARGET_PATCHES_STATUS", "configured"),
+            candidate_scope_reason=env.get(
+                "BINRADAR_TARGET_PATCHES_REASON", "not-recorded"),
+            filter_total_patches=int(env.get(
+                "FILTER_TOTAL_PATCHES", env["TOTAL_PATCHES"])),
+            invocation=env.get("BINRADAR_INVOCATION", ""),
             forkserver_child_timeout=forkserver_child_timeout,
             brpatched_total_patches=int(env.get(
                 "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])))
@@ -1146,6 +1167,52 @@ class BinRadarExecutor:
         self.run_id = run_id
         self.run_dir = run_dir
         self.run_prefix = run_prefix
+
+    def write_run_settings(self, execution_mode: str) -> None:
+        """Append the resolved invocation before any phase starts."""
+        def field(name: str, value: object) -> str:
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            else:
+                rendered = str(value)
+            return f"[{name} {sbsv.escape_str(rendered, quote=True)}]"
+
+        settings = [
+            "[binradar-setting]",
+            "[version 1]",
+            field("invocation", self.invocation),
+            field("execution-mode", execution_mode),
+            field("workdir", self.workdir),
+            field("outdir", self.outdir),
+            field("run-prefix", self.run_prefix),
+            field("run-id", self.run_id),
+            field("timeout", self.timeout),
+            field("target-patches", self.requested_candidate_scope),
+            field("target-patches-status", self.candidate_scope_status),
+            field("target-patches-reason", self.candidate_scope_reason),
+            field("compiled-patches", self.brpatched_total_patches),
+            field("filtered-patches", self.filter_total_patches),
+            field("effective-patches", self.total_patches),
+            field("disable-binradar", self.disable_binradar),
+            field("feedback", self.feedback_mode),
+            field("symbolic-mutation-mode", self.symbolic_mutation_mode),
+            field("fuzzy", self.fuzzy),
+            field("reverse-directed", self.reverse_directed),
+            field("less-strict", self.less_strict),
+            field("forkserver-child-timeout", self.forkserver_child_timeout),
+        ]
+        output = os.path.join(self.run_dir, "binradar-setting.sbsv")
+        previous = ""
+        if os.path.exists(output):
+            with open(output, "r", encoding="utf-8") as settings_file:
+                previous = settings_file.read()
+            if previous and not previous.endswith("\n"):
+                previous += "\n"
+        temporary = f"{output}.tmp"
+        with open(temporary, "w", encoding="utf-8") as settings_file:
+            settings_file.write(previous)
+            settings_file.write(" ".join(settings) + "\n")
+        os.replace(temporary, output)
 
     def set_config(self, key: str, value: str):
         self.config[key] = value
@@ -2189,6 +2256,7 @@ class BinRadarExecutor:
         self.disable_binradar = True
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.write_run_settings("fuzzer-only")
         self.run_probe()
         if not self.filter_result:
             logger.info("[BINRADAR] No patch survived setup filtering. Skipping the remaining phases.")
@@ -2211,6 +2279,7 @@ class BinRadarExecutor:
     def run_sequential(self, run_prefix: str = "run"):
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.write_run_settings("sequential")
         self.run_probe()
         if not self.filter_result:
             logger.info("[BINRADAR] No patch survived setup filtering. Skipping the remaining phases.")
@@ -2241,6 +2310,8 @@ class BinRadarExecutor:
             self.run_dir = os.path.join(self.outdir, f"{run_prefix}-{self.run_id:05d}")
             os.makedirs(self.run_dir, exist_ok=True)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        phase_name = phase.name.lower().replace("_", "-")
+        self.write_run_settings(f"single-phase-{phase_name}")
         self.run_probe()
         if phase == BinRadarPhase.PROBE:
             return
@@ -2269,6 +2340,7 @@ class BinRadarExecutor:
     def run_multithreaded(self, run_prefix: str = "run"):
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.write_run_settings("multithreaded")
         self.run_probe()
 
         if not self.filter_result:
@@ -2467,6 +2539,10 @@ def main():
         else env.get("BINRADAR_SYMBOLIC_MUTATION_MODE",
                      SYMBOLIC_MUTATION_MODE_DEFAULT))
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
+    env["BINRADAR_INVOCATION"] = shlex.join(sys.argv)
+    env["BINRADAR_TARGET_PATCHES"] = args.target_patches
+    env["BINRADAR_TARGET_PATCHES_STATUS"] = "top-30"
+    env["BINRADAR_TARGET_PATCHES_REASON"] = "requested top-30"
     # .brpatched compiles only the top 30 setup-filter survivors into
     # its static predicate table. Record that cap explicitly so no phase can
     # execute an uncompiled id on it, even when the effective candidate set is
@@ -2487,6 +2563,9 @@ def main():
                                  env["TOTAL_PATCHES"]))
         if filter_total <= compiled_total:
             env["TOTAL_PATCHES"] = str(filter_total)
+            env["BINRADAR_TARGET_PATCHES_STATUS"] = "all-within-compiled"
+            env["BINRADAR_TARGET_PATCHES_REASON"] = (
+                "filtered total does not exceed compiled capacity")
         else:
             coverage = binradar_verifier.load_cached_predicate_set(
                 Path(workdir) / "brpatches.json",
@@ -2501,6 +2580,8 @@ def main():
                     f"(FILTER_TOTAL_PATCHES={filter_total}); candidates past "
                     f"the compiled cap cannot be run ({coverage.reason})")
                 env["TOTAL_PATCHES"] = str(compiled_total)
+                env["BINRADAR_TARGET_PATCHES_STATUS"] = "all-clamped"
+                env["BINRADAR_TARGET_PATCHES_REASON"] = coverage.reason
             else:
                 logger.info(
                     f"--target-patches all: the .brcached artifact and "
@@ -2508,6 +2589,9 @@ def main():
                     f"survivors; running the full set (the .brpatched "
                     f"artifact compiles only the top {compiled_total})")
                 env["TOTAL_PATCHES"] = str(filter_total)
+                env["BINRADAR_TARGET_PATCHES_STATUS"] = "all-expanded"
+                env["BINRADAR_TARGET_PATCHES_REASON"] = (
+                    "cached artifact and manifest cover every filtered patch")
     outdir = os.path.abspath(os.path.join(workdir, "out")) 
     if args.output != "":
         outdir = os.path.abspath(args.output)

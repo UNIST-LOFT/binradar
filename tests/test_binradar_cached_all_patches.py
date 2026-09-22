@@ -98,6 +98,11 @@ def test_target_patches_all_expands_when_brcached_covers_every_survivor(
     # The compiled cap stays visible so no phase runs an id past it on
     # .brpatched.
     assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+    assert captured["BINRADAR_TARGET_PATCHES"] == "all"
+    assert captured["BINRADAR_TARGET_PATCHES_STATUS"] == "all-expanded"
+    assert captured["BINRADAR_TARGET_PATCHES_REASON"] == (
+        "cached artifact and manifest cover every filtered patch")
+    assert "--target-patches all" in captured["BINRADAR_INVOCATION"]
 
 
 def test_target_patches_all_clamps_without_a_covering_cache(
@@ -111,6 +116,9 @@ def test_target_patches_all_clamps_without_a_covering_cache(
 
     assert captured["TOTAL_PATCHES"] == "30"
     assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+    assert captured["BINRADAR_TARGET_PATCHES"] == "all"
+    assert captured["BINRADAR_TARGET_PATCHES_STATUS"] == "all-clamped"
+    assert captured["BINRADAR_TARGET_PATCHES_REASON"]
 
 
 def test_target_patches_all_clamps_when_manifest_is_short(
@@ -126,6 +134,18 @@ def test_target_patches_all_clamps_when_manifest_is_short(
     assert captured["TOTAL_PATCHES"] == "30"
 
 
+def test_target_patches_all_records_within_compiled_scope(
+        tmp_path, monkeypatch):
+    _, captured = _run_main(
+        monkeypatch, tmp_path, ["--target-patches", "all"],
+        _BASE_ENV + ['FILTER_TOTAL_PATCHES="12"\n'])
+
+    assert captured["TOTAL_PATCHES"] == "12"
+    assert captured["BINRADAR_TARGET_PATCHES_STATUS"] == "all-within-compiled"
+    assert captured["BINRADAR_TARGET_PATCHES_REASON"] == (
+        "filtered total does not exceed compiled capacity")
+
+
 def test_target_patches_top_30_records_the_compiled_cap(
         tmp_path, monkeypatch):
     _, captured = _run_main(
@@ -134,6 +154,8 @@ def test_target_patches_top_30_records_the_compiled_cap(
 
     assert captured["TOTAL_PATCHES"] == "30"
     assert captured["BRPATCHED_TOTAL_PATCHES"] == "30"
+    assert captured["BINRADAR_TARGET_PATCHES_STATUS"] == "top-30"
+    assert captured["BINRADAR_TARGET_PATCHES_REASON"] == "requested top-30"
 
 
 def test_target_patches_all_expands_under_the_smaller_compiled_set(

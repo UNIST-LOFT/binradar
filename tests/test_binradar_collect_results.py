@@ -31,8 +31,8 @@ def test_parse_compact_filter_and_verifier_artifacts(tmp_path):
         1: ["rejected"],
     }
     stats = collector.parse_verifier_test_result_stats(str(verifier_path))
-    assert stats[1]["cf"] == 1
-    assert stats[1]["cp"] == 1
+    assert stats[1]["crash-fail"] == 1
+    assert stats[1]["crash-pass"] == 1
     representatives = collector.parse_verifier_representative_stats(
         str(verifier_path))
     assert representatives.runs == -1
@@ -448,6 +448,61 @@ def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     assert csv_row["verifier_rejected_patches"] == ""
     assert "binradar_rejected_patches" in csv_row
     assert "(+2 more)" in csv_row["remaining_patches"]
+
+
+def test_collect_reports_untruncated_binradar_counts(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1, 2, 3, 4, 5]] "
+        "[binradar_remaining_patches [2, 4]]\n")
+    collector.binradar_evidence.write_verifier(
+        run_dir / "verifier.br",
+        [collector.binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=True, accept_evidences=1,
+            total_evidences=1, observations={"crash-pass": 1})
+         for patch in range(1, 6)])
+    (run_dir / "binradar.log").write_text(
+        "[FINAL] Processed 17 complete BINRADAR evidence iteration(s); "
+        "rejected 3 patch(es).\n")
+    (run_dir / "final.sbsv").write_text(
+        "[final] [confidence] [patch 1] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n"
+        "[final] [binradar] [patch 1] [res rejected] "
+        "[reason same-crash] [iter 3]\n"
+        "[final] [binradar] [patch 2] [res verified] "
+        "[reason none] [iter -1]\n"
+        "[final] [binradar] [patch 3] [res rejected] "
+        "[reason same-crash] [iter 4]\n"
+        "[final] [binradar] [patch 4] [res verified] "
+        "[reason none] [iter -1]\n"
+        "[final] [binradar] [patch 5] [res rejected] "
+        "[reason same-crash] [iter 5]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run", top_patches=1)
+
+    run = result.runs[0]
+    assert run.verifier_candidate_count == 5
+    assert run.remaining_patches_count == 5
+    assert run.binradar_evidence_iterations == 17
+    assert run.binradar_rejected_count == 3
+    assert run.binradar_remaining_patches_count == 2
+    assert run.binradar_rejected == "1"
+
+    row = collector.format_results_csv([result])[0]
+    assert row["verifier_candidate_count"] == "5"
+    assert row["remaining_patches_count"] == "5"
+    assert row["binradar_evidence_iterations"] == "17"
+    assert row["binradar_rejected_count"] == "3"
+    assert row["binradar_remaining_patches_count"] == "2"
+    assert row["binradar_rejected_patches"] == "1"
+    log = collector.format_result_log(result)
+    assert "[verifier] candidates: 5  remaining: 5" in log
+    assert "[binradar] complete iterations: 17  rejected: 3  remaining: 2" in log
 
 
 def test_collect_taosc_counts_original_and_filtered_predicates(tmp_path):
