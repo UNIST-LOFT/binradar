@@ -26,6 +26,8 @@ _spec = importlib.util.spec_from_file_location(
 assert _spec is not None and _spec.loader is not None
 binradar = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar)
+import binradar_artifacts
+
 binradar_verifier = binradar.binradar_verifier
 
 
@@ -204,42 +206,34 @@ def test_cwe805_coverage_requires_only_the_used_stack_bytes(
 def test_artifact_selection_prefers_brcached_for_a_cached_only_survivor(
         tmp_path):
     """A lone survivor past the compile cap can only run on .brcached."""
-    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.workdir = str(tmp_path)
-    executor.binary = "bin"
-    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
-                       "BRCACHE_STACK_SIZE": "0"}
-    executor.brpatched_total_patches = 30
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin", "generic-erm", 0, 30)
     (tmp_path / "bin.brpatched").write_bytes(b"patched")
     (tmp_path / "bin.brcached").write_bytes(b"cached")
     _write_manifest(tmp_path, ["=p0p0"] * 31)
 
-    executor.filter_result = [31]
-    assert executor.cached_needed() is True
-    assert executor.verifier_binary() == str(tmp_path / "bin.brcached")
-    assert executor.binradar_binary() == str(tmp_path / "bin.brcached")
+    assert artifacts.requires_cache([31]) is True
+    assert artifacts.select_verifier([31]).path == str(
+        tmp_path / "bin.brcached")
+    assert artifacts.select_tracer([31]).path == str(
+        tmp_path / "bin.brcached")
 
     # A compiled survivor keeps the previous behaviour.
-    executor.filter_result = [5]
-    assert executor.cached_needed() is False
-    assert executor.verifier_binary() == str(tmp_path / "bin.brpatched")
+    assert artifacts.requires_cache([5]) is False
+    assert artifacts.select_verifier([5]).path == str(
+        tmp_path / "bin.brpatched")
 
 
 def test_artifact_selection_refuses_an_uncovered_survivor(tmp_path):
-    """Above-cap survivors without manifest coverage fall back to .brpatched
-    rather than selecting a cache that cannot serve them."""
-    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.workdir = str(tmp_path)
-    executor.binary = "bin"
-    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm",
-                       "BRCACHE_STACK_SIZE": "0"}
-    executor.brpatched_total_patches = 30
+    """Above-cap survivors without coverage fail before tracer startup."""
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin", "generic-erm", 0, 30)
     (tmp_path / "bin.brpatched").write_bytes(b"patched")
     (tmp_path / "bin.brcached").write_bytes(b"cached")
     _write_manifest(tmp_path, ["=p0p0"] * 30)
 
-    executor.filter_result = [31]
-    assert executor.binradar_binary() == str(tmp_path / "bin.brpatched")
+    with pytest.raises(binradar_artifacts.ArtifactUnavailableError):
+        artifacts.select_tracer([31])
 
 
 

@@ -8,8 +8,8 @@ propagation contracts land (Phases 1-2).
 P0-1: disjoint E9 trampoline/reserve maps are collapsed into one min..max
       envelope by fuzzolic/binradar-setup.py::extract_trampoline_info,
       excluding unmapped gaps (39.5 MiB for xmllint, 1.93 GiB for tiffcp).
-P0-2: BinRadarExecutor.get_env() never sets E9_RELOCATED_CALL_JUMPS for the
-      symbolic tracer modes, and the .orig memcheck run receives the
+P0-2: phase-environment construction must set E9_RELOCATED_CALL_JUMPS for the
+      selected symbolic tracer artifact, and the .orig memcheck run receives the
       patched binary's range values.
 
 The synthetic E9 binaries embed a minimal e9_config_s (the same layout
@@ -47,6 +47,7 @@ _spec2 = importlib.util.spec_from_file_location(
 assert _spec2 is not None and _spec2.loader is not None
 binradar = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(binradar)
+import binradar_artifacts
 
 PAGE = binradar_setup.PAGE_SIZE
 TRAMPOLINE = binradar_setup.E9MapType.TRAMPOLINE
@@ -381,7 +382,7 @@ def test_executor_retains_all_prefixed_metadata(tmp_path):
         "BRCACHED_E9_RELOCATED_CALL_JUMPS": "0x7c254091:0x4d60a5:0x4d60aa",
     }
     executor = binradar.BinRadarExecutor.from_env(str(tmp_path), env)
-    config = executor.extract_config()
+    config = executor._worker_environment()
     assert config["BRPATCHED_E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert config["BRPATCHED_E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
@@ -822,17 +823,23 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     executor.workdir = str(tmp_path)
     executor.outdir = str(tmp_path / "out")
     executor.timeout = 60
-    executor.forkserver_child_timeout = binradar.FORKSERVER_CHILD_TIMEOUT_DEFAULT
+    executor.forkserver_child_timeout = \
+        binradar.binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT
     executor.binary = "nm"
     executor.poc_input = "poc/nullderef"
     executor.test_cmd = "-l @@"
     executor.patch_loc = "0x4585dd"
-    executor.e9_metadata_prefix = e9_metadata_prefix
     executor.config = config if config is not None else {}
-    executor.e9_exclude_ranges, executor.e9_relocated_calls = \
-        binradar_utils.get_e9_metadata(executor.config, e9_metadata_prefix)
     executor.total_patches = 2
     executor.brpatched_total_patches = 2
+    executor.artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "nm", "", 0, 2)
+    artifact_path = (executor.artifacts.cached
+                     if e9_metadata_prefix == "brcached"
+                     else executor.artifacts.patched)
+    executor.test_artifact_selection = binradar_artifacts.ArtifactSelection(
+        artifact_path, e9_metadata_prefix,
+        e9_metadata_prefix == "brcached", False, "test selection")
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = False
@@ -846,6 +853,12 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     return executor
 
 
+def _phase_env(executor, mode, run_dir):
+    artifact = (executor.test_artifact_selection
+                if mode == "binradar" else None)
+    return executor._phase_environment(mode, str(run_dir), artifact)
+
+
 def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
     """Original producers get empty E9 metadata; BinRadar gets its pair."""
     config = {
@@ -854,10 +867,10 @@ def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
     }
     executor = _stub_executor(tmp_path, config=config)
     for mode in ("fuzzolic", "directed"):
-        env = executor.get_env(mode, str(tmp_path))
+        env = _phase_env(executor, mode, tmp_path)
         assert env["E9_RELOCATED_CALL_JUMPS"] == ""
         assert env["E9_EXCLUDE_RANGES"] == ""
-    env = executor.get_env("binradar", str(tmp_path))
+    env = _phase_env(executor, "binradar", tmp_path)
     assert env["E9_RELOCATED_CALL_JUMPS"] == RECORDS
     assert env["E9_EXCLUDE_RANGES"] == \
         "0x54b000-0x54c000,0x2cc7000-0x2cc9000"
@@ -882,8 +895,8 @@ def test_metadata_selection_is_artifact_scoped(tmp_path):
                                config=config)
     brcached = _stub_executor(tmp_path, e9_metadata_prefix="brcached",
                               config=config)
-    env_b = brpatched.get_env("binradar", str(tmp_path))
-    env_p = brcached.get_env("binradar", str(tmp_path))
+    env_b = _phase_env(brpatched, "binradar", tmp_path)
+    env_p = _phase_env(brcached, "binradar", tmp_path)
     assert env_b["E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env_b["E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
@@ -907,6 +920,14 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
             "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
             "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
         })
+    executor._worker_environment = lambda: {
+        **executor.config,
+        "BINARY": executor.binary,
+        "POC_INPUT": executor.poc_input,
+        "TEST_CMD": executor.test_cmd,
+        "PATCH_LOC": executor.patch_loc,
+        "TOTAL_PATCHES": str(executor.total_patches),
+    }
 
     captured = {}
 

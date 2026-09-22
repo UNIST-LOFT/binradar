@@ -18,6 +18,7 @@ assert _spec is not None
 assert _spec.loader is not None
 binradar = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar)
+import binradar_artifacts  # noqa: E402  (same fuzzolic module path)
 import binradar_utils  # noqa: E402  (same fuzzolic module path)
 
 
@@ -31,8 +32,22 @@ def _stub_executor(tmp_path):
     executor.probe_result = SimpleNamespace()
     executor.filter_result = [1, 2]
     executor.brpatched_total_patches = 2
+    executor.filter_total_patches = 2
+    executor.total_patches = 2
+    executor.workdir = str(tmp_path)
+    executor.outdir = str(tmp_path)
+    executor.timeout = 60
     executor.disable_binradar = True
     executor.feedback_mode = False
+    executor.invocation = "test"
+    executor.requested_candidate_scope = "top-30"
+    executor.candidate_scope_status = "top-30"
+    executor.candidate_scope_reason = "requested top-30"
+    executor.symbolic_mutation_mode = "off"
+    executor.fuzzy = False
+    executor.reverse_directed = False
+    executor.less_strict = False
+    executor.forkserver_child_timeout = 900
     executor.binradar_failed = False
     executor.wall_time_reached = False
     executor.phase_failures = {}
@@ -323,41 +338,37 @@ def test_final_confidence_rows_sorted_and_only_accepted_patches(tmp_path):
 
 
 def test_verifier_binary_uses_cached_artifact_for_multiple_patches(tmp_path):
-    executor = _stub_executor(tmp_path)
-    executor.workdir = str(tmp_path)
-    executor.binary = "imginfo"
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "imginfo", "generic-erm", 0, 2)
     (tmp_path / "imginfo.brpatched").write_bytes(b"patched")
     (tmp_path / "imginfo.brcached").write_bytes(b"cached")
 
-    executor.filter_result = [1, 2]
-    assert executor.verifier_binary() == str(tmp_path / "imginfo.brcached")
+    assert artifacts.select_verifier([1, 2]).path == str(
+        tmp_path / "imginfo.brcached")
+    assert artifacts.select_verifier([1]).path == str(
+        tmp_path / "imginfo.brpatched")
 
-    executor.filter_result = [1]
-    assert executor.verifier_binary() == str(tmp_path / "imginfo.brpatched")
-
-    executor.filter_result = [1, 2]
     (tmp_path / "imginfo.brcached").unlink()
-    assert executor.verifier_binary() == str(tmp_path / "imginfo.brpatched")
+    assert artifacts.select_verifier([1, 2]).path == str(
+        tmp_path / "imginfo.brpatched")
 
 
 def test_binradar_binary_requires_valid_manifest_and_active_ids(tmp_path):
-    executor = _stub_executor(tmp_path)
-    executor.workdir = str(tmp_path)
-    executor.binary = "imginfo"
-    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm"}
-    executor.filter_result = [1, 2]
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "imginfo", "generic-erm", 0, 2)
     (tmp_path / "imginfo.brpatched").write_bytes(b"patched")
     (tmp_path / "imginfo.brcached").write_bytes(b"cached")
 
     _write_generic_manifest(tmp_path, ["=p0p0", "=p1p0"])
-    assert executor.binradar_binary() == str(tmp_path / "imginfo.brcached")
+    assert artifacts.select_tracer([1, 2]).path == str(
+        tmp_path / "imginfo.brcached")
+    with pytest.raises(binradar_artifacts.ArtifactUnavailableError):
+        artifacts.select_tracer([1, 3])
 
-    executor.filter_result = [1, 3]
-    assert executor.binradar_binary() == str(tmp_path / "imginfo.brpatched")
-
-    executor.filter_result = [1, 2]
-    executor.config["BINRADAR_PATCH_KIND"] = "CWE805-erm"
-    assert executor.binradar_binary() == str(tmp_path / "imginfo.brpatched")
+    wrong_family = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "imginfo", "CWE805-erm", 0, 2)
+    assert wrong_family.select_tracer([1, 2]).path == str(
+        tmp_path / "imginfo.brpatched")
 
 
 def _write_generic_manifest(workdir, descriptors):

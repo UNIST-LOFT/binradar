@@ -612,16 +612,32 @@ def _stub_executor(tmp_path):
     executor.poc_input = "poc"
     executor.test_cmd = "-l @@"
     executor.patch_loc = "0x1000"
-    executor.e9_metadata_prefix = "brpatched"
-    executor.e9_exclude_ranges = ""
-    executor.e9_relocated_calls = ""
     executor.total_patches = 1
     executor.brpatched_total_patches = 1
+    executor.filter_total_patches = 1
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.disable_binradar = True
     executor.feedback_mode = False
+    executor.less_strict = False
+    executor.symbolic_mutation_mode = "off"
+    executor.forkserver_child_timeout = 900
+    executor.invocation = "test"
+    executor.requested_candidate_scope = "top-30"
+    executor.candidate_scope_status = "top-30"
+    executor.candidate_scope_reason = "requested top-30"
     executor.config = {}
+    executor.artifacts = binradar.binradar_artifacts.ArtifactSet(
+        str(tmp_path), "nm", "", 0, 1)
+    executor._worker_environment = lambda: {
+        "BINRADAR_OUTDIR": executor.outdir,
+        "BINRADAR_TIMEOUT": str(executor.timeout),
+        "BINARY": executor.binary,
+        "POC_INPUT": executor.poc_input,
+        "TEST_CMD": executor.test_cmd,
+        "PATCH_LOC": executor.patch_loc,
+        "TOTAL_PATCHES": str(executor.total_patches),
+    }
     executor.progress_filename = str(tmp_path / "out" / "progress.sbsv")
     executor.previous_progress = None
     executor.start_time = time.time()
@@ -662,7 +678,7 @@ def test_run_fuzzer_rejects_unexpected_exit(tmp_path, monkeypatch):
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
     executor.check_requirements = lambda: None
-    executor.extract_config = lambda: {}
+    executor._worker_environment = lambda: {}
     progress = []
     executor.save_progress = progress.append
     # pid must exist for the process-group registry (2**30 is not a live pid;
@@ -689,7 +705,7 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
     executor.check_requirements = lambda: None
-    executor.extract_config = lambda: {}
+    executor._worker_environment = lambda: {}
     progress = []
     executor.save_progress = progress.append
     process = SimpleNamespace(pid=2 ** 30)
@@ -751,7 +767,7 @@ def test_concolic_solver_deadline_is_graceful(
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
     executor.check_requirements = lambda: None
-    executor.get_env = lambda phase, run_dir: {}
+    executor._phase_environment = lambda phase, run_dir: {}
     progress = []
     executor.save_progress = progress.append
 
@@ -819,7 +835,7 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
     executor.check_requirements = lambda: None
-    executor.get_env = lambda phase, run_dir: {}
+    executor._phase_environment = lambda phase, run_dir: {}
     executor.save_progress = lambda row: None
 
     class FakeShm:

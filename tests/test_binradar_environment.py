@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 SPEC = importlib.util.spec_from_file_location(
@@ -14,6 +13,8 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError("failed to load fuzzolic/binradar.py")
 binradar = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar)
+import binradar_artifacts
+import binradar_config
 
 
 @pytest.fixture
@@ -23,11 +24,25 @@ def executor(tmp_path):
     instance.probe_result = SimpleNamespace(patch_func_hit_cnt=3)
     instance.timeout = 17
     instance.reverse_directed = False
-    instance.e9_exclude_ranges = "0x70000000-0x70001000"
-    instance.e9_relocated_calls = "0x70000010:0x401000:0x401005"
+    instance.config.update({
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x70000000-0x70001000",
+        "BRPATCHED_E9_RELOCATED_CALL_JUMPS":
+            "0x70000010:0x401000:0x401005",
+    })
     instance.forkserver_child_timeout = 900
     instance.filter_result = [1, 2]
+    instance.artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin", "", 0, 2)
     return instance, tmp_path
+
+
+def _phase_env(instance, mode, run_dir):
+    artifact = None
+    if mode == "binradar":
+        artifact = binradar_artifacts.ArtifactSelection(
+            instance.artifacts.patched, "brpatched", False, False,
+            "cached artifact not required")
+    return instance._phase_environment(mode, str(run_dir), artifact)
 
 
 @pytest.mark.parametrize(
@@ -37,12 +52,13 @@ def executor(tmp_path):
 def test_get_env_gates_osprey_by_mode(monkeypatch, executor, mode, expected_osprey):
     instance, run_dir = executor
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")
-    env = instance.get_env(mode, str(run_dir))
+    env = _phase_env(instance, mode, run_dir)
     assert env["BINRADAR_OSPREY_ENABLE"] == expected_osprey
     assert env["BINRADAR_TRACER_LOG_FILE"] == str(run_dir / f"{mode}-tracer-msg.log")
     if mode == "binradar":
-        assert env["E9_EXCLUDE_RANGES"] == instance.e9_exclude_ranges
-        assert env["E9_RELOCATED_CALL_JUMPS"] == instance.e9_relocated_calls
+        assert env["E9_EXCLUDE_RANGES"] == "0x70000000-0x70001000"
+        assert env["E9_RELOCATED_CALL_JUMPS"] == \
+            "0x70000010:0x401000:0x401005"
         assert env["BINRADAR_EVIDENCE_FILE"] == str(run_dir / "binradar.br")
     else:
         assert env["E9_EXCLUDE_RANGES"] == ""
@@ -51,7 +67,7 @@ def test_get_env_gates_osprey_by_mode(monkeypatch, executor, mode, expected_ospr
 
 def test_binradar_disables_trace_artifact(executor):
     instance, run_dir = executor
-    env = instance.get_env("binradar", str(run_dir))
+    env = _phase_env(instance, "binradar", run_dir)
     assert env["BINRADAR_TRACE_FILE"] == "none"
     assert not (run_dir / "binradar-tracer-trace.log").exists()
 
@@ -60,7 +76,7 @@ def test_non_binradar_modes_cannot_inherit_osprey(monkeypatch, executor):
     instance, run_dir = executor
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")
     for mode in ("fuzzolic", "directed"):
-        env = instance.get_env(mode, str(run_dir / mode))
+        env = _phase_env(instance, mode, run_dir / mode)
         assert env["BINRADAR_OSPREY_ENABLE"] == "0"
         assert env["BINRADAR_TRACE_FILE"] == "none"
 
@@ -69,7 +85,7 @@ def test_binradar_keeps_developer_dump_paths_output_only(monkeypatch, executor):
     monkeypatch.delenv("BINRADAR_OSPREY_DUMP_FILE", raising=False)
     monkeypatch.delenv("BINRADAR_OSPREY_GRAPH_DUMP_FILE", raising=False)
     instance, run_dir = executor
-    env = instance.get_env("binradar", str(run_dir))
+    env = _phase_env(instance, "binradar", run_dir)
     assert "BINRADAR_OSPREY_DUMP_FILE" not in env
     assert "BINRADAR_OSPREY_GRAPH_DUMP_FILE" not in env
     assert env["BINRADAR_TRACER_LOG_FILE"].endswith("binradar-tracer-msg.log")
@@ -92,7 +108,9 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     instance.run_prefix = "run"
     instance.run_id = 0
     instance.config = {}
-    instance.extract_config = dict
+    instance._worker_environment = dict
+    instance.artifacts = SimpleNamespace(
+        original=str(workdir / "target.orig"))
     instance.save_progress = lambda _row: None
 
     probe_result = SimpleNamespace(
@@ -140,12 +158,12 @@ def test_get_env_gates_symbolic_advisor_by_mode(monkeypatch, executor):
     instance, run_dir = executor
     monkeypatch.setenv("BINRADAR_SYMBOLIC_MUTATION_MODE", "boundary")
 
-    env = instance.get_env("binradar", str(run_dir))
+    env = _phase_env(instance, "binradar", run_dir)
     assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
 
     for index, mode in enumerate(
             ["fuzzolic", "directed", "probe", "minimizer", "verifier"]):
-        forced = instance.get_env(mode, str(run_dir / f"m{index}"))
+        forced = _phase_env(instance, mode, run_dir / f"m{index}")
         assert forced["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off", mode
 
 
@@ -156,9 +174,9 @@ def test_feedback_and_symbolic_advisor_are_independent(monkeypatch, executor):
     # Feedback on does not turn the advisor on, and the advisor being on does
     # not turn feedback on: each feature reads only its own configuration.
     instance.feedback_mode = True
-    feedback_on = instance.get_env("binradar", str(run_dir))
+    feedback_on = _phase_env(instance, "binradar", run_dir)
     instance.feedback_mode = False
-    feedback_off = instance.get_env("binradar", str(run_dir / "off"))
+    feedback_off = _phase_env(instance, "binradar", run_dir / "off")
 
     assert feedback_on["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
     assert feedback_off["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
@@ -171,7 +189,7 @@ def test_feedback_and_symbolic_advisor_are_independent(monkeypatch, executor):
 def test_symbolic_mode_defaults_off_without_environment(monkeypatch, executor):
     instance, run_dir = executor
     monkeypatch.delenv("BINRADAR_SYMBOLIC_MUTATION_MODE", raising=False)
-    env = instance.get_env("binradar", str(run_dir))
+    env = _phase_env(instance, "binradar", run_dir)
     assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off"
 
 
@@ -179,11 +197,12 @@ def test_config_overrides_inherited_symbolic_mode(monkeypatch, executor):
     instance, run_dir = executor
     monkeypatch.setenv("BINRADAR_SYMBOLIC_MUTATION_MODE", "shadow")
     instance.config["BINRADAR_SYMBOLIC_MUTATION_MODE"] = "boundary"
-    env = instance.get_env("binradar", str(run_dir))
+    env = _phase_env(instance, "binradar", run_dir)
     assert env["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "boundary"
 
 
 def test_symbolic_mode_rejects_unknown_value():
     with pytest.raises(ValueError):
-        binradar.validate_symbolic_mutation_mode("aggressive")
-    assert binradar.validate_symbolic_mutation_mode(" Boundary ") == "boundary"
+        binradar_config.validate_symbolic_mutation_mode("aggressive")
+    assert binradar_config.validate_symbolic_mutation_mode(
+        " Boundary ") == "boundary"
