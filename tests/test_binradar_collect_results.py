@@ -72,6 +72,7 @@ def test_collect_verifier_representative_runs(tmp_path):
         "[verifier-cache] [group] [representative 1] [members 3] [id 0]\n"
         "[verifier-cache] [miss] [patch 4] [id 0] [file first]\n"
         "[verifier-cache] [fallback] [patch 4] [id 0]\n"
+        "[testcase] [try] [patch 4] [id 0] / 2: [file first]\n"
         "[verifier-cache] [miss] [patch 1] [id 1] [file second]\n"
         "[verifier-cache] [group] [representative 1] [members 2] [id 1]\n")
 
@@ -99,6 +100,24 @@ def test_collect_verifier_representative_runs(tmp_path):
     assert csv_row["representative_saved_runs"] == "3"
     assert csv_row["representative_reduction_pct"] == "50.00"
     assert csv_row["representative_fallbacks"] == "1"
+
+
+def test_parse_individual_verifier_runs_as_representatives(tmp_path):
+    verifier_log = tmp_path / "verifier.log"
+    verifier_log.write_text(
+        "2026-09-22 01:53:41,426 - "
+        "[testcase] [try] [patch 1] [id 0] / 1: [file first]\n"
+        "[testcase] [try] [patch 1] [id 1] / 2: [file second]\n"
+        "[testcase] [try] [patch 1] [id 2] / 3: [file third]\n")
+
+    representatives = collector.parse_verifier_representative_stats(
+        str(verifier_log))
+
+    assert representatives.source == "verifier.log"
+    assert representatives.testcases == 3
+    assert representatives.runs == 3
+    assert representatives.represented_patch_runs == 3
+    assert representatives.fallbacks == 0
 
 
 def test_parse_filter_new_id_rows(tmp_path):

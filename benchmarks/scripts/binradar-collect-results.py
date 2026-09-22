@@ -56,7 +56,9 @@ Subcommands:
         statistics for the top --top patches ranked by confidence (from
         final.sbsv). Representative runs, represented patch runs, savings,
         testcase counts, and fallbacks come from <run>/verifier.log (or
-        legacy verifier.sbsv). Aggregate observation counters come from
+        legacy verifier.sbsv): cached runs use [verifier-cache] [miss], while
+        uncached single/direct families use [testcase] [try]. Aggregate
+        observation counters come from
         <run>/verifier.br (or legacy [verifier] [...] rows): pc
         (patch-crashed), csda (crash-skip-diff-addr), cf (crash-fail), cp
         (crash-pass), ct (crash-timeout), ncsda
@@ -574,6 +576,8 @@ _VERIFIER_CACHE_GROUP_RE = re.compile(
 _VERIFIER_CACHE_FALLBACK_RE = re.compile(
     r"^\[verifier-cache\] \[(?:fallback|runtime-mismatch)\] "
     r"\[patch (\d+)\] \[id (\d+)\]")
+_VERIFIER_TESTCASE_TRY_RE = re.compile(
+    r"^\[testcase\] \[try\] \[patch (\d+)\] \[id (\d+)\]")
 
 
 def parse_verifier_representative_stats(log_path: str) -> RepresentativeStats:
@@ -583,7 +587,9 @@ def parse_verifier_representative_stats(log_path: str) -> RepresentativeStats:
     A matching ``[group]`` row records the complete group size, including the
     representative; a miss without a group is a singleton. ``fallback`` and
     ``runtime-mismatch`` rows count representative attempts that required a
-    second, uncached execution.
+    second, uncached execution. When a verifier has no cache misses, each
+    ``[testcase] [try]`` is an individual representative run; this is the
+    normal path for single/direct patch families without a cache artifact.
 
     Compact ``verifier.br`` does not retain these cache events. Callers must
     therefore pass ``verifier.log`` or a legacy ``verifier.sbsv`` containing
@@ -593,11 +599,13 @@ def parse_verifier_representative_stats(log_path: str) -> RepresentativeStats:
         return RepresentativeStats()
 
     misses: List[Tuple[int, int]] = []
+    individual_runs: List[Tuple[int, int]] = []
     group_sizes: Dict[Tuple[int, int], int] = {}
     fallbacks = 0
     with open(log_path, "r") as f:
         for line in f:
-            if "[verifier-cache] [" not in line:
+            if ("[verifier-cache] [" not in line
+                    and "[testcase] [try]" not in line):
                 continue
             payload = _strip_log_prefix(line.strip())
             match = _VERIFIER_CACHE_MISS_RE.match(payload)
@@ -611,15 +619,23 @@ def parse_verifier_representative_stats(log_path: str) -> RepresentativeStats:
                 continue
             if _VERIFIER_CACHE_FALLBACK_RE.match(payload) is not None:
                 fallbacks += 1
+                continue
+            match = _VERIFIER_TESTCASE_TRY_RE.match(payload)
+            if match is not None:
+                individual_runs.append(
+                    (int(match.group(2)), int(match.group(1))))
 
-    testcases = {testcase for testcase, _ in misses}
-    represented_patch_runs = sum(group_sizes.get(key, 1) for key in misses)
+    runs = misses or individual_runs
+    testcases = {testcase for testcase, _ in runs}
+    represented_patch_runs = (
+        sum(group_sizes.get(key, 1) for key in misses)
+        if misses else len(individual_runs))
     return RepresentativeStats(
         source=os.path.basename(log_path),
         testcases=len(testcases),
-        runs=len(misses),
+        runs=len(runs),
         represented_patch_runs=represented_patch_runs,
-        fallbacks=fallbacks)
+        fallbacks=fallbacks if misses else 0)
 
 
 def parse_filter_sbsv(sbsv_path: str) -> Dict[int, bool]:
