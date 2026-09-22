@@ -1,9 +1,9 @@
-import subprocess
 import os
 import signal
+import subprocess
 import threading
 import time
-from typing import List, Set, Tuple, Dict, Optional, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import logger
 
@@ -135,7 +135,7 @@ def _sweep_session_group(process: subprocess.Popen) -> None:
         pass
 
 
-def execute_await(process: subprocess.Popen, timeout: float = 60.0, verbose: bool = False) -> ExecutionResult:
+def execute_await(process: subprocess.Popen, timeout: Optional[float] = 60.0, verbose: bool = False) -> ExecutionResult:
 
     if verbose:
         logger.debug(f"Awaiting process with PID {process.pid} for up to {timeout} seconds")

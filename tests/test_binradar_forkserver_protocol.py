@@ -1,4 +1,3 @@
-import importlib.util
 import os
 import select
 import stat
@@ -10,21 +9,15 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
-SPEC = importlib.util.spec_from_file_location(
-    "binradar_protocol", ROOT / "fuzzolic" / "binradar.py")
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("failed to load fuzzolic/binradar.py")
-binradar = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(binradar)
+import binradar_runtime
 
 
-def test_pipe_manager_keeps_cached_binary_records_off_patch_log():
+def test_transport_keeps_cached_binary_records_off_patch_log():
     env = {"BINRADAR_PATCH_CACHE_ENABLE": "1"}
-    pipes = binradar.PipeManager(env, "binradar")
-    pipes.setup_pipe()
+    pipes = binradar_runtime.ForkserverTransport(env, "binradar")
+    pipes.setup()
     try:
         assert env["PATCH_FD"] != env["PATCH_CACHED_FD"]
         os.write(int(env["PATCH_FD"]), b"[patch] [id 7] [br 1] [v 11]\n")
@@ -172,8 +165,8 @@ def make_executor(tmp_path, monkeypatch, fake_script, mode="check_unread", statu
     )
     if statuses is not None:
         env["FAKE_STATUSES"] = ";".join(",".join(str(x) for x in row) for row in statuses)
-    monkeypatch.setattr(binradar, "TRACER_BIN", str(fake_script))
-    executor = binradar.TracerExecutor(
+    monkeypatch.setattr(binradar_runtime, "TRACER_BIN", str(fake_script))
+    executor = binradar_runtime.TracerExecutor(
         "protocol",
         env,
         str(tmp_path),
@@ -181,7 +174,7 @@ def make_executor(tmp_path, monkeypatch, fake_script, mode="check_unread", statu
         "ignored",
         "",
         "ignored",
-        1,
+        binradar_runtime.Deadline.from_timeout(1),
     )
     executor.forkserver_init_timeout = 0.5
     executor.forkserver_timeout = 0.25
@@ -345,7 +338,7 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
     os.close(stat_w)
     try:
         banner = struct.unpack("<I", read_pipe(stat_r, 4))[0]
-        assert banner == binradar.HANDSHAKE_EXPECTED
+        assert banner == binradar_runtime.HANDSHAKE_EXPECTED
         old_word = 0x41464C01
         os.write(ctrl_w, struct.pack("<I", old_word ^ 0xFFFFFFFF))
         proc.wait(timeout=1)

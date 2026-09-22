@@ -1,45 +1,37 @@
 #!/usr/bin/python3 -u
 
 import argparse
-import ctypes
 import enum
 import fcntl
 import hashlib
 import os
 import queue
-import random
 import resource
-import select
 import shlex
 import shutil
 import signal
-import struct
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import binradar_artifacts
 import binradar_config
 import binradar_evidence
 import binradar_fuzzer
 import binradar_minimizer
+import binradar_runtime
 import binradar_utils
 import binradar_verifier
 import logger
 import sbsv
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-SOLVER_SMT_BIN = SCRIPT_DIR + "/../solver/build/solver-smt"
-SOLVER_FUZZY_BIN = SCRIPT_DIR + "/../solver/build/solver-fuzzy"
 TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
-SOLVER_WAIT_TIME_AT_STARTUP = 1 # s
-SOLVER_TIMEOUT = 10 # s
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 # Security boundary for --less-strict: only independent evidence producers
 # may fail open. Phases needed to establish or serialize a verdict are never
@@ -48,15 +40,7 @@ OPTIONAL_EVIDENCE_PHASES = frozenset({
     "fuzzolic", "directed", "fuzzer", "binradar", "feedback",
 })
 
-RUNNING_PROCESSES: List[subprocess.Popen] = []
-RUNNING_PROCESSES_LOCK = threading.Lock()
-# pid -> process group id, captured at spawn.
-RUNNING_PROCESS_PGIDS: Dict[int, int] = {}
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
-SHM_KEYS = ["EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY"]
-
-# Tracer forkserver protocol v3: one 12-byte logical-iteration summary.
-HANDSHAKE_EXPECTED = 0x41464C02
 
 
 def parse_bool(value):
@@ -123,543 +107,7 @@ def setlimits():
         resource.RLIMIT_AS, (MAX_VIRTUAL_MEMORY, MAX_VIRTUAL_MEMORY))
 
 
-def register_running_process(process: subprocess.Popen) -> int:
-    """Track ``process`` and return its spawn-time process-group id."""
-    pgid = binradar_utils.process_group_id(process)
-    with RUNNING_PROCESSES_LOCK:
-        RUNNING_PROCESSES.append(process)
-        RUNNING_PROCESS_PGIDS[process.pid] = pgid
-    return pgid
 
-
-def registered_process_pgid(process: subprocess.Popen) -> Optional[int]:
-    """Return the process-group id captured when ``process`` was registered."""
-    with RUNNING_PROCESSES_LOCK:
-        return RUNNING_PROCESS_PGIDS.get(process.pid)
-
-def unregister_running_process(process: subprocess.Popen):
-    with RUNNING_PROCESSES_LOCK:
-        if process in RUNNING_PROCESSES:
-            RUNNING_PROCESSES.remove(process)
-        RUNNING_PROCESS_PGIDS.pop(process.pid, None)
-
-def stop_running_processes():
-    with RUNNING_PROCESSES_LOCK:
-        processes = [(proc, RUNNING_PROCESS_PGIDS.get(proc.pid))
-                     for proc in RUNNING_PROCESSES]
-    for proc, pgid in processes:
-        # execute_await gives the leader a graceful shutdown window; when
-        # the leader is already dead it returns instantly without ever
-        # signaling the group, so always sweep the group captured at spawn.
-        binradar_utils.execute_await(proc, timeout=1)
-        if pgid is not None:
-            binradar_utils.kill_process_group(pgid, grace=1)
-        else:
-            logger.warning(
-                f"[CLEANUP] No registered process group for pid {proc.pid}")
-        unregister_running_process(proc)
-
-def handler(signo, stackframe):
-    del signo
-    del stackframe
-
-    print("[BINRADAR] Aborting... Wait for safe cleanup.")
-    stop_running_processes()
-    sys.exit(f"Aborted binradar with cleanup.")
-
-class SharedMemoryManager:
-    def __init__(self, env: Dict[str, str]):
-        self.env = env
-        self.libc = ctypes.CDLL("libc.so.6")
-        self.shm_keys = list()
-    
-    def assign_random_keys(self):
-        for key in SHM_KEYS:
-            shm_key = random.getrandbits(32)
-            self.env[key] = hex(shm_key)
-            self.shm_keys.append(shm_key)
-    
-    def assign_random_key_for_binradar(self):
-        shm_key = random.getrandbits(32)
-        self.env["BINRADAR_PATCH_SHM_KEY"] = hex(shm_key)
-        self.shm_keys.append(shm_key)
-    
-    def cleanup(self):
-        ipc_rmid = 0
-        for shm_key in self.shm_keys:
-            shm_id = self.libc.shmget(
-                ctypes.c_int(shm_key), ctypes.c_int(1), ctypes.c_int(0))
-            if shm_id != -1:
-                result = self.libc.shmctl(
-                    ctypes.c_int(shm_id),
-                    ctypes.c_int(ipc_rmid),
-                    ctypes.c_void_p(0))
-                logger.info(
-                    "Shared memory detach on (%s, %s): %s"
-                    % (shm_key, shm_id, result))
-
-
-class PipeManager:
-    def __init__(self, env: Dict[str, str], mode: str):
-        self.env = env
-        self.mode = mode
-        self.closed = False
-        self.cleanup_done = False
-        self.ctrl_r = 0
-        self.ctrl_w = 0
-        self.stat_r = 0
-        self.stat_w = 0
-        self.patch_fd_r = 0
-        self.patch_fd_w = 0
-        self.patch_cached_fd_r = 0
-        self.patch_cached_fd_w = 0
-
-    def setup_pipe(self):
-        result = list()
-        self.ctrl_r, self.ctrl_w = os.pipe()
-        self.stat_r, self.stat_w = os.pipe()
-        self.env["BINRADAR_FORKSERVER_CTRL_R"] = str(self.ctrl_r)
-        self.env["BINRADAR_FORKSERVER_STAT_W"] = str(self.stat_w)
-        if self.mode == "binradar":
-            self.patch_fd_r, self.patch_fd_w = os.pipe()
-            self.env["PATCH_FD"] = str(self.patch_fd_w)
-            self.env["BINRADAR_PATCH_FD_R"] = str(self.patch_fd_r)
-            if self.env.get("BINRADAR_PATCH_CACHE_ENABLE") == "1":
-                self.patch_cached_fd_r, self.patch_cached_fd_w = os.pipe()
-                self.env["PATCH_CACHED_FD"] = str(self.patch_cached_fd_w)
-                self.env["BINRADAR_PATCH_CACHED_FD_R"] = \
-                    str(self.patch_cached_fd_r)
-        return result
-
-    def get_pass_fds(self) -> List[int]:
-        pass_fds = [self.ctrl_r, self.stat_w]
-        if self.mode == "binradar":
-            pass_fds += [self.patch_fd_r, self.patch_fd_w]
-            if self.patch_cached_fd_r:
-                pass_fds += [self.patch_cached_fd_r,
-                             self.patch_cached_fd_w]
-        return pass_fds
-    
-    def close_passed_fds(self):
-        if self.closed:
-            return
-        for fd in self.get_pass_fds():
-            os.close(fd)
-        self.closed = True
-
-    def cleanup(self):
-        if self.cleanup_done:
-            return
-        if not self.closed:
-            self.close_passed_fds()
-        os.close(self.ctrl_w)
-        os.close(self.stat_r)
-        self.cleanup_done = True
-    
-    def get_ctrl_w(self) -> int:
-        return self.ctrl_w
-
-    def get_stat_r(self) -> int:
-        return self.stat_r
-
-class TracerExecutor:
-    forkserver_init_timeout: float = 1800.0
-    forkserver_timeout: float = 1800.0
-    forkserver_analyze_margin: float = 300.0
-    # Protocol failures must not spend a second long grace window in
-    # ``stop()`` after ``run()`` has already killed the registered group.
-    process_cleanup_grace: float = 0.2
-    process_cleanup_wait: float = 0.25
-    process_reap_timeout: float = 0.5
-    command: List[str]
-    mode: str
-    env: Dict[str, str]
-    workdir: str
-    rundir: str
-    process: Optional[subprocess.Popen]
-    timeout: float
-    # Forkserver
-    forkserver_mode: bool
-    pipe_manager: Optional[PipeManager]
-    iter: int
-    run_result: Optional[binradar_utils.ExecutionResult]
-    def __init__(self, mode: str, env: Dict[str, str], workdir: str, rundir: str, binary: str, test_cmd: str, testcase: str, timeout: float):
-        self.command = [TRACER_BIN, "-symbolic", "-d", "page", binary] + shlex.split(test_cmd.replace("@@", testcase))
-        self.mode = mode
-        self.env = env
-        self.workdir = workdir
-        self.rundir = rundir
-        self.timeout = timeout
-        self.deadline = (time.monotonic() + timeout if timeout > 0 else None)
-        self.process = None
-        self.pgid = None
-        self._process_cleanup_started = False
-        self._process_cleanup_done = False
-        self.forkserver_mode = self.env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
-        self.iter = 0
-        self.representative_runs = 0
-        self.run_result = None
-        self.pipe_manager = None
-
-    def remaining_phase_time(self, cap: Optional[float] = None) -> float:
-        """Return a positive wait bounded by this tracer phase's deadline."""
-        if self.deadline is None:
-            if cap is None:
-                return self.timeout
-            return cap
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"[TRACER] [{self.mode}] Phase deadline reached")
-        return remaining if cap is None else min(cap, remaining)
-
-    def phase_deadline_reached(self) -> bool:
-        return self.deadline is not None and time.monotonic() >= self.deadline
-    
-    def start(self):
-        """ 
-        Start the tracer process and set up forkserver communication if enabled. 
-        Should be called after SolverExecutor.start() - shared memory is set in solver process
-        """
-        self.start_time = time.time()
-        self._process_cleanup_started = False
-        self._process_cleanup_done = False
-        if not self.forkserver_mode:
-            self.process = subprocess.Popen(
-                self.command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd=self.workdir,
-                env=self.env,
-                start_new_session=True)
-            self.pgid = register_running_process(self.process)
-            logger.info(f"[TRACER] [{self.mode}] Started tracer without forkserver mode. {' '.join(self.command)}")
-            return
-
-        # Set up pipes for forkserver communication
-        self.pipe_manager = PipeManager(self.env, self.mode)
-        self.pipe_manager.setup_pipe()
-        pass_fds = self.pipe_manager.get_pass_fds()
-        
-        self.process = subprocess.Popen(
-            self.command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=self.workdir,
-            env=self.env,
-            pass_fds=pass_fds,
-            start_new_session=True)
-        
-        self.pgid = register_running_process(self.process)
-        self.pipe_manager.close_passed_fds()
-        
-        # Handshake with forkserver
-        logger.info(f"[TRACER] [{self.mode}] Started tracer {' '.join(self.command)}")
-        banner = self._read_u32(
-            self.remaining_phase_time(self.forkserver_init_timeout))
-        if banner != HANDSHAKE_EXPECTED:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
-        self._write_u32(HANDSHAKE_EXPECTED ^ 0xFFFFFFFF)
-        ack = self._read_u32(
-            self.remaining_phase_time(self.forkserver_timeout))
-        if ack != HANDSHAKE_EXPECTED:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
-        logger.info(f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
-        
-    def run(self) -> Tuple[int, bool, int]: # synchronous run, wait for target binary to finish
-        if self.process is None:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Tracer process not started")
-        start_time = time.time()
-        if not self.forkserver_mode:
-            self.run_result = binradar_utils.execute_await(
-                self.process, timeout=self.remaining_phase_time())
-            logger.info(f"[TRACER] [{self.mode}] Target process finished with exit code {self.run_result.decode_status()}, success {self.run_result.success}")
-            self.representative_runs = 1
-            return int((time.time() - start_time) * 1000), self.run_result.success, 0
-        is_timeout = False
-        try:
-            self._write_u32(0)  # was_killed - send run command to forkserver
-            iteration, representative_runs, remaining = self._read_status(
-                self.remaining_phase_time(self.forkserver_timeout))
-            self.iter = iteration
-            self.representative_runs = representative_runs
-            if representative_runs == 0:
-                raise RuntimeError(
-                    f"[TRACER] [{self.mode}] Forkserver returned an empty "
-                    f"iteration summary for iteration {iteration}")
-            if self.mode != "binradar":
-                logger.debug(
-                    f"[TRACER] [{self.mode}] Logical iteration {iteration} "
-                    f"finished after {representative_runs} child run(s); "
-                    f"remaining {remaining}")
-        except Exception as e:
-            is_timeout = True
-            logger.error(f"[TRACER] [{self.mode}] Error while waiting for tracer forkserver: {str(e)}")
-            if self.process.poll() is not None:
-                logger.error(f"[TRACER] [{self.mode}] Tracer process exited with code {self.process.returncode}")
-            else:
-                logger.error(f"[TRACER] [{self.mode}] Tracer process is still running - killing its process group to stop it and any in-flight forkserver child")
-            # Keep SIGINT first so a forkserver parent can unwind gracefully,
-            # but use a short, single grace window.  kill_process_group then
-            # sends SIGKILL to every remaining member of the registered group.
-            self._cleanup_process_group(grace=self.process_cleanup_grace)
-            raise e
-        return int((time.time() - start_time) * 1000), (not is_timeout), remaining
-
-    def _cleanup_process_group(self, grace: float,
-                               wait_before_signal: float = 0.0) -> None:
-        """Kill and reap this tracer's registered process group once.
-
-        ``kill_process_group`` deliberately waits for its grace interval even
-        when SIGINT has made the leader a zombie.  Reap the leader promptly
-        and record completion so an exception handler followed by ``stop()``
-        cannot pay that grace interval a second time.
-        """
-        if self.process is None or self._process_cleanup_done:
-            return
-        process = self.process
-        if self.pgid is None:
-            self.pgid = registered_process_pgid(process)
-        # A second caller (normally stop() after a run() exception) must not
-        # open another grace window.  It retries the captured group with an
-        # immediate SIGKILL instead.
-        retry = self._process_cleanup_started
-        self._process_cleanup_started = True
-        if not retry and wait_before_signal and process.poll() is None:
-            try:
-                process.wait(timeout=wait_before_signal)
-            except subprocess.TimeoutExpired:
-                pass
-        if self.pgid is not None:
-            binradar_utils.kill_process_group(
-                self.pgid,
-                grace=0 if retry else grace,
-                first_signal=signal.SIGKILL if retry else signal.SIGINT)
-        else:
-            logger.warning(
-                f"[TRACER] [{self.mode}] No registered process group "
-                f"for pid {process.pid}")
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        try:
-            process.wait(timeout=self.process_reap_timeout)
-        except subprocess.TimeoutExpired:
-            # The group kill should already have sent SIGKILL.  Retry the
-            # whole registered group, rather than falling back to leader-only
-            # killing, before the final bounded reap attempt.
-            if self.pgid is not None:
-                binradar_utils.kill_process_group(
-                    self.pgid, grace=0, first_signal=signal.SIGKILL)
-            else:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            try:
-                process.wait(timeout=self.process_reap_timeout)
-            except subprocess.TimeoutExpired:
-                logger.error(
-                    f"[TRACER] [{self.mode}] Tracer did not reap after "
-                    "process-group SIGKILL")
-        if process.poll() is None:
-            # Do not unregister or discard a handle for a process that failed
-            # to reap; a later global cleanup pass must retain its pgid.
-            return
-        self._process_cleanup_done = True
-        unregister_running_process(process)
-
-    def stop(self):
-        if self.pipe_manager is not None:
-            self.pipe_manager.cleanup()
-        if self.process is not None:
-            logger.info(f"[TRACER] [{self.mode}] Stopping tracer process...")
-            # Let a cooperative peer observe the closed control pipe briefly;
-            # a stalled peer then takes the same single bounded group-kill
-            # path as protocol errors.
-            self._cleanup_process_group(
-                grace=self.process_cleanup_grace,
-                wait_before_signal=self.process_cleanup_wait)
-            if self._process_cleanup_done:
-                unregister_running_process(self.process)
-                self.process = None
-
-    def _write_u32(self, value: int):
-        self._write(struct.pack("<I", value))
-    
-    def _write(self, data: bytes):
-        if self.pipe_manager is None:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
-        total_written = 0
-        while total_written < len(data):
-            try:
-                written = os.write(self.pipe_manager.get_ctrl_w(), data[total_written:])
-                total_written += written
-            except BrokenPipeError:
-                raise RuntimeError(f"[TRACER] [{self.mode}] Tracer forkserver pipe is broken")
-            except BlockingIOError:
-                continue
-    
-    def _read_u32(self, timeout: float) -> int:
-        data = self._read(4, timeout)
-        return struct.unpack("<I", data)[0]
-    
-    def _read_status(self, timeout: float) -> Tuple[int, int, int]:
-        data = self._read(12, timeout)
-        return struct.unpack("<III", data)
-    
-    def _read(self, size: int, timeout: Optional[float] = None) -> bytes:
-        if self.pipe_manager is None:
-            raise RuntimeError(f"[TRACER] [{self.mode}] Pipe manager not initialized")
-        fd = self.pipe_manager.get_stat_r()
-        deadline = None if timeout is None else time.monotonic() + timeout
-        data = bytearray()
-        while len(data) < size:
-            wait = None
-            if deadline is not None:
-                wait = deadline - time.monotonic()
-                if wait <= 0:
-                    raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
-            try:
-                rlist, _, _ = select.select([fd], [], [], wait)
-            except InterruptedError:
-                continue
-            if not rlist:
-                raise TimeoutError(f"[TRACER] [{self.mode}] Timeout while waiting for forkserver response")
-            try:
-                chunk = os.read(fd, size - len(data))
-            except InterruptedError:
-                continue
-            if not chunk:
-                raise EOFError(f"[TRACER] [{self.mode}] EOF while reading from forkserver")
-            data.extend(chunk)
-        return bytes(data)
-
-class SolverExecutor:
-    mode: str
-    command: List[str]
-    out_dir: str
-    env: Dict[str, str]
-    workdir: str
-    rundir: str
-    log_fp: BinaryIO
-    process: Optional[subprocess.Popen]
-    timeout: float
-    run_result: Optional[binradar_utils.ExecutionResult]
-    timed_out: bool
-    def __init__(self, mode: str, testcase: str, run_dir: str, env: Dict[str, str], workdir: str, timeout: float, fuzzy: bool = False, reverse_directed: bool = False):
-        self.mode = mode
-        global_bitmap = os.path.join(run_dir, f"{mode}-branch-bitmap")
-        context_bitmap = os.path.join(run_dir, f"{mode}-context-bitmap")
-        memory_bitmap = os.path.join(run_dir, f"{mode}-memory-bitmap")
-        self.out_dir = os.path.join(run_dir, f"{mode}-tests")
-        os.makedirs(self.out_dir, exist_ok=True)
-        for bitmap in [global_bitmap, context_bitmap, memory_bitmap]:
-            with open(bitmap, "w") as f:
-                pass
-        # Reverse-directed solving currently uses the Z3 bounded-prefix path.
-        # Keep --fuzzy available for the other phases until fuzzy parity exists.
-        solver_bin = SOLVER_SMT_BIN if reverse_directed else (SOLVER_FUZZY_BIN if fuzzy else SOLVER_SMT_BIN)
-        self.command = ["stdbuf", "-o0", solver_bin,
-                        "-i", testcase, 
-                        "-o", self.out_dir, 
-                        "-b", global_bitmap,
-                        "-c", context_bitmap,
-                        "-m", memory_bitmap]
-        self.env = env
-        self.workdir = workdir
-        self.rundir = run_dir
-        self.timeout = timeout
-        log_file = os.path.join(run_dir, f"{mode}-solver.log")
-        self.log_fp = open(log_file, "wb")
-        self.process = None
-        self.pgid = None
-        self.run_result = None
-        self.timed_out = False
-    
-    def start(self):
-        logger.info(f"[SOLVER] [{self.mode}] Starting solver with command: {' '.join(self.command)}")
-        logger.debug(f"[SOLVER] [{self.mode}] timeout set to {self.timeout} seconds")
-        self.process = subprocess.Popen(
-            self.command,
-            stdout=self.log_fp,
-            stderr=subprocess.STDOUT,
-            cwd=self.rundir,
-            env=self.env,
-            start_new_session=True)
-        self.pgid = register_running_process(self.process)
-        # Give the solver some time to start up and create shared memories
-        time.sleep(SOLVER_WAIT_TIME_AT_STARTUP)
-    
-    def create_inputs(self):
-        if self.process is None:
-            raise RuntimeError(f"[SOLVER] [{self.mode}] Solver process not started")
-        logger.info(f"[SOLVER] [{self.mode}] Sending signal to create inputs...")
-        self.process.send_signal(signal.SIGUSR1)
-    
-    def wait(self) -> Tuple[int, bool]:
-        if self.process is None:
-            raise RuntimeError(f"[SOLVER] [{self.mode}] Solver process not started - cannot wait")
-        start_time = time.monotonic()
-        deadline = (start_time + self.timeout
-                    if self.timeout > 0 else None)
-        self.timed_out = False
-        while True:
-            wait_timeout = SOLVER_TIMEOUT
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.timed_out = True
-                    break
-                wait_timeout = min(wait_timeout, remaining)
-            try:
-                self.process.wait(wait_timeout)
-                break
-            except subprocess.TimeoutExpired:
-                if deadline is not None and time.monotonic() >= deadline:
-                    self.timed_out = True
-                    break
-        if self.timed_out:
-            logger.info(f"[SOLVER] [{self.mode}] Solver reached its phase deadline. Let us stop it.")
-            self.process.send_signal(signal.SIGUSR2)
-            try:
-                self.process.wait(SOLVER_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                logger.info(f"[SOLVER] [{self.mode}] Solver will be killed.")
-                binradar_utils.execute_await(self.process, timeout=1)
-                if self.pgid is None:
-                    self.pgid = registered_process_pgid(self.process)
-                if self.pgid is not None:
-                    binradar_utils.kill_process_group(self.pgid, grace=1)
-                else:
-                    logger.warning(
-                        f"[SOLVER] [{self.mode}] No registered process "
-                        f"group for pid {self.process.pid}")
-        succeeded = (not self.timed_out and self.process.returncode == 0)
-        return int((time.monotonic() - start_time) * 1000), succeeded
-
-    def stop(self):
-        if self.process:
-            logger.info(f"[SOLVER] [{self.mode}] Stopping solver process...")
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-            if self.pgid is None:
-                self.pgid = registered_process_pgid(self.process)
-            if self.pgid is not None:
-                binradar_utils.kill_process_group(self.pgid, grace=1)
-            else:
-                logger.warning(
-                    f"[SOLVER] [{self.mode}] No registered process group "
-                    f"for pid {self.process.pid}")
-            unregister_running_process(self.process)
-            self.process = None
-        if not self.log_fp.closed:
-            self.log_fp.close()
 
 class BinRadarProgress:
     run_id: int
@@ -829,7 +277,6 @@ class BinRadarExecutor:
         self.patch_loc = config.patch_loc
         self.filter_result = list(range(1, config.total_patches + 1))
 
-        self.libc = ctypes.CDLL("libc.so.6")
         os.makedirs(self.outdir, exist_ok=True)
         self.progress_filename = os.path.join(self.outdir, "progress.sbsv")
         self.previous_progress = None
@@ -941,31 +388,15 @@ class BinRadarExecutor:
                 f"[{phase}] [wall-time-reached] [prefix {self.run_prefix}] "
                 f"[id {self.run_id}]")
 
-    def phase_deadline(self, factor: float = 1.0) -> Optional[float]:
-        """Return an absolute monotonic deadline for a phase."""
-        if self.timeout <= 0:
-            return None
-        return time.monotonic() + self.timeout * factor
+    def phase_deadline(
+            self, factor: float = 1.0) -> binradar_runtime.Deadline:
+        """Create the single absolute monotonic deadline for a phase."""
+        return binradar_runtime.Deadline.from_timeout(self.timeout, factor)
 
     @staticmethod
-    def remaining_phase_time(deadline: Optional[float]) -> Optional[float]:
-        """Return the non-negative time left before ``deadline``."""
-        if deadline is None:
-            return None
-        return max(0.0, deadline - time.monotonic())
-
     def remaining_concrete_timeout(
-            self, deadline: Optional[float]) -> Optional[float]:
-        """Return a concrete-worker timeout without turning expiry into off.
-
-        Concrete workers interpret non-positive values as "deadline disabled".
-        Once an orchestrator deadline has expired, pass the smallest positive
-        float so the worker takes its normal graceful-cutoff path immediately.
-        """
-        remaining = self.remaining_phase_time(deadline)
-        if remaining is None or remaining > 0:
-            return remaining
-        return sys.float_info.min
+            deadline: binradar_runtime.Deadline) -> Optional[float]:
+        return deadline.worker_timeout()
 
     def minimizer_verifier_timeout(self) -> Optional[float]:
         """Wall-clock budget for each minimizer/verifier phase.
@@ -1105,8 +536,8 @@ class BinRadarExecutor:
                 e9_exclude_ranges=exclude_ranges,
                 e9_relocated_calls=relocated_calls,
             ),
-            forkserver_read_timeout=TracerExecutor.forkserver_timeout,
-            forkserver_analyze_margin=TracerExecutor.forkserver_analyze_margin,
+            forkserver_read_timeout=binradar_runtime.TracerExecutor.forkserver_timeout,
+            forkserver_analyze_margin=binradar_runtime.TracerExecutor.forkserver_analyze_margin,
         )
     
     def run_probe(self):
@@ -1223,69 +654,56 @@ class BinRadarExecutor:
         self.save_progress(
             f"[{exec_mode}] [start] [prefix {self.run_prefix}] "
             f"[id {self.run_id}]")
-        deadline = self.phase_deadline()
-
-        phase_env = self._phase_environment(exec_mode, self.run_dir)
-        shm = SharedMemoryManager(phase_env)
-        shm.assign_random_keys()
-        initial_timeout = self.remaining_phase_time(deadline)
-        if initial_timeout is None:
-            initial_timeout = self.timeout
-        solver = SolverExecutor(
-            exec_mode, testcase, self.run_dir, phase_env, self.workdir,
-            timeout=initial_timeout, fuzzy=self.fuzzy,
-            reverse_directed=(self.reverse_directed
-                              if exec_mode == "directed" else False))
-        tracer = TracerExecutor(
-            exec_mode, phase_env, self.workdir, self.run_dir,
-            self.artifacts.original, self.test_cmd, testcase,
-            timeout=initial_timeout)
         timed_out = False
+        phase_env = self._phase_environment(exec_mode, self.run_dir)
+        session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
 
         try:
-            solver.start()
-            if deadline is not None and self.remaining_phase_time(deadline) == 0:
-                timed_out = True
-            else:
-                tracer.start()
-                tracer_time, tracer_success, _ = tracer.run()
-                self.save_progress(
-                    f"[{exec_mode}] [tracer] [prefix {self.run_prefix}] "
-                    f"[id {self.run_id}] [tracer-time {tracer_time}] "
-                    f"[tracer-success {tracer_success}]")
-                if not tracer_success:
-                    if (tracer.run_result is not None
-                            and tracer.run_result.timed_out):
-                        timed_out = True
-                    else:
-                        raise RuntimeError(f"{phase_name} tracer failed")
-            if not timed_out:
-                remaining = self.remaining_phase_time(deadline)
-                if remaining is not None and remaining == 0:
+            with session:
+                session.shared_memory(phase_env)
+                solver = session.start_solver(
+                    mode=exec_mode, testcase=testcase, run_dir=self.run_dir,
+                    env=phase_env, workdir=self.workdir, fuzzy=self.fuzzy,
+                    reverse_directed=(self.reverse_directed
+                                      if exec_mode == "directed" else False))
+                if session.deadline.expired():
                     timed_out = True
                 else:
-                    solver.create_inputs()
-                    if remaining is not None:
-                        solver.timeout = remaining
-                    solver_time, solver_success = solver.wait()
+                    tracer = session.start_tracer(
+                        mode=exec_mode, env=phase_env, workdir=self.workdir,
+                        rundir=self.run_dir, binary=self.artifacts.original,
+                        test_cmd=self.test_cmd, testcase=testcase)
+                    tracer_time, tracer_success, _ = tracer.run()
                     self.save_progress(
-                        f"[{exec_mode}] [solver] "
-                        f"[prefix {self.run_prefix}] [id {self.run_id}] "
-                        f"[solver-time {solver_time}] "
-                        f"[solver-success {solver_success}]")
-                    if not solver_success:
-                        if (solver.timed_out
-                                or (deadline is not None
-                                    and self.remaining_phase_time(deadline) == 0)):
+                        f"[{exec_mode}] [tracer] [prefix {self.run_prefix}] "
+                        f"[id {self.run_id}] [tracer-time {tracer_time}] "
+                        f"[tracer-success {tracer_success}]")
+                    if not tracer_success:
+                        if (tracer.run_result is not None
+                                and tracer.run_result.timed_out):
                             timed_out = True
                         else:
-                            raise RuntimeError(
-                                f"{phase_name} solver exited with status "
-                                f"{solver.process.returncode if solver.process else 'unknown'}")
+                            raise RuntimeError(f"{phase_name} tracer failed")
+                if not timed_out:
+                    if session.deadline.expired():
+                        timed_out = True
+                    else:
+                        solver.create_inputs()
+                        solver_time, solver_success = solver.wait()
+                        self.save_progress(
+                            f"[{exec_mode}] [solver] "
+                            f"[prefix {self.run_prefix}] [id {self.run_id}] "
+                            f"[solver-time {solver_time}] "
+                            f"[solver-success {solver_success}]")
+                        if not solver_success:
+                            if solver.timed_out or session.deadline.expired():
+                                timed_out = True
+                            else:
+                                raise RuntimeError(
+                                    f"{phase_name} solver exited with status "
+                                    f"{solver.process.returncode if solver.process else 'unknown'}")
         except TimeoutError as exc:
-            if (tracer.phase_deadline_reached()
-                    or (deadline is not None
-                        and self.remaining_phase_time(deadline) == 0)):
+            if session.deadline.expired():
                 timed_out = True
             else:
                 logger.error(
@@ -1294,10 +712,6 @@ class BinRadarExecutor:
         except Exception as exc:
             logger.error(f"Error during {exec_mode} execution: {str(exc)}")
             raise
-        finally:
-            tracer.stop()
-            solver.stop()
-            shm.cleanup()
 
         if timed_out:
             logger.info(
@@ -1335,7 +749,7 @@ class BinRadarExecutor:
         self.check_requirements()
         exec_mode = "fuzzer"
         self.save_progress(f"[fuzzer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        deadline = self.phase_deadline()
+        session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
         config = self._worker_environment()
         fuzzer_outdir = self.fuzzer_outdir()
         if not getattr(self, "_fuzzer_output_prepared", False):
@@ -1343,16 +757,12 @@ class BinRadarExecutor:
         self._fuzzer_output_prepared = False
         fuzzer = binradar_fuzzer.AFLppFuzzer.from_env(
             self.workdir, fuzzer_outdir, config)
-        fuzzer.start()
-        if fuzzer.process is None:
-            raise RuntimeError("Failed to start fuzzer process")
-        register_running_process(fuzzer.process)
-        try:
-            remaining = self.remaining_phase_time(deadline)
-            result = fuzzer.wait(
-                timeout=self.timeout if remaining is None else remaining)
-        finally:
-            unregister_running_process(fuzzer.process)
+        with session:
+            fuzzer.start()
+            if fuzzer.process is None:
+                raise RuntimeError("Failed to start fuzzer process")
+            session.track_process(fuzzer.process)
+            result = fuzzer.wait(timeout=session.deadline.remaining())
         if result is None:
             raise RuntimeError("Fuzzer process was not started")
         if result.timed_out:
@@ -1521,42 +931,57 @@ class BinRadarExecutor:
                     "the selected artifact has no snapshot channel")
             binradar_env.pop("BINRADAR_PATCH_CACHE_ENABLE", None)
             binradar_env.pop("BINRADAR_PATCH_MANIFEST", None)
-        shm = SharedMemoryManager(binradar_env)
-        shm.assign_random_keys()
-        shm.assign_random_key_for_binradar()
-        
-        solver = SolverExecutor(exec_mode, testcase, self.run_dir, binradar_env, self.workdir, timeout=self.timeout, fuzzy=self.fuzzy)
-        tracer = TracerExecutor(exec_mode, binradar_env, self.workdir, self.run_dir, tracer_binary, self.test_cmd, testcase, timeout=self.timeout)
-        
+        session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
+        timed_out = False
         try:
-            solver.start()
-            tracer.start()
-            remaining = 1
-            while remaining > 0:
-                if time.time() - self.start_time > self.timeout:
-                    logger.info(f"[BINRADAR] [id {self.run_id}] Timeout reached. Stopping binradar execution.")
-                    break
-                tracer_time, tracer_success, remaining = tracer.run()
-                message = (f"[binradar] [tracer] [iter {tracer.iter}] "
-                           f"[representative-runs "
-                           f"{tracer.representative_runs}] "
-                           f"[time {tracer_time}] [remaining {remaining}]")
-                if tracer_success:
-                    logger.debug(message)
+            with session:
+                session.shared_memory(binradar_env, include_patch_key=True)
+                session.start_solver(
+                    mode=exec_mode, testcase=testcase, run_dir=self.run_dir,
+                    env=binradar_env, workdir=self.workdir, fuzzy=self.fuzzy)
+                if session.deadline.expired():
+                    timed_out = True
                 else:
-                    logger.warning(message + " [failed true]")
-            # TODO: currently, we don't utilize collected constraints
-            tracer.stop()
-            solver.stop()
-        except Exception as e:
-            logger.error(f"Error during binradar execution: {str(e)}")
-            tracer.stop()
-            solver.stop()
-            raise e
-        finally:
-            shm.cleanup()
+                    tracer = session.start_tracer(
+                        mode=exec_mode, env=binradar_env,
+                        workdir=self.workdir, rundir=self.run_dir,
+                        binary=tracer_binary, test_cmd=self.test_cmd,
+                        testcase=testcase)
+                    remaining = 1
+                    while remaining > 0:
+                        if session.deadline.expired():
+                            timed_out = True
+                            break
+                        tracer_time, tracer_success, remaining = tracer.run()
+                        message = (
+                            f"[binradar] [tracer] [iter {tracer.iter}] "
+                            f"[representative-runs "
+                            f"{tracer.representative_runs}] "
+                            f"[time {tracer_time}] [remaining {remaining}]")
+                        if tracer_success:
+                            logger.debug(message)
+                        else:
+                            logger.warning(message + " [failed true]")
+        except TimeoutError as exc:
+            if session.deadline.expired():
+                timed_out = True
+            else:
+                logger.error(f"Error during binradar execution: {exc}")
+                raise
+        except Exception as exc:
+            logger.error(f"Error during binradar execution: {exc}")
+            raise
 
-        self.save_progress(f"[binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+        if timed_out:
+            logger.info(
+                f"[BINRADAR] [id {self.run_id}] Phase deadline reached; "
+                "stopping binradar execution.")
+            self.save_progress(
+                f"[binradar] [{binradar_utils.WALL_TIME_REACHED}] "
+                f"[prefix {self.run_prefix}] [id {self.run_id}]")
+        self.save_progress(
+            f"[binradar] [done] [prefix {self.run_prefix}] "
+            f"[id {self.run_id}]")
     
     def run_feedback(self):
         # Generate feedback for taosc
@@ -2025,7 +1450,7 @@ class BinRadarExecutor:
             # A producer, the minimizer, or the verifier failed. Stop external
             # processes and wait for every producer wrapper before surfacing
             # the authoritative exception.
-            stop_running_processes()
+            binradar_runtime.PROCESS_REGISTRY.stop_all()
             for thread in producer_threads:
                 thread.join(timeout=60)
             raise
@@ -2034,7 +1459,7 @@ class BinRadarExecutor:
             thread.join()
         if not thread_errors.empty():
             _, exc, tb = thread_errors.get()
-            stop_running_processes()
+            binradar_runtime.PROCESS_REGISTRY.stop_all()
             if tb is not None:
                 raise exc.with_traceback(tb)
             raise exc
@@ -2189,7 +1614,7 @@ class BinRadarExecutor:
             if thread_errors.empty():
                 return
             _, exc, tb = thread_errors.get()
-            stop_running_processes()
+            binradar_runtime.PROCESS_REGISTRY.stop_all()
             if wait_for_binradar and binradar_thread is not None:
                 binradar_thread.join()
             if tb is not None:
@@ -2221,7 +1646,7 @@ class BinRadarExecutor:
         except BaseException:
             # A producer, the minimizer, or the verifier failed: stop the
             # remaining phases before surfacing the error.
-            stop_running_processes()
+            binradar_runtime.PROCESS_REGISTRY.stop_all()
             for thread in threads_concrete:
                 thread.join(timeout=60)
             if binradar_thread is not None:
@@ -2236,7 +1661,7 @@ class BinRadarExecutor:
             binradar_thread.join(timeout=60)
             if binradar_thread.is_alive():
                 logger.error("[BINRADAR] binradar thread did not finish within 60s after minimizer/verifier - stopping remaining processes")
-                stop_running_processes()
+                binradar_runtime.PROCESS_REGISTRY.stop_all()
                 binradar_thread.join(timeout=10)
         raise_thread_error_if_any()
         if self.feedback_mode:
@@ -2247,8 +1672,8 @@ class BinRadarExecutor:
     
 def main():
     setlimits()
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, binradar_runtime.abort_handler)
+    signal.signal(signal.SIGTERM, binradar_runtime.abort_handler)
 
     parser = argparse.ArgumentParser(
         description="binradar: a binary patch verification tool")

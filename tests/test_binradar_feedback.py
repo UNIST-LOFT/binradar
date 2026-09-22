@@ -29,6 +29,8 @@ def _feedback_executor(tmp_path):
     executor.workdir = str(workdir)
     executor.run_dir = str(run_dir)
     executor.binary = "target"
+    executor.artifacts = SimpleNamespace(
+        original=str(workdir / "target.orig"))
     executor.poc_input = "poc/input"
     executor.probe_result = SimpleNamespace(fault_addr=0x1234)
     executor.run_prefix = "run"

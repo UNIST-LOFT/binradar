@@ -4,8 +4,8 @@
 The tracer parent waits for a hung forkserver child up to
 BINRADAR_FORKSERVER_CHILD_TIMEOUT.  That value used to be the whole-run
 budget (21600 s) while python's forkserver read timeout is a fixed
-1800 s, so any hung child failed the phase at exactly 1800 s.  get_env
-must now set the child cap well below the python read timeout, and a
+1800 s, so any hung child failed the phase at exactly 1800 s. Phase environment
+construction must set the child cap well below the python read timeout, and a
 misconfigured cap must fail the startup invariant instead of silently
 exceeding the read timeout.
 """
@@ -27,6 +27,7 @@ binradar = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar)
 import binradar_artifacts
 import binradar_config
+import binradar_runtime
 
 
 def _executor(
@@ -58,11 +59,11 @@ def test_binradar_env_child_timeout_is_capped_below_read_timeout(tmp_path):
     env = _phase_env(executor, "binradar", tmp_path)
     child_timeout = int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"])
     assert child_timeout == binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT
-    assert child_timeout < binradar.TracerExecutor.forkserver_timeout
+    assert child_timeout < binradar_runtime.TracerExecutor.forkserver_timeout
     # Invariant from the F1 plan: child cap + analyze margin stays below
     # python's forkserver read timeout.
-    assert (child_timeout + binradar.TracerExecutor.forkserver_analyze_margin
-            < binradar.TracerExecutor.forkserver_timeout)
+    assert (child_timeout + binradar_runtime.TracerExecutor.forkserver_analyze_margin
+            < binradar_runtime.TracerExecutor.forkserver_timeout)
 
 
 def test_directed_env_gets_the_same_cap(tmp_path):

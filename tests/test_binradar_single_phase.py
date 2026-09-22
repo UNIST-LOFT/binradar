@@ -14,6 +14,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
+import binradar_artifacts
+import binradar_config
 import binradar_verifier
 
 _spec = importlib.util.spec_from_file_location(
@@ -106,23 +108,48 @@ def _make_workdir(tmp_path):
 
 
 def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
+    run_config = binradar_config.RunConfig.from_environment(str(workdir), {
+        "BINRADAR_OUTDIR": str(workdir / "out"),
+        "BINRADAR_TIMEOUT": "60",
+        "BINARY": "nm",
+        "POC_INPUT": "poc/x",
+        "TEST_CMD": "-l @@",
+        "PATCH_LOC": "0x1000",
+        "TOTAL_PATCHES": "2",
+        "BRPATCHED_TOTAL_PATCHES": "2",
+        "FILTER_TOTAL_PATCHES": "2",
+        "BINRADAR_INVOCATION": "test",
+        "BINRADAR_TARGET_PATCHES": "top-30",
+        "BINRADAR_TARGET_PATCHES_STATUS": "top-30",
+        "BINRADAR_TARGET_PATCHES_REASON": "requested top-30",
+    })
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.workdir = str(workdir)
-    executor.outdir = str(workdir / "out")
-    executor.timeout = 60
-    executor.binary = "nm"
-    executor.poc_input = "poc/x"
-    executor.test_cmd = "-l @@"
-    executor.patch_loc = "0x1000"
-    executor.e9_metadata_prefix = "brpatched"
-    executor.e9_exclude_ranges = ""
-    executor.e9_relocated_calls = ""
-    executor.total_patches = 2
-    executor.brpatched_total_patches = 2
-    executor.fuzzy = False
-    executor.reverse_directed = False
-    executor.disable_binradar = False
-    executor.config = {}
+    executor.run_config = run_config
+    executor.workdir = run_config.workdir
+    executor.outdir = run_config.outdir
+    executor.timeout = run_config.timeout
+    executor.binary = run_config.binary
+    executor.poc_input = run_config.poc_input
+    executor.test_cmd = run_config.test_cmd
+    executor.patch_loc = run_config.patch_loc
+    executor.total_patches = run_config.total_patches
+    executor.brpatched_total_patches = run_config.brpatched_total_patches
+    executor.filter_total_patches = run_config.filter_total_patches
+    executor.fuzzy = run_config.fuzzy
+    executor.reverse_directed = run_config.reverse_directed
+    executor.disable_binradar = run_config.disable_binradar
+    executor.less_strict = run_config.less_strict
+    executor.feedback_mode = run_config.feedback_mode
+    executor.symbolic_mutation_mode = run_config.symbolic_mutation_mode
+    executor.forkserver_child_timeout = run_config.forkserver_child_timeout
+    executor.invocation = run_config.invocation
+    executor.requested_candidate_scope = run_config.requested_candidate_scope
+    executor.candidate_scope_status = run_config.candidate_scope_status
+    executor.candidate_scope_reason = run_config.candidate_scope_reason
+    executor.config = binradar_config.build_base_environment(
+        run_config, str(workdir / "out" / "plt_info.txt"))
+    executor.artifacts = binradar_artifacts.ArtifactSet(
+        str(workdir), "nm", "", 0, 2)
     executor.progress_filename = str(workdir / "out" / "progress.sbsv")
     executor.previous_progress = None
     executor.start_time = time.time()

@@ -16,7 +16,6 @@ behavior:
   that exited normally.
 """
 
-import importlib.util
 import os
 import signal
 import subprocess
@@ -28,13 +27,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
+import binradar_runtime  # noqa: E402
 import binradar_utils  # noqa: E402
-
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None and _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
 
 
 def _alive(pid: int) -> bool:
@@ -158,16 +152,15 @@ def test_stop_running_processes_sweeps_registered_group():
     # stop it: the grandchild must not survive as an orphan.
     leader, grandchild_pid = _spawn_leader_with_grandchild(GRANDCHILD_SCRIPT)
     try:
-        binradar.register_running_process(leader)
-        assert leader.pid in binradar.RUNNING_PROCESS_PGIDS
-        binradar.stop_running_processes()
+        binradar_runtime.PROCESS_REGISTRY.register(leader)
+        assert binradar_runtime.PROCESS_REGISTRY.contains(leader)
+        binradar_runtime.PROCESS_REGISTRY.stop_all()
         assert not _alive(leader.pid)
         _assert_grandchild_dead(grandchild_pid)
-        assert leader not in binradar.RUNNING_PROCESSES
-        assert leader.pid not in binradar.RUNNING_PROCESS_PGIDS
+        assert not binradar_runtime.PROCESS_REGISTRY.contains(leader)
     finally:
         leader.stdout.close()
-        binradar.unregister_running_process(leader)
+        binradar_runtime.PROCESS_REGISTRY.unregister(leader)
 
 
 def test_stop_running_processes_uses_captured_group_after_leader_exit():
@@ -175,31 +168,30 @@ def test_stop_running_processes_uses_captured_group_after_leader_exit():
     # spawn-time pgid must still reach its surviving forkserver child.
     leader, grandchild_pid = _spawn_leader_with_grandchild(GRANDCHILD_SCRIPT)
     try:
-        captured_pgid = binradar.register_running_process(leader)
-        assert binradar.RUNNING_PROCESS_PGIDS[leader.pid] == captured_pgid
+        captured_pgid = binradar_runtime.PROCESS_REGISTRY.register(leader)
+        assert binradar_runtime.PROCESS_REGISTRY.pgid(leader) == captured_pgid
         leader.wait(timeout=10)
         assert _alive(grandchild_pid)
-        binradar.stop_running_processes()
+        binradar_runtime.PROCESS_REGISTRY.stop_all()
         _assert_grandchild_dead(grandchild_pid)
-        assert leader.pid not in binradar.RUNNING_PROCESS_PGIDS
+        assert not binradar_runtime.PROCESS_REGISTRY.contains(leader)
     finally:
         leader.stdout.close()
-        binradar.unregister_running_process(leader)
+        binradar_runtime.PROCESS_REGISTRY.unregister(leader)
 
 
 def test_stop_running_processes_cleans_an_empty_registry():
-    binradar.stop_running_processes()  # must not raise
+    binradar_runtime.PROCESS_REGISTRY.stop_all()  # must not raise
 
 
 def test_register_unregister_roundtrip():
     leader = subprocess.Popen(["sleep", "5"], start_new_session=True)
     try:
-        binradar.register_running_process(leader)
-        assert leader in binradar.RUNNING_PROCESSES
-        assert binradar.RUNNING_PROCESS_PGIDS[leader.pid] == leader.pid
-        binradar.unregister_running_process(leader)
-        assert leader not in binradar.RUNNING_PROCESSES
-        assert leader.pid not in binradar.RUNNING_PROCESS_PGIDS
+        binradar_runtime.PROCESS_REGISTRY.register(leader)
+        assert binradar_runtime.PROCESS_REGISTRY.contains(leader)
+        assert binradar_runtime.PROCESS_REGISTRY.pgid(leader) == leader.pid
+        binradar_runtime.PROCESS_REGISTRY.unregister(leader)
+        assert not binradar_runtime.PROCESS_REGISTRY.contains(leader)
     finally:
         leader.kill()
         leader.wait(timeout=10)

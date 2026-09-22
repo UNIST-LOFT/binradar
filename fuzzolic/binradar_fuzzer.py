@@ -1,16 +1,14 @@
-import subprocess
-import os
-import signal
-import shlex
 import logging
+import os
+import shlex
+import signal
+import subprocess
 import time
-from typing import List, Set, Tuple, Dict, Optional, Any, TextIO
-
-import sbsv
-
-import logger
+from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
 import binradar_utils
+import logger
+import sbsv
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_targeted_simple", "target", "release", "qemu_targeted_simple")
@@ -55,7 +53,7 @@ class BinRadarFuzzer:
     def start(self) -> subprocess.Popen:
         raise NotImplementedError("start() method must be implemented in subclasses")
 
-    def wait(self, timeout: float = 1800.0) -> Optional[binradar_utils.ExecutionResult]:
+    def wait(self, timeout: Optional[float] = 1800.0) -> Optional[binradar_utils.ExecutionResult]:
         if self.process is None:
             return None
         result = binradar_utils.execute_await(

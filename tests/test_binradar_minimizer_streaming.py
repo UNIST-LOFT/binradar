@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "fuzzolic"))
 import binradar_evidence
 import binradar_fuzzer
 import binradar_minimizer
+import binradar_runtime
 import binradar_utils
 import binradar_verifier
 
@@ -683,7 +684,9 @@ def test_run_fuzzer_rejects_unexpected_exit(tmp_path, monkeypatch):
     executor.save_progress = progress.append
     # pid must exist for the process-group registry (2**30 is not a live pid;
     # getpgid fails and the fallback records it unchanged).
-    process = SimpleNamespace(pid=2 ** 30)
+    process = SimpleNamespace(
+        pid=2 ** 30, returncode=0,
+        communicate=lambda timeout=None: (b"", b""))
     fake = SimpleNamespace(
         process=process,
         start=lambda: process,
@@ -697,7 +700,7 @@ def test_run_fuzzer_rejects_unexpected_exit(tmp_path, monkeypatch):
         executor.run_fuzzer()
 
     assert not any("[fuzzer] [done]" in row for row in progress)
-    assert process not in binradar.RUNNING_PROCESSES
+    assert not binradar_runtime.PROCESS_REGISTRY.contains(process)
 
 
 def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
@@ -708,7 +711,9 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
     executor._worker_environment = lambda: {}
     progress = []
     executor.save_progress = progress.append
-    process = SimpleNamespace(pid=2 ** 30)
+    process = SimpleNamespace(
+        pid=2 ** 30, returncode=0,
+        communicate=lambda timeout=None: (b"", b""))
     fake = SimpleNamespace(
         process=process,
         start=lambda: process,
@@ -723,13 +728,14 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
     assert any(f"[fuzzer] [{binradar_utils.WALL_TIME_REACHED}]" in row
                for row in progress)
     assert any("[fuzzer] [done]" in row for row in progress)
-    assert process not in binradar.RUNNING_PROCESSES
+    assert not binradar_runtime.PROCESS_REGISTRY.contains(process)
 
 
 def test_solver_wait_rejects_nonzero_exit():
-    solver = binradar.SolverExecutor.__new__(binradar.SolverExecutor)
+    solver = binradar_runtime.SolverExecutor.__new__(
+        binradar_runtime.SolverExecutor)
     solver.mode = "test"
-    solver.timeout = 1
+    solver.deadline = binradar_runtime.Deadline.from_timeout(1)
     solver.process = subprocess.Popen(["sh", "-c", "exit 7"])
 
     _, succeeded = solver.wait()
@@ -740,21 +746,29 @@ def test_solver_wait_rejects_nonzero_exit():
 
 
 def test_solver_wait_stops_at_deadline():
-    solver = binradar.SolverExecutor.__new__(binradar.SolverExecutor)
+    solver = binradar_runtime.SolverExecutor.__new__(
+        binradar_runtime.SolverExecutor)
     solver.mode = "test"
-    solver.timeout = 0.05
+    solver.deadline = binradar_runtime.Deadline.from_timeout(0.05)
+    solver.registry = binradar_runtime.ProcessRegistry()
     solver.process = subprocess.Popen([
         sys.executable, "-c",
         "import signal, sys, time; signal.signal(signal.SIGUSR2, lambda *_: sys.exit(0)); time.sleep(60)",
     ], start_new_session=True)
-    solver.pgid = solver.process.pid
+    solver.pgid = solver.registry.register(solver.process)
 
-    started = time.monotonic()
-    _, succeeded = solver.wait()
+    try:
+        started = time.monotonic()
+        _, succeeded = solver.wait()
 
-    assert succeeded is False
-    assert solver.timed_out is True
-    assert time.monotonic() - started < 1.0
+        assert succeeded is False
+        assert solver.timed_out is True
+        assert time.monotonic() - started < 1.0
+    finally:
+        if solver.process.poll() is None:
+            solver.process.kill()
+            solver.process.wait(timeout=2)
+        solver.registry.unregister(solver.process)
 
 
 @pytest.mark.parametrize("method_name, mode", [
@@ -784,8 +798,8 @@ def test_concolic_solver_deadline_is_graceful(
     solvers = []
 
     class FakeSolver:
-        def __init__(self, *args, timeout, **kwargs):
-            self.timeout = timeout
+        def __init__(self, *args, deadline, **kwargs):
+            self.deadline = deadline
             self.timed_out = True
             self.process = SimpleNamespace(returncode=1)
             solvers.append(self)
@@ -803,7 +817,8 @@ def test_concolic_solver_deadline_is_graceful(
             pass
 
     class FakeTracer:
-        def __init__(self, *args, timeout, **kwargs):
+        def __init__(self, *args, deadline, **kwargs):
+            self.deadline = deadline
             self.run_result = None
 
         def start(self):
@@ -818,13 +833,14 @@ def test_concolic_solver_deadline_is_graceful(
         def phase_deadline_reached(self):
             return False
 
-    monkeypatch.setattr(binradar, "SharedMemoryManager", FakeShm)
-    monkeypatch.setattr(binradar, "SolverExecutor", FakeSolver)
-    monkeypatch.setattr(binradar, "TracerExecutor", FakeTracer)
+    monkeypatch.setattr(binradar_runtime, "SharedMemoryManager", FakeShm)
+    monkeypatch.setattr(binradar_runtime, "SolverExecutor", FakeSolver)
+    monkeypatch.setattr(binradar_runtime, "TracerExecutor", FakeTracer)
 
     getattr(executor, method_name)()
 
-    assert 0 < solvers[0].timeout <= executor.timeout
+    remaining = solvers[0].deadline.remaining()
+    assert remaining is not None and 0 < remaining <= executor.timeout
     assert any(f"[{mode}] [{binradar_utils.WALL_TIME_REACHED}]" in row
                for row in progress)
     assert any(f"[{mode}] [done]" in row for row in progress)
@@ -849,8 +865,8 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
             pass
 
     class FakeSolver:
-        def __init__(self, *args, timeout, **kwargs):
-            self.timeout = timeout
+        def __init__(self, *args, deadline, **kwargs):
+            self.deadline = deadline
             self.timed_out = False
             self.process = SimpleNamespace(returncode=7)
 
@@ -867,7 +883,8 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
             pass
 
     class FakeTracer:
-        def __init__(self, *args, timeout, **kwargs):
+        def __init__(self, *args, deadline, **kwargs):
+            self.deadline = deadline
             self.run_result = None
 
         def start(self):
@@ -882,9 +899,9 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
         def phase_deadline_reached(self):
             return False
 
-    monkeypatch.setattr(binradar, "SharedMemoryManager", FakeShm)
-    monkeypatch.setattr(binradar, "SolverExecutor", FakeSolver)
-    monkeypatch.setattr(binradar, "TracerExecutor", FakeTracer)
+    monkeypatch.setattr(binradar_runtime, "SharedMemoryManager", FakeShm)
+    monkeypatch.setattr(binradar_runtime, "SolverExecutor", FakeSolver)
+    monkeypatch.setattr(binradar_runtime, "TracerExecutor", FakeTracer)
 
     with pytest.raises(RuntimeError, match="Directed solver exited with status 7"):
         executor.run_directed()

@@ -31,6 +31,21 @@ def _policy_executor(tmp_path, less_strict):
     executor.run_id = 0
     executor.run_dir = str(tmp_path)
     executor.filter_result = [1]
+    executor.workdir = str(tmp_path)
+    executor.outdir = str(tmp_path)
+    executor.timeout = 60
+    executor.total_patches = 1
+    executor.brpatched_total_patches = 1
+    executor.filter_total_patches = 1
+    executor.disable_binradar = False
+    executor.invocation = "test"
+    executor.requested_candidate_scope = "top-30"
+    executor.candidate_scope_status = "top-30"
+    executor.candidate_scope_reason = "requested top-30"
+    executor.symbolic_mutation_mode = "off"
+    executor.fuzzy = False
+    executor.reverse_directed = False
+    executor.forkserver_child_timeout = 900
     executor.start_time = time.time()
     executor.progress_filename = str(tmp_path / "progress.sbsv")
     return executor
