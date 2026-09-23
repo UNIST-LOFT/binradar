@@ -109,6 +109,8 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     instance.run_id = 0
     instance.config = {}
     instance._worker_environment = dict
+    instance.forkserver_child_timeout = (
+        binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
     instance.artifacts = SimpleNamespace(
         original=str(workdir / "target.orig"))
     instance.save_progress = lambda _row: None
@@ -142,7 +144,8 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
 
     def execute(_command, **kwargs):
         captured.update(kwargs["env"])
-        return SimpleNamespace(success=False, stderr=b"")
+        return binradar.binradar_utils.ExecutionResult(
+            success=False, exit_code=1, stdout="", stderr="")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", execute)
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")

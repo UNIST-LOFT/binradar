@@ -18,6 +18,7 @@ parser without invoking e9tool.
 """
 
 import importlib.util
+import signal
 import struct
 import subprocess
 import sys
@@ -933,7 +934,8 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
 
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["env"] = env
-        return SimpleNamespace(success=True, stderr="")
+        return binradar.binradar_utils.ExecutionResult(
+            success=True, exit_code=0, stdout="", stderr="")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
 
@@ -1020,3 +1022,125 @@ def test_extract_relocated_call_jumps_synthetic(tmp_path):
     jumps = binradar_setup.extract_relocated_call_jumps(
         patched, metadata, original, 0x401000)
     assert jumps == [(0x54b005, 0x401000, 0x401005)]
+
+
+# ---------------------------------------------------------------------------
+# PROBE normalized-fault-reference run budget
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("success", "timed_out", "exit_code", "expected"), [
+    (False, True, -signal.SIGTERM, None),  # managed timeout with salvage
+    (True, False, -signal.SIGTERM, None),  # external SIGTERM after communicate
+    (True, False, -signal.SIGSEGV, 0x4000affb90),  # real guest crash self-signals
+])
+def test_probe_reference_discriminates_guest_and_termination_signals(
+        tmp_path, monkeypatch, success, timed_out, exit_code, expected):
+    """Ignore cancellation salvage but retain a real guest-signal fault.
+
+    QEMU re-raises real guest faults through a host signal too; blanket
+    negative-return-code rejection would discard a legitimate SIGSEGV POC.
+    """
+    (tmp_path / "nm.orig").write_bytes(b"")
+    (tmp_path / "poc").mkdir()
+    (tmp_path / "poc" / "nullderef").write_bytes(b"")
+    executor = _stub_executor(tmp_path)
+    executor._worker_environment = lambda: {
+        **executor.config,
+        "BINARY": executor.binary,
+        "POC_INPUT": executor.poc_input,
+        "TEST_CMD": executor.test_cmd,
+        "PATCH_LOC": executor.patch_loc,
+        "TOTAL_PATCHES": str(executor.total_patches),
+    }
+
+    captured = {}
+
+    def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
+        captured["timeout"] = timeout
+        return SimpleNamespace(
+            success=success, timed_out=timed_out, exit_code=exit_code,
+            stdout="",
+            stderr="[snapshot] [fault-reference] [version 2] [valid true] "
+                   "[source guest-signal] [address 4000affb90]\n")
+
+    monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
+
+    probe = SimpleNamespace(
+        patch_hit=lambda: True,
+        is_crash=lambda: True,
+        patch_func_hit=lambda: True,
+        multi_patch_func=lambda: False,
+        patch_func_entry=0x401000,
+        fault_addr=0x41ab2b,
+        patch_func_hit_cnt=3,
+        serialize=lambda: "probe")
+    monkeypatch.setattr(
+        binradar.binradar_verifier.BinRadarQemuRunner, "test_with_original",
+        lambda self, testcase, verbose=True: probe)
+    monkeypatch.setattr(
+        binradar.binradar_verifier.BinRadarQemuRunner, "test_with_file_trace",
+        lambda self, testcase, patch_func_entry=0, verbose=True:
+            SimpleNamespace(serialize_file_trace_result=lambda: "file-trace"))
+
+    executor.run_probe()
+
+    # The default 900 s child cap is above the 600 s floor; the run must not
+    # fall back to the old 60 s cap after being killed.
+    assert captured["timeout"] == float(executor.forkserver_child_timeout)
+    assert captured["timeout"] > 60.0
+    reference = executor.probe_result.tracer_fault_reference
+    assert (reference.address if reference is not None else None) == expected
+    if reference is not None:
+        assert reference.source == "guest-signal"
+
+
+@pytest.mark.parametrize(("child_timeout", "expected_timeout"), [
+    (300, 600),
+    (1800, 1800),
+])
+def test_probe_reference_run_budget_respects_floor_and_child_cap(
+        tmp_path, monkeypatch, child_timeout, expected_timeout):
+    """A low cap keeps the safety floor; a larger cap is not truncated."""
+
+    (tmp_path / "nm.orig").write_bytes(b"")
+    (tmp_path / "poc").mkdir()
+    (tmp_path / "poc" / "nullderef").write_bytes(b"")
+    executor = _stub_executor(tmp_path)
+    executor.forkserver_child_timeout = child_timeout
+    executor._worker_environment = lambda: {
+        **executor.config,
+        "BINARY": executor.binary,
+        "POC_INPUT": executor.poc_input,
+        "TEST_CMD": executor.test_cmd,
+        "PATCH_LOC": executor.patch_loc,
+        "TOTAL_PATCHES": str(executor.total_patches),
+    }
+
+    captured = {}
+
+    def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
+        captured["timeout"] = timeout
+        return SimpleNamespace(success=True, timed_out=False, exit_code=0,
+                               stdout="", stderr="")
+
+    monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
+    probe = SimpleNamespace(
+        patch_hit=lambda: True,
+        is_crash=lambda: True,
+        patch_func_hit=lambda: True,
+        multi_patch_func=lambda: False,
+        patch_func_entry=0x401000,
+        fault_addr=0x41ab2b,
+        patch_func_hit_cnt=3,
+        serialize=lambda: "probe")
+    monkeypatch.setattr(
+        binradar.binradar_verifier.BinRadarQemuRunner, "test_with_original",
+        lambda self, testcase, verbose=True: probe)
+    monkeypatch.setattr(
+        binradar.binradar_verifier.BinRadarQemuRunner, "test_with_file_trace",
+        lambda self, testcase, patch_func_entry=0, verbose=True:
+            SimpleNamespace(serialize_file_trace_result=lambda: "file-trace"))
+
+    executor.run_probe()
+
+    assert captured["timeout"] == expected_timeout

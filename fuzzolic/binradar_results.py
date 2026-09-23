@@ -12,6 +12,11 @@ import sbsv
 
 IterationResults = tuple[int, dict[int, dict]]
 
+# Serialization bound for the exact rejection ID sets.  The sets themselves
+# stay exact; only a single report row is bounded so a 100k-candidate subject
+# cannot emit a megabyte-long line.
+REJECTION_ID_LIMIT = 512
+
 
 @dataclass(frozen=True)
 class FinalResultRequest:
@@ -343,6 +348,45 @@ def write_final_result(request: FinalResultRequest) -> None:
         f"[fault-reference-valid {str(fault_reference_valid).lower()}]")
     request.save_progress(coverage_row)
 
+    def bounded_ids(ids: set[int]) -> tuple[str, bool]:
+        """Comma-joined sorted IDs plus whether the list hit the cap.
+
+        The sets themselves stay exact; only this row's serialization is
+        bounded, so a 100,000-candidate subject cannot write a megabyte-long
+        line.  Exact totals remain in the coverage row.
+        """
+        ordered = sorted(ids)
+        if len(ordered) > REJECTION_ID_LIMIT:
+            return (",".join(str(entry)
+                             for entry in ordered[:REJECTION_ID_LIMIT]), True)
+        return ",".join(str(entry) for entry in ordered), False
+
+    # The exact standalone/overlap/incremental membership, not only the
+    # scalar counts.  These are FINAL's own classification: the standalone
+    # set includes patches the concrete verifier already rejected, so the
+    # intersection here is the genuine overlap.
+    fields = {
+        "standalone": standalone_rejections,
+        "overlap": overlap,
+        "incremental": incremental,
+        "final-survivors": binradar_remaining_patches,
+    }
+    rendered: dict[str, str] = {}
+    truncated_sets: list[str] = []
+    for name, ids in fields.items():
+        text, truncated = bounded_ids(ids)
+        rendered[name] = text
+        if truncated:
+            truncated_sets.append(name)
+    rejection_sets_row = (
+        f"[final] [rejection-sets] "
+        f"[standalone {rendered['standalone']}] "
+        f"[overlap {rendered['overlap']}] "
+        f"[incremental {rendered['incremental']}] "
+        f"[final-survivors {rendered['final-survivors']}] "
+        f"[truncated-sets {','.join(truncated_sets)}]")
+    request.save_progress(rejection_sets_row)
+
     failed_phases = list(request.failed_phases)
     issues_suffix = (
         f" [issues true] [failed-phases {','.join(failed_phases)}]"
@@ -397,6 +441,7 @@ def write_final_result(request: FinalResultRequest) -> None:
             f"[source {reference_source}] [address {reference_address:x}] "
             f"[hard-crash-classification {crash_classification}]\n")
         result_file.write(coverage_row + "\n")
+        result_file.write(rejection_sets_row + "\n")
         if failed_phases:
             result_file.write(
                 f"[final] [failed-phases] [prefix {request.run_prefix}] "

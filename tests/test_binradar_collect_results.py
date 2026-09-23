@@ -673,7 +673,9 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
         "[normal-branch-differences 3] [standalone-rejected 3] "
         "[overlap-rejected 1] [incremental-rejected 2] "
         "[final-survivors 2] [subject-kind multi] "
-        "[fault-reference-valid true]\n")
+        "[fault-reference-valid true]\n"
+        "[final] [rejection-sets] [standalone 1,3,9] [overlap 3] "
+        "[incremental 1,9] [final-survivors 2,4] [truncated-sets ]\n")
 
     result = collector.collect_experiment_result(
         str(tmp_path), "workdir", "run", top_patches=1)
@@ -689,6 +691,11 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert run.binradar_incremental_rejected == 2
     assert run.binradar_original_unclassified_crash == 0
     assert run.binradar_final_survivors == 2
+    # Exact membership survives --top and is independent of the scalar counts.
+    assert run.binradar_standalone_ids == [1, 3, 9]
+    assert run.binradar_overlap_ids == [3]
+    assert run.binradar_incremental_ids == [1, 9]
+    assert run.binradar_rejection_ids_truncated is False
     assert run.binradar_stop_reason == "wall-time-reached"
     assert run.binradar_attempted == 2
     assert run.binradar_committed == 2
@@ -724,6 +731,10 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert row["binradar_incremental_rejected"] == "2"
     assert row["binradar_final_survivors"] == "2"
     assert row["binradar_original_unclassified_crash"] == "0"
+    assert row["binradar_standalone_ids"] == "1,3,9"
+    assert row["binradar_overlap_ids"] == "3"
+    assert row["binradar_incremental_ids"] == "1,9"
+    assert row["binradar_rejection_ids_truncated"] == "False"
     assert row["binradar_stop_reason"] == "wall-time-reached"
     assert row["binradar_representative_runs_partial"] == "True"
     assert row["binradar_memcheck_enabled"] == "True"
@@ -745,3 +756,37 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert "stop reason: wall-time-reached" in log
     assert "reproduces POC: True" in log
     assert "complete iterations: 7" in log
+
+    # An explicitly empty rejection set is not a missing legacy row. Even
+    # when only final survivors exceed the serialization cap, the marker
+    # must still reach CSV despite all three rejection lists being empty.
+    final_path = run_dir / "final.sbsv"
+    final_text = final_path.read_text()
+    original_sets = ("[standalone 1,3,9] [overlap 3] "
+                     "[incremental 1,9] [final-survivors 2,4] "
+                     "[truncated-sets ]")
+    final_path.write_text(final_text.replace(
+        original_sets,
+        "[standalone ] [overlap ] [incremental ] "
+        "[final-survivors 2,4] [truncated-sets final-survivors]"))
+    empty_row = collector.format_results_csv([
+        collector.collect_experiment_result(
+            str(tmp_path), "workdir", "run", top_patches=1)])[0]
+    assert empty_row["binradar_standalone_ids"] == ""
+    assert empty_row["binradar_rejection_ids_truncated"] == "True"
+
+    final_path.write_text(final_text.replace(
+        original_sets,
+        "[standalone ] [overlap ] [incremental ] "
+        "[final-survivors 2,4] [truncated-sets ]"))
+    no_reject_row = collector.format_results_csv([
+        collector.collect_experiment_result(
+            str(tmp_path), "workdir", "run", top_patches=1)])[0]
+    assert no_reject_row["binradar_rejection_ids_truncated"] == "False"
+
+    final_path.write_text(final_text.replace(
+        "[final] [rejection-sets] " + original_sets + "\n", ""))
+    legacy_row = collector.format_results_csv([
+        collector.collect_experiment_result(
+            str(tmp_path), "workdir", "run", top_patches=1)])[0]
+    assert legacy_row["binradar_rejection_ids_truncated"] == ""

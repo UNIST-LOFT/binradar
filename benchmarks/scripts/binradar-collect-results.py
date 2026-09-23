@@ -245,6 +245,13 @@ class RunResult:
     binradar_overlap_rejected: int = -1
     binradar_incremental_rejected: int = -1
     binradar_final_survivors: int = -1
+    # Serialized rejection ID prefixes from FINAL; only complete when the
+    # truncation marker is false. None distinguishes absent legacy telemetry
+    # from an explicit, empty or non-truncated set (counts remain exact).
+    binradar_standalone_ids: List[int] = field(default_factory=list)
+    binradar_overlap_ids: List[int] = field(default_factory=list)
+    binradar_incremental_ids: List[int] = field(default_factory=list)
+    binradar_rejection_ids_truncated: Optional[bool] = None
     binradar_subject_kind: str = ""
     binradar_fault_reference_valid: Optional[bool] = None
     binradar_attempted: int = -1
@@ -791,6 +798,28 @@ def parse_final_coverage(final_path: str) -> Dict[str, str]:
     return coverage
 
 
+def parse_final_rejection_sets(
+        final_path: str) -> Tuple[List[int], List[int], List[int], Optional[bool]]:
+    """Read sorted serialized ID prefixes; None means no producer row."""
+    sets: Tuple[List[int], List[int], List[int], Optional[bool]] = (
+        [], [], [], None)
+    if not os.path.isfile(final_path):
+        return sets
+    with open(final_path, "r", encoding="utf-8") as stream:
+        for line in stream:
+            payload = _strip_log_prefix(line.strip())
+            if not payload.startswith("[final] [rejection-sets]"):
+                continue
+            fields = _bracket_fields(payload)
+            sets = (
+                _parse_patch_list(fields.get("standalone", "")),
+                _parse_patch_list(fields.get("overlap", "")),
+                _parse_patch_list(fields.get("incremental", "")),
+                bool(fields.get("truncated-sets", "").strip()),
+            )
+    return sets
+
+
 def parse_progress_coverage_marker(progress_path: str, prefix: str,
                                    run_id: str) -> str:
     """Read coverage status appended to the matching final done row."""
@@ -1283,6 +1312,10 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         run_res.binradar_subject_kind = coverage.get("subject-kind", "")
         run_res.binradar_fault_reference_valid = _optional_bool(
             coverage.get("fault-reference-valid"))
+        (run_res.binradar_standalone_ids, run_res.binradar_overlap_ids,
+         run_res.binradar_incremental_ids,
+         run_res.binradar_rejection_ids_truncated) = (
+            parse_final_rejection_sets(final_path))
 
         runtime = parse_binradar_runtime_telemetry(
             progress_path, run_dir, prefix, run_id)
@@ -1941,6 +1974,10 @@ CSV_COLUMNS = [
     "binradar_overlap_rejected",
     "binradar_incremental_rejected",
     "binradar_final_survivors",
+    "binradar_standalone_ids",
+    "binradar_overlap_ids",
+    "binradar_incremental_ids",
+    "binradar_rejection_ids_truncated",
     "binradar_subject_kind",
     "binradar_fault_reference_valid",
     "binradar_attempted",
@@ -2056,6 +2093,16 @@ def format_results_csv(all_results: List[ExperimentResult],
                 value = getattr(run_res, column)
                 row[column] = str(value) if value >= 0 else ""
             row["binradar_subject_kind"] = run_res.binradar_subject_kind
+            for column, ids in (
+                    ("binradar_standalone_ids", run_res.binradar_standalone_ids),
+                    ("binradar_overlap_ids", run_res.binradar_overlap_ids),
+                    ("binradar_incremental_ids",
+                     run_res.binradar_incremental_ids)):
+                row[column] = ",".join(str(entry) for entry in ids)
+            row["binradar_rejection_ids_truncated"] = (
+                str(run_res.binradar_rejection_ids_truncated)
+                if run_res.binradar_rejection_ids_truncated is not None
+                else "")
             row["binradar_fault_reference_valid"] = (
                 str(run_res.binradar_fault_reference_valid)
                 if run_res.binradar_fault_reference_valid is not None else "")

@@ -38,6 +38,11 @@ TRACER_FAULT_REFERENCE_SCHEMA = (
     "[source: str] [address: hex]")
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
+# Floor for the PROBE normalized-fault-reference tracer run.  The reference
+# run instruments the whole original binary, so it is far slower than the
+# QASAN probe; the historical hard-coded 60 s killed slow subjects mid-run and
+# their SIGTERM salvage published a `guest-signal` identity at the kill PC.
+PROBE_TRACER_TIMEOUT_MIN = 600.0
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 
 
@@ -636,12 +641,41 @@ class BinRadarExecutor:
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")
+        # The reference run instruments the whole original binary with the
+        # memcheck/provenance policy, so on a slow subject it costs far more
+        # than the un-instrumented PROBE. A short timeout can kill it before it
+        # reaches the fault; SIGTERM salvage may still emit a plausible-looking
+        # guest-signal row at the interrupted PC, which is not a fault identity.
+        # Give this standalone PROBE run a finite budget based on the
+        # configured forkserver child cap, with a 600s floor for instrumentation
+        # overhead. Unlike BINRADAR preflight, it has no PhaseSession deadline.
+        # Never accept a reference from a killed run.
+        probe_timeout = max(
+            float(self.forkserver_child_timeout), PROBE_TRACER_TIMEOUT_MIN)
         tracer_result = binradar_utils.execute(
-            tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=60.0, verbose=False)
+            tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=probe_timeout,
+            verbose=False)
         parser = sbsv.parser()
         parser.add_schema(TRACER_FAULT_REFERENCE_SCHEMA)
         tracer_fault_reference = None
-        if tracer_result.success:
+        if tracer_result.timed_out:
+            logger.warning(
+                f"[PROBE] Tracer reference run exceeded {probe_timeout:g}s and "
+                "was killed; no normalized fault reference is published from a "
+                "killed run (its salvaged SIGTERM fault identity would name the "
+                "kill PC, not the fault).")
+        elif tracer_result.exit_code in (
+                -signal.SIGTERM, -signal.SIGINT, -signal.SIGHUP,
+                -signal.SIGQUIT, -signal.SIGKILL):
+            # QEMU self-signals on genuine guest faults (including SIGSEGV),
+            # so a negative return code alone is not a host cancellation.
+            # Ignore the external cancellation signals that can salvage the
+            # interrupted guest PC as a plausible guest-signal reference.
+            logger.warning(
+                "[PROBE] Tracer reference process ended on a termination "
+                "signal; no normalized fault reference is published from "
+                "its salvaged output.")
+        elif tracer_result.success:
             result = parser.loads(tracer_result.stderr)
             rows = result["snapshot"]["fault-reference"]
             if rows:

@@ -362,3 +362,244 @@ def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):
     assert "[binradar] [crash] [iter 2] [patch 300]" in binradar_text
     assert "[binradar] [commit] [iter 2] [patch 300] [br 20]" in binradar_text
     assert "[patch 2]" not in binradar_text
+
+
+def _write_binradar_frames(path: Path, *, frames=()) -> None:
+    """Write v2 BINRADAR evidence from caller-built frame payloads."""
+    data = (struct.pack("<8sHHI", b"BRDATAB1", 2, 3, 0)
+            + b"".join(_frame(4, frame) for frame in frames))
+    path.write_bytes(data)
+
+
+def _final_request(run_dir: Path, candidates, reference):
+    return binradar_results.FinalResultRequest(
+        run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        candidates=list(candidates), tracer_fault_reference=reference,
+        disable_binradar=False, binradar_failed=False,
+        wall_time_reached=False, failed_phases=[],
+        save_progress=lambda _: None, record_wall_time_reached=lambda: None)
+
+
+@pytest.mark.parametrize("reference,expected", [
+    (binradar_verifier.TracerFaultReference(0x1234, "guest-signal"),
+     "[original-other-crash 1] [original-unclassified-crash 0]"),
+    (None, "[original-other-crash 0] [original-unclassified-crash 1]"),
+])
+def test_final_classifies_original_crash_by_reference_validity(
+        tmp_path, reference, expected):
+    """A crash at another address is only `other` with a valid reference.
+
+    Without one, the baseline crash cannot be typed at all: counting it as
+    `other` would silently turn a missing identity into a real comparison.
+    """
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 2, 2)
+        + _group(0, 2, 0x9999, [0], [0])
+        + _group(1, 2, 0x9999, [1], [1]),
+    ]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=0, total_evidences=0,
+            observations={})])
+    binradar_results.write_final_result(
+        _final_request(tmp_path, [1], reference))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert expected in report
+    # Neither form may hard-reject: the addresses differ from the POC.
+    assert "[reason same-crash]" not in report
+
+
+@pytest.mark.parametrize("disable,binradar_failed,stop_row", [
+    (True, False, None),
+    (False, True, None),
+    (False, False,
+     "[binradar] [stop] [prefix trial] [id 0] "
+     "[reason baseline-unavailable] [attempt 1] [remaining 0] "
+     "[committed 0] [discarded 1]\n"),
+])
+def test_final_reports_unavailable_coverage(tmp_path, disable,
+                                            binradar_failed, stop_row):
+    """Disabled, failed, and baseline-unavailable BinRadar are `unavailable`."""
+    run_dir = tmp_path / "trial-00000"
+    run_dir.mkdir()
+    frames = [struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])]
+    _write_binradar_frames(run_dir / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        run_dir / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=0, total_evidences=0,
+            observations={})])
+    if stop_row is not None:
+        # _run_stop reads the sibling progress file of the run directory.
+        (tmp_path / "progress.sbsv").write_text(stop_row)
+    request = binradar_results.FinalResultRequest(
+        run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        candidates=[1],
+        tracer_fault_reference=binradar_verifier.TracerFaultReference(
+            0x1234, "guest-signal"),
+        disable_binradar=disable, binradar_failed=binradar_failed,
+        wall_time_reached=False, failed_phases=[],
+        save_progress=lambda _: None, record_wall_time_reached=lambda: None)
+    binradar_results.write_final_result(request)
+    report = (run_dir / "final.sbsv").read_text()
+    assert "[binradar-coverage unavailable]" in report
+
+
+def test_final_reports_singleton_subject_kind(tmp_path):
+    """One candidate is reported as a singleton, not as a multi-candidate set."""
+    frames = [struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=7, verified=True, accept_evidences=0, total_evidences=0,
+            observations={})])
+    binradar_results.write_final_result(_final_request(
+        tmp_path, [7],
+        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[subject-kind singleton]" in report
+    assert "[subject-kind multi]" not in report
+
+
+def test_binradar_frame_corruption_is_rejected(tmp_path):
+    """A corrupted complete BINRADAR frame is fatal, not a discarded attempt."""
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 2, 2)
+        + _group(0, 1, 0, [0], [0])
+        + _group(1, 1, 0, [1], [1]),
+    ]
+    path = tmp_path / "binradar.br"
+    _write_binradar_frames(path, frames=frames)
+    assert len(list(binradar_evidence.read_binradar(path))) == 2
+
+    corrupt = bytearray(path.read_bytes())
+    corrupt[-9] ^= 0x20          # payload byte of the final complete frame
+    corrupt_path = tmp_path / "binradar-corrupt.br"
+    corrupt_path.write_bytes(corrupt)
+    with pytest.raises(binradar_evidence.EvidenceError, match="checksum"):
+        list(binradar_evidence.read_binradar(corrupt_path))
+
+
+def test_final_rejects_incomplete_candidate_coverage(tmp_path):
+    """A complete mutation frame must cover every candidate exactly once."""
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 2, 2)
+        + _group(0, 1, 0, [0], [0])
+        + _group(1, 1, 0, [1], [1, 2]),
+    ]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=True, accept_evidences=0, total_evidences=0,
+            observations={}) for patch in (1, 2, 3)])
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        binradar_results.write_final_result(_final_request(
+            tmp_path, [1, 2, 3],
+            binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+
+
+def test_final_publishes_exact_rejection_id_sets(tmp_path):
+    """FINAL publishes membership, not only counts, for every rejection set.
+
+    The standalone set intentionally includes patches the concrete verifier
+    already rejected, so the recorded intersection is the genuine overlap and
+    the coverage row's scalar counts must agree with the emitted IDs.
+    """
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 2, 5)
+        + _group(0, 2, 0x1234, [0], [0])
+        + _group(1, 2, 0x1234, [1], [1])
+        + _group(2, 1, 0, [1], [2])
+        + _group(3, 2, 0x1234, [1], [3])
+        + _group(4, 1, 0, [1], [4]),
+    ]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    # Patch 3 is both a standalone tracer rejection and a concrete rejection,
+    # so the recorded intersection is the genuine, non-empty overlap.
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=patch not in (3, 4), accept_evidences=0,
+            total_evidences=0, observations={})
+         for patch in (1, 2, 3, 4)])
+    binradar_results.write_final_result(_final_request(
+        tmp_path, [1, 2, 3, 4],
+        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert ("[final] [rejection-sets] [standalone 1,3] [overlap 3] "
+            "[incremental 1] [final-survivors 2] "
+            "[truncated-sets ]") in report
+    assert ("[standalone-rejected 2] [overlap-rejected 1] "
+            "[incremental-rejected 1]") in report
+
+
+def test_rejection_set_serialization_is_bounded(tmp_path, monkeypatch):
+    """A set past the cap is shortened only in its serialization."""
+    monkeypatch.setattr(binradar_results, "REJECTION_ID_LIMIT", 2)
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 2, 2)
+        + _group(0, 2, 0x1234, [0], [0])
+        + _group(5, 2, 0x1234, [1], [1, 2, 3, 4, 5]),
+    ]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=True, accept_evidences=0, total_evidences=0,
+            observations={}) for patch in (1, 2, 3, 4, 5)])
+    binradar_results.write_final_result(_final_request(
+        tmp_path, [1, 2, 3, 4, 5],
+        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (tmp_path / "final.sbsv").read_text()
+    # The exact count survives in the coverage row; the ID row is marked.
+    assert "[standalone-rejected 5]" in report
+    assert "[standalone 1,2] " in report
+    assert "[truncated-sets standalone,incremental]" in report
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("exhausted", "partial"),
+    ("failure-limit", "partial"),
+])
+def test_discarded_attempt_never_reports_complete_coverage(tmp_path, reason,
+                                                           expected):
+    """A discarded attempt keeps coverage partial even at `remaining 0`.
+
+    The terminal plan being discarded is the dangerous case: the queue looks
+    exhausted and `remaining`/`queued` are zero, but a discarded attempt
+    published no evidence, so the run is not the complete finite-queue sweep.
+    """
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 3, 2)
+        + _group(0, 1, 0, [0], [0])
+        + _group(1, 1, 0, [1], [1]),
+    ]
+    _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=0, total_evidences=0,
+            observations={})])
+    (tmp_path / "progress.sbsv").write_text(
+        f"[binradar] [stop] [prefix trial] [id 0] [reason {reason}] "
+        "[attempt 3] [remaining 0] [committed 2] [discarded 1] "
+        "[representative-runs 4] [representative-runs-partial false] "
+        "[planned 2] [attempted 3] [mutation-attempted 2] "
+        "[mutation-discarded 1] [mutation-committed 1] "
+        "[mutation-pending 0] [queued 0]\n")
+    binradar_results.write_final_result(_final_request(
+        tmp_path, [1],
+        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert f"[binradar-coverage {expected}]" in report
+    assert "[binradar-coverage complete]" not in report
