@@ -4,6 +4,7 @@ import argparse
 import enum
 import os
 import queue
+import re
 import resource
 import shlex
 import shutil
@@ -96,6 +97,77 @@ def phase_from_name(name: str) -> BinRadarPhase:
 SINGLE_PHASE_NAMES = ["probe", "fuzzolic", "directed", "fuzzer",
                       "minimizer", "verifier", "minimizer-verifier",
                       "binradar", "feedback", "final"]
+
+
+def _read_binradar_advisor_metrics(
+        log_path: Optional[str], effective_mode: str) -> Dict[str, object]:
+    """Read bounded advisor summaries and per-attempt child-use aggregates."""
+    keys = (
+        "candidates_generated", "families_generated", "families_accepted",
+        "unsupported_abstentions", "budget_abstentions",
+        "families_executed", "child_uses",
+    )
+    metrics: Dict[str, object] = {"mode": effective_mode or "off"}
+    default_count = 0 if metrics["mode"] == "off" else None
+    metrics.update({key: default_count for key in keys})
+    if not log_path:
+        return metrics
+
+    summary = None
+    executed_families = set()
+    child_uses = 0
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if "[symbolic-advisor] [summary]" in line:
+                    fields = re.findall(r"\[([^\]]*)\]", line)
+                    summary = {}
+                    for field in fields[2:]:
+                        name, separator, value = field.partition(" ")
+                        if separator:
+                            summary[name] = value
+                elif "[binradar] [advisor-attempt]" in line:
+                    fields = re.findall(r"\[([^\]]*)\]", line)
+                    attempt = {}
+                    for field in fields[2:]:
+                        name, separator, value = field.partition(" ")
+                        if separator:
+                            attempt[name] = value
+                    try:
+                        if int(attempt.get("advisor-id", "-1")) != 2:
+                            continue
+                        uses = int(attempt["child-uses"])
+                        family = int(attempt["family"])
+                        source = int(attempt["source"])
+                    except (KeyError, ValueError):
+                        continue
+                    if uses < 0:
+                        continue
+                    child_uses += uses
+                    if uses > 0:
+                        executed_families.add((family, source))
+    except OSError:
+        return metrics
+
+    if summary is not None:
+        metrics["mode"] = summary.get("mode", metrics["mode"])
+        summary_keys = {
+            "candidates_generated": "candidates-generated",
+            "families_generated": "families-generated",
+            "families_accepted": "families-accepted",
+            "unsupported_abstentions": "unsupported",
+            "budget_abstentions": "budget",
+        }
+        for output_key, summary_key in summary_keys.items():
+            try:
+                count = int(summary[summary_key])
+            except (KeyError, ValueError):
+                continue
+            if count >= 0:
+                metrics[output_key] = count
+    metrics["families_executed"] = len(executed_families)
+    metrics["child_uses"] = child_uses
+    return metrics
 
 
 def setlimits():
@@ -892,6 +964,14 @@ class BinRadarExecutor:
         summary = None
         committed = 0
         discarded = 0
+        representative_runs = 0
+        planned = None
+        attempted = 0
+        mutation_attempted = 0
+        mutation_discarded = 0
+        mutation_committed = 0
+        mutation_pending = 0
+        active_attempt = None
         try:
             with session:
                 self._validate_baseline(
@@ -912,7 +992,23 @@ class BinRadarExecutor:
                         if session.deadline.expired():
                             timed_out = True
                             break
+                        active_attempt = (
+                            tracer.iter + 1 if tracer.forkserver_mode else 0)
+                        attempted += 1
                         summary = tracer.run()
+                        active_attempt = None
+                        representative_runs += summary.representative_runs
+                        if not tracer.forkserver_mode:
+                            planned = 0
+                        elif summary.attempt == 1:
+                            planned = summary.remaining_plans
+                        elif summary.attempt > 1:
+                            mutation_attempted += 1
+                            if summary.attempt_result == \
+                                    binradar_runtime.AttemptResult.COMPLETED:
+                                mutation_committed += 1
+                            else:
+                                mutation_discarded += 1
                         message = (
                             f"[binradar] [tracer] [attempt {summary.attempt}] "
                             f"[representative-runs "
@@ -922,7 +1018,8 @@ class BinRadarExecutor:
                             f"[attempt-result "
                             f"{binradar_runtime.protocol_enum_name(summary.attempt_result)}] "
                             f"[stop "
-                            f"{binradar_runtime.protocol_enum_name(summary.stop_reason)}]")
+                            f"{binradar_runtime.protocol_enum_name(summary.stop_reason)}] "
+                            f"[prefix {self.run_prefix}] [id {self.run_id}]")
                         if summary.attempt_result == \
                                 binradar_runtime.AttemptResult.COMPLETED:
                             committed += 1
@@ -937,6 +1034,9 @@ class BinRadarExecutor:
         except TimeoutError as exc:
             if session.deadline.expired():
                 timed_out = True
+                if active_attempt is not None and active_attempt > 1:
+                    mutation_attempted += 1
+                    mutation_pending += 1
             else:
                 logger.error(f"Error during binradar execution: {exc}")
                 raise
@@ -952,8 +1052,23 @@ class BinRadarExecutor:
                 stop_reason = binradar_runtime.protocol_enum_name(
                     summary.stop_reason)
             stop_attempt = summary.attempt if summary is not None else 0
-            stop_remaining = (str(summary.remaining_plans)
-                              if summary is not None else "unknown")
+            in_flight_attempt = timed_out and active_attempt is not None
+            stop_remaining = (
+                "unknown" if summary is None or in_flight_attempt
+                else str(summary.remaining_plans))
+            planned_text = "unknown" if planned is None else str(planned)
+            advisor = _read_binradar_advisor_metrics(
+                binradar_env.get("BINRADAR_TRACER_LOG_FILE"),
+                binradar_env.get("BINRADAR_SYMBOLIC_MUTATION_MODE", "off"))
+            if mutation_pending and advisor["families_accepted"] != 0:
+                advisor["families_executed"] = None
+                advisor["child_uses"] = None
+            advisor_value = lambda name: (
+                "unknown" if advisor[name] is None else str(advisor[name]))
+            memcheck_value = binradar_env.get("BINRADAR_MEMCHECK_ENABLE")
+            memcheck = ("true" if memcheck_value == "1" else
+                        "false" if memcheck_value == "0" else "unknown")
+            representative_runs_partial = in_flight_attempt
             self.save_progress(
                 f"[binradar] [stop] "
                 f"[prefix {self.run_prefix}] [id {self.run_id}] "
@@ -961,7 +1076,33 @@ class BinRadarExecutor:
                 f"[attempt {stop_attempt}] "
                 f"[remaining {stop_remaining}] "
                 f"[committed {committed}] "
-                f"[discarded {discarded}]")
+                f"[discarded {discarded}] "
+                f"[representative-runs {representative_runs}] "
+                f"[representative-runs-partial "
+                f"{str(representative_runs_partial).lower()}] "
+                f"[planned {planned_text}] "
+                f"[attempted {attempted}] "
+                f"[mutation-attempted {mutation_attempted}] "
+                f"[mutation-discarded {mutation_discarded}] "
+                f"[mutation-committed {mutation_committed}] "
+                f"[mutation-pending {mutation_pending}] "
+                f"[queued {stop_remaining}] "
+                f"[memcheck {memcheck}] "
+                f"[advisor-mode {advisor['mode']}] "
+                f"[advisor-candidates-generated "
+                f"{advisor_value('candidates_generated')}] "
+                f"[advisor-families-generated "
+                f"{advisor_value('families_generated')}] "
+                f"[advisor-families-accepted "
+                f"{advisor_value('families_accepted')}] "
+                f"[advisor-unsupported-abstentions "
+                f"{advisor_value('unsupported_abstentions')}] "
+                f"[advisor-budget-abstentions "
+                f"{advisor_value('budget_abstentions')}] "
+                f"[advisor-families-executed "
+                f"{advisor_value('families_executed')}] "
+                f"[advisor-child-uses "
+                f"{advisor_value('child_uses')}]")
 
         if timed_out:
             logger.info(

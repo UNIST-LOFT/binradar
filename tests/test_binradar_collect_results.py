@@ -516,6 +516,9 @@ def test_collect_reports_untruncated_binradar_counts(tmp_path):
     assert row["verifier_candidate_count"] == "5"
     assert row["remaining_patches_count"] == "5"
     assert row["binradar_evidence_iterations"] == "17"
+    assert row["binradar_coverage"] == ""
+    assert row["binradar_raw_committed"] == ""
+    assert row["binradar_processed"] == ""
     assert row["binradar_rejected_count"] == "3"
     assert row["binradar_remaining_patches_count"] == "2"
     assert row["binradar_rejected_patches"] == "1"
@@ -613,3 +616,132 @@ def test_filter_skipped_for_single_patch_format(tmp_path):
 
     assert result.runs[0].setup_filter_done is collector.DoneStatus.SKIPPED
     assert "status: SKIPPED" in collector.format_result_log(result)
+
+
+def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[binradar] [tracer] [attempt 1] [representative-runs 98] "
+        "[prefix run] [id 0]\n"
+        "[binradar] [start] [prefix run] [id 0]\n"
+        "[binradar] [tracer] [attempt 1] [representative-runs 6] "
+        "[time 10] [remaining 5] [attempt-result completed] [stop none] "
+        "[prefix run] [id 0]\n"
+        "[binradar] [tracer] [attempt 5] [representative-runs 99] "
+        "[time 12] [remaining 1] [attempt-result completed] [stop none] "
+        "[prefix other] [id 4]\n"
+        "[binradar] [tracer] [attempt 2] [representative-runs 6] "
+        "[time 11] [remaining 4] [attempt-result completed] [stop none] "
+        "[prefix run] [id 0]\n"
+        "[binradar] [baseline] [reproduced] [artifact .brcached] "
+        "[reference 401234 guest-signal] [prefix run] [id 0]\n"
+        "[binradar] [stop] [prefix run] [id 0] "
+        "[reason wall-time-reached] [attempt 3] [remaining 4] "
+        "[representative-runs 12] [representative-runs-partial true] "
+        "[planned 20] [attempted 2] "
+        "[discarded 0] [committed 2] [queued 4] [memcheck true] "
+        "[mutation-attempted 3] [mutation-discarded 1] "
+        "[mutation-committed 2] [mutation-pending 0] "
+        "[advisor-mode boundary] [advisor-candidates-generated 9] "
+        "[advisor-families-generated 4] [advisor-families-accepted 3] "
+        "[advisor-unsupported-abstentions 1] "
+        "[advisor-budget-abstentions 2] [advisor-families-executed 2] "
+        "[advisor-child-uses 7]\n"
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1, 2, 3, 4, 5]] "
+        "[binradar_remaining_patches [2, 3]] [issues false] "
+        "[failed-phases none] [wall-time-reached true] "
+        "[binradar-coverage partial]\n")
+    (run_dir / "binradar.log").write_text(
+        "[FINAL] Processed 99 complete BINRADAR evidence iteration(s); "
+        "rejected 3 patch(es).\n")
+    confidence_rows = "".join(
+        f"[final] [confidence] [patch {patch}] [score {1.0 - patch / 10}] "
+        f"[accept-evidences 1] [total-evidences 1]\n"
+        for patch in range(1, 6))
+    (run_dir / "final.sbsv").write_text(
+        confidence_rows
+        + "[final] [coverage] [binradar-coverage partial] "
+        "[raw-committed 8] [processed 7] "
+        "[patch0-no-observation 1] [original-normal 4] "
+        "[original-poc-crash 2] [original-other-crash 1] "
+        "[original-unclassified-crash 0] "
+        "[normal-branch-differences 3] [standalone-rejected 3] "
+        "[overlap-rejected 1] [incremental-rejected 2] "
+        "[final-survivors 2] [subject-kind multi] "
+        "[fault-reference-valid true]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run", top_patches=1)
+
+    run = result.runs[0]
+    assert run.status == "OK (wall-time-reached; binradar partial coverage)"
+    assert run.top_patches == [1]
+    assert run.binradar_coverage == "partial"
+    assert run.binradar_evidence_iterations == 7
+    assert run.binradar_raw_committed == 8
+    assert run.binradar_patch0_no_observation == 1
+    assert run.binradar_overlap_rejected == 1
+    assert run.binradar_incremental_rejected == 2
+    assert run.binradar_original_unclassified_crash == 0
+    assert run.binradar_final_survivors == 2
+    assert run.binradar_stop_reason == "wall-time-reached"
+    assert run.binradar_attempted == 2
+    assert run.binradar_committed == 2
+    assert run.binradar_discarded == 0
+    assert run.binradar_queued == 4
+    assert run.binradar_representative_runs == 12
+    assert run.binradar_representative_runs_partial is True
+    assert run.binradar_stop_attempt == 3
+    assert run.binradar_planned == 20
+    assert run.binradar_tracer_attempts == 2
+    assert run.binradar_baseline_reproduced is True
+    assert run.binradar_memcheck_enabled is True
+    assert run.binradar_mutation_attempted == 3
+    assert run.binradar_mutation_discarded == 1
+    assert run.binradar_mutation_committed == 2
+    assert run.binradar_mutation_pending == 0
+    assert run.binradar_advisor_mode == "boundary"
+    assert run.binradar_advisor_candidates_generated == 9
+    assert run.binradar_advisor_families_generated == 4
+    assert run.binradar_advisor_families_accepted == 3
+    assert run.binradar_advisor_unsupported_abstentions == 1
+    assert run.binradar_advisor_budget_abstentions == 2
+    assert run.binradar_advisor_families_executed == 2
+    assert run.binradar_advisor_child_uses == 7
+
+    row = collector.format_results_csv([result])[0]
+    assert row["remaining_patches_count"] == "5"
+    assert row["remaining_patches"] == "[1(0.900)] (+4 more)"
+    assert row["binradar_coverage"] == "partial"
+    assert row["binradar_raw_committed"] == "8"
+    assert row["binradar_processed"] == "7"
+    assert row["binradar_overlap_rejected"] == "1"
+    assert row["binradar_incremental_rejected"] == "2"
+    assert row["binradar_final_survivors"] == "2"
+    assert row["binradar_original_unclassified_crash"] == "0"
+    assert row["binradar_stop_reason"] == "wall-time-reached"
+    assert row["binradar_representative_runs_partial"] == "True"
+    assert row["binradar_memcheck_enabled"] == "True"
+    assert row["binradar_baseline_reproduced"] == "True"
+    assert row["binradar_mutation_attempted"] == "3"
+    assert row["binradar_mutation_discarded"] == "1"
+    assert row["binradar_mutation_committed"] == "2"
+    assert row["binradar_mutation_pending"] == "0"
+    assert row["binradar_advisor_mode"] == "boundary"
+    assert row["binradar_advisor_candidates_generated"] == "9"
+    assert row["binradar_advisor_families_generated"] == "4"
+    assert row["binradar_advisor_families_accepted"] == "3"
+    assert row["binradar_advisor_unsupported_abstentions"] == "1"
+    assert row["binradar_advisor_budget_abstentions"] == "2"
+    assert row["binradar_advisor_families_executed"] == "2"
+    assert row["binradar_advisor_child_uses"] == "7"
+    log = collector.format_result_log(result)
+    assert "[coverage] partial" in log
+    assert "stop reason: wall-time-reached" in log
+    assert "reproduces POC: True" in log
+    assert "complete iterations: 7" in log

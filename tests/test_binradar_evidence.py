@@ -226,6 +226,109 @@ def test_final_requires_valid_fault_identity(tmp_path, source, address,
         assert "[reason introduced-crash]" not in report
 
 
+def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0]),
+        struct.pack("<II", 2, 2)
+        + _group(0, 1, 0, None, [0])
+        + _group(1, 1, 0, [0], [1, 2, 3]),
+        struct.pack("<II", 4, 4)
+        + _group(0, 1, 0, [0], [0])
+        + _group(1, 2, 0x1234, [1], [1])
+        + _group(2, 2, 0x1234, [1], [2])
+        + _group(3, 1, 0, [1], [3]),
+    ]
+    (tmp_path / "binradar.br").write_bytes(
+        struct.pack("<8sHHI", b"BRDATAB1", 2, 3, 0)
+        + b"".join(_frame(4, frame) for frame in frames))
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=patch != 1, accept_evidences=0,
+            total_evidences=0, observations={}) for patch in (1, 2, 3)])
+    out = tmp_path / "out"
+    out.mkdir()
+    run_dir = out / "trial-00000"
+    run_dir.mkdir()
+    for file in ("binradar.br", "verifier.br"):
+        (run_dir / file).write_bytes((tmp_path / file).read_bytes())
+    (out / "progress.sbsv").write_text(
+        "[binradar] [stop] [prefix trial] [id 0] [reason failure-limit] "
+        "[attempt 4] [remaining 5] [committed 3] [discarded 1]\n")
+    binradar_results.write_final_result(binradar_results.FinalResultRequest(
+        run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        candidates=[1, 2, 3],
+        tracer_fault_reference=binradar_verifier.TracerFaultReference(
+            0x1234, "guest-signal"),
+        disable_binradar=False, binradar_failed=False,
+        wall_time_reached=False, failed_phases=[],
+        save_progress=lambda _: None, record_wall_time_reached=lambda: None))
+    report = (run_dir / "final.sbsv").read_text()
+    assert "[binradar-coverage partial] [raw-committed 3] [processed 2]" in report
+    assert "[patch0-no-observation 1]" in report
+    assert "[original-normal 1] [original-poc-crash 1]" in report
+    assert "[normal-branch-differences 1]" in report
+    assert ("[standalone-rejected 2] [overlap-rejected 1] "
+            "[incremental-rejected 1] [final-survivors 1]") in report
+    assert "[final] [binradar] [patch 2] [res rejected]" in report
+    assert "[final] [binradar] [patch 1]" not in report
+    (out / "progress.sbsv").write_text(
+        "[binradar] [stop] [prefix trial] [id 0] [reason exhausted] "
+        "[attempt 4] [remaining 0] [committed 3] [discarded 0]\n")
+    binradar_results.write_final_result(binradar_results.FinalResultRequest(
+        run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        candidates=[1, 2, 3],
+        tracer_fault_reference=binradar_verifier.TracerFaultReference(
+            0x1234, "guest-signal"),
+        disable_binradar=False, binradar_failed=False,
+        wall_time_reached=False, failed_phases=[],
+        save_progress=lambda _: None, record_wall_time_reached=lambda: None))
+    assert "[binradar-coverage partial]" in (run_dir / "final.sbsv").read_text()
+
+
+@pytest.mark.parametrize("other_phase_cutoff", [False, True])
+def test_exhausted_queue_with_full_evidence_is_complete(
+        tmp_path, other_phase_cutoff):
+    run_dir = tmp_path / "trial-00000"
+    run_dir.mkdir()
+    _write_binradar(run_dir / "binradar.br")
+    binradar_evidence.write_verifier(
+        run_dir / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=True, accept_evidences=0,
+            total_evidences=0, observations={}) for patch in (1, 2, 300)])
+    request = binradar_results.FinalResultRequest(
+        run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        candidates=[1, 2, 300],
+        tracer_fault_reference=binradar_verifier.TracerFaultReference(
+            0x1234, "guest-signal"),
+        disable_binradar=False, binradar_failed=False,
+        wall_time_reached=other_phase_cutoff, failed_phases=[],
+        save_progress=lambda _: None, record_wall_time_reached=lambda: None)
+
+    # A historical P2 stop row cannot prove that all scheduled work was
+    # accounted for, even when its four scalar counters happen to match.
+    (tmp_path / "progress.sbsv").write_text(
+        "[binradar] [stop] [prefix trial] [id 0] [reason exhausted] "
+        "[attempt 2] [remaining 0] [committed 2] [discarded 0]\n")
+    binradar_results.write_final_result(request)
+    assert "[binradar-coverage partial]" in (
+        run_dir / "final.sbsv").read_text()
+
+    (tmp_path / "progress.sbsv").write_text(
+        "[binradar] [stop] [prefix trial] [id 0] [reason exhausted] "
+        "[attempt 2] [remaining 0] [committed 2] [discarded 0] "
+        "[representative-runs 4] [representative-runs-partial false] "
+        "[planned 1] [attempted 2] [mutation-attempted 1] "
+        "[mutation-discarded 0] [mutation-committed 1] "
+        "[mutation-pending 0] [queued 0]\n")
+    binradar_results.write_final_result(request)
+    report = (run_dir / "final.sbsv").read_text()
+    assert "[final] [coverage] [binradar-coverage complete]" in report
+    assert (f"[wall-time-reached {str(other_phase_cutoff).lower()}] "
+            "[binradar-coverage complete]") in report
+
+
 def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):
     filter_path = tmp_path / "filter.br"
     binradar_evidence.write_filter(filter_path, 3, [2])

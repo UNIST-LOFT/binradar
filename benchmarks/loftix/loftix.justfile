@@ -60,5 +60,5 @@ eval workdir="workdir" fuzzer="sdfuzz" fuzz_out="/workspace/binradar/benchmarks/
     uv run {{FUZZOLIC_ROOT}}/fuzzolic/binradar-evaluation.py -w {{workdir}} --fuzzer {{fuzzer}} --fuzz-out {{fuzz_out}}
 
 collect-results workdir="workdir" binradar_image="fuzzolic:2204" run_prefix="br-fo":
-    ABS_BENCHMARK_DIR=$(pwd); \
-    docker run --user $(id -u):$(id -g) -v $ABS_BENCHMARK_DIR:/workspace/fuzzolic/benchmarks/loftix -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/benchmarks/scripts/binradar-collect-results.py --workdir {{workdir}} --run-prefix {{run_prefix}} --format tsv
+    ABS_BENCHMARK_DIR=$(realpath "{{FUZZOLIC_ROOT}}/benchmarks/loftix"); \
+    docker run --user $(id -u):$(id -g) -v $ABS_BENCHMARK_DIR:/workspace/fuzzolic/benchmarks/loftix -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/benchmarks/scripts/binradar-collect-results.py binradar --exp /workspace/fuzzolic/benchmarks/loftix/exp.list --workdir {{workdir}} --run-prefix {{run_prefix}} --format tsv

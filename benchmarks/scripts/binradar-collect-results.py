@@ -230,6 +230,50 @@ class RunResult:
     binradar_evidence_iterations: int = -1
     binradar_rejected_count: int = -1
     binradar_remaining_patches_count: int = -1
+    # P3's reduction counters are independent of confidence-ranked patch lists;
+    # -1/None means the archived run did not record that field.
+    binradar_coverage: str = ""
+    binradar_raw_committed: int = -1
+    binradar_processed: int = -1
+    binradar_patch0_no_observation: int = -1
+    binradar_original_normal: int = -1
+    binradar_original_poc_crash: int = -1
+    binradar_original_other_crash: int = -1
+    binradar_original_unclassified_crash: int = -1
+    binradar_normal_branch_differences: int = -1
+    binradar_standalone_rejected: int = -1
+    binradar_overlap_rejected: int = -1
+    binradar_incremental_rejected: int = -1
+    binradar_final_survivors: int = -1
+    binradar_subject_kind: str = ""
+    binradar_fault_reference_valid: Optional[bool] = None
+    binradar_attempted: int = -1
+    binradar_committed: int = -1
+    binradar_discarded: int = -1
+    binradar_queued: int = -1
+    binradar_representative_runs: int = -1
+    binradar_representative_runs_partial: Optional[bool] = None
+    binradar_planned: int = -1
+    binradar_tracer_attempts: int = -1
+    binradar_stop_reason: str = ""
+    binradar_stop_attempt: int = -1
+    binradar_memcheck_enabled: Optional[bool] = None
+    binradar_baseline_status: str = ""
+    binradar_baseline_artifact: str = ""
+    binradar_baseline_reproduced: Optional[bool] = None
+    binradar_mutation_attempted: int = -1
+    binradar_mutation_discarded: int = -1
+    binradar_mutation_committed: int = -1
+    binradar_mutation_pending: int = -1
+    binradar_advisor_mode: str = ""
+    binradar_advisor_candidates_generated: int = -1
+    binradar_advisor_families_generated: int = -1
+    binradar_advisor_families_accepted: int = -1
+    binradar_advisor_unsupported_abstentions: int = -1
+    binradar_advisor_budget_abstentions: int = -1
+    binradar_advisor_families_executed: int = -1
+    binradar_advisor_child_uses: int = -1
+    binradar_advisor_telemetry: Dict[str, str] = field(default_factory=dict)
     remaining_patches: str = ""  # e.g. "[1, 2, 3]" or "[]"
     binradar_remaining_patches: str = ""
     verifier_rejected: str = ""  # e.g. "2,4,6"
@@ -699,6 +743,147 @@ def parse_final_sbsv(sbsv_path: str) -> Tuple[Dict[int, str], Dict[int, Dict[str
     return verifier_verdicts, binradar_verdicts, confidence_data
 
 
+COVERAGE_COUNTER_FIELDS = (
+    "raw-committed", "processed", "patch0-no-observation",
+    "original-normal", "original-poc-crash", "original-other-crash",
+    "original-unclassified-crash", "normal-branch-differences",
+    "standalone-rejected", "overlap-rejected", "incremental-rejected",
+    "final-survivors",
+)
+
+
+def _bracket_fields(line: str) -> Dict[str, str]:
+    """Read flat ``[key value]`` fields from one of our SBSV telemetry rows."""
+    return {key: value.strip().strip('"')
+            for key, value in re.findall(r"\[([\w-]+) ([^\]]*)\]", line)}
+
+
+def _optional_int(value: Optional[str]) -> int:
+    """Convert a telemetry counter without turning absent/bad data into zero."""
+    try:
+        return int(value) if value is not None else -1
+    except (TypeError, ValueError):
+        return -1
+
+
+def _optional_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes", "enabled"):
+        return True
+    if normalized in ("false", "0", "no", "disabled"):
+        return False
+    return None
+
+
+def parse_final_coverage(final_path: str) -> Dict[str, str]:
+    """Read the reducer's scalar coverage row without loading patch matrices."""
+    coverage: Dict[str, str] = {}
+    if not os.path.isfile(final_path):
+        return coverage
+    with open(final_path, "r", encoding="utf-8") as stream:
+        for line in stream:
+            payload = _strip_log_prefix(line.strip())
+            if not payload.startswith("[final] [coverage]"):
+                continue
+            coverage = _bracket_fields(payload)
+    return coverage
+
+
+def parse_progress_coverage_marker(progress_path: str, prefix: str,
+                                   run_id: str) -> str:
+    """Read coverage status appended to the matching final done row."""
+    if not os.path.isfile(progress_path):
+        return ""
+    status = ""
+    with open(progress_path, "r", encoding="utf-8") as stream:
+        for line in stream:
+            payload = _strip_log_prefix(line.strip())
+            if not payload.startswith("[final] [done]"):
+                continue
+            fields = _bracket_fields(payload)
+            if (fields.get("prefix") == prefix and
+                    fields.get("id") == str(run_id)):
+                status = fields.get("binradar-coverage", status)
+    return status
+
+
+def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
+                                    prefix: str, run_id: str) -> Dict[str, object]:
+    """Collect scalar BinRadar stop, attempt, baseline and advisor telemetry.
+
+    Current attempt rows carry a run id. Historical unscoped rows fall back to
+    the active ``[rundir] [set]`` record; run-scoped rows are checked against
+    the requested prefix/id to avoid reading another run's terminal data.
+    """
+    telemetry: Dict[str, object] = {
+        "stop": {}, "baseline_status": "", "baseline_artifact": "",
+        "tracer_attempts": -1, "advisor": {}, "settings": {},
+    }
+    active_run: Optional[Tuple[str, str]] = None
+    tracer_rows: List[Dict[str, str]] = []
+    advisor: Dict[str, str] = {}
+    if os.path.isfile(progress_path):
+        with open(progress_path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                payload = _strip_log_prefix(line.strip())
+                if not payload:
+                    continue
+                fields = _bracket_fields(payload)
+                if payload.startswith("[rundir] [set]"):
+                    active_run = (fields.get("prefix", ""),
+                                  fields.get("id", ""))
+                    continue
+                if "prefix" in fields or "id" in fields:
+                    scoped = (fields.get("prefix") == prefix and
+                              fields.get("id") == str(run_id))
+                else:
+                    scoped = active_run == (prefix, str(run_id))
+                if payload.startswith("[binradar] [start]") and scoped:
+                    tracer_rows.clear()
+                    advisor.clear()
+                    telemetry["stop"] = {}
+                    telemetry["baseline_status"] = ""
+                    telemetry["baseline_artifact"] = ""
+                elif payload.startswith("[binradar] [tracer]") and scoped:
+                    tracer_rows.append(fields)
+                elif payload.startswith("[binradar] [advisor]") and scoped:
+                    advisor.update({key: value for key, value in fields.items()
+                                    if key not in ("binradar", "advisor")})
+                elif payload.startswith("[binradar] [stop]") and (
+                        fields.get("prefix") == prefix and
+                        fields.get("id") == str(run_id)):
+                    telemetry["stop"] = fields
+                elif payload.startswith("[binradar] [baseline]") and (
+                        fields.get("prefix") == prefix and
+                        fields.get("id") == str(run_id)):
+                    status_match = re.match(
+                        r"\[binradar\] \[baseline\] \[([^\]]+)\]",
+                        payload)
+                    if status_match:
+                        telemetry["baseline_status"] = status_match.group(1)
+                        telemetry["baseline_artifact"] = fields.get(
+                            "artifact", "")
+
+    telemetry["tracer_attempts"] = len(tracer_rows) if tracer_rows else -1
+    telemetry["advisor"] = advisor
+    settings: Dict[str, str] = {}
+    settings_path = os.path.join(run_dir, "binradar-setting.sbsv")
+    if os.path.isfile(settings_path):
+        with open(settings_path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                payload = _strip_log_prefix(line.strip())
+                if not payload.startswith("[binradar-setting]"):
+                    continue
+                fields = _bracket_fields(payload)
+                if (fields.get("run-prefix", prefix) == prefix and
+                        fields.get("run-id", str(run_id)) == str(run_id)):
+                    settings.update(fields)
+    telemetry["settings"] = settings
+    return telemetry
+
+
 def parse_setup_filter_sbsv(sbsv_path: str) -> Dict[str, int]:
     """Parse current setup-filter result and done rows."""
     result = {"total": -1, "survived": -1, "done": 0}
@@ -1081,6 +1266,94 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             tracer_errors=tracer_errors,
         )
 
+        final_path = os.path.join(run_dir, "final.sbsv")
+        coverage = parse_final_coverage(final_path)
+        run_res.binradar_coverage = coverage.get("binradar-coverage", "")
+        if not run_res.binradar_coverage:
+            run_res.binradar_coverage = parse_progress_coverage_marker(
+                progress_path, prefix, run_id)
+        if (run_res.has_final and not run_res.issues
+                and run_res.binradar_coverage in ("partial", "unavailable")):
+            cutoff = "wall-time-reached; " if run_res.wall_time_reached else ""
+            run_res.status = (
+                f"OK ({cutoff}binradar {run_res.binradar_coverage} coverage)")
+        for counter in COVERAGE_COUNTER_FIELDS:
+            attr = "binradar_" + counter.replace("-", "_")
+            setattr(run_res, attr, _optional_int(coverage.get(counter)))
+        run_res.binradar_subject_kind = coverage.get("subject-kind", "")
+        run_res.binradar_fault_reference_valid = _optional_bool(
+            coverage.get("fault-reference-valid"))
+
+        runtime = parse_binradar_runtime_telemetry(
+            progress_path, run_dir, prefix, run_id)
+        stop = runtime["stop"]
+        if isinstance(stop, dict):
+            run_res.binradar_attempted = _optional_int(stop.get("attempted"))
+            run_res.binradar_committed = _optional_int(stop.get("committed"))
+            run_res.binradar_discarded = _optional_int(stop.get("discarded"))
+            run_res.binradar_queued = _optional_int(stop.get("queued"))
+            run_res.binradar_representative_runs = _optional_int(
+                stop.get("representative-runs"))
+            run_res.binradar_representative_runs_partial = _optional_bool(
+                stop.get("representative-runs-partial"))
+            run_res.binradar_planned = _optional_int(stop.get("planned"))
+            run_res.binradar_stop_reason = stop.get("reason", "")
+            run_res.binradar_stop_attempt = _optional_int(stop.get("attempt"))
+            run_res.binradar_memcheck_enabled = _optional_bool(
+                stop.get("memcheck"))
+            run_res.binradar_mutation_attempted = _optional_int(
+                stop.get("mutation-attempted"))
+            run_res.binradar_mutation_discarded = _optional_int(
+                stop.get("mutation-discarded"))
+            run_res.binradar_mutation_committed = _optional_int(
+                stop.get("mutation-committed"))
+            run_res.binradar_mutation_pending = _optional_int(
+                stop.get("mutation-pending"))
+            run_res.binradar_advisor_mode = stop.get("advisor-mode", "")
+            for name in (
+                    "candidates-generated", "families-generated",
+                    "families-accepted",
+                    "unsupported-abstentions", "budget-abstentions",
+                    "families-executed", "child-uses"):
+                column = "binradar_advisor_" + name.replace("-", "_")
+                setattr(run_res, column, _optional_int(
+                    stop.get("advisor-" + name)))
+            run_res.binradar_advisor_telemetry.update({
+                key: value for key, value in stop.items()
+                if key.startswith("advisor-") or
+                key.startswith("mutation-")
+            })
+        run_res.binradar_tracer_attempts = _optional_int(
+            str(runtime.get("tracer_attempts", "")))
+        run_res.binradar_baseline_status = str(
+            runtime.get("baseline_status", ""))
+        run_res.binradar_baseline_artifact = str(
+            runtime.get("baseline_artifact", ""))
+        if run_res.binradar_baseline_status in (
+                "reproduced", "normal", "different-fault"):
+            run_res.binradar_baseline_reproduced = (
+                run_res.binradar_baseline_status == "reproduced")
+        settings = runtime.get("settings", {})
+        if isinstance(settings, dict):
+            if run_res.binradar_memcheck_enabled is None:
+                for key, value in settings.items():
+                    normalized_key = key.lower().replace("_", "-")
+                    if normalized_key in (
+                            "binradar-memcheck-enable", "memcheck-enable",
+                            "memcheck-enabled", "memcheck"):
+                        run_res.binradar_memcheck_enabled = _optional_bool(
+                            value)
+                        break
+            if not run_res.binradar_advisor_mode:
+                for key, value in settings.items():
+                    if key.lower().replace("_", "-") == \
+                            "symbolic-mutation-mode":
+                        run_res.binradar_advisor_mode = value
+                        break
+        advisor = runtime.get("advisor", {})
+        if isinstance(advisor, dict):
+            run_res.binradar_advisor_telemetry.update(advisor)
+
         if final_entry:
             remaining = final_entry.get("remaining_patches", "N/A")
             br_remaining = final_entry.get("binradar_remaining_patches", "N/A")
@@ -1102,9 +1375,11 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                 run_res.verifier_data = verifier_results
                 run_res.verifier_candidate_count = len(verifier_results)
 
-        run_res.binradar_evidence_iterations = extract_count(
-            binradar_log,
-            r"Processed (\d+) complete BINRADAR evidence iteration")
+        run_res.binradar_evidence_iterations = (
+            run_res.binradar_processed
+            if run_res.binradar_processed >= 0 else extract_count(
+                binradar_log,
+                r"Processed (\d+) complete BINRADAR evidence iteration"))
 
         # Per-patch binradar verdicts and confidence from final.sbsv (written
         # by the FINAL phase). The confidence rows rank the accepted patches;
@@ -1475,6 +1750,71 @@ def format_result_log(result: ExperimentResult) -> str:
     for run_res in result.runs:
         lines.append(f"  [{run_res.run_name}] {run_res.status}")
 
+        if run_res.binradar_coverage:
+            rendered_counts = []
+            for key in COVERAGE_COUNTER_FIELDS:
+                value = getattr(
+                    run_res, "binradar_" + key.replace("-", "_"))
+                rendered_counts.append(
+                    f"{key} {value if value >= 0 else 'N/A'}")
+            coverage_counts = "; ".join(rendered_counts)
+            fault_reference = (
+                str(run_res.binradar_fault_reference_valid)
+                if run_res.binradar_fault_reference_valid is not None else "N/A")
+            lines.append(
+                f"    [coverage] {run_res.binradar_coverage}: "
+                f"{coverage_counts}; subject-kind "
+                f"{run_res.binradar_subject_kind or 'N/A'}; "
+                f"fault-reference-valid {fault_reference}")
+        if (run_res.binradar_attempted >= 0 or
+                run_res.binradar_stop_reason or
+                run_res.binradar_tracer_attempts >= 0):
+            attempted = (str(run_res.binradar_attempted)
+                         if run_res.binradar_attempted >= 0 else "N/A")
+            committed = (str(run_res.binradar_committed)
+                         if run_res.binradar_committed >= 0 else "N/A")
+            discarded = (str(run_res.binradar_discarded)
+                         if run_res.binradar_discarded >= 0 else "N/A")
+            queued = (str(run_res.binradar_queued)
+                      if run_res.binradar_queued >= 0 else "N/A")
+            lines.append(
+                f"    [binradar] attempts: {attempted}  committed: "
+                f"{committed}  discarded: {discarded}  queued: {queued}  "
+                f"stop reason: {run_res.binradar_stop_reason or 'N/A'}")
+        if run_res.binradar_tracer_attempts >= 0:
+            representative_runs = (
+                str(run_res.binradar_representative_runs)
+                if run_res.binradar_representative_runs >= 0 else "N/A")
+            planned = (str(run_res.binradar_planned)
+                       if run_res.binradar_planned >= 0 else "N/A")
+            memcheck = (str(run_res.binradar_memcheck_enabled)
+                        if run_res.binradar_memcheck_enabled is not None
+                        else "N/A")
+            representative_partial = (
+                str(run_res.binradar_representative_runs_partial)
+                if run_res.binradar_representative_runs_partial is not None
+                else "N/A")
+            lines.append(
+                f"    [binradar] tracer attempts observed: "
+                f"{run_res.binradar_tracer_attempts}  representative runs: "
+                f"{representative_runs}  representative-runs-partial: "
+                f"{representative_partial}  planned: {planned}  memcheck: "
+                f"{memcheck}")
+        if run_res.binradar_baseline_status:
+            reproduced = (
+                str(run_res.binradar_baseline_reproduced)
+                if run_res.binradar_baseline_reproduced is not None else "N/A")
+            lines.append(
+                f"    [binradar] selected baseline: "
+                f"{run_res.binradar_baseline_artifact or 'N/A'} "
+                f"status {run_res.binradar_baseline_status}; reproduces POC: "
+                f"{reproduced}")
+        if run_res.binradar_advisor_telemetry:
+            advisor_summary = "  ".join(
+                f"{key}: {value}" for key, value in sorted(
+                    run_res.binradar_advisor_telemetry.items()))
+            lines.append(f"    [binradar] advisor: {advisor_summary}")
+
         if run_res.has_final:
             lines.append(
                 f"    [final] remaining_patches: "
@@ -1588,6 +1928,48 @@ CSV_COLUMNS = [
     "binradar_evidence_iterations",
     "binradar_rejected_count",
     "binradar_remaining_patches_count",
+    "binradar_coverage",
+    "binradar_raw_committed",
+    "binradar_processed",
+    "binradar_patch0_no_observation",
+    "binradar_original_normal",
+    "binradar_original_poc_crash",
+    "binradar_original_other_crash",
+    "binradar_original_unclassified_crash",
+    "binradar_normal_branch_differences",
+    "binradar_standalone_rejected",
+    "binradar_overlap_rejected",
+    "binradar_incremental_rejected",
+    "binradar_final_survivors",
+    "binradar_subject_kind",
+    "binradar_fault_reference_valid",
+    "binradar_attempted",
+    "binradar_committed",
+    "binradar_discarded",
+    "binradar_queued",
+    "binradar_representative_runs",
+    "binradar_representative_runs_partial",
+    "binradar_planned",
+    "binradar_tracer_attempts",
+    "binradar_stop_reason",
+    "binradar_stop_attempt",
+    "binradar_memcheck_enabled",
+    "binradar_baseline_status",
+    "binradar_baseline_artifact",
+    "binradar_baseline_reproduced",
+    "binradar_mutation_attempted",
+    "binradar_mutation_discarded",
+    "binradar_mutation_committed",
+    "binradar_mutation_pending",
+    "binradar_advisor_mode",
+    "binradar_advisor_candidates_generated",
+    "binradar_advisor_families_generated",
+    "binradar_advisor_families_accepted",
+    "binradar_advisor_unsupported_abstentions",
+    "binradar_advisor_budget_abstentions",
+    "binradar_advisor_families_executed",
+    "binradar_advisor_child_uses",
+    "binradar_advisor_telemetry",
     "remaining_patches",
     "binradar_remaining_patches",
     "filter_survived_patches",
@@ -1610,30 +1992,10 @@ def format_results_csv(all_results: List[ExperimentResult],
     rows: List[Dict[str, str]] = []
     for result in all_results:
         if result.error_message:
-            row = {
-                "run": "",
-                "status": f"ERROR: {result.error_message}",
-                "has_final": "",
-                "at_least_one_remaining_patches": "",
-                "verifier_candidate_count": "",
-                "remaining_patches_count": "",
-                "binradar_evidence_iterations": "",
-                "binradar_rejected_count": "",
-                "binradar_remaining_patches_count": "",
-                "remaining_patches": "",
-                "binradar_remaining_patches": "",
-                "filter_survived_patches": "",
-                "filter_rejected_patches": "",
-                "setup_filter_total": "",
-                "setup_filter_survived": "",
-                "setup_filter_done": "",
-                "verifier_rejected_patches": "",
-                "binradar_rejected_patches": "",
-                "binradar_reject_reasons": "",
-                "log_errors_count": "",
-                "tracer_errors_count": "",
-                "error_preview": result.error_message,
-            }
+            row = {column: "" for column in CSV_COLUMNS
+                   if include_subject_id or column != "experiment"}
+            row["status"] = f"ERROR: {result.error_message}"
+            row["error_preview"] = result.error_message
             if include_subject_id:
                 row["experiment"] = result.exp_dir
             rows.append(row)
@@ -1688,6 +2050,70 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "tracer_errors_count": str(len(run_res.tracer_errors)),
                 "error_preview": error_preview,
             }
+            row["binradar_coverage"] = run_res.binradar_coverage
+            for counter in COVERAGE_COUNTER_FIELDS:
+                column = "binradar_" + counter.replace("-", "_")
+                value = getattr(run_res, column)
+                row[column] = str(value) if value >= 0 else ""
+            row["binradar_subject_kind"] = run_res.binradar_subject_kind
+            row["binradar_fault_reference_valid"] = (
+                str(run_res.binradar_fault_reference_valid)
+                if run_res.binradar_fault_reference_valid is not None else "")
+            for column, value in (
+                    ("binradar_attempted", run_res.binradar_attempted),
+                    ("binradar_committed", run_res.binradar_committed),
+                    ("binradar_discarded", run_res.binradar_discarded),
+                    ("binradar_queued", run_res.binradar_queued),
+                    ("binradar_representative_runs",
+                     run_res.binradar_representative_runs),
+                    ("binradar_planned", run_res.binradar_planned),
+                    ("binradar_tracer_attempts",
+                     run_res.binradar_tracer_attempts),
+                    ("binradar_stop_attempt", run_res.binradar_stop_attempt)):
+                row[column] = str(value) if value >= 0 else ""
+            row["binradar_representative_runs_partial"] = (
+                str(run_res.binradar_representative_runs_partial)
+                if run_res.binradar_representative_runs_partial is not None
+                else "")
+            row["binradar_stop_reason"] = run_res.binradar_stop_reason
+            row["binradar_memcheck_enabled"] = (
+                str(run_res.binradar_memcheck_enabled)
+                if run_res.binradar_memcheck_enabled is not None else "")
+            row["binradar_baseline_status"] = (
+                run_res.binradar_baseline_status)
+            row["binradar_baseline_artifact"] = (
+                run_res.binradar_baseline_artifact)
+            row["binradar_baseline_reproduced"] = (
+                str(run_res.binradar_baseline_reproduced)
+                if run_res.binradar_baseline_reproduced is not None else "")
+            row["binradar_advisor_mode"] = run_res.binradar_advisor_mode
+            for column, value in (
+                    ("binradar_mutation_attempted",
+                     run_res.binradar_mutation_attempted),
+                    ("binradar_mutation_discarded",
+                     run_res.binradar_mutation_discarded),
+                    ("binradar_mutation_committed",
+                     run_res.binradar_mutation_committed),
+                    ("binradar_mutation_pending",
+                     run_res.binradar_mutation_pending),
+                    ("binradar_advisor_candidates_generated",
+                     run_res.binradar_advisor_candidates_generated),
+                    ("binradar_advisor_families_generated",
+                     run_res.binradar_advisor_families_generated),
+                    ("binradar_advisor_families_accepted",
+                     run_res.binradar_advisor_families_accepted),
+                    ("binradar_advisor_unsupported_abstentions",
+                     run_res.binradar_advisor_unsupported_abstentions),
+                    ("binradar_advisor_budget_abstentions",
+                     run_res.binradar_advisor_budget_abstentions),
+                    ("binradar_advisor_families_executed",
+                     run_res.binradar_advisor_families_executed),
+                    ("binradar_advisor_child_uses",
+                     run_res.binradar_advisor_child_uses)):
+                row[column] = str(value) if value >= 0 else ""
+            row["binradar_advisor_telemetry"] = ";".join(
+                f"{key}={value}" for key, value in sorted(
+                    run_res.binradar_advisor_telemetry.items()))
             if include_subject_id:
                 row["experiment"] = result.exp_dir
             rows.append(row)

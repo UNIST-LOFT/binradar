@@ -19,6 +19,29 @@ binradar = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar)
 
 
+def test_advisor_report_counts_applied_children_not_only_proposals(tmp_path):
+    log = tmp_path / "tracer.log"
+    log.write_text(
+        "[symbolic-advisor] [summary] [mode boundary] [sources 2] "
+        "[valid-roots 2] [consumers 3] [candidates 8] [families 2] "
+        "[unsupported 1] [budget 0] [work 20] [bytes 40] [time-ms 2] "
+        "[candidates-generated 4] [families-generated 3] "
+        "[families-accepted 2]\n"
+        "[binradar] [advisor-attempt] [attempt 2] [advisor-id 2] "
+        "[family 11] [source 11] [child-uses 2]\n"
+        "[binradar] [advisor-attempt] [attempt 3] [advisor-id 2] "
+        "[family 11] [source 11] [child-uses 1]\n"
+        "[binradar] [advisor-attempt] [attempt 4] [advisor-id 2] "
+        "[family 12] [source 12] [child-uses 0]\n")
+    metrics = binradar._read_binradar_advisor_metrics(str(log), "boundary")
+    assert metrics["candidates_generated"] == 4
+    assert metrics["families_generated"] == 3
+    assert metrics["families_accepted"] == 2
+    assert metrics["families_executed"] == 1
+    assert metrics["child_uses"] == 3
+    assert metrics["unsupported_abstentions"] == 1
+
+
 def test_unlimited_deadline_stays_unlimited():
     deadline = binradar_runtime.Deadline.from_timeout(0)
 
@@ -167,6 +190,7 @@ def _install_runtime_fakes(monkeypatch, solver_start_delay=0):
             del args
             del kwargs
             self.deadline = deadline
+            self.forkserver_mode = True
             self.iter = 0
             self.representative_runs = 0
             deadlines.append(deadline)
@@ -218,7 +242,8 @@ def test_binradar_startup_expiry_is_graceful(tmp_path, monkeypatch):
                for row in executor.progress)
     assert any("[binradar] [stop]" in row and
                "[reason wall-time-reached]" in row and
-               "[attempt 0]" in row and "[remaining unknown]" in row
+               "[attempt 0]" in row and "[remaining unknown]" in row and
+               "[planned unknown]" in row and "[attempted 0]" in row
                for row in executor.progress)
     assert any("[binradar] [done]" in row for row in executor.progress)
 
@@ -228,6 +253,7 @@ class _RecordingTracer:
 
     def __init__(self, summaries):
         self.summaries = list(summaries)
+        self.forkserver_mode = True
         self.iter = 0
         self.representative_runs = 0
 
@@ -298,13 +324,76 @@ def _binradar_loop_executor(tmp_path):
     return executor
 
 
+def test_binradar_inflight_deadline_does_not_reuse_stale_queue_count(
+        tmp_path, monkeypatch):
+    class _Deadline:
+        reached = False
+
+        def expired(self):
+            return self.reached
+
+    class _TimeoutTracer:
+        forkserver_mode = True
+        iter = 0
+        representative_runs = 0
+        deadline = None
+
+        def run(self):
+            if self.iter == 0:
+                self.iter = 1
+                return _summary(
+                    1, 2, binradar_runtime.AttemptResult.COMPLETED,
+                    binradar_runtime.StopReason.CONTINUE, runs=3)
+            self.deadline.reached = True
+            raise TimeoutError("phase deadline")
+
+    tracer = _TimeoutTracer()
+
+    class _Session:
+        def __init__(self, mode, timeout):
+            del mode, timeout
+            self.deadline = _Deadline()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def shared_memory(self, *args, **kwargs):
+            del args, kwargs
+
+        def start_solver(self, *args, **kwargs):
+            del args, kwargs
+
+        def start_tracer(self, *args, **kwargs):
+            del args, kwargs
+            tracer.deadline = self.deadline
+            return tracer
+
+    monkeypatch.setattr(binradar_runtime, "PhaseSession", _Session)
+    executor = _binradar_loop_executor(tmp_path)
+    rows: list[str] = []
+    executor.save_progress = rows.append
+
+    executor.run_binradar()
+
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[reason wall-time-reached]" in stop
+    assert "[attempt 1] [remaining unknown]" in stop
+    assert "[representative-runs 3] [representative-runs-partial true]" in stop
+    assert "[planned 2] [attempted 2]" in stop
+    assert "[mutation-attempted 1]" in stop
+    assert "[mutation-pending 1] [queued unknown]" in stop
+
+
 def test_binradar_loop_continues_after_a_discarded_attempt(
         tmp_path, monkeypatch):
     """P2 regression: one unusable attempt must not end the queued sweep."""
     tracer = _RecordingTracer([
-        _summary(1, 2, binradar_runtime.AttemptResult.COMPLETED,
+        _summary(1, 3, binradar_runtime.AttemptResult.COMPLETED,
                  binradar_runtime.StopReason.CONTINUE),
-        _summary(2, 1, binradar_runtime.AttemptResult.UNUSABLE_EXIT,
+        _summary(2, 2, binradar_runtime.AttemptResult.UNUSABLE_EXIT,
                  binradar_runtime.StopReason.CONTINUE),
         _summary(3, 1, binradar_runtime.AttemptResult.TIMEOUT,
                  binradar_runtime.StopReason.CONTINUE),
@@ -330,6 +419,10 @@ def test_binradar_loop_continues_after_a_discarded_attempt(
     assert "[remaining 0]" in stop_rows[0]
     assert "[committed 2]" in stop_rows[0]
     assert "[discarded 2]" in stop_rows[0]
+    assert "[planned 3] [attempted 4]" in stop_rows[0]
+    assert "[representative-runs 4]" in stop_rows[0]
+    assert "[mutation-attempted 3] [mutation-discarded 2] " \
+           "[mutation-committed 1] [mutation-pending 0]" in stop_rows[0]
 
 
 def test_binradar_loop_reports_baseline_unavailable(tmp_path, monkeypatch):

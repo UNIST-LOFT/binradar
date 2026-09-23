@@ -1,6 +1,7 @@
 """Final BinRadar evidence reduction and report rendering."""
 
 import os
+import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
@@ -67,20 +68,61 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
         yield current_iteration, current
 
 
-def iter_binary_binradar_results(
-        evidence_file: str) -> Iterator[IterationResults]:
-    """Expand one compact equivalence-class frame at a time."""
-    for iteration in binradar_evidence.read_binradar(evidence_file):
-        results: dict[int, dict] = {}
-        for group in iteration.groups:
-            branch = ("null" if group.branches is None else
-                      "".join(str(value) for value in group.branches))
-            for patch in group.members:
-                result = {"result": group.outcome, "br": branch}
-                if group.outcome == "crash":
-                    result["fault_addr"] = group.fault_addr
-                results[patch] = result
-        yield iteration.iteration, results
+def _run_stop(run_dir: str, prefix: str, run_id: int) -> dict[str, str]:
+    """Read the last terminal row for this run, not another run's progress."""
+    path = os.path.join(os.path.dirname(os.path.normpath(run_dir)),
+                        "progress.sbsv")
+    stop: dict[str, str] = {}
+    if not os.path.isfile(path):
+        return stop
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            if not line.startswith("[binradar] [stop] "):
+                continue
+            fields = dict(re.findall(r"\[([\w-]+) ([^\]]*)\]", line))
+            if fields.get("prefix") == prefix and fields.get("id") == str(run_id):
+                stop = fields
+    return stop
+
+
+def _has_complete_coverage_contract(
+        stop: dict[str, str], raw_committed: int,
+        patch0_no_observation: int) -> bool:
+    """Prove that the finite P3 queue completed from the full stop record.
+
+    P2 stop rows carried only reason/attempt/remaining/commit counts.  They
+    cannot prove that no request was in flight or that every planned mutation
+    was accounted for, so they remain partial even when their scalar counts
+    happen to match the evidence file.
+    """
+    integer_fields = (
+        "attempt", "remaining", "committed", "discarded", "attempted",
+        "representative-runs", "planned", "queued", "mutation-attempted",
+        "mutation-discarded", "mutation-committed", "mutation-pending",
+    )
+    try:
+        counters = {name: int(stop[name]) for name in integer_fields}
+    except (KeyError, ValueError):
+        return False
+
+    planned = raw_committed - 1
+    return (
+        raw_committed > 0
+        and patch0_no_observation == 0
+        and stop.get("reason") == "exhausted"
+        and stop.get("representative-runs-partial") == "false"
+        and counters["attempt"] == raw_committed
+        and counters["remaining"] == 0
+        and counters["committed"] == raw_committed
+        and counters["discarded"] == 0
+        and counters["attempted"] == raw_committed
+        and counters["representative-runs"] >= raw_committed
+        and counters["planned"] == planned
+        and counters["queued"] == 0
+        and counters["mutation-attempted"] == planned
+        and counters["mutation-discarded"] == 0
+        and counters["mutation-committed"] == planned
+        and counters["mutation-pending"] == 0)
 
 
 def write_final_result(request: FinalResultRequest) -> None:
@@ -146,10 +188,11 @@ def write_final_result(request: FinalResultRequest) -> None:
     skip_binradar_analysis = (
         request.disable_binradar or request.binradar_failed)
     compact_binradar = False
+    stop = _run_stop(request.run_dir, request.run_prefix, request.run_id)
     if request.disable_binradar:
         logger.info(
             "[FINAL] BinRadar phase disabled; skipping evidence analysis.")
-        binradar_iterations: Iterator[IterationResults] = iter(())
+        binradar_iterations = iter(())
     elif request.binradar_failed:
         logger.warning(
             "[FINAL] BinRadar phase failed under --less-strict; ignoring "
@@ -158,7 +201,7 @@ def write_final_result(request: FinalResultRequest) -> None:
         binradar_iterations = iter(())
     elif os.path.exists(binradar_evidence_file):
         compact_binradar = True
-        binradar_iterations = iter_binary_binradar_results(
+        binradar_iterations = binradar_evidence.read_binradar(
             binradar_evidence_file)
     elif os.path.exists(trace_msg_log_file):
         binradar_iterations = iter_legacy_binradar_results(
@@ -185,49 +228,84 @@ def write_final_result(request: FinalResultRequest) -> None:
             "normal/normal confidence evidence remain available.")
 
     expected_candidates = set(candidates)
-    processed_iterations = 0
-    for iteration, iteration_results in binradar_iterations:
-        actual = set(iteration_results)
-        expected = {0} if iteration == 1 else expected_candidates | {0}
-        if compact_binradar and actual != expected:
-            raise ValueError(
-                f"BINRADAR iteration {iteration} coverage mismatch: "
-                f"missing {sorted(expected - actual)}; "
-                f"unexpected {sorted(actual - expected)}")
-        original = iteration_results.get(0)
+    processed_iterations = raw_committed = patch0_no_observation = 0
+    original_normal = original_poc_crash = original_other_crash = 0
+    original_unclassified_crash = normal_branch_differences = 0
+    standalone_rejections: set[int] = set()
+    for frame in binradar_iterations:
+        if compact_binradar:
+            assert isinstance(frame, binradar_evidence.BinradarIteration)
+            iteration = frame.iteration
+            actual = {member for group in frame.groups for member in group.members}
+            expected = {0} if iteration == 1 else expected_candidates | {0}
+            if actual != expected:
+                raise ValueError(
+                    f"BINRADAR iteration {iteration} coverage mismatch: "
+                    f"missing {sorted(expected - actual)}; "
+                    f"unexpected {sorted(actual - expected)}")
+            original_group = next(group for group in frame.groups
+                                  if 0 in group.members)
+            original = {"result": original_group.outcome,
+                        "br": original_group.branches,
+                        "fault_addr": original_group.fault_addr}
+            groups = ((group.members,
+                       {"result": group.outcome, "br": group.branches,
+                        "fault_addr": group.fault_addr})
+                      for group in frame.groups)
+        else:
+            assert not isinstance(frame, binradar_evidence.BinradarIteration)
+            iteration, iteration_results = frame
+            original = iteration_results.get(0)
+            groups = (([patch], result)
+                      for patch, result in iteration_results.items())
+        raw_committed += 1
         if (original is None or "result" not in original
-                or "br" not in original or original["br"] == "null"):
+                or "br" not in original or original["br"] in (None, "null")):
+            patch0_no_observation += 1
             continue
         processed_iterations += 1
-        for patch in remaining_patches:
-            patch_result = iteration_results.get(patch)
-            if (patch_result is None or "result" not in patch_result
-                    or "br" not in patch_result):
+        if original["result"] == "normal":
+            original_normal += 1
+        elif fault_reference_valid:
+            if original.get("fault_addr") == poc_fault_loc:
+                original_poc_crash += 1
+            else:
+                original_other_crash += 1
+        else:
+            original_unclassified_crash += 1
+        for members, patch_result in groups:
+            if "result" not in patch_result or "br" not in patch_result:
                 continue
-            if (original["result"] == "crash"
-                    and patch_result["result"] == "crash"):
-                if (fault_reference_valid
-                        and original.get("fault_addr") == poc_fault_loc
-                        and patch_result.get("fault_addr") == poc_fault_loc):
-                    record_evidence(patch, False)
-                    binradar_remaining_patches.discard(patch)
-                    binradar_reject_reasons[patch] = (
-                        "same-crash", iteration)
-            elif (original["result"] == "crash"
-                  and patch_result["result"] == "normal"):
-                record_evidence(patch, True)
-            elif (original["result"] == "normal"
-                  and patch_result["result"] == "crash"):
-                if (fault_reference_valid
-                        and patch_result.get("fault_addr") == poc_fault_loc):
-                    record_evidence(patch, False)
-                    binradar_remaining_patches.discard(patch)
-                    binradar_reject_reasons[patch] = (
-                        "introduced-crash", iteration)
-            elif (original["result"] == "normal"
-                  and patch_result["result"] == "normal"):
-                record_evidence(
-                    patch, original["br"] == patch_result["br"])
+            same_crash = (original["result"] == "crash"
+                          and patch_result["result"] == "crash"
+                          and fault_reference_valid
+                          and original.get("fault_addr") == poc_fault_loc
+                          and patch_result.get("fault_addr") == poc_fault_loc)
+            introduced_crash = (original["result"] == "normal"
+                                and patch_result["result"] == "crash"
+                                and fault_reference_valid
+                                and patch_result.get("fault_addr") == poc_fault_loc)
+            same_branch = original["br"] == patch_result["br"]
+            for patch in members:
+                if patch not in expected_candidates:
+                    continue
+                if same_crash or introduced_crash:
+                    standalone_rejections.add(patch)
+                    if patch in remaining_patches:
+                        record_evidence(patch, False)
+                        binradar_remaining_patches.discard(patch)
+                        binradar_reject_reasons[patch] = (
+                            "same-crash" if same_crash else "introduced-crash",
+                            iteration)
+                elif patch in remaining_patches:
+                    if (original["result"] == "crash"
+                            and patch_result["result"] == "normal"):
+                        record_evidence(patch, True)
+                    elif (original["result"] == "normal"
+                          and patch_result["result"] == "normal"):
+                        record_evidence(patch, same_branch)
+                        if not same_branch:
+                            normal_branch_differences += 1
 
     if not skip_binradar_analysis:
         logger.info(
@@ -236,6 +314,35 @@ def write_final_result(request: FinalResultRequest) -> None:
             f"{len(remaining_patches - binradar_remaining_patches)} "
             f"patch(es).")
 
+    concrete_rejected = expected_candidates - remaining_patches
+    overlap = standalone_rejections & concrete_rejected
+    incremental = standalone_rejections - concrete_rejected
+    if skip_binradar_analysis or stop.get("reason") == "baseline-unavailable":
+        coverage = "unavailable"
+    elif _has_complete_coverage_contract(
+            stop, raw_committed, patch0_no_observation):
+        coverage = "complete"
+    elif raw_committed or stop:
+        coverage = "partial"
+    else:
+        coverage = "unavailable"
+    coverage_row = (
+        f"[final] [coverage] [binradar-coverage {coverage}] "
+        f"[raw-committed {raw_committed}] [processed {processed_iterations}] "
+        f"[patch0-no-observation {patch0_no_observation}] "
+        f"[original-normal {original_normal}] "
+        f"[original-poc-crash {original_poc_crash}] "
+        f"[original-other-crash {original_other_crash}] "
+        f"[original-unclassified-crash {original_unclassified_crash}] "
+        f"[normal-branch-differences {normal_branch_differences}] "
+        f"[standalone-rejected {len(standalone_rejections)}] "
+        f"[overlap-rejected {len(overlap)}] "
+        f"[incremental-rejected {len(incremental)}] "
+        f"[final-survivors {len(binradar_remaining_patches)}] "
+        f"[subject-kind {'singleton' if len(candidates) == 1 else 'multi' if candidates else 'empty'}] "
+        f"[fault-reference-valid {str(fault_reference_valid).lower()}]")
+    request.save_progress(coverage_row)
+
     failed_phases = list(request.failed_phases)
     issues_suffix = (
         f" [issues true] [failed-phases {','.join(failed_phases)}]"
@@ -243,6 +350,7 @@ def write_final_result(request: FinalResultRequest) -> None:
     wall_time_suffix = (
         " [wall-time-reached true]" if wall_time_reached
         else " [wall-time-reached false]")
+    coverage_suffix = f" [binradar-coverage {coverage}]"
     if failed_phases:
         request.save_progress(
             f"[final] [failed-phases] [prefix {request.run_prefix}] "
@@ -257,7 +365,7 @@ def write_final_result(request: FinalResultRequest) -> None:
         f"[id {request.run_id}] "
         f"[remaining_patches {sorted(remaining_patches)}] "
         f"[binradar_remaining_patches {sorted(binradar_remaining_patches)}]"
-        f"{issues_suffix}{wall_time_suffix}")
+        f"{issues_suffix}{wall_time_suffix}{coverage_suffix}")
 
     final_result_file = os.path.join(request.run_dir, "final.sbsv")
     if request.disable_binradar:
@@ -288,6 +396,7 @@ def write_final_result(request: FinalResultRequest) -> None:
             f"[valid {str(fault_reference_valid).lower()}] "
             f"[source {reference_source}] [address {reference_address:x}] "
             f"[hard-crash-classification {crash_classification}]\n")
+        result_file.write(coverage_row + "\n")
         if failed_phases:
             result_file.write(
                 f"[final] [failed-phases] [prefix {request.run_prefix}] "
@@ -339,5 +448,5 @@ def write_final_result(request: FinalResultRequest) -> None:
             f"[remaining_patches {sorted(remaining_patches)}] "
             f"[binradar_remaining_patches "
             f"{sorted(binradar_remaining_patches)}]"
-            f"{issues_suffix}{wall_time_suffix}\n")
+            f"{issues_suffix}{wall_time_suffix}{coverage_suffix}\n")
     logger.info(f"[FINAL] Saved final result: {final_result_file}")
