@@ -6,6 +6,7 @@ import logging
 import time
 import threading
 import fcntl
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
                     Set, TextIO, Tuple)
@@ -31,6 +32,109 @@ from binradar_taosc_predicates import (
     predicate_stack_bytes,
 )
 
+TRACER_FAULT_VALID_SOURCES = frozenset(("guest-signal", "provenance-access"))
+TRACER_FAULT_SOURCES = frozenset((*TRACER_FAULT_VALID_SOURCES, "unavailable",
+                                  "legacy-unvalidated"))
+
+# Version 1 is the historical probe row. Version 2 deliberately stores the
+# reference's validity and provenance separately, so address zero is no longer
+# overloaded as an unavailable value.
+PROBE_RESULT_SCHEMA_V1 = (
+    "[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] "
+    "[patch-hit: int] [func-hit: int] [fault-addr: hex] "
+    "[tracer-fault-addr: hex] [patch-func-candidates: list[str]] "
+    "[stacktrace: list[str]]")
+PROBE_RESULT_SCHEMA_V2 = (
+    "[probe-info] [version: int] [exit: str] [patch-loc: hex] "
+    "[func-entry: hex] [patch-hit: int] [func-hit: int] "
+    "[fault-addr: hex] [tracer-fault-valid: bool] "
+    "[tracer-fault-source: str] [tracer-fault-addr: hex] "
+    "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
+
+
+@dataclass(frozen=True)
+class TracerFaultReference:
+    """Tracer-observed instruction identity used by BINRADAR FINAL."""
+
+    address: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.source not in TRACER_FAULT_SOURCES:
+            raise ValueError(f"unsupported tracer fault source: {self.source!r}")
+        if self.address < 0:
+            raise ValueError("tracer fault address must be non-negative")
+
+    @property
+    def valid(self) -> bool:
+        return self.source in TRACER_FAULT_VALID_SOURCES
+
+
+def _row_field(row: Any, name: str, default: Any = None) -> Any:
+    """Read an SBSV field from either version of a probe row."""
+    try:
+        return row[name]
+    except (KeyError, TypeError):
+        return default
+
+
+def _stacktrace_from_row(entries: List[Any]) -> List[Tuple[int, str]]:
+    stacktrace: List[Tuple[int, str]] = []
+    for entry in entries:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            stacktrace.append((entry["addr"], entry.get("symbol") or ""))
+            continue
+        addr, symbol = str(entry).split(":", 1)
+        stacktrace.append((int(addr, 16), symbol))
+    return stacktrace
+
+
+def _decode_tracer_fault_reference(row: Any) -> Optional[TracerFaultReference]:
+    """Decode v2 fields, rejecting invalid claims rather than promoting them."""
+    version = _row_field(row, "version")
+    if version != 2:
+        raise ValueError(f"unsupported probe result version: {version!r}")
+    valid = bool(_row_field(row, "tracer-fault-valid", False))
+    source = _row_field(row, "tracer-fault-source", "unavailable")
+    address = int(_row_field(row, "tracer-fault-addr", 0))
+    if not valid:
+        if address != 0:
+            raise ValueError(
+                "invalid tracer fault reference must use address zero")
+        return None
+    if source not in TRACER_FAULT_VALID_SOURCES:
+        raise ValueError(f"invalid tracer fault source for valid row: {source!r}")
+    return TracerFaultReference(address, source)
+
+
+def _decode_legacy_tracer_fault_reference(address: int) -> Optional[TracerFaultReference]:
+    if address == 0:
+        return None
+    return TracerFaultReference(address, "legacy-unvalidated")
+
+
+def _probe_reference_fields(
+        reference: Optional[TracerFaultReference]) -> Tuple[bool, str, int]:
+    if reference is None:
+        return False, "unavailable", 0
+    if reference.source == "legacy-unvalidated":
+        raise ValueError(
+            "legacy-unvalidated tracer fault references cannot be "
+            "serialized as fresh probe data")
+    if not reference.valid:
+        return False, "unavailable", 0
+    return True, reference.source, reference.address
+
+
+def _probe_version(row: Any) -> Optional[int]:
+    try:
+        return int(row["version"])
+    except (KeyError, TypeError):
+        return None
+
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "utils", "binradar-aflplusplus", "afl-qemu-trace")
@@ -51,6 +155,31 @@ def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
         except ValueError:
             continue
     return False
+
+
+def e9_relocated_call_site(fault_addr: int, relocated_calls: Sequence[str]) -> Optional[int]:
+    """Return the original call-site address when ``fault_addr`` is the
+    *exact* E9 relocated-call jump that re-implements it, else None.
+
+    ``relocated_calls`` records are ``jump:call-site:return`` triples
+    produced by setup's ``extract_relocated_call_jumps``: the jump address
+    is the trampoline jump E9Patch emits to emulate one original call, and
+    the record proves that this exact PC denotes that one original
+    instruction.  This is the identity relation -- never a range -- so an
+    unrelated trampoline/reserve crash can never be silently folded onto
+    the patch site.
+    """
+    for record in relocated_calls:
+        fields = record.split(":")
+        if len(fields) != 3:
+            continue
+        try:
+            jump, site = int(fields[0], 0), int(fields[1], 0)
+        except ValueError:
+            continue
+        if jump == fault_addr:
+            return site
+    return None
 
 
 class CachedPredicateSet(NamedTuple):
@@ -114,9 +243,18 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
 
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
-    line_parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
+    line_parser.add_schema(PROBE_RESULT_SCHEMA_V2)
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
-    def __init__(self, patch_loc: int, patch_func_entry: int, stacktrace: List[Tuple[int, str]], exit_info: str, patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int, patch_func_candidates: List[Tuple[int, int]], tracer_fault_addr: int = 0):
+    legacy_line_parser: sbsv.parser = sbsv.parser()
+    legacy_line_parser.add_schema(PROBE_RESULT_SCHEMA_V1)
+    legacy_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
+
+    def __init__(
+            self, patch_loc: int, patch_func_entry: int,
+            stacktrace: List[Tuple[int, str]], exit_info: str,
+            patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int,
+            patch_func_candidates: List[Tuple[int, int]],
+            tracer_fault_reference: Optional[TracerFaultReference] = None):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
         self.stacktrace = stacktrace
@@ -125,7 +263,8 @@ class BinRadarProbeResult:
         self.patch_func_hit_cnt = patch_func_hit_cnt
         self.fault_addr = fault_addr
         self.patch_func_candidates = patch_func_candidates
-        self.tracer_fault_addr = tracer_fault_addr
+        self.tracer_fault_reference = tracer_fault_reference
+        self._probe_serialization_version = 2
         self.need_file_hook = False
     
     @staticmethod
@@ -218,11 +357,14 @@ class BinRadarProbeResult:
     
     @staticmethod
     def from_sbsv(sbsv_file: str) -> Optional["BinRadarProbeResult"]:
-        parser = sbsv.parser()
-        parser.add_schema("[probe-info] [exit: str] [patch-loc: hex] [func-entry: hex] [patch-hit: int] [func-hit: int] [fault-addr: hex] [tracer-fault-addr: hex] [patch-func-candidates: list[str]] [stacktrace: list[str]]")
-        parser.add_schema("[file-trace] [need-file-hook: bool]")
         with open(sbsv_file, "r", encoding="utf-8") as f:
-            result = parser.load(f)
+            data = f.read()
+        try:
+            result = BinRadarProbeResult.line_parser.loads(data)
+        except ValueError:
+            result = None
+        if result is None or len(result["probe-info"]) == 0:
+            result = BinRadarProbeResult.legacy_line_parser.loads(data)
         if len(result["probe-info"]) == 0:
             logger.error("Probe info not found in the log.")
             return None
@@ -230,39 +372,33 @@ class BinRadarProbeResult:
             logger.error("File trace info not found in the log.")
             return None
         probe_info = result["probe-info"][-1]
-        patch_loc = probe_info["patch-loc"]
-        patch_func_entry = probe_info["func-entry"]
-        stacktrace = list()
-        for entry in probe_info["stacktrace"]:
-            if not entry:
-                continue
-            addr, symbol = entry.split(":", 1)
-            stacktrace.append((int(addr, 16), symbol))
-        
-        exit_info = probe_info["exit"]
-        patch_hit_cnt = probe_info["patch-hit"]
-        patch_func_hit_cnt = probe_info["func-hit"]
-        fault_addr = probe_info["fault-addr"]
-        tracer_fault_addr = probe_info["tracer-fault-addr"]
-        patch_func_candidates = list()
+        version = _probe_version(probe_info)
+        if version is None:
+            tracer_fault_reference = _decode_legacy_tracer_fault_reference(
+                probe_info["tracer-fault-addr"])
+        elif version == 2:
+            tracer_fault_reference = _decode_tracer_fault_reference(probe_info)
+        else:
+            raise ValueError(f"unsupported probe result version: {version}")
+        patch_func_candidates = []
         for func in probe_info["patch-func-candidates"]:
             if not func:
                 continue
             entry, hits = func.split(":", 1)
             patch_func_candidates.append((int(entry, 16), int(hits)))
-        need_file_hook = result["file-trace"][-1]["need-file-hook"]
         probe_result = BinRadarProbeResult(
-            patch_loc=patch_loc,
-            patch_func_entry=patch_func_entry,
-            stacktrace=stacktrace,
-            exit_info=exit_info,
-            patch_hit_cnt=patch_hit_cnt,
-            patch_func_hit_cnt=patch_func_hit_cnt,
-            fault_addr=fault_addr,
+            patch_loc=probe_info["patch-loc"],
+            patch_func_entry=probe_info["func-entry"],
+            stacktrace=_stacktrace_from_row(probe_info["stacktrace"]),
+            exit_info=probe_info["exit"],
+            patch_hit_cnt=probe_info["patch-hit"],
+            patch_func_hit_cnt=probe_info["func-hit"],
+            fault_addr=probe_info["fault-addr"],
             patch_func_candidates=patch_func_candidates,
-            tracer_fault_addr=tracer_fault_addr
+            tracer_fault_reference=tracer_fault_reference,
         )
-        probe_result.need_file_hook = need_file_hook
+        probe_result.need_file_hook = result["file-trace"][-1]["need-file-hook"]
+        probe_result._probe_serialization_version = 2 if version == 2 else 1
         return probe_result
         
     def update_with_file_trace(self, log: str):
@@ -321,7 +457,20 @@ class BinRadarProbeResult:
                                 break
 
     def serialize(self) -> str:
-        return f"[exit {self.exit_info}] [patch-loc {self.patch_loc:x}] [func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] [func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] [tracer-fault-addr {self.tracer_fault_addr:x}] [patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] [stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]"
+        if getattr(self, "_probe_serialization_version", 2) != 2:
+            raise ValueError(
+                "legacy probe results cannot be serialized as fresh data")
+        valid, source, address = _probe_reference_fields(
+            self.tracer_fault_reference)
+        valid_text = "true" if valid else "false"
+        return (
+            f"[version 2] [exit {self.exit_info}] [patch-loc {self.patch_loc:x}] "
+            f"[func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] "
+            f"[func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] "
+            f"[tracer-fault-valid {valid_text}] [tracer-fault-source {source}] "
+            f"[tracer-fault-addr {address:x}] "
+            f"[patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] "
+            f"[stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]")
 
     def serialize_file_trace_result(self) -> str:
         return f"[need-file-hook {self.need_file_hook}]"
@@ -329,34 +478,59 @@ class BinRadarProbeResult:
     @classmethod
     def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
         for line in data.splitlines():
-            res = cls.line_parser.parse_line_detached(line)
-            if res is not None:
-                if res.get_name() == "probe-info":
-                    return cls(
-                        patch_loc=res["patch-loc"],
-                        patch_func_entry=res["func-entry"],
-                        stacktrace=[(entry["addr"], entry["symbol"] or "") for entry in res["stacktrace"]],
-                        exit_info=res["exit"],
-                        patch_hit_cnt=res["patch-hit"],
-                        patch_func_hit_cnt=res["func-hit"],
-                        fault_addr=res["fault-addr"],
-                        patch_func_candidates=[(int(func.split(":")[0], 16), int(func.split(":")[1])) for func in res["patch-func-candidates"]],
-                        tracer_fault_addr=res["tracer-fault-addr"]
-                    )
-                elif res.get_name() == "file-trace":
-                    tmp = cls(
-                        patch_loc=0,
-                        patch_func_entry=0,
-                        stacktrace=[],
-                        exit_info="",
-                        patch_hit_cnt=0,
-                        patch_func_hit_cnt=0,
-                        fault_addr=0,
-                        patch_func_candidates=[],
-                        tracer_fault_addr=0
-                    )
-                    tmp.need_file_hook = res["need-file-hook"]
-                    return tmp
+            try:
+                res = cls.line_parser.parse_line_detached(line)
+            except ValueError:
+                res = None
+            if res is None:
+                try:
+                    res = cls.legacy_line_parser.parse_line_detached(line)
+                except ValueError:
+                    res = None
+            if res is None:
+                continue
+            if res.get_name() == "probe-info":
+                version = _probe_version(res)
+                if version is None:
+                    tracer_fault_reference = _decode_legacy_tracer_fault_reference(
+                        res["tracer-fault-addr"])
+                elif version == 2:
+                    tracer_fault_reference = _decode_tracer_fault_reference(res)
+                else:
+                    raise ValueError(f"unsupported probe result version: {version}")
+                patch_func_candidates = []
+                for func in res["patch-func-candidates"]:
+                    if not func:
+                        continue
+                    entry, hits = func.split(":", 1)
+                    patch_func_candidates.append((int(entry, 16), int(hits)))
+                probe_result = cls(
+                    patch_loc=res["patch-loc"],
+                    patch_func_entry=res["func-entry"],
+                    stacktrace=_stacktrace_from_row(res["stacktrace"]),
+                    exit_info=res["exit"],
+                    patch_hit_cnt=res["patch-hit"],
+                    patch_func_hit_cnt=res["func-hit"],
+                    fault_addr=res["fault-addr"],
+                    patch_func_candidates=patch_func_candidates,
+                    tracer_fault_reference=tracer_fault_reference,
+                )
+                probe_result._probe_serialization_version = (
+                    2 if version == 2 else 1)
+                return probe_result
+            if res.get_name() == "file-trace":
+                tmp = cls(
+                    patch_loc=0,
+                    patch_func_entry=0,
+                    stacktrace=[],
+                    exit_info="",
+                    patch_hit_cnt=0,
+                    patch_func_hit_cnt=0,
+                    fault_addr=0,
+                    patch_func_candidates=[],
+                )
+                tmp.need_file_hook = res["need-file-hook"]
+                return tmp
         return None
     
     def patch_hit(self) -> bool:
@@ -542,12 +716,24 @@ class BinRadarQemuRunner:
         rule as binradar-test.py's qasan probes).  Without this, a
         non-fixing patch's crash would be classified as "crash elsewhere"
         (ignored) instead of "crash at the original fault address".
-        Original binaries have no E9 metadata, so they are unchanged."""
-        ranges, _ = self.e9_metadata_for_binary(
+        Original binaries have no E9 metadata, so they are unchanged.
+
+        Only the artifact's own relocated-call records are used as
+        identity proof: a pc that merely lies inside the E9 ranges but is
+        not a recorded relocated jump of this patch site is left
+        unnormalized, so an unrelated trampoline/reserve crash can never be
+        silently folded onto the patch site."""
+        ranges, relocated_calls = self.e9_metadata_for_binary(
             binary if binary is not None else self.patched_binary())
-        if fault_addr is not None and ranges \
-                and addr_in_e9_ranges(fault_addr, ranges):
-            return int(self.patch_loc, 0)
+        if fault_addr is None:
+            return fault_addr
+        site = e9_relocated_call_site(fault_addr, relocated_calls)
+        if site is not None:
+            return site
+        # Inside an E9 map with no relocation record, or outside every E9
+        # map: not provably the patch-site instruction.  Keep the raw pc so
+        # the comparison reports the real identity instead of folding an
+        # unrelated crash onto the patch site.
         return fault_addr
     
     def original_binary(self) -> str:

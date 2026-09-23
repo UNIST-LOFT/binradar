@@ -6,6 +6,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import binradar_verifier
 import logger
 import sbsv
 
@@ -23,14 +24,15 @@ class FeedbackExportRequest:
 
 
 def _result_parsers():
-    full_parser = sbsv.parser()
-    full_parser.add_schema(
-        "[testcase] [result] [id: int] [file: str] [exit: str] "
-        "[patch-loc: hex] [func-entry: hex] [patch-hit: int] "
-        "[func-hit: int] [fault-addr: hex] "
-        "[tracer-fault-addr: hex] "
-        "[patch-func-candidates: list[str]] [stacktrace: list[str]] "
-        "[pid: int] [br: list[int]]")
+    full_parsers = []
+    for schema in (binradar_verifier.PROBE_RESULT_SCHEMA_V2,
+                   binradar_verifier.PROBE_RESULT_SCHEMA_V1):
+        parser = sbsv.parser()
+        parser.add_schema(
+            "[testcase] [result] [id: int] [file: str] "
+            + schema.removeprefix("[probe-info] ")
+            + " [pid: int] [br: list[int]]")
+        full_parsers.append(parser)
     legacy_parser = sbsv.parser()
     legacy_parser.add_schema(
         "[testcase] [result] [id: int] [file: str] [exit: str] "
@@ -39,7 +41,7 @@ def _result_parsers():
     minimal_parser.add_schema(
         "[testcase] [result] [id: int] [file: str] [exit: str] "
         "[fault-addr: hex]")
-    return full_parser, legacy_parser, minimal_parser
+    return *full_parsers, legacy_parser, minimal_parser
 
 
 def _parse_result_row(line: str, parsers) -> sbsv.SbsvData | None:
@@ -59,6 +61,25 @@ def export_feedback(request: FeedbackExportRequest) -> None:
     if not os.path.exists(minimizer_result_file):
         raise FileNotFoundError(
             f"Minimizer result file not found: {minimizer_result_file}")
+
+    # Version 1 classified mutation crashes against the QASAN address without
+    # explicit tracer-reference validity. Never re-export that classification
+    # as corrected feedback; leave historical artifacts untouched.
+    mutation_feedback = os.path.join(request.run_dir, "binradar-feedback")
+    if os.path.isdir(mutation_feedback):
+        parser = sbsv.parser()
+        parser.add_schema("[binradar-feedback] [version: int]")
+        with os.scandir(mutation_feedback) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".sbsv"):
+                    continue
+                with open(entry.path, "r", encoding="utf-8") as sidecar:
+                    header = parser.parse_line_detached(sidecar.readline())
+                if header is None or header["version"] != 2:
+                    raise ValueError(
+                        "Mutation feedback requires fault-reference version 2; "
+                        "use a fresh run rather than reclassifying archived pairs: "
+                        f"{entry.path}")
 
     request.save_progress(
         f"[feedback] [start] [prefix {request.run_prefix}] "
@@ -88,7 +109,6 @@ def export_feedback(request: FeedbackExportRequest) -> None:
     manifest = os.path.join(request.workdir, "brpatches.json")
     if os.path.exists(manifest):
         shutil.copyfile(manifest, os.path.join(feedback_dir, "brpatches.json"))
-    mutation_feedback = os.path.join(request.run_dir, "binradar-feedback")
     if os.path.isdir(mutation_feedback):
         shutil.copytree(
             mutation_feedback, os.path.join(feedback_dir, "binradar"))

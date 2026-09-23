@@ -116,7 +116,7 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     probe_result = SimpleNamespace(
         patch_func_entry=0x1000,
         fault_addr=0x2000,
-        tracer_fault_addr=0,
+        tracer_fault_reference=None,
         patch_hit=lambda: True,
         is_timeout=lambda: False,
         is_crash=lambda: True,
@@ -206,3 +206,28 @@ def test_symbolic_mode_rejects_unknown_value():
         binradar_config.validate_symbolic_mutation_mode("aggressive")
     assert binradar_config.validate_symbolic_mutation_mode(
         " Boundary ") == "boundary"
+
+
+def test_memcheck_policy_is_explicit_per_mode(monkeypatch, executor):
+    """The crash-detection policy is set by the phase, never inherited."""
+    instance, run_dir = executor
+    # An ambient value must not decide whether a phase can observe a guest
+    # memory violation at all.
+    monkeypatch.setenv("BINRADAR_MEMCHECK_ENABLE", "1")
+
+    # BINRADAR must detect what PROBE detects, so it is enabled there.
+    assert _phase_env(instance, "binradar", run_dir)[
+        "BINRADAR_MEMCHECK_ENABLE"] == "1"
+    # FUZZOLIC and DIRECTED keep their existing policy.
+    for index, mode in enumerate(["fuzzolic", "directed", "probe",
+                                  "minimizer", "verifier"]):
+        forced = _phase_env(instance, mode, run_dir / f"m{index}")
+        assert forced["BINRADAR_MEMCHECK_ENABLE"] == "0", mode
+
+
+def test_memcheck_policy_overrides_inherited_disabled_value(
+        monkeypatch, executor):
+    instance, run_dir = executor
+    monkeypatch.setenv("BINRADAR_MEMCHECK_ENABLE", "0")
+    assert _phase_env(instance, "binradar", run_dir)[
+        "BINRADAR_MEMCHECK_ENABLE"] == "1"

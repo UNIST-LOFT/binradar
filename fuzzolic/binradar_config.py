@@ -13,6 +13,9 @@ SYMBOLIC_MAX_WORK_DEFAULT = 1_000_000
 SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
 SYMBOLIC_DEADLINE_MS_DEFAULT = 100
 
+# We need to turn on MEMCHECK in tracer for binradar phase
+MEMCHECK_ENABLED_MODES = ("binradar",)
+
 _RETAINED_ENVIRONMENT_KEYS = (
     "BINRADAR_PATCH_KIND",
     "BRCACHE_STACK_SIZE",
@@ -201,6 +204,10 @@ def build_phase_environment(
     environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] = (
         requested_mode if mode == "binradar" else "off")
     environment["BINRADAR_TRACER_LOG_FILE"] = phase_log_file(mode, run_dir)
+
+    # Explicit crash-detection policy.
+    environment["BINRADAR_MEMCHECK_ENABLE"] = (
+        "1" if mode in MEMCHECK_ENABLED_MODES else "0")
 
     # Original-binary phases must not inherit patched E9 metadata.
     environment["E9_EXCLUDE_RANGES"] = ""

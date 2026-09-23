@@ -270,7 +270,19 @@ def main():
         logger.info(f"[PROBE] Loaded existing probe result: {probe_file}")
     else:
         probe_result = run_probe(workdir, env, probe_file)
-    logger.info(f"[PROBE] {probe_result.serialize()}")
+    reference = probe_result.tracer_fault_reference
+    legacy_probe = (
+        getattr(probe_result, "_probe_serialization_version", 1) != 2)
+    if legacy_probe:
+        if reference is None:
+            probe_summary = "[legacy probe (fault reference unavailable)]"
+        else:
+            probe_summary = (
+                f"[legacy reference {reference.address:#x} "
+                f"({reference.source})]")
+    else:
+        probe_summary = probe_result.serialize()
+    logger.info(f"[PROBE] {probe_summary}")
 
     # 1b. Filter: keep only patches that do not crash at the original fault
     # address with the POC input. The verifier only checks survivors.

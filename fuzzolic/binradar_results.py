@@ -18,7 +18,7 @@ class FinalResultRequest:
     run_prefix: str
     run_id: int
     candidates: Sequence[int]
-    tracer_fault_addr: int
+    tracer_fault_reference: binradar_verifier.TracerFaultReference | None
     disable_binradar: bool
     binradar_failed: bool
     wall_time_reached: bool
@@ -174,11 +174,15 @@ def write_final_result(request: FinalResultRequest) -> None:
             remaining_patches.discard(patch_id)
     binradar_remaining_patches = remaining_patches.copy()
     binradar_reject_reasons: dict[int, tuple[str, int]] = {}
-    poc_fault_loc = 0 if skip_binradar_analysis else request.tracer_fault_addr
-    if not skip_binradar_analysis and poc_fault_loc == 0:
+    fault_reference = request.tracer_fault_reference
+    fault_reference_valid = (
+        fault_reference is not None and fault_reference.valid)
+    poc_fault_loc = fault_reference.address if fault_reference_valid else None
+    if not skip_binradar_analysis and not fault_reference_valid:
         logger.warning(
-            "[FINAL] tracer_fault_addr is 0; binradar crash comparison "
-            "will not match any fault address.")
+            "[FINAL] No validated tracer fault reference; BINRADAR hard-crash "
+            "classification is unavailable. Concrete verdicts and "
+            "normal/normal confidence evidence remain available.")
 
     expected_candidates = set(candidates)
     processed_iterations = 0
@@ -202,7 +206,8 @@ def write_final_result(request: FinalResultRequest) -> None:
                 continue
             if (original["result"] == "crash"
                     and patch_result["result"] == "crash"):
-                if (original.get("fault_addr") == poc_fault_loc
+                if (fault_reference_valid
+                        and original.get("fault_addr") == poc_fault_loc
                         and patch_result.get("fault_addr") == poc_fault_loc):
                     record_evidence(patch, False)
                     binradar_remaining_patches.discard(patch)
@@ -213,7 +218,8 @@ def write_final_result(request: FinalResultRequest) -> None:
                 record_evidence(patch, True)
             elif (original["result"] == "normal"
                   and patch_result["result"] == "crash"):
-                if patch_result.get("fault_addr") == poc_fault_loc:
+                if (fault_reference_valid
+                        and patch_result.get("fault_addr") == poc_fault_loc):
                     record_evidence(patch, False)
                     binradar_remaining_patches.discard(patch)
                     binradar_reject_reasons[patch] = (
@@ -270,6 +276,18 @@ def write_final_result(request: FinalResultRequest) -> None:
             f"[id {request.run_id}] "
             f"[verifier {os.path.basename(verifier_result_file)}] "
             f"{trace_metadata}\n")
+        reference_source = (fault_reference.source if fault_reference is not None
+                            else "unavailable")
+        reference_address = (fault_reference.address if fault_reference is not None
+                             else 0)
+        crash_classification = (
+            "available" if fault_reference_valid and not skip_binradar_analysis
+            else "unavailable")
+        result_file.write(
+            f"[final] [fault-reference] [version 2] "
+            f"[valid {str(fault_reference_valid).lower()}] "
+            f"[source {reference_source}] [address {reference_address:x}] "
+            f"[hard-crash-classification {crash_classification}]\n")
         if failed_phases:
             result_file.write(
                 f"[final] [failed-phases] [prefix {request.run_prefix}] "

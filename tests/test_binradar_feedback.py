@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
@@ -43,11 +45,29 @@ def _feedback_executor(tmp_path):
 def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1):
     return (
         f"[testcase] [result] [id {testcase_id}] [file {filename}] "
-        f"[exit {exit_info}] [patch-loc 1000] [func-entry 2000] "
+        f"[version 2] [exit {exit_info}] [patch-loc 1000] [func-entry 2000] "
         f"[patch-hit {patch_hit}] [func-hit 1] [fault-addr {fault_addr:x}] "
+        "[tracer-fault-valid false] [tracer-fault-source unavailable] "
         "[tracer-fault-addr 0] [patch-func-candidates []] "
         "[stacktrace []] [pid 0] [br [0]] [time 1]\n"
     )
+
+
+def test_feedback_rejects_legacy_mutation_classification_without_overwrite(tmp_path):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    (run_dir / "minimizer.sbsv").write_text("")
+    mutation = run_dir / "binradar-feedback"
+    mutation.mkdir()
+    sidecar = mutation / "iteration-00000002-patch-00000001.sbsv"
+    legacy = "[binradar-feedback] [version 1] [result malicious]\n"
+    sidecar.write_text(legacy)
+    existing = run_dir / "feedback"
+    existing.mkdir()
+    (existing / "keep").write_bytes(b"historical")
+    with pytest.raises(ValueError, match="fresh run"):
+        executor.run_feedback()
+    assert sidecar.read_text() == legacy
+    assert (existing / "keep").read_bytes() == b"historical"
 
 
 def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
@@ -69,10 +89,12 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
     # applied plan, including the synthesized value, so the copy must preserve
     # every mutation row byte for byte and not just the header.
     symbolic_sidecar = (
-        "[binradar-feedback] [version 1] [iteration 2] [patch 1] "
+        "[binradar-feedback] [version 2] [iteration 2] [patch 1] "
         "[snapshot-file iteration-00000002-patch-00000001.brch] "
         "[snapshot-count 1] [branches 1] [outcome normal] [fault-addr 0] "
-        "[poc-fault-addr 1234] [same-fault false] [result benign] "
+        "[fault-valid false] [fault-source unavailable] "
+        "[poc-fault-addr 1234] [poc-fault-valid true] "
+        "[poc-fault-source guest-signal] [same-fault false] [result benign] "
         "[mutation-writes 1]\n"
         "[binradar-mutation] [index 0] [kind bytes] [addr 404080] [size 4] "
         "[value 00100000] [target-extent 0]\n"

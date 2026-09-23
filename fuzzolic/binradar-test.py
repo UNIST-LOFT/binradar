@@ -26,7 +26,7 @@ from binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
     QEMU_STACKTRACE_RELEASE,
-    addr_in_e9_ranges,
+    e9_relocated_call_site,
 )
 
 LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
@@ -422,31 +422,28 @@ def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
     return fault_addr, exit_info
 
 
-def _in_e9_exclude_ranges(addr: int, exclude_ranges: str) -> bool:
-    """True if addr lies inside one of the canonical half-open
-    0x<start>-0x<end> E9 exclude ranges (trampoline/reserve pages).
-    Delegates to the shared verifier helper."""
-    return addr_in_e9_ranges(addr, exclude_ranges)
-
-
 def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
                                  binary_path: str) -> Tuple[int, bool]:
-    """Map a fault pc inside the E9 trampoline/reserve pages back to the
-    patch site.
+    """Map a fault pc onto the original patch-site instruction.
 
     With PATCH_ID=0 the patch stub takes the no-patch path and re-executes
     the relocated copy of the original patch-site instruction inside the E9
     trampoline pages, so a crash caused by that instruction reports the
-    trampoline address instead of the in-binary site.  A crash with the pc
-    inside the artifact's E9 exclude ranges can only come from patch-stub
-    code, so attribute it to PATCH_LOC."""
-    exclude_ranges, _ = runner.e9_metadata_for_binary(binary_path)
-    if fault_addr is not None and _in_e9_exclude_ranges(fault_addr, exclude_ranges):
-        return int(runner.patch_loc, 0), True
+    trampoline address instead of the in-binary site.  Only the artifact's
+    own relocated-call record proves that relation: a pc that merely lies
+    inside the E9 exclude ranges is *not* attributed, because an unrelated
+    trampoline/reserve crash must not be folded onto the patch site."""
+    _, relocated_calls = runner.e9_metadata_for_binary(binary_path)
+    site = e9_relocated_call_site(fault_addr, relocated_calls)
+    if site is not None:
+        return site, True
     return fault_addr, False
 
 
 _TRACER_PARSER = sbsv.parser()
+_TRACER_PARSER.add_schema(
+    "[snapshot] [fault-reference] [version: int] [valid: bool] "
+    "[source: str] [address: hex]")
 _TRACER_PARSER.add_schema(
     "[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] "
     "[guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
@@ -460,15 +457,22 @@ _TRACER_PARSER.add_schema(
 
 
 def extract_tracer_fault_addr(log: str) -> Optional[int]:
-    """Return the fault_addr from a tracer crash log line.
+    """Return a valid normalized fault-reference address, if published.
 
-    The tracer records info->fault_addr (= guest_pc, the faulting
-    instruction) in its [snapshot] [crash] line written to
-    BINRADAR_TRACER_LOG_FILE."""
+    Live standalone comparisons consume only the explicit v2 normalized row.
+    The historical ``snapshot/crash`` exit row is intentionally not a fallback:
+    its address can be an exit PC, and an unavailable host signal is not a
+    valid guest instruction identity. Provenance-finalized accesses publish
+    the same normalized address in this row with source ``provenance-access``.
+    """
     for line in log.splitlines():
         row = _TRACER_PARSER.parse_line_detached(line)
-        if row is not None and row.get_name() == "snapshot$crash":
-            return row["fault_addr"]
+        if row is None or row.get_name() != "snapshot$fault-reference":
+            continue
+        if (row["version"] == 2 and row["valid"]
+                and row["source"] in ("guest-signal", "provenance-access")):
+            return row["address"]
+        return None
     return None
 
 
@@ -520,10 +524,10 @@ def extract_tracer_prov_finding(log: str) -> Optional[Dict[str, object]]:
     snapshot_record_guest_normal_exit and carries the access instruction PC
     (access_pc), the data address (access_addr), the object identity and
     tracked offset, and the provenance producer/last-writer PCs. access_pc
-    is the raw (unrelocated) guest PC of the faulting access, so it is
-    directly comparable with the fault addresses reported by valgrind and
-    QASAN -- unlike the '[snapshot] [crash]' line, whose fault_addr is the
-    exit-site guest_pc (relocated for .brpatched binaries)."""
+    identifies the deferred faulting access; live fault identity comparisons
+    use the normalized v2 ``snapshot/fault-reference`` row, not a legacy
+    crash-row fallback. This helper retains detailed provenance metadata for
+    diagnostics and valgrind/QASAN comparison."""
     for line in log.splitlines():
         row = _TRACER_PARSER.parse_line_detached(line)
         if row is not None and row.get_name() == "prov$finalize$finding":
@@ -609,8 +613,10 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
 def run_tracer_probe(workdir: str, env: Dict[str, str],
                      testcase: str, timeout: float):
     """Run the fuzzolic tracer on <binary>.orig (no -symbolic) and parse
-    the crash fault_addr from its log. Returns (fault_addr, exit_str,
-    result, repro)."""
+    its explicit v2 normalized fault reference. Returns (fault_addr,
+    exit_str, result, repro); unavailable references return ``None``.
+    Historical crash rows are not used as a fallback.
+    """
     binary = env.get("BINARY", "")
     orig_bin = os.path.join(workdir, f"{binary}.orig")
     test_cmd = env.get("TEST_CMD", "")

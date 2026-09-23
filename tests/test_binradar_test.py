@@ -11,6 +11,19 @@ binradar_test = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar_test)
 
 
+def test_tracer_reference_requires_explicit_valid_v2_row():
+    old_row = (
+        "[snapshot] [crash] [hit-count 1] [reason memcheck] "
+        "[guest_pc dead] [guest_cs_base 0] [fault_addr dead] "
+        "[host_fault_addr 0]\n")
+    assert binradar_test.extract_tracer_fault_addr(old_row) is None
+
+    normalized = (
+        "[snapshot] [fault-reference] [version 2] [valid true] "
+        "[source provenance-access] [address 0]\n")
+    assert binradar_test.extract_tracer_fault_addr(normalized) == 0
+
+
 def test_valgrind_interceptor_uses_target_return_address():
     log = """
 ==1== Invalid write of size 1

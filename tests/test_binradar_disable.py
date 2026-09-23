@@ -244,7 +244,9 @@ def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
     )
     executor = _stub_executor(tmp_path)
     executor.disable_binradar = False
-    executor.probe_result = SimpleNamespace(tracer_fault_addr=0xDEAD)
+    executor.probe_result = SimpleNamespace(
+        tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
+            0xDEAD, "guest-signal"))
     executor.save_progress = lambda row: None
 
     executor.run_final()
@@ -285,7 +287,9 @@ def test_final_ignores_interrupted_iteration_without_baseline(tmp_path):
     )
     executor = _stub_executor(tmp_path)
     executor.disable_binradar = False
-    executor.probe_result = SimpleNamespace(tracer_fault_addr=0xDEAD)
+    executor.probe_result = SimpleNamespace(
+        tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
+            0xDEAD, "guest-signal"))
     executor.save_progress = lambda row: None
 
     executor.run_final()

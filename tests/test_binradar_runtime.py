@@ -117,11 +117,15 @@ def _binradar_executor(tmp_path, timeout):
     executor.test_cmd = "@@"
     executor.fuzzy = False
     executor.timeout = timeout
+    executor.forkserver_child_timeout = 900
     executor.start_time = time.time() - 3600
     executor.feedback_mode = False
     executor.run_prefix = "run"
     executor.run_id = 0
     executor._phase_environment = lambda *args: {}
+    # The pre-flight baseline validation spawns real tracer processes and is
+    # covered by its own tests; these cases pin phase-deadline behavior.
+    executor._validate_baseline = lambda *args, **kwargs: None
     executor.progress = []
     executor.save_progress = executor.progress.append
     return executor

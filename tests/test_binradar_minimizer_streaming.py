@@ -41,7 +41,8 @@ def _probe(exit_info="ok", fault_addr=0x1234):
     return binradar_verifier.BinRadarProbeResult(
         patch_loc=0x1000, patch_func_entry=0x2000, stacktrace=[],
         exit_info=exit_info, patch_hit_cnt=1, patch_func_hit_cnt=1,
-        fault_addr=fault_addr, patch_func_candidates=[], tracer_fault_addr=0)
+        fault_addr=fault_addr, patch_func_candidates=[],
+        tracer_fault_reference=None)
 
 
 def _patch_result():

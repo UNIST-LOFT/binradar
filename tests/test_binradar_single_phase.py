@@ -30,7 +30,8 @@ def _probe(exit_info="ok", fault_addr=0x1234):
     return binradar_verifier.BinRadarProbeResult(
         patch_loc=0x1000, patch_func_entry=0x2000, stacktrace=[],
         exit_info=exit_info, patch_hit_cnt=1, patch_func_hit_cnt=1,
-        fault_addr=fault_addr, patch_func_candidates=[], tracer_fault_addr=0)
+        fault_addr=fault_addr, patch_func_candidates=[],
+        tracer_fault_reference=None)
 
 
 def _patch_result():
@@ -95,9 +96,10 @@ def _make_workdir(tmp_path):
     poc.write_bytes(b"poc")
     # Probe results as run_probe() itself serializes them.
     (rundir / "probe-results.sbsv").write_text(
-        "[probe-info] [exit crash] [patch-loc 1000] [func-entry 2000] "
-        "[patch-hit 1] [func-hit 1] [fault-addr 1234] [tracer-fault-addr 1234] "
-        "[patch-func-candidates []] [stacktrace []]\n"
+        "[probe-info] [version 2] [exit crash] [patch-loc 1000] "
+        "[func-entry 2000] [patch-hit 1] [func-hit 1] [fault-addr 1234] "
+        "[tracer-fault-valid false] [tracer-fault-source unavailable] "
+        "[tracer-fault-addr 0] [patch-func-candidates []] [stacktrace []]\n"
         "[file-trace] [need-file-hook false]\n")
     # Already-produced testcases (as the fuzzolic producer phase would leave).
     testcases = rundir / "fuzzolic-tests"
@@ -186,6 +188,29 @@ def test_minimizer_verifier_timeout_is_one_and_a_half_times_configured():
 
     executor.timeout = 0
     assert executor.minimizer_verifier_timeout() is None
+
+
+def test_historical_final_loads_legacy_probe_without_regeneration(tmp_path):
+    workdir, rundir = _make_workdir(tmp_path)
+    (rundir / "probe-results.sbsv").write_text(
+        "[probe-info] [exit crash] [patch-loc 1000] [func-entry 2000] "
+        "[patch-hit 1] [func-hit 1] [fault-addr 1234] "
+        "[tracer-fault-addr dead] [patch-func-candidates []] "
+        "[stacktrace []]\n[file-trace] [need-file-hook false]\n",
+        encoding="utf-8",
+    )
+    executor = _build_executor(workdir)
+    executor.save_progress = lambda _row: None
+    executor.done = lambda: None
+    observed = []
+    executor.run_final = lambda: observed.append(
+        executor.probe_result.tracer_fault_reference)
+
+    executor.run_single_phase("run", "0", binradar.BinRadarPhase.FINAL)
+
+    assert observed == [
+        binradar_verifier.TracerFaultReference(0xDEAD, "legacy-unvalidated")
+    ]
 
 
 def test_run_single_phase_minimizer_verifier(tmp_path, stub_runner_env):

@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / "fuzzolic"))
 
 import binradar
 import binradar_evidence
+import binradar_results
+import binradar_verifier
 
 
 def _uleb(value: int) -> bytes:
@@ -121,7 +123,9 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
     executor.run_prefix = "run"
     executor.run_id = 0
     executor.filter_result = [1, 2, 300]
-    executor.probe_result = SimpleNamespace(tracer_fault_addr=0x1234)
+    executor.probe_result = SimpleNamespace(
+        tracer_fault_reference=binradar_verifier.TracerFaultReference(
+            address=0x1234, source="guest-signal"))
     executor.disable_binradar = False
     executor.binradar_failed = False
     executor.wall_time_reached = False
@@ -136,6 +140,67 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
     for patch in (1, 2, 300):
         assert (f"[final] [binradar] [patch {patch}] [res rejected] "
                 f"[reason introduced-crash] [iter 2]") in final
+
+
+@pytest.mark.parametrize("source,address,hard_rejection", [
+    (None, 0, False),
+    ("legacy-unvalidated", 0x1234, False),
+    ("guest-signal", 0, True),
+    ("provenance-access", 0x1234, True),
+])
+@pytest.mark.parametrize("original_outcome,reason", [
+    (2, "same-crash"), (1, "introduced-crash"),
+])
+def test_final_requires_valid_fault_identity(tmp_path, source, address,
+                                             hard_rejection, original_outcome,
+                                             reason):
+    reference = (None if source is None else
+                 binradar_verifier.TracerFaultReference(address, source))
+    # Baseline, one crash-classification transition, then confidence evidence.
+    frames = [struct.pack("<II", 1, 1)
+              + _group(0, 2, address, [0], [0])]
+    frames.append(
+        struct.pack("<II", 2, 4)
+        + _group(0, original_outcome, address, [0], [0])
+        + _group(1, 2, address, [1], [1])
+        + _group(2, 2, address + 1, [1], [2])
+        + _group(3, 1, 0, [0], [3, 4]))
+    frames.append(
+        struct.pack("<II", 3, 3)
+        + _group(0, 1, 0, [0], [0, 2])
+        + _group(1, 1, 0, [1], [1, 3])
+        + _group(4, 1, 0, [0], [4]))
+    (tmp_path / "binradar.br").write_bytes(
+        struct.pack("<8sHHI", b"BRDATAB1", 1, 3, 0)
+        + b"".join(_frame(4, payload) for payload in frames))
+    binradar_evidence.write_verifier(
+        tmp_path / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=patch, verified=patch != 4, accept_evidences=0,
+            total_evidences=1 if patch == 4 else 0, observations={})
+         for patch in (1, 2, 3, 4)])
+    binradar_results.write_final_result(binradar_results.FinalResultRequest(
+        run_dir=str(tmp_path), run_prefix="regression", run_id=0,
+        candidates=[1, 2, 3, 4], tracer_fault_reference=reference,
+        disable_binradar=False, binradar_failed=False, wall_time_reached=False,
+        failed_phases=[], save_progress=lambda _: None,
+        record_wall_time_reached=lambda: None))
+    report = (tmp_path / "final.sbsv").read_text()
+    expected = "rejected" if hard_rejection else "verified"
+    assert f"[binradar] [patch 1] [res {expected}]" in report
+    assert "[binradar] [patch 2] [res verified]" in report
+    assert "[binradar] [patch 3] [res verified]" in report
+    assert "[verifier] [patch 4] [res rejected]" in report
+    assert "[binradar] [patch 4]" not in report
+    # A differing normal/normal branch contributes confidence, never rejection.
+    assert ("[confidence] [patch 3] [score 0.500000] "
+            "[accept-evidences 1] [total-evidences 2]") in report
+    if hard_rejection:
+        assert f"[res rejected] [reason {reason}] [iter 2]" in report
+    else:
+        assert "[hard-crash-classification unavailable]" in report
+        assert "[reason same-crash]" not in report
+        assert "[reason introduced-crash]" not in report
 
 
 def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):

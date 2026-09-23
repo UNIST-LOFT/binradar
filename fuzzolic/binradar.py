@@ -12,9 +12,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import binradar_artifacts
+import binradar_baseline
 import binradar_config
 import binradar_feedback
 import binradar_fuzzer
@@ -31,6 +32,9 @@ import sbsv
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
+TRACER_FAULT_REFERENCE_SCHEMA = (
+    "[snapshot] [fault-reference] [version: int] [valid: bool] "
+    "[source: str] [address: hex]")
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
@@ -412,18 +416,116 @@ class BinRadarExecutor:
             forkserver_read_timeout=binradar_runtime.TracerExecutor.forkserver_timeout,
             forkserver_analyze_margin=binradar_runtime.TracerExecutor.forkserver_analyze_margin,
         )
-    
+
+    def _artifact_e9_metadata(self) -> Dict[str, Tuple[str, List[str]]]:
+        """Every artifact's own E9 metadata, keyed by binary suffix.
+
+        Each artifact is validated with the metadata of the artifact being
+        executed, never another artifact's: `.brpatched` and `.brcached`
+        have distinct RESERVE/TRAMPOLINE maps and therefore distinct
+        exclusion ranges.
+        """
+        metadata: Dict[str, Tuple[str, List[str]]] = {".orig": ("", [])}
+        for suffix, prefix in ((".brpatched", "brpatched"),
+                               (".brcached", "brcached")):
+            ranges, calls = binradar_utils.get_e9_metadata(self.config, prefix)
+            metadata[suffix] = (
+                ranges,
+                [record for record in calls.split(",") if record.strip()])
+        return metadata
+
+    def _validate_baseline(
+            self, tracer_binary: str, testcase: str,
+            phase_environment: Dict[str, str],
+            deadline: binradar_runtime.Deadline) -> None:
+        """Validate the POC on the original and on the selected artifact's
+        unmutated patch 0 under this phase's crash-detection policy.
+
+        The phase environment supplies the policy (memcheck, E9 metadata)
+        but every descriptor and structured destination is stripped by the
+        validator: this is a pre-flight, not part of the forkserver, and it
+        completes and is reaped before the phase session exists.
+        """
+        # Bound the pre-flight by the same child-timeout rule the phase
+        # environment uses, so a hanging baseline can never consume more
+        # than one child's budget.
+        timeout = deadline.remaining(float(self.forkserver_child_timeout))
+        if timeout <= 0:
+            logger.warning(
+                "[binradar] [baseline] [skipped] [reason non-positive "
+                "child timeout]")
+            self._record_baseline_result(None)
+            return
+        try:
+            result = binradar_baseline.validate_patch_zero_baseline(
+                self.workdir,
+                dict(phase_environment),
+                original=self.artifacts.original,
+                probe_reference=self.probe_result.tracer_fault_reference,
+                selected_binary=tracer_binary,
+                patch_loc=self.patch_loc,
+                test_cmd=self.test_cmd,
+                testcase=testcase,
+                timeout=timeout,
+                phase_deadline=deadline.expires_at,
+                metadata=self._artifact_e9_metadata(),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[binradar] [baseline] [unusable] [detail {type(exc).__name__}: "
+                f"{exc}]")
+            self._record_baseline_result(None)
+            return
+        binradar_baseline.log_result(result)
+        self._record_baseline_result(result)
+
+    def _record_baseline_result(
+            self, result: Optional[binradar_baseline.BaselineResult]) -> None:
+        """Persist the baseline outcome as an ignorable diagnostic row.
+
+        The row uses no registered action, so progress/collector consumers
+        skip it, and it is deliberately not a `[binradar] [crash]` row: the
+        canonical evidence must not carry a fabricated iteration.
+        """
+        if result is None or result.selected is None:
+            self.save_progress(
+                f"[binradar] [baseline] [unusable] "
+                f"[prefix {self.run_prefix}] [id {self.run_id}]")
+            return
+        reference = result.reference
+        reference_text = (
+            f"{reference.address:x} {reference.source}"
+            if reference is not None else "unavailable 0")
+        entry = result.selected
+        self.save_progress(
+            f"[binradar] [baseline] [{entry.status.value}] "
+            f"[artifact {entry.artifact}] [reference {reference_text}] "
+            f"[prefix {self.run_prefix}] [id {self.run_id}]")
+
     def run_probe(self):
         if not os.path.exists(self.artifacts.original):
             sys.exit("ERROR: binary does not exist.")
         if not os.path.exists(self.resolved_poc_input()):
             sys.exit("ERROR: input does not exist.")
-        if os.path.exists(os.path.join(self.run_dir, "probe-results.sbsv")):
-            self.probe_result = binradar_verifier.BinRadarProbeResult.from_sbsv(os.path.join(self.run_dir, "probe-results.sbsv"))
-            if self.probe_result is not None:
-                self.set_config("BINRADAR_ENTRYPOINT", hex(self.probe_result.patch_func_entry))
-                logger.info(f"[PROBE] Loaded existing probe result: {self.probe_result.serialize()}")
-                return
+        probe_file = os.path.join(self.run_dir, "probe-results.sbsv")
+        if os.path.exists(probe_file):
+            self.probe_result = binradar_verifier.BinRadarProbeResult.from_sbsv(
+                probe_file)
+            if self.probe_result is None:
+                sys.exit(
+                    "ERROR: existing probe result is unreadable; start a fresh "
+                    "run with --run-id n instead of overwriting it.")
+            if getattr(self.probe_result, "_probe_serialization_version", 1) != 2:
+                sys.exit(
+                    "ERROR: existing probe result uses the legacy fault "
+                    "reference format; start a fresh run with --run-id n "
+                    "to regenerate PROBE without rewriting historical data.")
+            self.set_config("BINRADAR_ENTRYPOINT",
+                            hex(self.probe_result.patch_func_entry))
+            logger.info(
+                f"[PROBE] Loaded existing probe result: "
+                f"{self.probe_result.serialize()}")
+            return
         config = self._worker_environment()
         self.save_progress(f"[probe] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         probe_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
@@ -445,8 +547,9 @@ class BinRadarExecutor:
             logger.info("[PROBE] Multiple patch function hits found. Current implementation does not support this case.")
             sys.exit(1)
         self.probe_result = probe_result
-        # Run the tracer on .orig to obtain the tracer's fault address. 
-        # It will be used for analyzing the result of BINRADAR phase in FINAL phase.
+        # Run the tracer on .orig to obtain a normalized fault reference.
+        # It is used for BINRADAR analysis in FINAL; QASAN's concrete address
+        # remains a separate observation.
         tracer_cmd = [TRACER_BIN, self.artifacts.original] + shlex.split(
             self.test_cmd.replace("@@", self.resolved_poc_input()))
         tracer_env = os.environ.copy()
@@ -464,18 +567,34 @@ class BinRadarExecutor:
         tracer_result = binradar_utils.execute(
             tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=60.0, verbose=False)
         parser = sbsv.parser()
-        parser.add_schema("[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
-        tracer_fault_addr = 0
+        parser.add_schema(TRACER_FAULT_REFERENCE_SCHEMA)
+        tracer_fault_reference = None
         if tracer_result.success:
             result = parser.loads(tracer_result.stderr)
-            if len(result["snapshot"]["crash"]) > 0:
-                tracer_fault_addr = result["snapshot"]["crash"][0]["fault_addr"]
+            rows = result["snapshot"]["fault-reference"]
+            if rows:
+                row = rows[-1]
+                if row["version"] == 2 and row["valid"] \
+                        and row["source"] in binradar_verifier.TRACER_FAULT_VALID_SOURCES:
+                    tracer_fault_reference = (
+                        binradar_verifier.TracerFaultReference(
+                            row["address"], row["source"]))
 
-        if tracer_fault_addr == 0:
-            logger.warning(f"[PROBE] Tracer did not detect a crash fault address. "
-                           f"tracer_fault_addr will be 0; final phase binradar comparison disabled.")
-        probe_result.tracer_fault_addr = tracer_fault_addr
-        logger.info(f"[PROBE] Tracer fault address: {tracer_fault_addr:#x} (afl-qemu-trace fault address: {probe_result.fault_addr:#x})")
+        if tracer_fault_reference is None:
+            logger.warning(
+                "[PROBE] Tracer did not publish a valid normalized fault "
+                "reference; final BINRADAR crash classification is unavailable.")
+        probe_result.tracer_fault_reference = tracer_fault_reference
+        if tracer_fault_reference is not None:
+            logger.info(
+                f"[PROBE] Tracer fault reference: "
+                f"{tracer_fault_reference.address:#x} "
+                f"({tracer_fault_reference.source}) "
+                f"(afl-qemu-trace fault address: {probe_result.fault_addr:#x})")
+        else:
+            logger.info(
+                f"[PROBE] Tracer fault reference unavailable "
+                f"(afl-qemu-trace fault address: {probe_result.fault_addr:#x})")
         file_trace_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         file_trace_result = file_trace_runner.test_with_file_trace(self.resolved_poc_input(), patch_func_entry=probe_result.patch_func_entry, verbose=True)
         if file_trace_result is None:
@@ -748,8 +867,17 @@ class BinRadarExecutor:
             if self.feedback_mode:
                 os.makedirs(feedback_staging)
                 binradar_env["BINRADAR_FEEDBACK_DIR"] = feedback_staging
-                binradar_env["BINRADAR_POC_FAULT_ADDR"] = hex(
-                    self.probe_result.fault_addr)
+                reference = self.probe_result.tracer_fault_reference
+                reference_valid = (reference is not None and reference.valid)
+                binradar_env["BINRADAR_POC_FAULT_VALID"] = (
+                    "1" if reference_valid else "0")
+                binradar_env["BINRADAR_POC_FAULT_SOURCE"] = (
+                    reference.source if reference_valid else "unavailable")
+                if reference_valid:
+                    binradar_env["BINRADAR_POC_FAULT_ADDR"] = hex(
+                        reference.address)
+                else:
+                    binradar_env.pop("BINRADAR_POC_FAULT_ADDR", None)
         else:
             if self.feedback_mode:
                 logger.warning(
@@ -761,13 +889,15 @@ class BinRadarExecutor:
         timed_out = False
         try:
             with session:
-                session.shared_memory(binradar_env, include_patch_key=True)
-                session.start_solver(
-                    mode=exec_mode, testcase=testcase, run_dir=self.run_dir,
-                    env=binradar_env, workdir=self.workdir, fuzzy=self.fuzzy)
+                self._validate_baseline(
+                    tracer_binary, testcase, binradar_env, session.deadline)
                 if session.deadline.expired():
                     timed_out = True
                 else:
+                    session.shared_memory(binradar_env, include_patch_key=True)
+                    session.start_solver(
+                        mode=exec_mode, testcase=testcase, run_dir=self.run_dir,
+                        env=binradar_env, workdir=self.workdir, fuzzy=self.fuzzy)
                     tracer = session.start_tracer(
                         mode=exec_mode, env=binradar_env,
                         workdir=self.workdir, rundir=self.run_dir,
@@ -837,9 +967,9 @@ class BinRadarExecutor:
                 run_prefix=self.run_prefix,
                 run_id=self.run_id,
                 candidates=self.filter_result,
-                tracer_fault_addr=(
-                    0 if skip_binradar
-                    else self.probe_result.tracer_fault_addr),
+                tracer_fault_reference=(
+                    None if skip_binradar
+                    else self.probe_result.tracer_fault_reference),
                 disable_binradar=self.disable_binradar,
                 binradar_failed=self.binradar_failed,
                 wall_time_reached=self.wall_time_reached,
@@ -924,7 +1054,35 @@ class BinRadarExecutor:
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         phase_name = phase.name.lower().replace("_", "-")
         self.write_run_settings(f"single-phase-{phase_name}")
-        self.run_probe()
+        if phase == BinRadarPhase.FINAL:
+            probe_file = os.path.join(self.run_dir, "probe-results.sbsv")
+            if not os.path.exists(probe_file):
+                sys.exit(
+                    "ERROR: historical FINAL requires an existing "
+                    "probe-results.sbsv")
+            self.probe_result = (
+                binradar_verifier.BinRadarProbeResult.from_sbsv(probe_file))
+            if self.probe_result is None:
+                sys.exit("ERROR: failed to parse historical probe result")
+            self.set_config("BINRADAR_ENTRYPOINT",
+                            hex(self.probe_result.patch_func_entry))
+            reference = self.probe_result.tracer_fault_reference
+            legacy_probe = (
+                getattr(self.probe_result, "_probe_serialization_version", 1)
+                != 2)
+            if legacy_probe:
+                if reference is None:
+                    probe_summary = "legacy probe (fault reference unavailable)"
+                else:
+                    probe_summary = (
+                        f"legacy reference {reference.address:#x} "
+                        f"({reference.source})")
+            else:
+                probe_summary = self.probe_result.serialize()
+            logger.info(
+                f"[PROBE] Loaded historical probe result: {probe_summary}")
+        else:
+            self.run_probe()
         if phase == BinRadarPhase.PROBE:
             return
         if phase == BinRadarPhase.FUZZOLIC:
