@@ -653,7 +653,9 @@ class BinRadarExecutor:
                         mode=exec_mode, env=phase_env, workdir=self.workdir,
                         rundir=self.run_dir, binary=self.artifacts.original,
                         test_cmd=self.test_cmd, testcase=testcase)
-                    tracer_time, tracer_success, _ = tracer.run()
+                    summary = tracer.run()
+                    tracer_time, tracer_success = (
+                        summary.elapsed_ms, summary.success)
                     self.save_progress(
                         f"[{exec_mode}] [tracer] [prefix {self.run_prefix}] "
                         f"[id {self.run_id}] [tracer-time {tracer_time}] "
@@ -887,6 +889,9 @@ class BinRadarExecutor:
             binradar_env.pop("BINRADAR_PATCH_MANIFEST", None)
         session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
         timed_out = False
+        summary = None
+        committed = 0
+        discarded = 0
         try:
             with session:
                 self._validate_baseline(
@@ -903,21 +908,32 @@ class BinRadarExecutor:
                         workdir=self.workdir, rundir=self.run_dir,
                         binary=tracer_binary, test_cmd=self.test_cmd,
                         testcase=testcase)
-                    remaining = 1
-                    while remaining > 0:
+                    while True:
                         if session.deadline.expired():
                             timed_out = True
                             break
-                        tracer_time, tracer_success, remaining = tracer.run()
+                        summary = tracer.run()
                         message = (
-                            f"[binradar] [tracer] [iter {tracer.iter}] "
+                            f"[binradar] [tracer] [attempt {summary.attempt}] "
                             f"[representative-runs "
-                            f"{tracer.representative_runs}] "
-                            f"[time {tracer_time}] [remaining {remaining}]")
-                        if tracer_success:
+                            f"{summary.representative_runs}] "
+                            f"[time {summary.elapsed_ms}] "
+                            f"[remaining {summary.remaining_plans}] "
+                            f"[attempt-result "
+                            f"{binradar_runtime.protocol_enum_name(summary.attempt_result)}] "
+                            f"[stop "
+                            f"{binradar_runtime.protocol_enum_name(summary.stop_reason)}]")
+                        if summary.attempt_result == \
+                                binradar_runtime.AttemptResult.COMPLETED:
+                            committed += 1
                             logger.debug(message)
                         else:
-                            logger.warning(message + " [failed true]")
+                            discarded += 1
+                            message += " [discarded true]"
+                            logger.warning(message)
+                        self.save_progress(message)
+                        if summary.terminal:
+                            break
         except TimeoutError as exc:
             if session.deadline.expired():
                 timed_out = True
@@ -928,6 +944,25 @@ class BinRadarExecutor:
             logger.error(f"Error during binradar execution: {exc}")
             raise
 
+        if summary is not None or timed_out:
+            if timed_out:
+                stop_reason = "wall-time-reached"
+            else:
+                assert summary is not None
+                stop_reason = binradar_runtime.protocol_enum_name(
+                    summary.stop_reason)
+            stop_attempt = summary.attempt if summary is not None else 0
+            stop_remaining = (str(summary.remaining_plans)
+                              if summary is not None else "unknown")
+            self.save_progress(
+                f"[binradar] [stop] "
+                f"[prefix {self.run_prefix}] [id {self.run_id}] "
+                f"[reason {stop_reason}] "
+                f"[attempt {stop_attempt}] "
+                f"[remaining {stop_remaining}] "
+                f"[committed {committed}] "
+                f"[discarded {discarded}]")
+
         if timed_out:
             logger.info(
                 f"[BINRADAR] [id {self.run_id}] Phase deadline reached; "
@@ -935,6 +970,14 @@ class BinRadarExecutor:
             self.save_progress(
                 f"[binradar] [{binradar_utils.WALL_TIME_REACHED}] "
                 f"[prefix {self.run_prefix}] [id {self.run_id}]")
+        if summary is not None and not summary.success:
+            error = (
+                f"BinRadar tracer reported "
+                f"{binradar_runtime.protocol_enum_name(summary.stop_reason)} "
+                f"at attempt {summary.attempt} with "
+                f"{summary.remaining_plans} plan(s) left")
+            logger.error(error)
+            raise RuntimeError(error)
         self.save_progress(
             f"[binradar] [done] [prefix {self.run_prefix}] "
             f"[id {self.run_id}]")

@@ -39,7 +39,7 @@ ctrl = int(os.environ["BINRADAR_FORKSERVER_CTRL_R"])
 stat = int(os.environ["BINRADAR_FORKSERVER_STAT_W"])
 mode = os.environ.get("FAKE_MODE", "normal")
 log_path = os.environ.get("FAKE_LOG")
-version = int(os.environ.get("FAKE_VERSION", "0x41464c02"), 0)
+version = int(os.environ.get("FAKE_VERSION", "0x41464c03"), 0)
 wrong_ack = int(os.environ.get("FAKE_WRONG_ACK", "0x12345678"), 0)
 
 
@@ -64,7 +64,10 @@ def send(value):
 
 
 def run_summaries(summaries):
-    for iteration, representative_runs, remaining in summaries:
+    for row in summaries:
+        attempt, representative_runs, remaining = row[:3]
+        attempt_result = row[3] if len(row) > 3 else 0
+        stop_reason = row[4] if len(row) > 4 else (0 if remaining else 1)
         command = read_exact(ctrl, 4)
         if len(command) != 4:
             log("parent-eof")
@@ -73,8 +76,8 @@ def run_summaries(summaries):
         if mode == "stall_after_command":
             time.sleep(3)
             return
-        summary = struct.pack("<III", iteration, representative_runs,
-                              remaining)
+        summary = struct.pack("<IIIII", attempt, representative_runs,
+                              remaining, attempt_result, stop_reason)
         if mode in ("partial_summary", "close_during_summary"):
             os.write(stat, summary[:2])
             if mode == "partial_summary":
@@ -84,7 +87,7 @@ def run_summaries(summaries):
             return
         os.write(stat, summary)
         log("summary:%d:%d:%d" %
-            (iteration, representative_runs, remaining))
+            (attempt, representative_runs, remaining))
         if mode == "stall_after_summary":
             time.sleep(3)
             return
@@ -211,10 +214,14 @@ def test_new_protocol_one_run_has_no_payload(monkeypatch, tmp_path, fake_script)
     executor, log_path = make_executor(tmp_path, monkeypatch, fake_script)
     try:
         executor.start()
-        elapsed, success, remaining = executor.run()
-        assert elapsed >= 0
-        assert success is True
-        assert remaining == 5
+        summary = executor.run()
+        assert summary.elapsed_ms >= 0
+        assert summary.success is True
+        assert summary.remaining_plans == 5
+        assert summary.attempt == 1
+        assert summary.representative_runs == 1
+        assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+        assert summary.stop_reason == binradar_runtime.StopReason.CONTINUE
         assert executor.iter == 1
         assert executor.representative_runs == 1
     finally:
@@ -234,9 +241,9 @@ def test_back_to_back_runs_keep_status_boundaries(monkeypatch, tmp_path, fake_sc
     )
     try:
         executor.start()
-        assert executor.run()[2] == 4
+        assert executor.run().remaining_plans == 4
         assert executor.representative_runs == 3
-        assert executor.run()[2] == 3
+        assert executor.run().remaining_plans == 3
         assert executor.representative_runs == 2
         assert executor.iter == 2
     finally:
@@ -304,7 +311,7 @@ def test_wrong_acknowledgement_fails_handshake(monkeypatch, tmp_path, fake_scrip
 
 def test_old_word_tracer_fails_new_runner(monkeypatch, tmp_path, fake_script):
     executor, _ = make_executor(tmp_path, monkeypatch, fake_script, mode="normal")
-    executor.env["FAKE_VERSION"] = "0x41464c01"
+    executor.env["FAKE_VERSION"] = "0x41464c02"
     started = time.monotonic()
     try:
         with pytest.raises(RuntimeError, match="Unexpected forkserver handshake"):
@@ -339,7 +346,7 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
     try:
         banner = struct.unpack("<I", read_pipe(stat_r, 4))[0]
         assert banner == binradar_runtime.HANDSHAKE_EXPECTED
-        old_word = 0x41464C01
+        old_word = 0x41464C02
         os.write(ctrl_w, struct.pack("<I", old_word ^ 0xFFFFFFFF))
         proc.wait(timeout=1)
     finally:
@@ -351,6 +358,114 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
     assert log_path.read_text(encoding="ascii").splitlines() == ["ack-mismatch"]
 
 
+HEADER_PATH = ROOT / "tracer" / "linux-user" / "binradar-forkserver.h"
+
+
+def _header_enum_values(enum_name: str) -> dict[str, int]:
+    """Extract ``NAME = value`` rows of one C enum from the tracer header."""
+    text = HEADER_PATH.read_text(encoding="utf-8")
+    body = text.split(f"typedef enum {enum_name} {{", 1)[1].split("}", 1)[0]
+    values: dict[str, int] = {}
+    for line in body.splitlines():
+        line = line.split("/*", 1)[0].strip().rstrip(",")
+        if not line or "=" not in line:
+            continue
+        name, raw = line.split("=", 1)
+        values[name.strip()] = int(raw.strip(), 0)
+    return values
+
+
+def test_python_protocol_enums_mirror_the_tracer_header():
+    """Cross-language fixture: a half-migrated deployment must not be silent."""
+    header = HEADER_PATH.read_text(encoding="utf-8")
+    assert "BINRADAR_FORKSERVER_PROTOCOL_V4 0x41464c03u" in header
+    assert "BINRADAR_FORKSERVER_SUMMARY_WORDS 5u" in header
+    assert binradar_runtime.HANDSHAKE_EXPECTED == 0x41464C03
+    assert binradar_runtime.FORKSERVER_SUMMARY_WORDS == 5
+
+    attempt = _header_enum_values("BinradarForkserverAttemptResult")
+    assert attempt == {
+        "BINRADAR_FORKSERVER_ATTEMPT_COMPLETED":
+            binradar_runtime.AttemptResult.COMPLETED,
+        "BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION":
+            binradar_runtime.AttemptResult.NO_OBSERVATION,
+        "BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT":
+            binradar_runtime.AttemptResult.UNUSABLE_EXIT,
+        "BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT":
+            binradar_runtime.AttemptResult.TIMEOUT,
+    }
+    stop = _header_enum_values("BinradarForkserverStopReason")
+    assert stop == {
+        "BINRADAR_FORKSERVER_STOP_CONTINUE":
+            binradar_runtime.StopReason.CONTINUE,
+        "BINRADAR_FORKSERVER_STOP_EXHAUSTED":
+            binradar_runtime.StopReason.EXHAUSTED,
+        "BINRADAR_FORKSERVER_STOP_BASELINE_UNAVAILABLE":
+            binradar_runtime.StopReason.BASELINE_UNAVAILABLE,
+        "BINRADAR_FORKSERVER_STOP_FAILURE_LIMIT":
+            binradar_runtime.StopReason.FAILURE_LIMIT,
+        "BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE":
+            binradar_runtime.StopReason.RESOURCE_FAILURE,
+    }
+
+
+def test_unknown_attempt_result_is_a_protocol_error(monkeypatch, tmp_path,
+                                                    fake_script):
+    """An out-of-table reply is never converted into an ordinary miss."""
+    executor, _ = make_executor(tmp_path, monkeypatch, fake_script,
+                                statuses=[(1, 1, 2, 99, 0)])
+    try:
+        executor.start()
+        with pytest.raises(RuntimeError, match="unknown attempt result"):
+            executor.run()
+    finally:
+        stop_executor(executor)
+
+
+def test_resource_failure_summary_marks_phase_failed(monkeypatch, tmp_path,
+                                                     fake_script):
+    """resource-failure must not look like an exhausted mutation sweep."""
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script,
+        statuses=[(1, 1, 9,
+                   int(binradar_runtime.AttemptResult.UNUSABLE_EXIT),
+                   int(binradar_runtime.StopReason.RESOURCE_FAILURE))])
+    try:
+        executor.start()
+        summary = executor.run()
+        assert summary.success is False
+        assert summary.attempt_result == \
+            binradar_runtime.AttemptResult.UNUSABLE_EXIT
+        assert summary.stop_reason == \
+            binradar_runtime.StopReason.RESOURCE_FAILURE
+        assert summary.remaining_plans == 9
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize(
+    "status, message",
+    [
+        ((2, 1, 1, 0, 0), "expected 1"),
+        ((1, 1, 0, 0, 0), "continue without a queued plan"),
+        ((1, 1, 2, 0, 1), "exhaustion with 2 queued plan"),
+        ((1, 1, 0, 0, 2), "invalid baseline-unavailable"),
+        ((1, 1, 2, 3, 4), "resource-failure with timeout"),
+    ],
+)
+def test_inconsistent_summary_is_a_protocol_error(
+        monkeypatch, tmp_path, fake_script, status, message):
+    """Known enum values still fail when their packet invariants disagree."""
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, statuses=[status])
+    try:
+        executor.start()
+        with pytest.raises(RuntimeError, match=message):
+            executor.run()
+    finally:
+        stop_executor(executor)
+
+
 def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_script):
     executor, log_path = make_executor(
         tmp_path,
@@ -360,9 +475,10 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
     )
     try:
         executor.start()
-        _, success, remaining = executor.run()
-        assert success is True
-        assert remaining == 0
+        summary = executor.run()
+        assert summary.success is True
+        assert summary.remaining_plans == 0
+        assert summary.stop_reason == binradar_runtime.StopReason.EXHAUSTED
         assert executor.iter == 1
     finally:
         stop_executor(executor)

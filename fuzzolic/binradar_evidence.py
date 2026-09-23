@@ -21,11 +21,19 @@ from pathlib import Path
 from typing import BinaryIO
 
 MAGIC = b"BRDATAB1"
+# FILTER and VERIFIER payloads stay at version 1.  BINRADAR evidence is
+# version 2: attempt ids are strictly increasing but may have gaps because a
+# discarded attempt commits no frame.
 VERSION = 1
+BINRADAR_VERSION = 2
 HEADER_STRUCT = struct.Struct("<8sHHI")
 FRAME_HEADER_STRUCT = struct.Struct("<IHH")
 FRAME_CRC_STRUCT = struct.Struct("<I")
 MAX_FRAME_SIZE = 256 * 1024 * 1024
+
+
+def _version_for(kind: "EvidenceKind") -> int:
+    return BINRADAR_VERSION if kind == EvidenceKind.BINRADAR else VERSION
 
 
 class EvidenceError(ValueError):
@@ -126,7 +134,7 @@ def _frame_crc(record_type: int, flags: int, payload: bytes) -> int:
 
 
 def _write_header(stream: BinaryIO, kind: EvidenceKind) -> None:
-    stream.write(HEADER_STRUCT.pack(MAGIC, VERSION, int(kind), 0))
+    stream.write(HEADER_STRUCT.pack(MAGIC, _version_for(kind), int(kind), 0))
 
 
 def _write_frame(stream: BinaryIO, record_type: RecordType,
@@ -172,7 +180,9 @@ def _open_frames(path: os.PathLike[str] | str, expected: EvidenceKind,
         magic, version, kind, reserved = HEADER_STRUCT.unpack(header)
         if magic != MAGIC:
             raise EvidenceError("invalid evidence magic")
-        if version != VERSION:
+        accepted = ({BINRADAR_VERSION, VERSION}
+                    if expected == EvidenceKind.BINRADAR else {VERSION})
+        if version not in accepted:
             raise EvidenceError(f"unsupported evidence version {version}")
         if kind != int(expected):
             raise EvidenceError(
@@ -461,14 +471,35 @@ def _parse_binradar_iteration(payload: bytes) -> BinradarIteration:
 
 
 def read_binradar(path: os.PathLike[str] | str) -> Iterator[BinradarIteration]:
+    """Expand one compact BINRADAR attempt frame at a time.
+
+    Version 2 permits strictly increasing attempt ids with gaps: a discarded
+    attempt commits no frame, so contiguity is not a valid invariant.  The
+    first frame must still be baseline attempt 1, duplicate and backward ids
+    remain invalid, and version-1 files keep the historical contiguous-id
+    validation.
+    """
+    with open(path, "rb") as stream:
+        header = stream.read(HEADER_STRUCT.size)
+    if len(header) != HEADER_STRUCT.size:
+        raise EvidenceError("truncated evidence header")
+    _, version, _, _ = HEADER_STRUCT.unpack(header)
+    contiguous = version == VERSION
     previous_iteration = 0
     for record_type, flags, payload in _open_frames(
             path, EvidenceKind.BINRADAR, allow_truncated_tail=True):
         if record_type != RecordType.BINRADAR_ITERATION or flags != 0:
             raise EvidenceError("unexpected BINRADAR evidence frame")
         iteration = _parse_binradar_iteration(payload)
-        if iteration.iteration != previous_iteration + 1:
-            raise EvidenceError("BINRADAR iterations are not contiguous")
+        if contiguous:
+            if iteration.iteration != previous_iteration + 1:
+                raise EvidenceError("BINRADAR iterations are not contiguous")
+        elif previous_iteration == 0:
+            if iteration.iteration != 1:
+                raise EvidenceError("BINRADAR evidence does not start at baseline attempt 1")
+        elif iteration.iteration <= previous_iteration:
+            raise EvidenceError(
+                "BINRADAR attempt ids are not strictly increasing")
         previous_iteration = iteration.iteration
         yield iteration
 
@@ -479,9 +510,16 @@ def evidence_kind(path: os.PathLike[str] | str) -> EvidenceKind:
     if len(header) != HEADER_STRUCT.size:
         raise EvidenceError("truncated evidence header")
     magic, version, raw_kind, reserved = HEADER_STRUCT.unpack(header)
-    if magic != MAGIC or version != VERSION or reserved != 0:
+    if magic != MAGIC or reserved != 0:
         raise EvidenceError("invalid evidence header")
     try:
-        return EvidenceKind(raw_kind)
+        kind = EvidenceKind(raw_kind)
     except ValueError as exc:
         raise EvidenceError(f"unknown evidence kind {raw_kind}") from exc
+    if version != _version_for(kind):
+        # A version-1 BINRADAR file is the historical contiguous-id format and
+        # stays readable; anything else is a header this reader cannot trust.
+        if not (kind == EvidenceKind.BINRADAR and version == VERSION):
+            raise EvidenceError(
+                f"unsupported evidence version {version} for kind {raw_kind}")
+    return kind

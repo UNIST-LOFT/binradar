@@ -826,7 +826,11 @@ def test_concolic_solver_deadline_is_graceful(
             pass
 
         def run(self):
-            return 3, True, 0
+            return binradar_runtime.RunSummary(
+                elapsed_ms=3, success=True, attempt=1, representative_runs=1,
+                remaining_plans=0,
+                attempt_result=binradar_runtime.AttemptResult.COMPLETED,
+                stop_reason=binradar_runtime.StopReason.EXHAUSTED)
 
         def stop(self):
             pass
@@ -892,7 +896,11 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
             pass
 
         def run(self):
-            return 3, True, 0
+            return binradar_runtime.RunSummary(
+                elapsed_ms=3, success=True, attempt=1, representative_runs=1,
+                remaining_plans=0,
+                attempt_result=binradar_runtime.AttemptResult.COMPLETED,
+                stop_reason=binradar_runtime.StopReason.EXHAUSTED)
 
         def stop(self):
             pass

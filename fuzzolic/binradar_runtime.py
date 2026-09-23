@@ -1,6 +1,7 @@
 """Phase runtime ownership for BinRadar subprocesses and transports."""
 
 import ctypes
+import enum
 import os
 import random
 import select
@@ -26,7 +27,45 @@ TRACER_BIN = str(SCRIPT_DIR / "../tracer/build/x86_64-linux-user/qemu-x86_64")
 SOLVER_WAIT_TIME_AT_STARTUP = 1.0
 SOLVER_TIMEOUT = 10.0
 SHM_KEYS = ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY")
-HANDSHAKE_EXPECTED = 0x41464C02
+# Protocol v4 handshake word.  Mirrors BINRADAR_FORKSERVER_PROTOCOL_V4 in
+# tracer/linux-user/binradar-forkserver.h; tests/test_binradar_forkserver_protocol.py
+# pins both sides so a half-migrated deployment fails the handshake rather
+# than misreading packet bytes.
+HANDSHAKE_EXPECTED = 0x41464C03
+FORKSERVER_SUMMARY_WORDS = 5
+
+
+class AttemptResult(enum.IntEnum):
+    """How one complete logical sweep ended.
+
+    Mirrors BinradarForkserverAttemptResult in
+    ``tracer/linux-user/binradar-forkserver.h``.  Only COMPLETED publishes
+    evidence; every other value is a discarded attempt.
+    """
+
+    COMPLETED = 0
+    NO_OBSERVATION = 1
+    UNUSABLE_EXIT = 2
+    TIMEOUT = 3
+
+
+class StopReason(enum.IntEnum):
+    """Why the tracer stopped replying with CONTINUE.
+
+    Mirrors BinradarForkserverStopReason in
+    ``tracer/linux-user/binradar-forkserver.h``.
+    """
+
+    CONTINUE = 0
+    EXHAUSTED = 1
+    BASELINE_UNAVAILABLE = 2
+    FAILURE_LIMIT = 3
+    RESOURCE_FAILURE = 4
+
+
+def protocol_enum_name(value: enum.IntEnum) -> str:
+    """Return the shared C/Python wire spelling used in run records."""
+    return value.name.lower().replace("_", "-")
 
 
 @dataclass(frozen=True)
@@ -242,8 +281,10 @@ class ForkserverTransport:
     def read_u32(self, timeout: Optional[float]) -> int:
         return struct.unpack("<I", self.read(4, timeout))[0]
 
-    def read_status(self, timeout: Optional[float]) -> Tuple[int, int, int]:
-        return struct.unpack("<III", self.read(12, timeout))
+    def read_summary(self, timeout: Optional[float]) -> Tuple[int, int, int, int, int]:
+        """Read the fixed five-word protocol-v4 attempt summary."""
+        return struct.unpack(
+            "<IIIII", self.read(4 * FORKSERVER_SUMMARY_WORDS, timeout))
 
     def read(self, size: int, timeout: Optional[float]) -> bytes:
         if self.stat_r is None:
@@ -276,6 +317,30 @@ class ForkserverTransport:
         return bytes(data)
 
 
+@dataclass(frozen=True)
+class RunSummary:
+    """One protocol-v4 attempt reply plus the wall time it took.
+
+    ``remaining_plans`` is the tracer's real not-yet-executed plan count, never
+    a fabricated stop flag.  ``attempt_result`` and ``stop_reason`` are the
+    shared enum values mirrored in the tracer header.  A valid
+    ``RESOURCE_FAILURE`` packet is terminal with ``success=False`` so its stop
+    row can be persisted before the phase raises.
+    """
+
+    elapsed_ms: int
+    success: bool
+    attempt: int
+    representative_runs: int
+    remaining_plans: int
+    attempt_result: AttemptResult
+    stop_reason: StopReason
+
+    @property
+    def terminal(self) -> bool:
+        return self.stop_reason != StopReason.CONTINUE
+
+
 class TracerExecutor:
     forkserver_init_timeout = 1800.0
     forkserver_timeout = 1800.0
@@ -303,6 +368,8 @@ class TracerExecutor:
         self.forkserver_mode = env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
         self.iter = 0
         self.representative_runs = 0
+        self.attempt_result = AttemptResult.COMPLETED
+        self.stop_reason = StopReason.EXHAUSTED
         self.run_result: Optional[binradar_utils.ExecutionResult] = None
         self.transport: Optional[ForkserverTransport] = None
 
@@ -351,7 +418,7 @@ class TracerExecutor:
         logger.info(
             f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
 
-    def run(self) -> Tuple[int, bool, int]:
+    def run(self) -> RunSummary:
         if self.process is None:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Tracer process not started")
@@ -363,25 +430,73 @@ class TracerExecutor:
                 f"[TRACER] [{self.mode}] Target process finished with exit code "
                 f"{self.run_result.decode_status()}, success {self.run_result.success}")
             self.representative_runs = 1
-            return (int((time.monotonic() - started) * 1000),
-                    self.run_result.success, 0)
+            return RunSummary(
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                success=self.run_result.success,
+                attempt=0,
+                representative_runs=1,
+                remaining_plans=0,
+                attempt_result=AttemptResult.COMPLETED,
+                stop_reason=StopReason.EXHAUSTED,
+            )
         try:
             assert self.transport is not None
             self.transport.write_u32(0)
-            iteration, representative_runs, remaining = \
-                self.transport.read_status(
+            attempt, representative_runs, remaining_plans, attempt_result, \
+                stop_reason = self.transport.read_summary(
                     self.deadline.remaining(self.forkserver_timeout))
-            self.iter = iteration
-            self.representative_runs = representative_runs
+            try:
+                parsed_result = AttemptResult(attempt_result)
+                parsed_stop = StopReason(stop_reason)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned unknown "
+                    f"attempt result {attempt_result} / stop reason "
+                    f"{stop_reason}") from exc
+
+            expected_attempt = self.iter + 1
+            if attempt != expected_attempt:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned attempt "
+                    f"{attempt}; expected {expected_attempt}")
             if representative_runs == 0:
+                # A reply without a single representative run is a protocol
+                # or engine defect, never an ordinary mutation miss.
                 raise RuntimeError(
                     f"[TRACER] [{self.mode}] Forkserver returned an empty "
-                    f"iteration summary for iteration {iteration}")
+                    f"attempt summary for attempt {attempt}")
+            if parsed_stop == StopReason.CONTINUE and remaining_plans == 0:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned continue "
+                    f"without a queued plan at attempt {attempt}")
+            if parsed_stop == StopReason.EXHAUSTED and remaining_plans != 0:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver reported exhaustion "
+                    f"with {remaining_plans} queued plan(s) at attempt "
+                    f"{attempt}")
+            if parsed_stop == StopReason.BASELINE_UNAVAILABLE and (
+                    attempt != 1 or remaining_plans != 0 or
+                    parsed_result not in (
+                        AttemptResult.UNUSABLE_EXIT, AttemptResult.TIMEOUT)):
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned an invalid "
+                    f"baseline-unavailable summary at attempt {attempt}")
+            if (parsed_stop == StopReason.RESOURCE_FAILURE and
+                    parsed_result != AttemptResult.UNUSABLE_EXIT):
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Forkserver returned resource-"
+                    f"failure with {protocol_enum_name(parsed_result)} at "
+                    f"attempt {attempt}")
+
+            self.iter = attempt
+            self.representative_runs = representative_runs
+            self.attempt_result = parsed_result
+            self.stop_reason = parsed_stop
             if self.mode != "binradar":
                 logger.debug(
-                    f"[TRACER] [{self.mode}] Logical iteration {iteration} "
+                    f"[TRACER] [{self.mode}] Logical attempt {attempt} "
                     f"finished after {representative_runs} child run(s); "
-                    f"remaining {remaining}")
+                    f"remaining {remaining_plans}")
         except Exception as exc:
             logger.error(
                 f"[TRACER] [{self.mode}] Error while waiting for tracer "
@@ -396,7 +511,18 @@ class TracerExecutor:
                     "killing its process group")
             self._cleanup_process_group(grace=self.process_cleanup_grace)
             raise
-        return int((time.monotonic() - started) * 1000), True, remaining
+        return RunSummary(
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            # Resource failure is a valid terminal packet but not a successful
+            # phase.  Returning it lets the orchestrator persist the real stop
+            # row before it raises the phase failure.
+            success=self.stop_reason != StopReason.RESOURCE_FAILURE,
+            attempt=attempt,
+            representative_runs=representative_runs,
+            remaining_plans=remaining_plans,
+            attempt_result=self.attempt_result,
+            stop_reason=self.stop_reason,
+        )
 
     def _cleanup_process_group(
             self, grace: float, wait_before_signal: float = 0.0) -> None:

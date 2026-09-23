@@ -55,13 +55,14 @@ def _group(representative: int, outcome: int, fault_addr: int,
             + packed + member_bytes)
 
 
-def _write_binradar(path: Path, *, truncated_tail: bool = False) -> None:
-    baseline = (struct.pack("<II", 1, 1)
+def _write_binradar(path: Path, *, truncated_tail: bool = False,
+                    version: int = 2, attempts=(1, 2)) -> None:
+    baseline = (struct.pack("<II", attempts[0], 1)
                 + _group(0, 1, 0, [0], [0]))
-    payload = (struct.pack("<II", 2, 2)
+    payload = (struct.pack("<II", attempts[1], 2)
                + _group(0, 1, 0, [0, 1, 2, 1], [0])
                + _group(2, 2, 0x1234, [2, 0], [1, 2, 300]))
-    data = (struct.pack("<8sHHI", b"BRDATAB1", 1, 3, 0)
+    data = (struct.pack("<8sHHI", b"BRDATAB1", version, 3, 0)
             + _frame(4, baseline) + _frame(4, payload))
     if truncated_tail:
         data += struct.pack("<IHH", 50, 4, 0) + b"partial"
@@ -107,6 +108,28 @@ def test_binradar_reader_expands_groups_and_ignores_truncated_tail(tmp_path):
     assert iterations[1].groups[0].branches == [0, 1, 2, 1]
     assert iterations[1].groups[1].members == [1, 2, 300]
     assert iterations[1].groups[1].fault_addr == 0x1234
+
+
+def test_binradar_v2_accepts_gaps_but_rejects_bad_ids(tmp_path):
+    """Attempt 2 was discarded, so committed attempts are 1 and 3."""
+    gapped = tmp_path / "gapped.br"
+    _write_binradar(gapped, attempts=(1, 3))
+    assert [row.iteration
+            for row in binradar_evidence.read_binradar(gapped)] == [1, 3]
+
+    for name, attempts in (("backward", (1, 1)), ("missing-baseline", (2, 3))):
+        path = tmp_path / f"{name}.br"
+        _write_binradar(path, attempts=attempts)
+        with pytest.raises(binradar_evidence.EvidenceError):
+            list(binradar_evidence.read_binradar(path))
+
+    # A version-1 BINRADAR file keeps the historical contiguity requirement.
+    legacy = tmp_path / "legacy.br"
+    _write_binradar(legacy, version=1, attempts=(1, 3))
+    with pytest.raises(binradar_evidence.EvidenceError, match="contiguous"):
+        list(binradar_evidence.read_binradar(legacy))
+    assert binradar_evidence.evidence_kind(legacy) == \
+        binradar_evidence.EvidenceKind.BINRADAR
 
 
 def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
