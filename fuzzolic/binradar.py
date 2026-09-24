@@ -98,6 +98,13 @@ def phase_from_name(name: str) -> BinRadarPhase:
     return BinRadarPhase[name.upper().replace("-", "_")]
 
 
+# Forkserver budget constants as configured for production.  Snapshotted at
+# import so the stop row's margin arithmetic reports the real limits even when
+# a test substitutes the executor class.
+FORKSERVER_READ_TIMEOUT = binradar_runtime.TracerExecutor.forkserver_timeout
+FORKSERVER_ANALYZE_MARGIN = (
+    binradar_runtime.TracerExecutor.forkserver_analyze_margin)
+
 # Valid --run-single-phase names; each must map through phase_from_name.
 SINGLE_PHASE_NAMES = ["probe", "fuzzolic", "directed", "fuzzer",
                       "minimizer", "verifier", "minimizer-verifier",
@@ -115,10 +122,15 @@ def _read_binradar_advisor_metrics(
     metrics: Dict[str, object] = {"mode": effective_mode or "off"}
     default_count = 0 if metrics["mode"] == "off" else None
     metrics.update({key: default_count for key in keys})
+    # The profile row is optional: a run from a tracer without the P4a
+    # release simply has no attribution, which is reported as unknown
+    # rather than as a zero that looks measured.
+    metrics["profile"] = {}
     if not log_path:
         return metrics
 
     summary = None
+    profile: Dict[str, str] = {}
     executed_families = set()
     child_uses = 0
     try:
@@ -131,6 +143,14 @@ def _read_binradar_advisor_metrics(
                         name, separator, value = field.partition(" ")
                         if separator:
                             summary[name] = value
+                elif "[symbolic-advisor] [profile]" in line:
+                    fields = re.findall(r"\[([^\]]*)\]", line)
+                    row = {}
+                    for field in fields[2:]:
+                        name, separator, value = field.partition(" ")
+                        if separator:
+                            row[name] = value
+                    profile = row
                 elif "[binradar] [advisor-attempt]" in line:
                     fields = re.findall(r"\[([^\]]*)\]", line)
                     attempt = {}
@@ -172,6 +192,7 @@ def _read_binradar_advisor_metrics(
                 metrics[output_key] = count
     metrics["families_executed"] = len(executed_families)
     metrics["child_uses"] = child_uses
+    metrics["profile"] = profile
     return metrics
 
 
@@ -211,6 +232,9 @@ class BinRadarExecutor:
     # "off" | "shadow" | "boundary".  Always explicit so an inherited CLI
     # environment cannot enable it in another phase.
     symbolic_mutation_mode: str
+    # Effective advisor budgets, resolved before the run starts: the tracer
+    # must receive exactly the values recorded in the settings row.
+    symbolic_budgets: binradar_config.SymbolicBudgets
     requested_candidate_scope: str
     candidate_scope_status: str
     candidate_scope_reason: str
@@ -246,6 +270,7 @@ class BinRadarExecutor:
         self.less_strict = config.less_strict
         self.feedback_mode = config.feedback_mode
         self.symbolic_mutation_mode = config.symbolic_mutation_mode
+        self.symbolic_budgets = config.symbolic_budgets
         self.requested_candidate_scope = config.requested_candidate_scope
         self.candidate_scope_status = config.candidate_scope_status
         self.candidate_scope_reason = config.candidate_scope_reason
@@ -444,6 +469,9 @@ class BinRadarExecutor:
                 disable_binradar=self.disable_binradar,
                 feedback=self.feedback_mode,
                 symbolic_mutation_mode=self.symbolic_mutation_mode,
+                symbolic_max_work=self.symbolic_budgets.max_work,
+                symbolic_max_bytes=self.symbolic_budgets.max_bytes,
+                symbolic_deadline_ms=self.symbolic_budgets.deadline_ms,
                 fuzzy=self.fuzzy,
                 reverse_directed=self.reverse_directed,
                 less_strict=self.less_strict,
@@ -993,6 +1021,14 @@ class BinRadarExecutor:
                     "the selected artifact has no snapshot channel")
             binradar_env.pop("BINRADAR_PATCH_CACHE_ENABLE", None)
             binradar_env.pop("BINRADAR_PATCH_MANIFEST", None)
+        # Phase latency and child high-water RSS.  RUSAGE_CHILDREN is global to
+        # this orchestrator process and never decreases, so a phase peak is
+        # exact only when this phase raises the prior high-water mark; otherwise
+        # the stop row reports it as unknown instead of reusing an earlier
+        # phase's larger child.
+        phase_start = time.monotonic()
+        child_peak_rss_before = resource.getrusage(
+            resource.RUSAGE_CHILDREN).ru_maxrss
         session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
         timed_out = False
         summary = None
@@ -1099,6 +1135,30 @@ class BinRadarExecutor:
                 advisor["child_uses"] = None
             advisor_value = lambda name: (
                 "unknown" if advisor[name] is None else str(advisor[name]))
+            # The tracer's own `[config]`/`[profile]` rows are the ground
+            # truth; carrying the effective budgets here lets a trial match
+            # its settings row against what the tracer actually received.
+            budgets = self.symbolic_budgets
+            profile = advisor["profile"] if isinstance(
+                advisor["profile"], dict) else {}
+
+            def profile_value(name: str) -> str:
+                value = profile.get(name)
+                return "unknown" if value is None else str(value)
+            phase_ms = int((time.monotonic() - phase_start) * 1000)
+            child_peak_rss_after = resource.getrusage(
+                resource.RUSAGE_CHILDREN).ru_maxrss
+            child_peak_rss_kib = (
+                str(child_peak_rss_after)
+                if child_peak_rss_after > child_peak_rss_before
+                else "unknown")
+            read_timeout = FORKSERVER_READ_TIMEOUT
+            analyze_margin = FORKSERVER_ANALYZE_MARGIN
+            effective_child_timeout = int(binradar_env.get(
+                "BINRADAR_FORKSERVER_CHILD_TIMEOUT",
+                self.forkserver_child_timeout))
+            forkserver_margin = (
+                read_timeout - effective_child_timeout - analyze_margin)
             memcheck_value = binradar_env.get("BINRADAR_MEMCHECK_ENABLE")
             memcheck = ("true" if memcheck_value == "1" else
                         "false" if memcheck_value == "0" else "unknown")
@@ -1136,7 +1196,24 @@ class BinRadarExecutor:
                 f"[advisor-families-executed "
                 f"{advisor_value('families_executed')}] "
                 f"[advisor-child-uses "
-                f"{advisor_value('child_uses')}]")
+                f"{advisor_value('child_uses')}] "
+                f"[advisor-max-work {budgets.max_work}] "
+                f"[advisor-max-bytes {budgets.max_bytes}] "
+                f"[advisor-deadline-ms {budgets.deadline_ms}] "
+                f"[advisor-stop-stage {profile_value('stop-stage')}] "
+                f"[advisor-stop-reason {profile_value('stop-reason')}] "
+                f"[advisor-would-submit-families "
+                f"{profile_value('would-submit-families')}] "
+                f"[advisor-would-submit-variants "
+                f"{profile_value('would-submit-variants')}] "
+                f"[advisor-analysis-complete "
+                f"{profile_value('analysis-complete')}] "
+                f"[advisor-digest {profile_value('digest')}] "
+                f"[phase-ms {phase_ms}] "
+                f"[child-peak-rss-kib {child_peak_rss_kib}] "
+                f"[forkserver-read-timeout {read_timeout:g}] "
+                f"[forkserver-child-timeout {effective_child_timeout}] "
+                f"[forkserver-margin {forkserver_margin:g}]")
 
         if timed_out:
             logger.info(
@@ -1400,6 +1477,22 @@ def main():
               "binradar.env); 'shadow' ranks and reports without proposing, "
               "'boundary' proposes comparison-guided values.  Every other "
               "phase always runs with the advisor off"))
+    parser.add_argument(
+        "--symbolic-max-work", dest="symbolic_max_work", default=None,
+        help=("symbolic boundary advisor work budget for the BinRadar tracer "
+              "phase (default: 1000000, or BINRADAR_SYMBOLIC_MAX_WORK from "
+              "binradar.env); 0 means the default"))
+    parser.add_argument(
+        "--symbolic-max-bytes", dest="symbolic_max_bytes", default=None,
+        help=("symbolic boundary advisor byte budget for the BinRadar tracer "
+              "phase (default: 16777216, or BINRADAR_SYMBOLIC_MAX_BYTES from "
+              "binradar.env); 0 means the default"))
+    parser.add_argument(
+        "--symbolic-deadline-ms", dest="symbolic_deadline_ms", default=None,
+        help=("symbolic boundary advisor emergency deadline in milliseconds "
+              "for the BinRadar tracer phase (default: 100, or "
+              "BINRADAR_SYMBOLIC_DEADLINE_MS from binradar.env); 0 disables "
+              "the guard and is not a production setting"))
     parser.add_argument("--less-strict", action="store_true",
         help=("continue when optional evidence phases (fuzzolic, directed, "
               "fuzzer, binradar, or feedback) fail; final output records the "
@@ -1453,6 +1546,16 @@ def main():
             else env.get(
                 "BINRADAR_SYMBOLIC_MUTATION_MODE",
                 binradar_config.SYMBOLIC_MUTATION_MODE_DEFAULT))
+    # Budgets resolve once, here, with CLI > binradar.env > default
+    # precedence.  The resolved values are written back so every phase
+    # environment and the settings row agree on one effective configuration.
+    budgets = binradar_config.resolve_symbolic_budgets({
+        "symbolic_max_work": args.symbolic_max_work,
+        "symbolic_max_bytes": args.symbolic_max_bytes,
+        "symbolic_deadline_ms": args.symbolic_deadline_ms,
+    }, env)
+    env.update(binradar_config.SymbolicBudgets.from_mapping(budgets)
+               .environment())
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     env["BINRADAR_INVOCATION"] = shlex.join(sys.argv)
     candidate_set = binradar_artifacts.resolve_candidate_set(

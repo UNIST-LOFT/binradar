@@ -12,6 +12,22 @@ SYMBOLIC_MUTATION_MODES = ("off", "shadow", "boundary")
 SYMBOLIC_MAX_WORK_DEFAULT = 1_000_000
 SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
 SYMBOLIC_DEADLINE_MS_DEFAULT = 100
+# The tracer guards the deadline by adding the span to the monotonic clock.
+# A span that cannot leave room for that sum is unrepresentable, and the
+# tracer clamps to this same ceiling; both sides must agree, so a larger
+# request is a configuration failure rather than a silent clamp.
+SYMBOLIC_DEADLINE_MS_MAX = (2 ** 63 - 1) // 4 // 1000
+SYMBOLIC_BUDGET_MAX = 2 ** 64 - 1
+
+# CLI destination -> (environment key, default, allow-zero-means-default)
+SYMBOLIC_BUDGET_FIELDS = (
+    ("symbolic_max_work", "BINRADAR_SYMBOLIC_MAX_WORK",
+     SYMBOLIC_MAX_WORK_DEFAULT, True),
+    ("symbolic_max_bytes", "BINRADAR_SYMBOLIC_MAX_BYTES",
+     SYMBOLIC_MAX_BYTES_DEFAULT, True),
+    ("symbolic_deadline_ms", "BINRADAR_SYMBOLIC_DEADLINE_MS",
+     SYMBOLIC_DEADLINE_MS_DEFAULT, False),
+)
 
 # We need to turn on MEMCHECK in tracer for binradar phase
 MEMCHECK_ENABLED_MODES = ("binradar",)
@@ -31,6 +47,74 @@ def validate_symbolic_mutation_mode(value: str) -> str:
             f"invalid symbolic mutation mode {value!r}; expected one of "
             f"{', '.join(SYMBOLIC_MUTATION_MODES)}")
     return normalized
+
+
+def parse_bounded_unsigned_decimal(name: str, value: object,
+                                   maximum: int) -> int:
+    """Parse an unsigned decimal budget without wrapping.
+
+    Rejects signs, whitespace, fractional, and out-of-range input
+    instead of silently truncating it; a budget that cannot be represented is
+    a configuration failure, not a fallback to the default.
+    """
+    text = str(value)
+    if not text or not all(character in "0123456789" for character in text):
+        raise ValueError(
+            f"invalid {name} {value!r}; expected an unsigned decimal integer")
+    parsed = int(text, 10)
+    if parsed > maximum:
+        raise ValueError(
+            f"{name} {parsed} exceeds the supported maximum {maximum}")
+    return parsed
+
+
+def resolve_symbolic_budgets(
+        cli_values: Mapping[str, object], env: Mapping[str, str]
+) -> dict[str, int]:
+    """Resolve the three advisor budgets once, before any trial runs.
+
+    Precedence is explicit CLI value, then the value loaded from the workdir's
+    ``binradar.env``, then the built-in default - the same shape the advisor
+    mode uses.  A work/byte zero means "use the default", matching the
+    tracer's existing behavior; a deadline of zero disables the emergency
+    guard and keeps that explicit meaning.
+    """
+    resolved: dict[str, int] = {}
+    for field, key, default, zero_is_default in SYMBOLIC_BUDGET_FIELDS:
+        cli_value = cli_values.get(field)
+        raw = cli_value if cli_value is not None else env.get(key, default)
+        maximum = (SYMBOLIC_DEADLINE_MS_MAX
+                   if field == "symbolic_deadline_ms"
+                   else SYMBOLIC_BUDGET_MAX)
+        parsed = parse_bounded_unsigned_decimal(key, raw, maximum)
+        if zero_is_default and parsed == 0:
+            parsed = default
+        resolved[field] = parsed
+    return resolved
+
+
+@dataclass(frozen=True)
+class SymbolicBudgets:
+    """Effective advisor budgets for one run."""
+
+    max_work: int
+    max_bytes: int
+    deadline_ms: int
+
+    @classmethod
+    def from_mapping(cls, resolved: Mapping[str, int]) -> "SymbolicBudgets":
+        return cls(
+            max_work=resolved["symbolic_max_work"],
+            max_bytes=resolved["symbolic_max_bytes"],
+            deadline_ms=resolved["symbolic_deadline_ms"],
+        )
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "BINRADAR_SYMBOLIC_MAX_WORK": str(self.max_work),
+            "BINRADAR_SYMBOLIC_MAX_BYTES": str(self.max_bytes),
+            "BINRADAR_SYMBOLIC_DEADLINE_MS": str(self.deadline_ms),
+        }
 
 
 @dataclass(frozen=True)
@@ -54,6 +138,7 @@ class RunConfig:
     feedback_mode: bool
     forkserver_child_timeout: int
     symbolic_mutation_mode: str
+    symbolic_budgets: SymbolicBudgets
     requested_candidate_scope: str
     candidate_scope_status: str
     candidate_scope_reason: str
@@ -111,6 +196,10 @@ class RunConfig:
             symbolic_mutation_mode=validate_symbolic_mutation_mode(env.get(
                 "BINRADAR_SYMBOLIC_MUTATION_MODE",
                 SYMBOLIC_MUTATION_MODE_DEFAULT)),
+            # CLI overrides arrive pre-merged into `env`, so the effective
+            # value here is already the resolved one.
+            symbolic_budgets=SymbolicBudgets.from_mapping(
+                resolve_symbolic_budgets({}, env)),
             requested_candidate_scope=env.get(
                 "BINRADAR_TARGET_PATCHES", "configured"),
             candidate_scope_status=env.get(
@@ -134,12 +223,12 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
         "BINRADAR_TIMEOUT": str(config.timeout),
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "BINRADAR_SYMBOLIC_MUTATION_MODE": config.symbolic_mutation_mode,
-        "BINRADAR_SYMBOLIC_MAX_WORK": str(SYMBOLIC_MAX_WORK_DEFAULT),
-        "BINRADAR_SYMBOLIC_MAX_BYTES": str(SYMBOLIC_MAX_BYTES_DEFAULT),
-        "BINRADAR_SYMBOLIC_DEADLINE_MS": str(SYMBOLIC_DEADLINE_MS_DEFAULT),
         "SYMBOLIC_TESTCASE_NAME": config.resolved_poc_input(),
         "PLT_INFO_FILE": plt_info_file,
     }
+    # The resolved budgets, not the module defaults: a per-run override must
+    # reach the tracer, and nothing later may overwrite it with a constant.
+    environment.update(config.symbolic_budgets.environment())
     if config.timeout > 0:
         environment["SOLVER_TIMEOUT"] = str(int(config.timeout * 1000))
     environment.update(config.retained_environment)

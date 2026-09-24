@@ -211,6 +211,94 @@ def test_symbolic_mode_rejects_unknown_value():
         " Boundary ") == "boundary"
 
 
+def test_symbolic_budget_cli_precedence_and_zero_normalization():
+    """CLI wins over binradar.env, which wins over the built-in default."""
+    loaded = {"BINRADAR_SYMBOLIC_DEADLINE_MS": "250",
+              "BINRADAR_SYMBOLIC_MAX_WORK": "7"}
+
+    from_cli = binradar_config.resolve_symbolic_budgets(
+        {"symbolic_deadline_ms": "500", "symbolic_max_work": None}, loaded)
+    assert from_cli["symbolic_deadline_ms"] == 500
+    assert from_cli["symbolic_max_work"] == 7
+    assert from_cli["symbolic_max_bytes"] == \
+        binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT
+
+    # Work/bytes keep the tracer's zero-means-default behavior; the deadline
+    # keeps its explicit zero-disables-the-guard meaning.
+    zeroed = binradar_config.resolve_symbolic_budgets(
+        {"symbolic_max_work": "0", "symbolic_max_bytes": "0",
+         "symbolic_deadline_ms": "0"}, {})
+    assert zeroed["symbolic_max_work"] == \
+        binradar_config.SYMBOLIC_MAX_WORK_DEFAULT
+    assert zeroed["symbolic_max_bytes"] == \
+        binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT
+    assert zeroed["symbolic_deadline_ms"] == 0
+
+
+@pytest.mark.parametrize(
+    "value", ["-1", "+1", "1.5", "0x10", "1e6", "", " 12", "12 ",
+              "12 34"])
+def test_symbolic_budget_rejects_malformed_values(value):
+    """A malformed budget is a configuration failure, never a silent wrap."""
+    with pytest.raises(ValueError):
+        binradar_config.resolve_symbolic_budgets(
+            {"symbolic_max_work": value}, {})
+
+
+def test_symbolic_budget_rejects_unrepresentable_deadline():
+    with pytest.raises(ValueError):
+        binradar_config.resolve_symbolic_budgets(
+            {"symbolic_deadline_ms":
+             str(binradar_config.SYMBOLIC_DEADLINE_MS_MAX + 1)}, {})
+    # The exact ceiling the tracer's deadline arithmetic can represent is
+    # accepted, so both sides agree on the boundary.
+    accepted = binradar_config.resolve_symbolic_budgets(
+        {"symbolic_deadline_ms":
+         str(binradar_config.SYMBOLIC_DEADLINE_MS_MAX)}, {})
+    assert accepted["symbolic_deadline_ms"] == \
+        binradar_config.SYMBOLIC_DEADLINE_MS_MAX
+
+
+def test_base_environment_emits_resolved_advisor_budgets(tmp_path):
+    """A per-run override must reach the phase environment, not a constant."""
+    run_config = binradar_config.RunConfig.from_environment(
+        str(tmp_path), {
+            "BINRADAR_OUTDIR": str(tmp_path / "out"),
+            "BINRADAR_TIMEOUT": "60",
+            "BINARY": "bin",
+            "POC_INPUT": "poc",
+            "TEST_CMD": "@@",
+            "PATCH_LOC": "0x1000",
+            "TOTAL_PATCHES": "2",
+            "BINRADAR_SYMBOLIC_MAX_WORK": "500000",
+            "BINRADAR_SYMBOLIC_MAX_BYTES": "1048576",
+            "BINRADAR_SYMBOLIC_DEADLINE_MS": "500",
+        })
+
+    assert run_config.symbolic_budgets == binradar_config.SymbolicBudgets(
+        max_work=500000, max_bytes=1048576, deadline_ms=500)
+    environment = binradar_config.build_base_environment(
+        run_config, str(tmp_path / "plt"))
+    assert environment["BINRADAR_SYMBOLIC_MAX_WORK"] == "500000"
+    assert environment["BINRADAR_SYMBOLIC_MAX_BYTES"] == "1048576"
+    assert environment["BINRADAR_SYMBOLIC_DEADLINE_MS"] == "500"
+
+    # The default case must still be explicit, not absent.
+    default_config = binradar_config.RunConfig.from_environment(
+        str(tmp_path), {
+            "BINRADAR_OUTDIR": str(tmp_path / "out"),
+            "BINRADAR_TIMEOUT": "60",
+            "BINARY": "bin",
+            "POC_INPUT": "poc",
+            "TEST_CMD": "@@",
+            "PATCH_LOC": "0x1000",
+            "TOTAL_PATCHES": "2",
+        })
+    default_environment = binradar_config.build_base_environment(
+        default_config, str(tmp_path / "plt"))
+    assert default_environment["BINRADAR_SYMBOLIC_DEADLINE_MS"] == "100"
+
+
 def test_memcheck_policy_is_explicit_per_mode(monkeypatch, executor):
     """The crash-detection policy is set by the phase, never inherited."""
     instance, run_dir = executor

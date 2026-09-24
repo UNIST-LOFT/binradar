@@ -15,18 +15,20 @@ _spec = importlib.util.spec_from_file_location(
 assert _spec is not None and _spec.loader is not None
 binradar = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(binradar)
+import binradar_config
 
 
-def _run_main(monkeypatch, tmp_path, extra_args):
+def _run_main(monkeypatch, tmp_path, extra_args, extra_env=""):
     workdir = tmp_path / "workdir"
     workdir.mkdir(parents=True)
+    (workdir / "poc").write_bytes(b"x")
     (workdir / "binradar.env").write_text(
         'BINARY="bin"\n'
         'POC_INPUT="poc"\n'
         'TEST_CMD="./bin @@"\n'
         'PATCH_LOC="0x1234"\n'
         'TOTAL_PATCHES="30"\n'
-        'FILTER_TOTAL_PATCHES="32"\n')
+        'FILTER_TOTAL_PATCHES="32"\n' + extra_env)
     captured = {}
 
     class FakeExecutor:
@@ -72,6 +74,41 @@ def test_reverse_directed_bare_flag_and_explicit_disable(tmp_path, monkeypatch):
     assert enabled_feedback["BINRADAR_FEEDBACK_MODE"] == "1"
 
 
+def test_symbolic_budget_cli_option_reaches_the_phase_environment(
+        tmp_path, monkeypatch):
+    """End-to-end: `--symbolic-deadline-ms 500` must arrive as 500.
+
+    The pre-change path delivered the constant default 100, so this fixture is
+    the regression for a requested budget being silently discarded.
+    """
+    captured = _run_main(
+        monkeypatch, tmp_path,
+        ["--symbolic-mutation-mode", "shadow",
+         "--symbolic-max-work", "500000",
+         "--symbolic-deadline-ms", "500"],
+        extra_env='BINRADAR_SYMBOLIC_DEADLINE_MS="100"\n')
+    workdir = tmp_path / "workdir"
+
+    assert captured["BINRADAR_SYMBOLIC_MAX_WORK"] == "500000"
+    assert captured["BINRADAR_SYMBOLIC_DEADLINE_MS"] == "500"
+    assert captured["BINRADAR_SYMBOLIC_MAX_BYTES"] == str(
+        binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT)
+
+    run_config = binradar_config.RunConfig.from_environment(
+        str(workdir), captured)
+    environment = binradar_config.build_base_environment(
+        run_config, str(tmp_path / "plt_info.txt"))
+    assert environment["BINRADAR_SYMBOLIC_DEADLINE_MS"] == "500"
+    assert environment["BINRADAR_SYMBOLIC_MAX_WORK"] == "500000"
+
+
+def test_symbolic_budget_cli_option_rejects_malformed_workdir_value(
+        tmp_path, monkeypatch):
+    with pytest.raises(ValueError):
+        _run_main(monkeypatch, tmp_path, [],
+                  extra_env='BINRADAR_SYMBOLIC_MAX_WORK="-5"\n')
+
+
 def test_target_patches_all_stays_within_compiled_count(tmp_path, monkeypatch):
     captured = _run_main(monkeypatch, tmp_path, ["--target-patches", "all"])
     assert captured["TOTAL_PATCHES"] == "30"
@@ -99,6 +136,8 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     executor.disable_binradar = False
     executor.feedback_mode = False
     executor.symbolic_mutation_mode = "off"
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=500000, max_bytes=1048576, deadline_ms=500)
     executor.fuzzy = False
     executor.reverse_directed = True
     executor.less_strict = False
@@ -117,7 +156,8 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
         "[disable-binradar: bool] [feedback: bool] "
         "[symbolic-mutation-mode: str] [fuzzy: bool] "
         "[reverse-directed: bool] [less-strict: bool] "
-        "[forkserver-child-timeout: int]")
+        "[forkserver-child-timeout: int] [symbolic-max-work: str] "
+        "[symbolic-max-bytes: str] [symbolic-deadline-ms: str]")
     with (run_dir / "binradar-setting.sbsv").open() as settings_file:
         row = parser.load(settings_file)["binradar-setting"][0]
 
@@ -129,6 +169,12 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert row["effective-patches"] == 41
     assert row["disable-binradar"] is False
     assert row["symbolic-mutation-mode"] == "off"
+    # Settings v2 records the effective budgets, so a reader can match a trial
+    # against the tracer's own `[config]`/`[profile]` rows.
+    assert row["version"] == 2
+    assert row["symbolic-max-work"] == "500000"
+    assert row["symbolic-max-bytes"] == "1048576"
+    assert row["symbolic-deadline-ms"] == "500"
 
     executor.invocation = "binradar.py --run-single-phase final --run-id 0"
     executor.write_run_settings("single-phase-final")

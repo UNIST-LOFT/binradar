@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import binradar_config
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 _spec = importlib.util.spec_from_file_location(
@@ -44,6 +46,10 @@ def _stub_executor(tmp_path):
     executor.candidate_scope_status = "top-30"
     executor.candidate_scope_reason = "requested top-30"
     executor.symbolic_mutation_mode = "off"
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
+        max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
+        deadline_ms=binradar_config.SYMBOLIC_DEADLINE_MS_DEFAULT)
     executor.fuzzy = False
     executor.reverse_directed = False
     executor.less_strict = False

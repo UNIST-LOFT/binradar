@@ -4,6 +4,7 @@ import fcntl
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import logger
 import sbsv
@@ -94,6 +95,16 @@ class RunSettings:
     reverse_directed: bool
     less_strict: bool
     forkserver_child_timeout: int
+    # Effective advisor budgets (settings v2).  None means the row predates
+    # the field or was written without one: an unknown budget is never
+    # reported as the built-in default.
+    symbolic_max_work: Optional[int] = None
+    symbolic_max_bytes: Optional[int] = None
+    symbolic_deadline_ms: Optional[int] = None
+
+
+# Settings row schema version.  Version 1 rows carry no advisor budgets.
+RUN_SETTINGS_VERSION = 2
 
 
 class RunRecordStore:
@@ -143,7 +154,7 @@ class RunRecordStore:
 
         fields = [
             "[binradar-setting]",
-            "[version 1]",
+            f"[version {RUN_SETTINGS_VERSION}]",
             field("invocation", settings.invocation),
             field("execution-mode", settings.execution_mode),
             field("workdir", settings.workdir),
@@ -167,6 +178,13 @@ class RunRecordStore:
                 "forkserver-child-timeout",
                 settings.forkserver_child_timeout),
         ]
+        # Effective budgets, recorded separately from the requested values so
+        # a reader can tell "not requested" from "requested as the default".
+        for name, value in (
+                ("symbolic-max-work", settings.symbolic_max_work),
+                ("symbolic-max-bytes", settings.symbolic_max_bytes),
+                ("symbolic-deadline-ms", settings.symbolic_deadline_ms)):
+            fields.append(field(name, "unknown" if value is None else value))
         output = os.path.join(run_dir, "binradar-setting.sbsv")
         previous = ""
         if os.path.exists(output):

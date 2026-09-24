@@ -281,6 +281,11 @@ class RunResult:
     binradar_advisor_families_executed: int = -1
     binradar_advisor_child_uses: int = -1
     binradar_advisor_telemetry: Dict[str, str] = field(default_factory=dict)
+    # Effective advisor budgets from a settings v2 row; -1 means the run
+    # predates budget provenance.
+    binradar_advisor_max_work: int = -1
+    binradar_advisor_max_bytes: int = -1
+    binradar_advisor_deadline_ms: int = -1
     remaining_patches: str = ""  # e.g. "[1, 2, 3]" or "[]"
     binradar_remaining_patches: str = ""
     verifier_rejected: str = ""  # e.g. "2,4,6"
@@ -1383,6 +1388,22 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                             "symbolic-mutation-mode":
                         run_res.binradar_advisor_mode = value
                         break
+            # A settings v1 row carries no advisor budgets.  Missing values
+            # stay absent rather than being reported as the built-in default,
+            # which would look like a measured configuration.
+            for key, column in (
+                    ("symbolic-max-work", "binradar_advisor_max_work"),
+                    ("symbolic-max-bytes", "binradar_advisor_max_bytes"),
+                    ("symbolic-deadline-ms", "binradar_advisor_deadline_ms")):
+                for setting_key, value in settings.items():
+                    if setting_key.lower().replace("_", "-") != key:
+                        continue
+                    if str(value).strip().lower() == "unknown":
+                        break
+                    setattr(run_res, column, _optional_int(value))
+                    run_res.binradar_advisor_telemetry[
+                        key] = str(value)
+                    break
         advisor = runtime.get("advisor", {})
         if isinstance(advisor, dict):
             run_res.binradar_advisor_telemetry.update(advisor)
@@ -2006,6 +2027,9 @@ CSV_COLUMNS = [
     "binradar_advisor_budget_abstentions",
     "binradar_advisor_families_executed",
     "binradar_advisor_child_uses",
+    "binradar_advisor_max_work",
+    "binradar_advisor_max_bytes",
+    "binradar_advisor_deadline_ms",
     "binradar_advisor_telemetry",
     "remaining_patches",
     "binradar_remaining_patches",
@@ -2156,7 +2180,13 @@ def format_results_csv(all_results: List[ExperimentResult],
                     ("binradar_advisor_families_executed",
                      run_res.binradar_advisor_families_executed),
                     ("binradar_advisor_child_uses",
-                     run_res.binradar_advisor_child_uses)):
+                     run_res.binradar_advisor_child_uses),
+                    ("binradar_advisor_max_work",
+                     run_res.binradar_advisor_max_work),
+                    ("binradar_advisor_max_bytes",
+                     run_res.binradar_advisor_max_bytes),
+                    ("binradar_advisor_deadline_ms",
+                     run_res.binradar_advisor_deadline_ms)):
                 row[column] = str(value) if value >= 0 else ""
             row["binradar_advisor_telemetry"] = ";".join(
                 f"{key}={value}" for key, value in sorted(

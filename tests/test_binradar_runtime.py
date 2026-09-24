@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
+import binradar_config
 import binradar_runtime
 
 SPEC = importlib.util.spec_from_file_location(
@@ -141,6 +142,10 @@ def _binradar_executor(tmp_path, timeout):
     executor.fuzzy = False
     executor.timeout = timeout
     executor.forkserver_child_timeout = 900
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
+        max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
+        deadline_ms=binradar_config.SYMBOLIC_DEADLINE_MS_DEFAULT)
     executor.start_time = time.time() - 3600
     executor.feedback_mode = False
     executor.run_prefix = "run"
@@ -321,6 +326,12 @@ def _binradar_loop_executor(tmp_path):
     executor._validate_baseline = lambda *a, **k: None
     executor.resolved_poc_input = lambda: "poc"
     executor.check_requirements = lambda: None
+    executor.forkserver_child_timeout = (
+        binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
+        max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
+        deadline_ms=binradar_config.SYMBOLIC_DEADLINE_MS_DEFAULT)
     return executor
 
 
@@ -466,3 +477,98 @@ def test_binradar_loop_records_resource_failure_before_raising(
     assert "[remaining 7]" in stop_rows[0]
     assert "[discarded 1]" in stop_rows[0]
     assert not any("[binradar] [done]" in row for row in rows)
+
+
+def test_advisor_profile_metrics_and_budget_traceability(tmp_path):
+    """Preserve the tracer's independently reported profile for trial joins.
+
+    Settings v2 records the orchestrator's effective request; `[config]` and
+    `[profile]` independently show what the tracer configured and measured. A
+    missing profile row is reported as unknown, never as a zero.
+    """
+    log = tmp_path / "binradar-tracer-msg.log"
+    log.write_text(
+        "[symbolic-advisor] [config] [mode shadow] [max-work 500000] "
+        "[max-bytes 16777216] [deadline-ms 500]\n"
+        "[symbolic-advisor] [profile] [version 1] [mode shadow] "
+        "[max-work 500000] [max-bytes 16777216] [deadline-ms 500] "
+        "[stop-stage consumers] [stop-reason work] "
+        "[would-submit-families 4] [would-submit-variants 9] "
+        "[analysis-complete 0] [digest 00000000000000ff]\n")
+
+    metrics = binradar._read_binradar_advisor_metrics(str(log), "shadow")
+    profile = metrics["profile"]
+
+    assert profile["max-work"] == "500000"
+    assert profile["deadline-ms"] == "500"
+    assert profile["stop-stage"] == "consumers"
+    assert profile["stop-reason"] == "work"
+    assert profile["would-submit-families"] == "4"
+    assert profile["would-submit-variants"] == "9"
+    assert profile["analysis-complete"] == "0"
+    assert profile["digest"] == "00000000000000ff"
+
+    # A tracer without the profile row leaves the attribution unknown.
+    summary_only = tmp_path / "summary-only.log"
+    summary_only.write_text(
+        "[symbolic-advisor] [summary] [mode boundary] [sources 2] "
+        "[valid-roots 2] [consumers 3] [candidates 8] [families 2] "
+        "[unsupported 1] [budget 0] [work 20] [bytes 40] [time-ms 2] "
+        "[candidates-generated 4] [families-generated 3] "
+        "[families-accepted 2]\n")
+    legacy = binradar._read_binradar_advisor_metrics(
+        str(summary_only), "boundary")
+    assert legacy["families_accepted"] == 2
+    assert legacy["profile"] == {}
+
+
+def test_stop_row_reports_effective_budgets_and_forkserver_margin(
+        tmp_path, monkeypatch):
+    """The terminal row carries the trial telemetry P4a requires.
+
+    Latency, honest child RSS, configured budgets, effective child timeout and
+    forkserver margin must appear on the row a trial reads. Profile attribution
+    comes from the tracer's own row; missing or process-global-only values are
+    `unknown`, never fabricated measurements.
+    """
+    tracer = _RecordingTracer([
+        _summary(1, 1, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.EXHAUSTED),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=500000, max_bytes=1048576, deadline_ms=500)
+    executor._phase_environment = lambda *a, **k: {
+        # The phase timeout lowers the requested 900-second cap to 60 seconds;
+        # terminal telemetry must report this effective value.
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "60",
+    }
+    child_usage = iter([
+        SimpleNamespace(ru_maxrss=4096),
+        SimpleNamespace(ru_maxrss=4096),
+    ])
+    monkeypatch.setattr(
+        binradar.resource, "getrusage", lambda _scope: next(child_usage))
+    rows: list[str] = []
+    executor.save_progress = rows.append
+
+    executor.run_binradar()
+
+    stop_rows = [row for row in rows if "[binradar] [stop]" in row]
+    assert len(stop_rows) == 1
+    row = stop_rows[0]
+    assert "[advisor-max-work 500000]" in row
+    assert "[advisor-max-bytes 1048576]" in row
+    assert "[advisor-deadline-ms 500]" in row
+    assert "[phase-ms " in row
+    # The phase did not raise the process-wide child high-water mark, so the
+    # phase-local peak is not knowable and must not reuse 4096 as if measured.
+    assert "[child-peak-rss-kib unknown]" in row
+    assert "[forkserver-read-timeout 1800]" in row
+    assert "[forkserver-child-timeout 60]" in row
+    assert "[forkserver-margin 1440]" in row
+    # No tracer log was written, so the profile attribution is unknown.
+    assert "[advisor-stop-reason unknown]" in row
+    assert "[advisor-would-submit-families unknown]" in row
+    assert "[advisor-digest unknown]" in row

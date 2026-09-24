@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import binradar_config
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
@@ -623,6 +625,10 @@ def _stub_executor(tmp_path):
     executor.feedback_mode = False
     executor.less_strict = False
     executor.symbolic_mutation_mode = "off"
+    executor.symbolic_budgets = binradar_config.SymbolicBudgets(
+        max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
+        max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
+        deadline_ms=binradar_config.SYMBOLIC_DEADLINE_MS_DEFAULT)
     executor.forkserver_child_timeout = 900
     executor.invocation = "test"
     executor.requested_candidate_scope = "top-30"

@@ -659,6 +659,13 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     (run_dir / "binradar.log").write_text(
         "[FINAL] Processed 99 complete BINRADAR evidence iteration(s); "
         "rejected 3 patch(es).\n")
+    # Settings v2 records the effective advisor budgets.  They are read from
+    # the settings row, so a trial can be matched against the tracer's own
+    # `[config]`/`[profile]` rows after the fact.
+    (run_dir / "binradar-setting.sbsv").write_text(
+        '[binradar-setting] [version 2] [run-prefix "run"] [run-id 0] '
+        '[symbolic-mutation-mode "boundary"] [symbolic-max-work "500000"] '
+        '[symbolic-max-bytes "16777216"] [symbolic-deadline-ms "500"]\n')
     confidence_rows = "".join(
         f"[final] [confidence] [patch {patch}] [score {1.0 - patch / 10}] "
         f"[accept-evidences 1] [total-evidences 1]\n"
@@ -720,6 +727,9 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert run.binradar_advisor_budget_abstentions == 2
     assert run.binradar_advisor_families_executed == 2
     assert run.binradar_advisor_child_uses == 7
+    assert run.binradar_advisor_max_work == 500000
+    assert run.binradar_advisor_max_bytes == 16777216
+    assert run.binradar_advisor_deadline_ms == 500
 
     row = collector.format_results_csv([result])[0]
     assert row["remaining_patches_count"] == "5"
@@ -751,6 +761,9 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert row["binradar_advisor_budget_abstentions"] == "2"
     assert row["binradar_advisor_families_executed"] == "2"
     assert row["binradar_advisor_child_uses"] == "7"
+    assert row["binradar_advisor_max_work"] == "500000"
+    assert row["binradar_advisor_max_bytes"] == "16777216"
+    assert row["binradar_advisor_deadline_ms"] == "500"
     log = collector.format_result_log(result)
     assert "[coverage] partial" in log
     assert "stop reason: wall-time-reached" in log
@@ -790,3 +803,55 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
         collector.collect_experiment_result(
             str(tmp_path), "workdir", "run", top_patches=1)])[0]
     assert legacy_row["binradar_rejection_ids_truncated"] == ""
+
+
+def test_legacy_settings_row_reports_unknown_advisor_budgets(tmp_path):
+    """A settings v1 row must not be read as the built-in defaults."""
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[binradar] [start] [prefix run] [id 0]\n")
+    (run_dir / "binradar.log").write_text("")
+    (run_dir / "binradar-setting.sbsv").write_text(
+        '[binradar-setting] [version 1] [run-prefix "run"] [run-id 0] '
+        '[symbolic-mutation-mode "shadow"]\n')
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run", top_patches=1)
+
+    run = result.runs[0]
+    assert run.binradar_advisor_mode == "shadow"
+    assert run.binradar_advisor_max_work == -1
+    assert run.binradar_advisor_max_bytes == -1
+    assert run.binradar_advisor_deadline_ms == -1
+
+    row = collector.format_results_csv([result])[0]
+    assert row["binradar_advisor_max_work"] == ""
+    assert row["binradar_advisor_deadline_ms"] == ""
+
+
+def test_settings_v2_with_unknown_budgets_is_not_a_default(tmp_path):
+    """An explicitly unknown budget stays absent, not 100/1e6/16 MiB."""
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[binradar] [start] [prefix run] [id 0]\n")
+    (run_dir / "binradar.log").write_text("")
+    (run_dir / "binradar-setting.sbsv").write_text(
+        '[binradar-setting] [version 2] [run-prefix "run"] [run-id 0] '
+        '[symbolic-max-work "unknown"] [symbolic-max-bytes "unknown"] '
+        '[symbolic-deadline-ms "unknown"]\n')
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run", top_patches=1)
+    run = result.runs[0]
+
+    assert run.binradar_advisor_max_work == -1
+    assert run.binradar_advisor_max_bytes == -1
+    assert run.binradar_advisor_deadline_ms == -1
