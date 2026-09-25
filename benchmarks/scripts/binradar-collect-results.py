@@ -73,6 +73,7 @@ logs/taosc-<datetime>.log / logs/binradar-stats-<datetime>.log
 
 import argparse
 import csv
+import json
 import os
 import re
 import sbsv
@@ -281,6 +282,12 @@ class RunResult:
     binradar_advisor_families_executed: int = -1
     binradar_advisor_child_uses: int = -1
     binradar_advisor_telemetry: Dict[str, str] = field(default_factory=dict)
+    # Bounded B1 diagnostic rows are keyed by tracer attempt ID within this
+    # run; absent legacy data remains empty rather than becoming zero counters.
+    binradar_plan_attempts: Dict[str, Dict[str, str]] = field(
+        default_factory=dict)
+    binradar_plan_funnel: Dict[str, Dict[str, str]] = field(
+        default_factory=dict)
     # Effective advisor budgets from a settings v2 row; -1 means the run
     # predates budget provenance.
     binradar_advisor_max_work: int = -1
@@ -850,13 +857,19 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
     Current attempt rows carry a run id. Historical unscoped rows fall back to
     the active ``[rundir] [set]`` record; run-scoped rows are checked against
     the requested prefix/id to avoid reading another run's terminal data.
+    Mutation diagnostics are joined to the v4 tracer attempt ID, not an
+    evidence-frame ID; absent historical diagnostic rows stay absent.
     """
     telemetry: Dict[str, object] = {
         "stop": {}, "baseline_status": "", "baseline_artifact": "",
         "tracer_attempts": -1, "advisor": {}, "settings": {},
+        "plan_attempts": {}, "plan_funnel": {}, "queue_bins": {},
     }
     active_run: Optional[Tuple[str, str]] = None
     tracer_rows: List[Dict[str, str]] = []
+    plan_attempts: Dict[str, Dict[str, str]] = {}
+    plan_funnel: Dict[str, Dict[str, str]] = {}
+    queue_bins: Dict[str, str] = {}
     advisor: Dict[str, str] = {}
     if os.path.isfile(progress_path):
         with open(progress_path, "r", encoding="utf-8") as stream:
@@ -880,8 +893,23 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
                     telemetry["stop"] = {}
                     telemetry["baseline_status"] = ""
                     telemetry["baseline_artifact"] = ""
+                    plan_attempts.clear()
+                    plan_funnel.clear()
+                    queue_bins.clear()
                 elif payload.startswith("[binradar] [tracer]") and scoped:
                     tracer_rows.append(fields)
+                elif payload.startswith("[binradar] [plan-attempt]") and scoped:
+                    attempt = fields.get("attempt", "")
+                    if fields.get("version") == "1" and attempt.isdigit():
+                        plan_attempts[attempt] = fields
+                elif payload.startswith("[binradar] [plan-funnel]") and scoped:
+                    if fields.get("version") == "1":
+                        key = (fields.get("advisor", "unknown") + "/" +
+                               fields.get("source-kind", "unknown"))
+                        plan_funnel[key] = fields
+                elif payload.startswith("[binradar] [queue-bins]") and scoped:
+                    if fields.get("version") == "1":
+                        queue_bins.update(fields)
                 elif payload.startswith("[binradar] [advisor]") and scoped:
                     advisor.update({key: value for key, value in fields.items()
                                     if key not in ("binradar", "advisor")})
@@ -902,6 +930,27 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
 
     telemetry["tracer_attempts"] = len(tracer_rows) if tracer_rows else -1
     telemetry["advisor"] = advisor
+    tracer_by_attempt = {
+        fields["attempt"]: fields for fields in tracer_rows
+        if fields.get("attempt", "").isdigit()
+    }
+    for attempt, diagnostic in plan_attempts.items():
+        tracer_row = tracer_by_attempt.get(attempt)
+        if tracer_row is None:
+            diagnostic["joined"] = "false"
+            continue
+        diagnostic["joined"] = "true"
+        diagnostic["protocol-attempt-result"] = tracer_row.get(
+            "attempt-result", "unknown")
+        diagnostic["attempt-result-match"] = str(
+            diagnostic.get("attempt-result", "unknown") ==
+            tracer_row.get("attempt-result", "unknown")).lower()
+        diagnostic["representative-runs"] = tracer_row.get(
+            "representative-runs", "unknown")
+        diagnostic["elapsed-ms"] = tracer_row.get("time", "unknown")
+    telemetry["plan_attempts"] = plan_attempts
+    telemetry["plan_funnel"] = plan_funnel
+    telemetry["queue_bins"] = queue_bins
     settings: Dict[str, str] = {}
     settings_path = os.path.join(run_dir, "binradar-setting.sbsv")
     if os.path.isfile(settings_path):
@@ -1359,8 +1408,15 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             run_res.binradar_advisor_telemetry.update({
                 key: value for key, value in stop.items()
                 if key.startswith("advisor-") or
-                key.startswith("mutation-")
+                key.startswith("mutation-") or
+                key.startswith("plan-funnel-")
             })
+        plan_attempts = runtime.get("plan_attempts", {})
+        if isinstance(plan_attempts, dict):
+            run_res.binradar_plan_attempts = plan_attempts
+        plan_funnel = runtime.get("plan_funnel", {})
+        if isinstance(plan_funnel, dict):
+            run_res.binradar_plan_funnel = plan_funnel
         run_res.binradar_tracer_attempts = _optional_int(
             str(runtime.get("tracer_attempts", "")))
         run_res.binradar_baseline_status = str(
@@ -1868,6 +1924,54 @@ def format_result_log(result: ExperimentResult) -> str:
                 f"{key}: {value}" for key, value in sorted(
                     run_res.binradar_advisor_telemetry.items()))
             lines.append(f"    [binradar] advisor: {advisor_summary}")
+        for attempt, diagnostic in sorted(
+                run_res.binradar_plan_attempts.items(),
+                key=lambda item: _optional_int(item[0])):
+            lines.append(
+                f"    [mutation-plan] attempt {attempt}: "
+                f"{diagnostic.get('advisor-id', 'unknown')}/"
+                f"{diagnostic.get('source-kind', 'unknown')} "
+                f"source-retained "
+                f"{diagnostic.get('source-retained', 'unknown')} "
+                f"applied {diagnostic.get('patch0-applied', 'unknown')} "
+                f"witness {diagnostic.get('patch0-read-witness', 'unknown')} "
+                f"site {diagnostic.get('patch0-site', 'unknown')} "
+                f"outcome {diagnostic.get('patch0-outcome', 'unknown')} "
+                f"committed {diagnostic.get('committed', 'unknown')} "
+                f"joined {diagnostic.get('joined', 'false')}")
+        for key, funnel in sorted(run_res.binradar_plan_funnel.items()):
+            lines.append(
+                f"    [mutation-funnel] {key}: "
+                f"scheduled {funnel.get('scheduled', 'unknown')} "
+                f"scheduled-retained "
+                f"{funnel.get('scheduled-retained', 'unknown')} "
+                f"scheduled-not-retained "
+                f"{funnel.get('scheduled-not-retained', 'unknown')} "
+                f"scheduled-retention-unknown "
+                f"{funnel.get('scheduled-retention-unknown', 'unknown')} "
+                f"attempted {funnel.get('attempted', 'unknown')} "
+                f"applied {funnel.get('applied', 'unknown')} "
+                f"not-applied {funnel.get('not-applied', 'unknown')} "
+                f"applied-unknown {funnel.get('applied-unknown', 'unknown')} "
+                f"matched-witness {funnel.get('matched-witness', 'unknown')} "
+                f"witness-unknown {funnel.get('witness-unknown', 'unknown')} "
+                f"site-yes {funnel.get('site-yes', 'unknown')} "
+                f"site-no {funnel.get('site-no', 'unknown')} "
+                f"site-unknown {funnel.get('site-unknown', 'unknown')} "
+                f"normal {funnel.get('normal', 'unknown')} "
+                f"poc-crash {funnel.get('poc-crash', 'unknown')} "
+                f"other-crash {funnel.get('other-crash', 'unknown')} "
+                f"unclassified-crash "
+                f"{funnel.get('unclassified-crash', 'unknown')} "
+                f"unusable {funnel.get('unusable', 'unknown')} "
+                f"outcome-unknown {funnel.get('outcome-unknown', 'unknown')} "
+                f"unknown {funnel.get('unknown', 'unknown')} "
+                f"discarded {funnel.get('discarded', 'unknown')} "
+                f"committed-useful {funnel.get('committed-useful', 'unknown')} "
+                f"representative-runs "
+                f"{funnel.get('representative-runs', 'unknown')} "
+                f"time-ms {funnel.get('time-ms', 'unknown')} "
+                f"pending {funnel.get('pending', 'unknown')}")
 
         if run_res.has_final:
             lines.append(
@@ -2031,6 +2135,8 @@ CSV_COLUMNS = [
     "binradar_advisor_max_bytes",
     "binradar_advisor_deadline_ms",
     "binradar_advisor_telemetry",
+    "binradar_plan_attempts",
+    "binradar_plan_funnel",
     "remaining_patches",
     "binradar_remaining_patches",
     "filter_survived_patches",
@@ -2191,6 +2297,14 @@ def format_results_csv(all_results: List[ExperimentResult],
             row["binradar_advisor_telemetry"] = ";".join(
                 f"{key}={value}" for key, value in sorted(
                     run_res.binradar_advisor_telemetry.items()))
+            row["binradar_plan_attempts"] = (
+                json.dumps(run_res.binradar_plan_attempts, sort_keys=True,
+                           separators=(",", ":"))
+                if run_res.binradar_plan_attempts else "")
+            row["binradar_plan_funnel"] = (
+                json.dumps(run_res.binradar_plan_funnel, sort_keys=True,
+                           separators=(",", ":"))
+                if run_res.binradar_plan_funnel else "")
             if include_subject_id:
                 row["experiment"] = result.exp_dir
             rows.append(row)

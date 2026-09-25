@@ -833,6 +833,92 @@ def test_legacy_settings_row_reports_unknown_advisor_budgets(tmp_path):
     assert row["binradar_advisor_deadline_ms"] == ""
 
 
+def test_collects_plan_attempt_funnel_join_and_keeps_legacy_unknown(tmp_path):
+    workdir = tmp_path / "workdir"
+    out_dir = workdir / "out"
+    run_dir = out_dir / "run-00000"
+    run_dir.mkdir(parents=True)
+    (run_dir / "binradar.log").write_text("")
+    (out_dir / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/run]\n"
+        "[binradar] [start] [prefix run] [id 0]\n"
+        "[binradar] [tracer] [attempt 2] [representative-runs 3] "
+        "[time 17] [remaining 1] [attempt-result completed] [stop continue] "
+        "[prefix run] [id 0]\n"
+        "[binradar] [tracer] [attempt 5] [representative-runs 4] "
+        "[time 19] [remaining 0] [attempt-result completed] [stop exhausted] "
+        "[prefix other] [id 1]\n"
+        "[binradar] [plan-attempt] [version 1] [epoch 9] [attempt 2] "
+        "[advisor-id 2] [family-id 7] [source-ordinal 11] "
+        "[source-kind primitive] [seed-semantics observed-read] "
+        "[write-count 1] [patch0-applied true] "
+        "[patch0-read-witness matched-value] [patch0-site yes] "
+        "[patch0-exit normal] [patch0-fault-valid false] "
+        "[patch0-fault-source unavailable] [patch0-fault-addr unknown] "
+        "[source-retained true] [patch0-outcome normal] "
+        "[attempt-result completed] [committed true] "
+        "[diagnostic-available true] [representative-runs 3] "
+        "[elapsed-ms 17] [pending false] [prefix run] [id 0]\n"
+        "[binradar] [plan-funnel] [version 1] [advisor symbolic] "
+        "[source-kind primitive] [scheduled 2] [scheduled-retained 1] "
+        "[scheduled-not-retained 1] [scheduled-retention-unknown 0] "
+        "[attempted 1] [applied 1] [matched-witness 1] "
+        "[witness-unknown 0] [site-yes 1] [normal 1] [poc-crash 0] "
+        "[other-crash 0] [unclassified-crash 0] [discarded 0] "
+        "[committed-useful 1] [representative-runs 3] [time-ms 17] "
+        "[pending 1] [prefix run] [id 0]\n"
+        "[binradar] [stop] [prefix run] [id 0] "
+        "[reason wall-time-reached] [attempt 2] [remaining 1] "
+        "[mutation-attempted 1] "
+        "[plan-funnel-version 1] [plan-funnel-scheduled-total 2] "
+        "[plan-funnel-scheduled-available true] "
+        "[plan-funnel-attempted 1] [plan-funnel-pending 1] "
+        "[plan-funnel-unknown-diagnostics 0]\n")
+
+    result = collector.collect_experiment_result(
+        str(tmp_path), "workdir", "run")
+    run = result.runs[0]
+
+    attempt = run.binradar_plan_attempts["2"]
+    assert attempt["patch0-outcome"] == "normal"
+    assert attempt["joined"] == "true"
+    assert attempt["attempt-result-match"] == "true"
+    assert attempt["representative-runs"] == "3"
+    assert attempt["elapsed-ms"] == "17"
+    assert "5" not in run.binradar_plan_attempts
+    funnel = run.binradar_plan_funnel["symbolic/primitive"]
+    assert funnel["scheduled"] == "2"
+    assert funnel["scheduled-retained"] == "1"
+    assert funnel["committed-useful"] == "1"
+    assert run.binradar_advisor_telemetry[
+        "plan-funnel-scheduled-total"] == "2"
+    assert run.binradar_mutation_attempted == 1
+
+    csv_row = collector.format_results_csv([result])[0]
+    assert '"symbolic/primitive"' in csv_row["binradar_plan_funnel"]
+    assert '"2"' in csv_row["binradar_plan_attempts"]
+
+    # Legacy runs have no B1 rows; do not convert their absence to zeros.
+    legacy_dir = tmp_path / "legacy"
+    legacy_out = legacy_dir / "workdir" / "out"
+    legacy_run = legacy_out / "run-00000"
+    legacy_run.mkdir(parents=True)
+    (legacy_run / "binradar.log").write_text("")
+    (legacy_out / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix run] [id 0] [dir /tmp/legacy]\n"
+        "[binradar] [start] [prefix run] [id 0]\n"
+        "[binradar] [stop] [prefix run] [id 0] [attempted 4]\n")
+    legacy = collector.collect_experiment_result(
+        str(legacy_dir), "workdir", "run").runs[0]
+    assert legacy.binradar_plan_attempts == {}
+    assert legacy.binradar_plan_funnel == {}
+    legacy_csv = collector.format_results_csv([
+        collector.collect_experiment_result(
+            str(legacy_dir), "workdir", "run")])[0]
+    assert legacy_csv["binradar_plan_attempts"] == ""
+    assert legacy_csv["binradar_plan_funnel"] == ""
+
+
 def test_settings_v2_with_unknown_budgets_is_not_a_default(tmp_path):
     """An explicitly unknown budget stays absent, not 100/1e6/16 MiB."""
     workdir = tmp_path / "workdir"

@@ -43,6 +43,190 @@ def test_advisor_report_counts_applied_children_not_only_proposals(tmp_path):
     assert metrics["unsupported_abstentions"] == 1
 
 
+def _plan_attempt(attempt=2, advisor="2", source_kind="primitive", **overrides):
+    row = {
+        "version": "1", "epoch": "9", "attempt": str(attempt),
+        "advisor-id": advisor, "family-id": "7", "source-ordinal": "11",
+        "source-kind": source_kind, "seed-semantics": "observed-read",
+        "write-count": "1", "patch0-applied": "true",
+        "patch0-read-witness": "matched-value", "patch0-site": "yes",
+        "patch0-exit": "normal", "patch0-fault-valid": "false",
+        "patch0-fault-source": "unavailable", "patch0-fault-addr": "unknown",
+        "source-retained": "true", "attempt-result": "completed",
+        "committed": "true",
+    }
+    row.update(overrides)
+    return row
+
+
+def _funnel_attempt(row, *, outcome="normal", result="completed",
+                    representative_runs=2, elapsed_ms=3,
+                    available=True, pending=False):
+    return {
+        "row": row, "outcome": outcome, "protocol-result": result,
+        "representative-runs": representative_runs,
+        "elapsed-ms": elapsed_ms, "diagnostic-available": available,
+        "pending": pending,
+    }
+
+
+def test_plan_attempt_crash_classification_requires_typed_valid_probe_reference():
+    reference = binradar.binradar_verifier.TracerFaultReference(
+        0x401234, "guest-signal")
+    tracer_row = _plan_attempt(
+        **{"patch0-exit": "crash", "patch0-fault-valid": "true",
+           "patch0-fault-source": "guest-signal",
+           "patch0-fault-addr": "401234"})
+    row = binradar._normalize_plan_attempt(tracer_row)
+    assert row is not None
+    assert row["patch0-fault-addr"] == "401234"
+
+    assert binradar._classify_plan_attempt_outcome(row, reference) == "poc-crash"
+    assert binradar._classify_plan_attempt_outcome(
+        {**row, "patch0-fault-source": "provenance-access"}, reference
+    ) == "poc-crash"
+    assert binradar._classify_plan_attempt_outcome(
+        row, binradar.binradar_verifier.TracerFaultReference(
+            0x401234, "unavailable")) == "unclassified-crash"
+    assert binradar._classify_plan_attempt_outcome(
+        row, None) == "unclassified-crash"
+    assert binradar._classify_plan_attempt_outcome(
+        {**row, "patch0-fault-valid": "false"}, reference
+    ) == "unclassified-crash"
+    assert binradar._classify_plan_attempt_outcome(
+        {**row, "patch0-fault-addr": "401235"}, reference
+    ) == "other-crash"
+
+
+def test_not_applicable_read_witness_is_not_reported_as_unknown():
+    row = _plan_attempt(
+        advisor="0", source_kind="argument-pointer",
+        **{"patch0-read-witness": "not-applicable"})
+    funnel = binradar._build_plan_funnel(
+        [_funnel_attempt(row)], None, "0", False)
+    argument = next(
+        item for item in funnel
+        if item["advisor"] == "generic" and
+        item["source-kind"] == "argument-pointer")
+
+    assert row["patch0-read-witness"] == "not-applicable"
+    assert argument["matched-witness"] == "0"
+    assert argument["witness-unknown"] == "0"
+
+
+def test_discarded_plan_diagnostic_does_not_count_as_committed_useful():
+    row = _plan_attempt(**{"committed": "false"})
+    funnel = binradar._build_plan_funnel(
+        [_funnel_attempt(row, result="unusable-exit")], None, "0", False)
+    primitive = next(
+        item for item in funnel
+        if item["advisor"] == "symbolic" and
+        item["source-kind"] == "primitive")
+
+    assert primitive["attempted"] == "1"
+    assert primitive["applied"] == "1"
+    assert primitive["normal"] == "1"
+    assert primitive["discarded"] == "1"
+    assert primitive["committed-useful"] == "0"
+    assert primitive["scheduled"] == "unknown"
+
+
+def test_interrupted_attempt_keeps_outcomes_unknown_and_pending():
+    row = binradar._empty_plan_attempt(3, "unknown")
+    funnel = binradar._build_plan_funnel(
+        [_funnel_attempt(row, outcome="unknown", result="unknown",
+                         representative_runs=None, elapsed_ms=None,
+                         available=False, pending=True)],
+        None, "unknown", True)
+    unknown = next(
+        item for item in funnel
+        if item["advisor"] == "unknown" and item["source-kind"] == "unknown")
+
+    assert unknown["attempted"] == "1"
+    assert unknown["unknown"] == "1"
+    assert unknown["pending"] == "unknown"
+    assert unknown["representative-runs"] == "unknown"
+    assert unknown["time-ms"] == "unknown"
+    assert unknown["scheduled"] == "unknown"
+
+
+def test_plan_attempt_reader_retries_partial_tracer_rows(tmp_path):
+    log = tmp_path / "tracer.log"
+    line = binradar._render_plan_attempt_progress(
+        _plan_attempt(), outcome="normal", diagnostic_available=True,
+        representative_runs="2", elapsed_ms="3", prefix="run", run_id=0)
+    split = len(line) // 2
+    log.write_text(line[:split])
+
+    events, queue_row, offset = binradar._read_new_plan_attempt_rows(
+        str(log), 0)
+    assert events == []
+    assert queue_row is None
+    assert offset == 0
+
+    with log.open("a") as stream:
+        stream.write(line[split:] + "\n")
+    events, queue_row, offset = binradar._read_new_plan_attempt_rows(
+        str(log), offset)
+    assert [event["attempt"] for event in events] == ["2"]
+    assert queue_row is None
+    assert offset == log.stat().st_size
+
+
+def test_queue_bins_and_attempts_preserve_mixed_advisor_source_counts(tmp_path):
+    log = tmp_path / "tracer.log"
+    log.write_text(
+        "[binradar] [queue-bins] [version 1] [total 2] "
+        "[generic-primitive 1] [generic-primitive-retained 1] "
+        "[generic-pointer 0] [generic-pointer-retained 0] "
+        "[generic-argument-primitive 0] "
+        "[generic-argument-primitive-retained 0] "
+        "[generic-argument-pointer 0] "
+        "[generic-argument-pointer-retained 0] "
+        "[osprey-primitive 0] [osprey-primitive-retained 0] "
+        "[osprey-pointer 0] [osprey-pointer-retained 0] "
+        "[symbolic-primitive 0] [symbolic-primitive-retained 0] "
+        "[symbolic-pointer 1] [symbolic-pointer-retained 0] [unknown 0]\n")
+    attempt_line = binradar._render_plan_attempt_progress(
+        _plan_attempt(advisor="0"), outcome="normal",
+        diagnostic_available=True, representative_runs="2", elapsed_ms="3",
+        prefix="run", run_id=0)
+    with log.open("a") as stream:
+        stream.write(attempt_line + "\n")
+    events, queue_row, _ = binradar._read_new_plan_attempt_rows(str(log), 0)
+    assert events[0]["attempt"] == "2"
+    assert events[0]["source-retained"] == "true"
+    scheduled = binradar._scheduled_plan_bins(queue_row)
+    assert scheduled is not None
+    assert scheduled[("generic", "primitive")] == {
+        "scheduled": 1, "retained": 1}
+    assert scheduled[("generic", "argument-primitive")] == {
+        "scheduled": 0, "retained": 0}
+    assert scheduled[("generic", "argument-pointer")] == {
+        "scheduled": 0, "retained": 0}
+    assert scheduled[("symbolic", "pointer")] == {
+        "scheduled": 1, "retained": 0}
+
+    records = [
+        _funnel_attempt(_plan_attempt(advisor="0")),
+        _funnel_attempt(_plan_attempt(
+            attempt=3, advisor="2", source_kind="pointer",
+            **{"source-retained": "false"}), outcome="other-crash",
+            result="completed", representative_runs=4, elapsed_ms=7),
+    ]
+    funnel = binradar._build_plan_funnel(records, scheduled, "0", False)
+    by_key = {(item["advisor"], item["source-kind"]): item for item in funnel}
+
+    assert by_key[("generic", "primitive")]["scheduled"] == "1"
+    assert by_key[("generic", "primitive")]["scheduled-retained"] == "1"
+    assert by_key[("generic", "primitive")]["committed-useful"] == "1"
+    assert by_key[("symbolic", "pointer")]["scheduled"] == "1"
+    assert by_key[("symbolic", "pointer")]["scheduled-not-retained"] == "1"
+    assert by_key[("symbolic", "pointer")]["other-crash"] == "1"
+    assert by_key[("symbolic", "pointer")]["representative-runs"] == "4"
+    assert by_key[("symbolic", "pointer")]["time-ms"] == "7"
+
+
 def test_unlimited_deadline_stays_unlimited():
     deadline = binradar_runtime.Deadline.from_timeout(0)
 

@@ -196,6 +196,442 @@ def _read_binradar_advisor_metrics(
     return metrics
 
 
+_PLAN_ATTEMPT_SOURCE_KINDS = frozenset((
+    "primitive", "pointer", "argument-primitive", "argument-pointer",
+    "unknown"))
+_PLAN_ATTEMPT_SEED_SEMANTICS = frozenset((
+    "snapshot-state", "observed-read", "unknown"))
+_PLAN_ATTEMPT_RESULTS = frozenset((
+    "completed", "no-observation", "unusable-exit", "timeout", "unknown"))
+_PLAN_ATTEMPT_EXITS = frozenset(("normal", "crash", "unusable", "unknown"))
+_PLAN_ATTEMPT_WITNESSES = frozenset((
+    "matched-value", "different-value", "unknown", "not-applicable"))
+_PLAN_ATTEMPT_SITES = frozenset(("yes", "no", "unknown"))
+_PLAN_ATTEMPT_FAULT_SOURCES = frozenset((
+    "guest-signal", "provenance-access", "unavailable", "unknown"))
+_PLAN_FUNNEL_ADVISORS = ("generic", "osprey", "symbolic", "unknown")
+_PLAN_FUNNEL_SOURCE_KINDS = (
+    "primitive", "pointer", "argument-primitive", "argument-pointer",
+    "unknown")
+_PLAN_FUNNEL_COUNTERS = (
+    "attempted", "applied", "not-applied", "applied-unknown",
+    "retained", "not-retained", "retention-unknown",
+    "matched-witness", "matched-value", "different-value",
+    "witness-not-applicable",
+    "witness-unknown", "site-yes", "site-no", "site-unknown",
+    "normal", "poc-crash", "other-crash", "unclassified-crash",
+    "unusable", "outcome-unknown", "unknown", "discarded",
+    "committed-useful", "representative-runs", "time-ms",
+)
+
+
+def _bracket_event_fields(line: str, event: str) -> Dict[str, str]:
+    """Read scalar fields after one exact BINRADAR tracer event marker."""
+    marker = f"[binradar] [{event}]"
+    offset = line.find(marker)
+    if offset < 0:
+        return {}
+    fields: Dict[str, str] = {}
+    for field in re.findall(r"\[([^\]]*)\]", line[offset:])[2:]:
+        name, separator, value = field.partition(" ")
+        if separator:
+            fields[name] = value.strip().strip('"')
+    return fields
+
+
+def _unsigned_diagnostic_value(value: str) -> Optional[int]:
+    """Parse a non-negative diagnostic integer, accepting decimal or hex."""
+    try:
+        parsed = int(value, 10)
+    except (TypeError, ValueError):
+        try:
+            parsed = int(value, 0)
+        except (TypeError, ValueError):
+            return None
+    return parsed if parsed >= 0 else None
+
+
+def _hex_diagnostic_value(value: str) -> Optional[int]:
+    """Tracer fault addresses follow the `%lx` format without a `0x` prefix."""
+    if value.lower().startswith("0x"):
+        return _unsigned_diagnostic_value(value)
+    try:
+        parsed = int(value, 16)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Validate and normalize one complete tracer plan-attempt v1 row."""
+    if fields.get("version") != "1":
+        return None
+    attempt = _unsigned_diagnostic_value(fields.get("attempt", ""))
+    if attempt is None or attempt == 0:
+        return None
+    required = (
+        "epoch", "advisor-id", "family-id", "source-ordinal", "source-kind",
+        "seed-semantics", "write-count", "patch0-applied",
+        "patch0-read-witness", "patch0-site", "patch0-exit",
+        "patch0-fault-valid", "patch0-fault-source", "patch0-fault-addr",
+        "attempt-result", "committed", "source-retained",
+    )
+    if any(name not in fields for name in required):
+        return None
+
+    def number_or_unknown(name: str) -> str:
+        value = fields[name]
+        if value == "unknown":
+            return value
+        parsed = _unsigned_diagnostic_value(value)
+        return str(parsed) if parsed is not None else "unknown"
+
+    def enum_or_unknown(name: str, valid_values) -> str:
+        value = fields[name]
+        return value if value in valid_values else "unknown"
+
+    def bool_or_unknown(name: str) -> str:
+        value = fields[name].lower()
+        return value if value in ("true", "false", "unknown") else "unknown"
+
+    def address_or_unknown() -> str:
+        value = fields["patch0-fault-addr"]
+        if value == "unknown" or _hex_diagnostic_value(value) is not None:
+            return value
+        return "unknown"
+
+    normalized = {
+        "version": "1",
+        "epoch": number_or_unknown("epoch"),
+        "attempt": str(attempt),
+        "advisor-id": number_or_unknown("advisor-id"),
+        "family-id": number_or_unknown("family-id"),
+        "source-ordinal": number_or_unknown("source-ordinal"),
+        "source-kind": enum_or_unknown(
+            "source-kind", _PLAN_ATTEMPT_SOURCE_KINDS),
+        "seed-semantics": enum_or_unknown(
+            "seed-semantics", _PLAN_ATTEMPT_SEED_SEMANTICS),
+        "write-count": number_or_unknown("write-count"),
+        "patch0-applied": bool_or_unknown("patch0-applied"),
+        "patch0-read-witness": enum_or_unknown(
+            "patch0-read-witness", _PLAN_ATTEMPT_WITNESSES),
+        "patch0-site": enum_or_unknown("patch0-site", _PLAN_ATTEMPT_SITES),
+        "patch0-exit": enum_or_unknown("patch0-exit", _PLAN_ATTEMPT_EXITS),
+        "patch0-fault-valid": bool_or_unknown("patch0-fault-valid"),
+        "patch0-fault-source": enum_or_unknown(
+            "patch0-fault-source", _PLAN_ATTEMPT_FAULT_SOURCES),
+        "patch0-fault-addr": address_or_unknown(),
+        "attempt-result": enum_or_unknown(
+            "attempt-result", _PLAN_ATTEMPT_RESULTS - {"unknown"}),
+        "committed": bool_or_unknown("committed"),
+        "source-retained": bool_or_unknown("source-retained"),
+    }
+    if normalized["patch0-fault-source"] not in (
+            "guest-signal", "provenance-access", "unavailable", "unknown"):
+        normalized["patch0-fault-source"] = "unknown"
+    return normalized
+
+
+def _classify_plan_attempt_outcome(
+        row: Dict[str, str], reference) -> str:
+    """Classify a patch-0 crash only against the typed persisted PROBE ref."""
+    patch0_exit = row.get("patch0-exit", "unknown")
+    if patch0_exit == "normal":
+        return "normal"
+    if patch0_exit == "unusable":
+        return "unusable"
+    if patch0_exit != "crash":
+        return "unknown"
+    if not isinstance(reference, binradar_verifier.TracerFaultReference):
+        return "unclassified-crash"
+    if not reference.valid:
+        return "unclassified-crash"
+    if (row.get("patch0-fault-valid") != "true"
+            or row.get("patch0-fault-source") not in
+            binradar_verifier.TRACER_FAULT_VALID_SOURCES):
+        return "unclassified-crash"
+    address = _hex_diagnostic_value(row.get("patch0-fault-addr", ""))
+    if address is None:
+        return "unclassified-crash"
+    if address == reference.address:
+        return "poc-crash"
+    return "other-crash"
+
+
+def _read_new_plan_attempt_rows(
+        log_path: Optional[str], offset: int
+) -> Tuple[List[Dict[str, str]], Optional[Dict[str, str]], int]:
+    """Incrementally read bounded mutation and queue-bin events from tracer."""
+    if not log_path:
+        return [], None, offset
+    rows: List[Dict[str, str]] = []
+    queue_bins = None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            while True:
+                line_offset = stream.tell()
+                line = stream.readline()
+                if not line:
+                    break
+                if not line.endswith("\n"):
+                    stream.seek(line_offset)
+                    break
+                if "[binradar] [plan-attempt]" in line:
+                    parsed = _normalize_plan_attempt(
+                        _bracket_event_fields(line, "plan-attempt"))
+                    if parsed is not None:
+                        rows.append(parsed)
+                elif "[binradar] [queue-bins]" in line:
+                    fields = _bracket_event_fields(line, "queue-bins")
+                    if fields.get("version") == "1":
+                        queue_bins = fields
+            offset = stream.tell()
+    except OSError:
+        return rows, queue_bins, offset
+    return rows, queue_bins, offset
+
+
+def _scheduled_plan_bins(
+        row: Optional[Dict[str, str]]) -> Optional[Dict[Tuple[str, str], Dict[str, Optional[int]]]]:
+    """Decode exact v1 plan and retained-source denominators."""
+    if row is None or row.get("version") != "1":
+        return None
+    counts: Dict[Tuple[str, str], Dict[str, Optional[int]]] = {}
+    specs = (
+        ("generic", ("primitive", "pointer", "argument-primitive",
+                     "argument-pointer")),
+        ("osprey", ("primitive", "pointer")),
+        ("symbolic", ("primitive", "pointer")),
+    )
+    scheduled_total = 0
+    for advisor, source_kinds in specs:
+        for source_kind in source_kinds:
+            key = f"{advisor}-{source_kind}"
+            value = _unsigned_diagnostic_value(row.get(key, ""))
+            if value is None:
+                return None
+            retained_key = f"{key}-retained"
+            retained = _unsigned_diagnostic_value(row.get(retained_key, ""))
+            if retained is not None and retained > value:
+                return None
+            counts[(advisor, source_kind)] = {
+                "scheduled": value,
+                "retained": retained,
+            }
+            scheduled_total += value
+    # OSPREY and symbolic only produce primitive and pointer plans.
+    for advisor in ("osprey", "symbolic"):
+        for source_kind in ("argument-primitive", "argument-pointer"):
+            counts[(advisor, source_kind)] = {
+                "scheduled": 0, "retained": 0,
+            }
+    unknown = _unsigned_diagnostic_value(row.get("unknown", ""))
+    total = _unsigned_diagnostic_value(row.get("total", ""))
+    if unknown is None or total is None or scheduled_total + unknown != total:
+        return None
+    counts[("unknown", "unknown")] = {
+        "scheduled": unknown, "retained": None,
+    }
+    return counts
+
+
+def _plan_funnel_bin(row: Dict[str, str]) -> Tuple[str, str]:
+    advisor_id = row.get("advisor-id", "unknown")
+    advisor = {"0": "generic", "1": "osprey", "2": "symbolic"}.get(
+        advisor_id, "unknown")
+    source_kind = row.get("source-kind", "unknown")
+    if source_kind not in _PLAN_FUNNEL_SOURCE_KINDS:
+        source_kind = "unknown"
+    if advisor == "unknown" or source_kind == "unknown":
+        return "unknown", "unknown"
+    return advisor, source_kind
+
+
+def _render_plan_attempt_progress(
+        row: Dict[str, str], *, outcome: str, diagnostic_available: bool,
+        representative_runs: str, elapsed_ms: str, prefix: str, run_id: int,
+        pending: bool = False) -> str:
+    fields = ["[binradar] [plan-attempt] [version 1]"]
+    for name in (
+            "epoch", "attempt", "advisor-id", "family-id", "source-ordinal",
+            "source-kind", "seed-semantics", "source-retained", "write-count",
+            "patch0-applied", "patch0-read-witness", "patch0-site",
+            "patch0-exit", "patch0-fault-valid", "patch0-fault-source",
+            "patch0-fault-addr"):
+        fields.append(f"[{name} {row.get(name, 'unknown')}]")
+    fields.append(f"[patch0-outcome {outcome}]")
+    for name in ("attempt-result", "committed"):
+        fields.append(f"[{name} {row.get(name, 'unknown')}]")
+    fields.extend((
+        f"[diagnostic-available {str(diagnostic_available).lower()}]",
+        f"[representative-runs {representative_runs}]",
+        f"[elapsed-ms {elapsed_ms}]",
+        f"[pending {str(pending).lower()}]",
+        f"[prefix {prefix}]", f"[id {run_id}]",
+    ))
+    return " ".join(fields)
+
+
+def _empty_plan_attempt(attempt: int, protocol_result: str) -> Dict[str, str]:
+    row = {
+        "version": "1", "epoch": "unknown", "attempt": str(attempt),
+        "advisor-id": "unknown", "family-id": "unknown",
+        "source-ordinal": "unknown", "source-kind": "unknown",
+        "seed-semantics": "unknown", "write-count": "unknown",
+        "patch0-applied": "unknown", "patch0-read-witness": "unknown",
+        "patch0-site": "unknown", "patch0-exit": "unknown",
+        "patch0-fault-valid": "unknown", "patch0-fault-source": "unknown",
+        "patch0-fault-addr": "unknown", "attempt-result": protocol_result,
+        "committed": "unknown", "source-retained": "unknown",
+    }
+    return row
+
+
+def _increment_plan_counter(
+        bucket: Dict[str, Optional[int]], name: str) -> None:
+    current = bucket[name]
+    if current is None:
+        raise AssertionError(f"plan funnel counter {name} is unavailable")
+    bucket[name] = current + 1
+
+
+def _build_plan_funnel(
+        attempts: List[Dict[str, object]],
+        scheduled: Optional[Dict[Tuple[str, str], Dict[str, Optional[int]]]],
+        remaining: str, pending_attempt: bool
+) -> List[Dict[str, str]]:
+    """Build fixed advisor/source bins; absent schedule metadata stays unknown."""
+    counters: Dict[Tuple[str, str], Dict[str, Optional[int]]] = {
+        (advisor, source_kind): dict.fromkeys(_PLAN_FUNNEL_COUNTERS, 0)
+        for advisor in _PLAN_FUNNEL_ADVISORS
+        for source_kind in _PLAN_FUNNEL_SOURCE_KINDS
+    }
+    unknown_attempts = 0
+    for attempt in attempts:
+        row = attempt["row"]
+        assert isinstance(row, dict)
+        bucket = counters[_plan_funnel_bin(row)]
+        _increment_plan_counter(bucket, "attempted")
+        if row.get("patch0-applied") == "true":
+            _increment_plan_counter(bucket, "applied")
+        elif row.get("patch0-applied") == "false":
+            _increment_plan_counter(bucket, "not-applied")
+        else:
+            _increment_plan_counter(bucket, "applied-unknown")
+        retained = row.get("source-retained", "unknown")
+        if retained == "true":
+            _increment_plan_counter(bucket, "retained")
+        elif retained == "false":
+            _increment_plan_counter(bucket, "not-retained")
+        else:
+            _increment_plan_counter(bucket, "retention-unknown")
+        witness = row.get("patch0-read-witness", "unknown")
+        if witness in ("matched-value", "different-value"):
+            _increment_plan_counter(bucket, "matched-witness")
+            _increment_plan_counter(
+                bucket, "matched-value" if witness == "matched-value"
+                else "different-value")
+        elif witness == "not-applicable":
+            _increment_plan_counter(bucket, "witness-not-applicable")
+        elif witness == "unknown":
+            _increment_plan_counter(bucket, "witness-unknown")
+        site = row.get("patch0-site", "unknown")
+        if site in ("yes", "no"):
+            _increment_plan_counter(bucket, f"site-{site}")
+        else:
+            _increment_plan_counter(bucket, "site-unknown")
+        outcome = str(attempt.get("outcome", "unknown"))
+        if outcome in ("normal", "poc-crash", "other-crash",
+                       "unclassified-crash", "unusable"):
+            _increment_plan_counter(bucket, outcome)
+        else:
+            _increment_plan_counter(bucket, "outcome-unknown")
+        if (not bool(attempt.get("diagnostic-available"))
+                or row.get("patch0-applied") == "unknown"
+                or witness == "unknown" or site == "unknown"
+                or outcome == "unknown" or row.get("committed") == "unknown"
+                or row.get("source-retained") == "unknown"):
+            _increment_plan_counter(bucket, "unknown")
+        result = str(attempt.get("protocol-result", "unknown"))
+        if (row.get("committed") == "false"
+                or result in ("no-observation", "unusable-exit", "timeout")):
+            _increment_plan_counter(bucket, "discarded")
+        if (row.get("committed") == "true" and site == "yes"
+                and outcome in ("normal", "poc-crash")):
+            _increment_plan_counter(bucket, "committed-useful")
+        for name, value in (
+                ("representative-runs", attempt.get("representative-runs")),
+                ("time-ms", attempt.get("elapsed-ms"))):
+            current = bucket[name]
+            if not isinstance(value, int):
+                bucket[name] = None
+            elif current is not None:
+                bucket[name] = current + value
+        if not bool(attempt.get("diagnostic-available")):
+            unknown_attempts += 1
+
+    remaining_count = _unsigned_diagnostic_value(remaining)
+    has_unattributed = unknown_attempts > 0 or pending_attempt
+    pending_by_key = None
+    if (remaining_count is not None and remaining_count > 0
+            and scheduled is not None and not has_unattributed):
+        pending_by_key = {}
+        for key, bucket in counters.items():
+            denominator = scheduled.get(key)
+            if (denominator is None or denominator["scheduled"] is None
+                    or int(bucket["attempted"] or 0) >
+                    denominator["scheduled"]):
+                pending_by_key = None
+                break
+            pending_by_key[key] = (
+                denominator["scheduled"] - int(bucket["attempted"] or 0))
+        if (pending_by_key is not None
+                and sum(pending_by_key.values()) != remaining_count):
+            pending_by_key = None
+    output: List[Dict[str, str]] = []
+    for key in sorted(counters):
+        advisor, source_kind = key
+        bucket = counters[key]
+        denominator = scheduled.get(key) if scheduled is not None else None
+        scheduled_value = (
+            str(denominator["scheduled"])
+            if denominator is not None and denominator["scheduled"] is not None
+            else "unknown")
+        scheduled_retained = (
+            denominator["retained"] if denominator is not None else None)
+        if denominator is None or denominator["scheduled"] is None:
+            retained_value = not_retained_value = retention_unknown_value = "unknown"
+        elif scheduled_retained is None:
+            retained_value = "unknown"
+            not_retained_value = "unknown"
+            retention_unknown_value = str(denominator["scheduled"])
+        else:
+            retained_value = str(scheduled_retained)
+            not_retained_value = str(denominator["scheduled"] - scheduled_retained)
+            retention_unknown_value = "0"
+        if remaining_count is None:
+            pending_value = "unknown"
+        elif remaining_count == 0:
+            pending_value = "0"
+        elif pending_by_key is not None:
+            pending_value = str(pending_by_key[key])
+        else:
+            pending_value = "unknown"
+        rendered = {
+            "version": "1", "advisor": advisor, "source-kind": source_kind,
+            "scheduled": scheduled_value,
+            "scheduled-retained": retained_value,
+            "scheduled-not-retained": not_retained_value,
+            "scheduled-retention-unknown": retention_unknown_value,
+            **{name: ("unknown" if value is None else str(value))
+               for name, value in bucket.items()},
+            "pending": pending_value,
+        }
+        output.append(rendered)
+    return output
+
+
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(
@@ -1042,6 +1478,70 @@ class BinRadarExecutor:
         mutation_committed = 0
         mutation_pending = 0
         active_attempt = None
+        tracer_log_path = binradar_env.get("BINRADAR_TRACER_LOG_FILE")
+        tracer_log_offset = 0
+        plan_attempt_rows: Dict[int, Dict[str, str]] = {}
+        queue_bins_row: Optional[Dict[str, str]] = None
+        queue_bins_persisted = False
+        mutation_diagnostics: List[Dict[str, object]] = []
+
+        def save_mutation_diagnostic(row: str) -> None:
+            try:
+                self.save_progress(row)
+            except Exception as exc:
+                logger.warning(
+                    f"[BINRADAR] Could not persist mutation diagnostic: {exc}")
+
+        def ingest_tracer_diagnostics() -> None:
+            nonlocal tracer_log_offset, queue_bins_row, queue_bins_persisted
+            rows, queue_row, tracer_log_offset = _read_new_plan_attempt_rows(
+                tracer_log_path, tracer_log_offset)
+            for row in rows:
+                attempt_id = int(row["attempt"])
+                plan_attempt_rows[attempt_id] = row
+            if queue_row is not None:
+                queue_bins_row = queue_row
+                if not queue_bins_persisted:
+                    queue_fields = ["[binradar] [queue-bins]"]
+                    queue_fields.extend(
+                        f"[{name} {value}]" for name, value in sorted(
+                            queue_row.items()))
+                    queue_fields.extend((
+                        f"[prefix {self.run_prefix}]", f"[id {self.run_id}]"))
+                    save_mutation_diagnostic(" ".join(queue_fields))
+                    queue_bins_persisted = True
+
+        def persist_plan_attempt(
+                attempt_id: int, protocol_result: Optional[str],
+                representative_count: Optional[int], elapsed_ms: Optional[int],
+                pending: bool = False) -> None:
+            row = plan_attempt_rows.pop(attempt_id, None)
+            available = row is not None and (
+                protocol_result is None
+                or row.get("attempt-result") == protocol_result)
+            if not available:
+                row = _empty_plan_attempt(
+                    attempt_id, protocol_result or "unknown")
+            assert row is not None
+            outcome = _classify_plan_attempt_outcome(
+                row, getattr(self.probe_result, "tracer_fault_reference", None)
+            ) if available else "unknown"
+            rendered = _render_plan_attempt_progress(
+                row, outcome=outcome, diagnostic_available=available,
+                representative_runs=(
+                    "unknown" if representative_count is None
+                    else str(representative_count)),
+                elapsed_ms=("unknown" if elapsed_ms is None else str(elapsed_ms)),
+                prefix=self.run_prefix, run_id=self.run_id, pending=pending)
+            save_mutation_diagnostic(rendered)
+            mutation_diagnostics.append({
+                "row": row, "outcome": outcome,
+                "protocol-result": protocol_result or "unknown",
+                "representative-runs": representative_count,
+                "elapsed-ms": elapsed_ms,
+                "diagnostic-available": available, "pending": pending,
+            })
+
         try:
             with session:
                 self._validate_baseline(
@@ -1066,6 +1566,7 @@ class BinRadarExecutor:
                             tracer.iter + 1 if tracer.forkserver_mode else 0)
                         attempted += 1
                         summary = tracer.run()
+                        ingest_tracer_diagnostics()
                         active_attempt = None
                         representative_runs += summary.representative_runs
                         if not tracer.forkserver_mode:
@@ -1099,6 +1600,13 @@ class BinRadarExecutor:
                             message += " [discarded true]"
                             logger.warning(message)
                         self.save_progress(message)
+                        if tracer.forkserver_mode and summary.attempt > 1:
+                            persist_plan_attempt(
+                                summary.attempt,
+                                binradar_runtime.protocol_enum_name(
+                                    summary.attempt_result),
+                                summary.representative_runs,
+                                summary.elapsed_ms)
                         if summary.terminal:
                             break
         except TimeoutError as exc:
@@ -1107,6 +1615,9 @@ class BinRadarExecutor:
                 if active_attempt is not None and active_attempt > 1:
                     mutation_attempted += 1
                     mutation_pending += 1
+                    ingest_tracer_diagnostics()
+                    persist_plan_attempt(
+                        active_attempt, None, None, None, pending=True)
             else:
                 logger.error(f"Error during binradar execution: {exc}")
                 raise
@@ -1163,6 +1674,25 @@ class BinRadarExecutor:
             memcheck = ("true" if memcheck_value == "1" else
                         "false" if memcheck_value == "0" else "unknown")
             representative_runs_partial = in_flight_attempt
+            scheduled_bins = _scheduled_plan_bins(queue_bins_row)
+            plan_funnel = _build_plan_funnel(
+                mutation_diagnostics, scheduled_bins, stop_remaining,
+                in_flight_attempt)
+            for funnel_row in plan_funnel:
+                fields = ["[binradar] [plan-funnel]"]
+                fields.extend(
+                    f"[{name} {value}]" for name, value in funnel_row.items())
+                fields.extend((
+                    "[terminal true]",
+                    f"[prefix {self.run_prefix}]", f"[id {self.run_id}]"))
+                save_mutation_diagnostic(" ".join(fields))
+            scheduled_total = (
+                queue_bins_row.get("total", "unknown")
+                if scheduled_bins is not None and queue_bins_row is not None
+                else "unknown")
+            unknown_diagnostics = sum(
+                not bool(row.get("diagnostic-available"))
+                for row in mutation_diagnostics)
             self.save_progress(
                 f"[binradar] [stop] "
                 f"[prefix {self.run_prefix}] [id {self.run_id}] "
@@ -1181,6 +1711,13 @@ class BinRadarExecutor:
                 f"[mutation-committed {mutation_committed}] "
                 f"[mutation-pending {mutation_pending}] "
                 f"[queued {stop_remaining}] "
+                f"[plan-funnel-version 1] "
+                f"[plan-funnel-scheduled-total {scheduled_total}] "
+                f"[plan-funnel-scheduled-available "
+                f"{str(scheduled_bins is not None).lower()}] "
+                f"[plan-funnel-attempted {mutation_attempted}] "
+                f"[plan-funnel-pending {stop_remaining}] "
+                f"[plan-funnel-unknown-diagnostics {unknown_diagnostics}] "
                 f"[memcheck {memcheck}] "
                 f"[advisor-mode {advisor['mode']}] "
                 f"[advisor-candidates-generated "
