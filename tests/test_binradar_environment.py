@@ -211,6 +211,36 @@ def test_symbolic_mode_rejects_unknown_value():
         " Boundary ") == "boundary"
 
 
+def test_symbolic_schedule_validator_and_phase_scope():
+    """Only the BinRadar phase may inherit an experimental policy."""
+    with pytest.raises(ValueError):
+        binradar_config.validate_symbolic_schedule("retainedfirst")
+    assert binradar_config.validate_symbolic_schedule(
+        " Retained-First ") == "retained-first"
+    # The tracer matches the exact spelling, so normalization is the resolver's
+    # job and must produce the canonical name, not the caller's casing.
+    environment = binradar_config.build_phase_environment(
+        "binradar", "/tmp/run",
+        {"BINRADAR_SYMBOLIC_SCHEDULE": "retained-first",
+         "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+        binradar_config.PhaseEnvironmentConfig(
+            timeout=60, forkserver_child_timeout=30,
+            reverse_directed=False, probe_patch_hit_count=1,
+            active_patch_count=1))
+    assert environment["BINRADAR_SYMBOLIC_SCHEDULE"] == "retained-first"
+    for mode in ("fuzzolic", "directed", "other"):
+        environment = binradar_config.build_phase_environment(
+            mode, "/tmp/run",
+            {"BINRADAR_SYMBOLIC_SCHEDULE": "retained-first",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+            binradar_config.PhaseEnvironmentConfig(
+                timeout=60, forkserver_child_timeout=30,
+                reverse_directed=False, probe_patch_hit_count=1,
+                active_patch_count=1))
+        assert environment["BINRADAR_SYMBOLIC_SCHEDULE"] == "existing"
+        assert environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off"
+
+
 def test_symbolic_budget_cli_precedence_and_zero_normalization():
     """CLI wins over binradar.env, which wins over the built-in default."""
     loaded = {"BINRADAR_SYMBOLIC_DEADLINE_MS": "250",

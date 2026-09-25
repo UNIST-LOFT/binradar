@@ -646,7 +646,8 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
         "[discarded 0] [committed 2] [queued 4] [memcheck true] "
         "[mutation-attempted 3] [mutation-discarded 1] "
         "[mutation-committed 2] [mutation-pending 0] "
-        "[advisor-mode boundary] [advisor-candidates-generated 9] "
+        "[advisor-mode boundary] [advisor-schedule retained-first] "
+        "[advisor-candidates-generated 9] "
         "[advisor-families-generated 4] [advisor-families-accepted 3] "
         "[advisor-unsupported-abstentions 1] "
         "[advisor-budget-abstentions 2] [advisor-families-executed 2] "
@@ -720,6 +721,9 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert run.binradar_mutation_committed == 2
     assert run.binradar_mutation_pending == 0
     assert run.binradar_advisor_mode == "boundary"
+    # A run whose stop row names a schedule reports the policy it actually
+    # executed; the settings row is only a fallback for rows that omit it.
+    assert run.binradar_advisor_schedule == "retained-first"
     assert run.binradar_advisor_candidates_generated == 9
     assert run.binradar_advisor_families_generated == 4
     assert run.binradar_advisor_families_accepted == 3
@@ -732,6 +736,7 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert run.binradar_advisor_deadline_ms == 500
 
     row = collector.format_results_csv([result])[0]
+    assert row["binradar_advisor_schedule"] == "retained-first"
     assert row["remaining_patches_count"] == "5"
     assert row["remaining_patches"] == "[1(0.900)] (+4 more)"
     assert row["binradar_coverage"] == "partial"

@@ -625,6 +625,7 @@ def _stub_executor(tmp_path):
     executor.feedback_mode = False
     executor.less_strict = False
     executor.symbolic_mutation_mode = "off"
+    executor.symbolic_schedule = "existing"
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,

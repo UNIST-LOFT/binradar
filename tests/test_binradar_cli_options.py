@@ -109,6 +109,41 @@ def test_symbolic_budget_cli_option_rejects_malformed_workdir_value(
                   extra_env='BINRADAR_SYMBOLIC_MAX_WORK="-5"\n')
 
 
+def test_symbolic_schedule_cli_option_reaches_the_phase_environment(
+        tmp_path, monkeypatch):
+    """`--symbolic-schedule` must reach the tracer environment verbatim.
+
+    The policy is only meaningful in the BinRadar phase and only when the
+    advisor actually proposes plans, so this fixture also pins the
+    phase-scoping: other phases must not inherit an experiment.
+    """
+    captured = _run_main(
+        monkeypatch, tmp_path,
+        ["--symbolic-mutation-mode", "boundary",
+         "--symbolic-schedule", "retained-first"],
+        extra_env='BINRADAR_SYMBOLIC_SCHEDULE="existing"\n')
+    workdir = tmp_path / "workdir"
+
+    assert captured["BINRADAR_SYMBOLIC_SCHEDULE"] == "retained-first"
+    run_config = binradar_config.RunConfig.from_environment(
+        str(workdir), captured)
+    environment = binradar_config.build_base_environment(
+        run_config, str(tmp_path / "plt_info.txt"))
+    assert environment["BINRADAR_SYMBOLIC_SCHEDULE"] == "retained-first"
+
+
+def test_symbolic_schedule_rejects_unknown_policy(tmp_path, monkeypatch):
+    """The CLI must reject a policy name the tracer would not recognize."""
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, tmp_path,
+                  ["--symbolic-schedule", "retainedfirst"])
+
+
+def test_symbolic_schedule_defaults_to_existing(tmp_path, monkeypatch):
+    captured = _run_main(monkeypatch, tmp_path, [])
+    assert captured["BINRADAR_SYMBOLIC_SCHEDULE"] == "existing"
+
+
 def test_target_patches_all_stays_within_compiled_count(tmp_path, monkeypatch):
     captured = _run_main(monkeypatch, tmp_path, ["--target-patches", "all"])
     assert captured["TOTAL_PATCHES"] == "30"
@@ -136,6 +171,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     executor.disable_binradar = False
     executor.feedback_mode = False
     executor.symbolic_mutation_mode = "off"
+    executor.symbolic_schedule = "retained-first"
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=500000, max_bytes=1048576, deadline_ms=500)
     executor.fuzzy = False
@@ -154,7 +190,8 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
         "[target-patches-reason: str] [compiled-patches: int] "
         "[filtered-patches: int] [effective-patches: int] "
         "[disable-binradar: bool] [feedback: bool] "
-        "[symbolic-mutation-mode: str] [fuzzy: bool] "
+        "[symbolic-mutation-mode: str] [symbolic-schedule: str] "
+        "[fuzzy: bool] "
         "[reverse-directed: bool] [less-strict: bool] "
         "[forkserver-child-timeout: int] [symbolic-max-work: str] "
         "[symbolic-max-bytes: str] [symbolic-deadline-ms: str]")
@@ -175,6 +212,9 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert row["symbolic-max-work"] == "500000"
     assert row["symbolic-max-bytes"] == "1048576"
     assert row["symbolic-deadline-ms"] == "500"
+    # A recorded policy is written verbatim; only an unrecorded field is
+    # `unknown`, never the built-in default.
+    assert row["symbolic-schedule"] == "retained-first"
 
     executor.invocation = "binradar.py --run-single-phase final --run-id 0"
     executor.write_run_settings("single-phase-final")

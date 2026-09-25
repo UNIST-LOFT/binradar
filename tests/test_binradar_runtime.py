@@ -326,6 +326,7 @@ def _binradar_executor(tmp_path, timeout):
     executor.fuzzy = False
     executor.timeout = timeout
     executor.forkserver_child_timeout = 900
+    executor.symbolic_schedule = binradar_config.SYMBOLIC_SCHEDULE_DEFAULT
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
@@ -512,6 +513,7 @@ def _binradar_loop_executor(tmp_path):
     executor.check_requirements = lambda: None
     executor.forkserver_child_timeout = (
         binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
+    executor.symbolic_schedule = binradar_config.SYMBOLIC_SCHEDULE_DEFAULT
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,

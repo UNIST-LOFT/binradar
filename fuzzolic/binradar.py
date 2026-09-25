@@ -668,6 +668,10 @@ class BinRadarExecutor:
     # "off" | "shadow" | "boundary".  Always explicit so an inherited CLI
     # environment cannot enable it in another phase.
     symbolic_mutation_mode: str
+    # Mutation queue scheduling policy for the BinRadar tracer phase:
+    # "existing" | "retained-first".  Explicit for the same reason as the
+    # mode: an inherited environment must not select an experiment.
+    symbolic_schedule: str
     # Effective advisor budgets, resolved before the run starts: the tracer
     # must receive exactly the values recorded in the settings row.
     symbolic_budgets: binradar_config.SymbolicBudgets
@@ -706,6 +710,7 @@ class BinRadarExecutor:
         self.less_strict = config.less_strict
         self.feedback_mode = config.feedback_mode
         self.symbolic_mutation_mode = config.symbolic_mutation_mode
+        self.symbolic_schedule = config.symbolic_schedule
         self.symbolic_budgets = config.symbolic_budgets
         self.requested_candidate_scope = config.requested_candidate_scope
         self.candidate_scope_status = config.candidate_scope_status
@@ -905,6 +910,7 @@ class BinRadarExecutor:
                 disable_binradar=self.disable_binradar,
                 feedback=self.feedback_mode,
                 symbolic_mutation_mode=self.symbolic_mutation_mode,
+                symbolic_schedule=self.symbolic_schedule,
                 symbolic_max_work=self.symbolic_budgets.max_work,
                 symbolic_max_bytes=self.symbolic_budgets.max_bytes,
                 symbolic_deadline_ms=self.symbolic_budgets.deadline_ms,
@@ -1720,6 +1726,7 @@ class BinRadarExecutor:
                 f"[plan-funnel-unknown-diagnostics {unknown_diagnostics}] "
                 f"[memcheck {memcheck}] "
                 f"[advisor-mode {advisor['mode']}] "
+                f"[advisor-schedule {self.symbolic_schedule}] "
                 f"[advisor-candidates-generated "
                 f"{advisor_value('candidates_generated')}] "
                 f"[advisor-families-generated "
@@ -2015,6 +2022,16 @@ def main():
               "'boundary' proposes comparison-guided values.  Every other "
               "phase always runs with the advisor off"))
     parser.add_argument(
+        "--symbolic-schedule", dest="symbolic_schedule",
+        choices=binradar_config.SYMBOLIC_SCHEDULES,
+        default=None,
+        help=("mutation queue scheduling policy for the BinRadar tracer "
+              "phase (default: existing, or BINRADAR_SYMBOLIC_SCHEDULE from "
+              "binradar.env); 'existing' keeps the advisors' own order and "
+              "'retained-first' runs witness-capable plans first.  The policy "
+              "permutes the same finite plan set; it never changes its "
+              "membership or contents"))
+    parser.add_argument(
         "--symbolic-max-work", dest="symbolic_max_work", default=None,
         help=("symbolic boundary advisor work budget for the BinRadar tracer "
               "phase (default: 1000000, or BINRADAR_SYMBOLIC_MAX_WORK from "
@@ -2083,6 +2100,15 @@ def main():
             else env.get(
                 "BINRADAR_SYMBOLIC_MUTATION_MODE",
                 binradar_config.SYMBOLIC_MUTATION_MODE_DEFAULT))
+    # The scheduling policy resolves with the same precedence as the mode, so
+    # a rollout can pin it in binradar.env and a flag still overrides it.
+    env["BINRADAR_SYMBOLIC_SCHEDULE"] = \
+        binradar_config.validate_symbolic_schedule(
+            args.symbolic_schedule
+            if args.symbolic_schedule is not None
+            else env.get(
+                "BINRADAR_SYMBOLIC_SCHEDULE",
+                binradar_config.SYMBOLIC_SCHEDULE_DEFAULT))
     # Budgets resolve once, here, with CLI > binradar.env > default
     # precedence.  The resolved values are written back so every phase
     # environment and the settings row agree on one effective configuration.

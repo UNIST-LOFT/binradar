@@ -95,6 +95,9 @@ class RunSettings:
     reverse_directed: bool
     less_strict: bool
     forkserver_child_timeout: int
+    # Queue scheduling policy for mutation plans.  None means the row predates
+    # the field; it is never reported as the built-in default.
+    symbolic_schedule: Optional[str] = None
     # Effective advisor budgets (settings v2).  None means the row predates
     # the field or was written without one: an unknown budget is never
     # reported as the built-in default.
@@ -171,6 +174,9 @@ class RunRecordStore:
             field("disable-binradar", settings.disable_binradar),
             field("feedback", settings.feedback),
             field("symbolic-mutation-mode", settings.symbolic_mutation_mode),
+            field("symbolic-schedule",
+                  "unknown" if settings.symbolic_schedule is None
+                  else settings.symbolic_schedule),
             field("fuzzy", settings.fuzzy),
             field("reverse-directed", settings.reverse_directed),
             field("less-strict", settings.less_strict),

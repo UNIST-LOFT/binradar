@@ -274,6 +274,7 @@ class RunResult:
     binradar_mutation_committed: int = -1
     binradar_mutation_pending: int = -1
     binradar_advisor_mode: str = ""
+    binradar_advisor_schedule: str = ""
     binradar_advisor_candidates_generated: int = -1
     binradar_advisor_families_generated: int = -1
     binradar_advisor_families_accepted: int = -1
@@ -1397,6 +1398,8 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
             run_res.binradar_mutation_pending = _optional_int(
                 stop.get("mutation-pending"))
             run_res.binradar_advisor_mode = stop.get("advisor-mode", "")
+            run_res.binradar_advisor_schedule = stop.get(
+                "advisor-schedule", "")
             for name in (
                     "candidates-generated", "families-generated",
                     "families-accepted",
@@ -1443,6 +1446,12 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                     if key.lower().replace("_", "-") == \
                             "symbolic-mutation-mode":
                         run_res.binradar_advisor_mode = value
+                        break
+            if not run_res.binradar_advisor_schedule:
+                for key, value in settings.items():
+                    if key.lower().replace("_", "-") == \
+                            "symbolic-schedule":
+                        run_res.binradar_advisor_schedule = value
                         break
             # A settings v1 row carries no advisor budgets.  Missing values
             # stay absent rather than being reported as the built-in default,
@@ -2124,6 +2133,7 @@ CSV_COLUMNS = [
     "binradar_mutation_committed",
     "binradar_mutation_pending",
     "binradar_advisor_mode",
+    "binradar_advisor_schedule",
     "binradar_advisor_candidates_generated",
     "binradar_advisor_families_generated",
     "binradar_advisor_families_accepted",
@@ -2264,6 +2274,8 @@ def format_results_csv(all_results: List[ExperimentResult],
                 str(run_res.binradar_baseline_reproduced)
                 if run_res.binradar_baseline_reproduced is not None else "")
             row["binradar_advisor_mode"] = run_res.binradar_advisor_mode
+            row["binradar_advisor_schedule"] = \
+                run_res.binradar_advisor_schedule
             for column, value in (
                     ("binradar_mutation_attempted",
                      run_res.binradar_mutation_attempted),

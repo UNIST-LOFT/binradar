@@ -9,6 +9,10 @@ import binradar_utils
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 SYMBOLIC_MUTATION_MODE_DEFAULT = "off"
 SYMBOLIC_MUTATION_MODES = ("off", "shadow", "boundary")
+# Queue scheduling policy for mutation plans.  `existing` is the historical
+# order and the default; `retained-first` is the one P4b B2 experiment.
+SYMBOLIC_SCHEDULE_DEFAULT = "existing"
+SYMBOLIC_SCHEDULES = ("existing", "retained-first")
 SYMBOLIC_MAX_WORK_DEFAULT = 1_000_000
 SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
 SYMBOLIC_DEADLINE_MS_DEFAULT = 100
@@ -46,6 +50,16 @@ def validate_symbolic_mutation_mode(value: str) -> str:
         raise ValueError(
             f"invalid symbolic mutation mode {value!r}; expected one of "
             f"{', '.join(SYMBOLIC_MUTATION_MODES)}")
+    return normalized
+
+
+def validate_symbolic_schedule(value: str) -> str:
+    """Normalize and validate a mutation queue scheduling policy name."""
+    normalized = str(value).strip().lower()
+    if normalized not in SYMBOLIC_SCHEDULES:
+        raise ValueError(
+            f"invalid symbolic schedule {value!r}; expected one of "
+            f"{', '.join(SYMBOLIC_SCHEDULES)}")
     return normalized
 
 
@@ -138,6 +152,7 @@ class RunConfig:
     feedback_mode: bool
     forkserver_child_timeout: int
     symbolic_mutation_mode: str
+    symbolic_schedule: str
     symbolic_budgets: SymbolicBudgets
     requested_candidate_scope: str
     candidate_scope_status: str
@@ -196,6 +211,9 @@ class RunConfig:
             symbolic_mutation_mode=validate_symbolic_mutation_mode(env.get(
                 "BINRADAR_SYMBOLIC_MUTATION_MODE",
                 SYMBOLIC_MUTATION_MODE_DEFAULT)),
+            symbolic_schedule=validate_symbolic_schedule(env.get(
+                "BINRADAR_SYMBOLIC_SCHEDULE",
+                SYMBOLIC_SCHEDULE_DEFAULT)),
             # CLI overrides arrive pre-merged into `env`, so the effective
             # value here is already the resolved one.
             symbolic_budgets=SymbolicBudgets.from_mapping(
@@ -223,6 +241,7 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
         "BINRADAR_TIMEOUT": str(config.timeout),
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "BINRADAR_SYMBOLIC_MUTATION_MODE": config.symbolic_mutation_mode,
+        "BINRADAR_SYMBOLIC_SCHEDULE": config.symbolic_schedule,
         "SYMBOLIC_TESTCASE_NAME": config.resolved_poc_input(),
         "PLT_INFO_FILE": plt_info_file,
     }
@@ -292,6 +311,15 @@ def build_phase_environment(
                             SYMBOLIC_MUTATION_MODE_DEFAULT)))
     environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] = (
         requested_mode if mode == "binradar" else "off")
+    requested_schedule = validate_symbolic_schedule(
+        base_environment.get(
+            "BINRADAR_SYMBOLIC_SCHEDULE",
+            environment.get("BINRADAR_SYMBOLIC_SCHEDULE",
+                            SYMBOLIC_SCHEDULE_DEFAULT)))
+    # The schedule only permutes mutation plans, which exist only in this
+    # phase; every other phase would inherit a meaningless value.
+    environment["BINRADAR_SYMBOLIC_SCHEDULE"] = (
+        requested_schedule if mode == "binradar" else SYMBOLIC_SCHEDULE_DEFAULT)
     environment["BINRADAR_TRACER_LOG_FILE"] = phase_log_file(mode, run_dir)
 
     # Explicit crash-detection policy.
