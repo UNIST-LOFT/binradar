@@ -98,16 +98,22 @@ class RunSettings:
     # Queue scheduling policy for mutation plans.  None means the row predates
     # the field; it is never reported as the built-in default.
     symbolic_schedule: Optional[str] = None
-    # Effective advisor budgets (settings v2).  None means the row predates
-    # the field or was written without one: an unknown budget is never
-    # reported as the built-in default.
+    # P4c C1 settings (version 3).  None means the row predates the field;
+    # readers must preserve that as unknown rather than substitute defaults.
+    mutation_portfolio: Optional[str] = None
+    representative_budget: Optional[int] = None
+    # Effective advisor budgets (present since settings v2).  None means the
+    # row predates the field or was written without one: an unknown budget is
+    # never reported as the built-in default.
     symbolic_max_work: Optional[int] = None
     symbolic_max_bytes: Optional[int] = None
     symbolic_deadline_ms: Optional[int] = None
 
 
-# Settings row schema version.  Version 1 rows carry no advisor budgets.
-RUN_SETTINGS_VERSION = 2
+# Settings row schema version.  Version 1 rows carry no advisor budgets;
+# version 2 carries P4a/B fields; version 3 adds the C1 portfolio and
+# representative budget.
+RUN_SETTINGS_VERSION = 3
 
 
 class RunRecordStore:
@@ -177,6 +183,12 @@ class RunRecordStore:
             field("symbolic-schedule",
                   "unknown" if settings.symbolic_schedule is None
                   else settings.symbolic_schedule),
+            field("mutation-portfolio",
+                  "unknown" if settings.mutation_portfolio is None
+                  else settings.mutation_portfolio),
+            field("representative-budget",
+                  "unknown" if settings.representative_budget is None
+                  else settings.representative_budget),
             field("fuzzy", settings.fuzzy),
             field("reverse-directed", settings.reverse_directed),
             field("less-strict", settings.less_strict),

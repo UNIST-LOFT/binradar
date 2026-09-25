@@ -47,6 +47,8 @@ def _stub_executor(tmp_path):
     executor.candidate_scope_reason = "requested top-30"
     executor.symbolic_mutation_mode = "off"
     executor.symbolic_schedule = "existing"
+    executor.mutation_portfolio = "replacement"
+    executor.representative_budget = 0
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,

@@ -322,7 +322,13 @@ def write_final_result(request: FinalResultRequest) -> None:
     concrete_rejected = expected_candidates - remaining_patches
     overlap = standalone_rejections & concrete_rejected
     incremental = standalone_rejections - concrete_rejected
-    if skip_binradar_analysis or stop.get("reason") == "baseline-unavailable":
+    # `representative-budget-unavailable` stops before the first attempt, so
+    # the phase produced no BinRadar evidence at all: that is the same
+    # no-evidence class as a disabled/failed/baseline-unavailable phase, not a
+    # partial sweep of real attempts.
+    if (skip_binradar_analysis
+            or stop.get("reason") in ("baseline-unavailable",
+                                      "representative-budget-unavailable")):
         coverage = "unavailable"
     elif _has_complete_coverage_contract(
             stop, raw_committed, patch0_no_observation):

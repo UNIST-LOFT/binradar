@@ -144,6 +144,52 @@ def test_symbolic_schedule_defaults_to_existing(tmp_path, monkeypatch):
     assert captured["BINRADAR_SYMBOLIC_SCHEDULE"] == "existing"
 
 
+def test_mixed_portfolio_and_budget_reach_resolved_configuration(
+        tmp_path, monkeypatch):
+    captured = _run_main(
+        monkeypatch, tmp_path,
+        ["--symbolic-mutation-mode", "boundary",
+         "--mutation-portfolio", "mixed",
+         "--binradar-representative-budget", "1000"],
+        extra_env=(
+            'BINRADAR_MUTATION_PORTFOLIO="replacement"\n'
+            'BINRADAR_REPRESENTATIVE_BUDGET="17"\n'))
+    workdir = tmp_path / "workdir"
+
+    assert captured["BINRADAR_MUTATION_PORTFOLIO"] == "mixed"
+    assert captured["BINRADAR_REPRESENTATIVE_BUDGET"] == "1000"
+    run_config = binradar_config.RunConfig.from_environment(
+        str(workdir), captured)
+    assert run_config.mutation_portfolio == "mixed"
+    assert run_config.representative_budget == 1000
+    environment = binradar_config.build_base_environment(
+        run_config, str(tmp_path / "plt_info.txt"))
+    assert environment["BINRADAR_MUTATION_PORTFOLIO"] == "mixed"
+    assert "BINRADAR_REPRESENTATIVE_BUDGET" not in environment
+
+
+@pytest.mark.parametrize("extra_args", [
+    ["--symbolic-mutation-mode", "boundary",
+     "--mutation-portfolio", "mixed"],
+    ["--symbolic-mutation-mode", "boundary",
+     "--symbolic-schedule", "retained-first",
+     "--mutation-portfolio", "mixed",
+     "--binradar-representative-budget", "100"],
+    ["--mutation-portfolio", "mixed",
+     "--binradar-representative-budget", "100"],
+])
+def test_mixed_portfolio_rejects_unbounded_or_rescheduled_trials(
+        tmp_path, monkeypatch, extra_args):
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, tmp_path, extra_args)
+
+
+def test_portfolio_and_representative_budget_defaults(tmp_path, monkeypatch):
+    captured = _run_main(monkeypatch, tmp_path, [])
+    assert captured["BINRADAR_MUTATION_PORTFOLIO"] == "replacement"
+    assert captured["BINRADAR_REPRESENTATIVE_BUDGET"] == "0"
+
+
 def test_target_patches_all_stays_within_compiled_count(tmp_path, monkeypatch):
     captured = _run_main(monkeypatch, tmp_path, ["--target-patches", "all"])
     assert captured["TOTAL_PATCHES"] == "30"
@@ -172,6 +218,8 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     executor.feedback_mode = False
     executor.symbolic_mutation_mode = "off"
     executor.symbolic_schedule = "retained-first"
+    executor.mutation_portfolio = "replacement"
+    executor.representative_budget = 1234
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=500000, max_bytes=1048576, deadline_ms=500)
     executor.fuzzy = False
@@ -191,6 +239,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
         "[filtered-patches: int] [effective-patches: int] "
         "[disable-binradar: bool] [feedback: bool] "
         "[symbolic-mutation-mode: str] [symbolic-schedule: str] "
+        "[mutation-portfolio: str] [representative-budget: str] "
         "[fuzzy: bool] "
         "[reverse-directed: bool] [less-strict: bool] "
         "[forkserver-child-timeout: int] [symbolic-max-work: str] "
@@ -206,9 +255,11 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert row["effective-patches"] == 41
     assert row["disable-binradar"] is False
     assert row["symbolic-mutation-mode"] == "off"
-    # Settings v2 records the effective budgets, so a reader can match a trial
-    # against the tracer's own `[config]`/`[profile]` rows.
-    assert row["version"] == 2
+    # Settings v3 retains the v2 advisor budgets and adds the C1 controls, so a
+    # reader can match a trial against both orchestrator and tracer telemetry.
+    assert row["version"] == 3
+    assert row["mutation-portfolio"] == "replacement"
+    assert row["representative-budget"] == "1234"
     assert row["symbolic-max-work"] == "500000"
     assert row["symbolic-max-bytes"] == "1048576"
     assert row["symbolic-deadline-ms"] == "500"

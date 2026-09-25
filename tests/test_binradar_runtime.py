@@ -375,6 +375,8 @@ def _binradar_executor(tmp_path, timeout):
     executor.timeout = timeout
     executor.forkserver_child_timeout = 900
     executor.symbolic_schedule = binradar_config.SYMBOLIC_SCHEDULE_DEFAULT
+    executor.mutation_portfolio = binradar_config.MUTATION_PORTFOLIO_DEFAULT
+    executor.representative_budget = 0
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
@@ -494,6 +496,7 @@ class _RecordingTracer:
         self.forkserver_mode = True
         self.iter = 0
         self.representative_runs = 0
+        self.started = False
 
     def run(self):
         summary = self.summaries.pop(0)
@@ -530,6 +533,7 @@ def _install_binradar_loop_fakes(monkeypatch, tracer):
 
         def start_tracer(self, *args, **kwargs):
             del args, kwargs
+            tracer.started = True
             return tracer
 
     monkeypatch.setattr(binradar_runtime, "PhaseSession", _Session)
@@ -562,6 +566,8 @@ def _binradar_loop_executor(tmp_path):
     executor.forkserver_child_timeout = (
         binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
     executor.symbolic_schedule = binradar_config.SYMBOLIC_SCHEDULE_DEFAULT
+    executor.mutation_portfolio = binradar_config.MUTATION_PORTFOLIO_DEFAULT
+    executor.representative_budget = 0
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
         max_work=binradar_config.SYMBOLIC_MAX_WORK_DEFAULT,
         max_bytes=binradar_config.SYMBOLIC_MAX_BYTES_DEFAULT,
@@ -670,6 +676,75 @@ def test_binradar_loop_continues_after_a_discarded_attempt(
            "[mutation-committed 1] [mutation-pending 0]" in stop_rows[0]
 
 
+def test_binradar_representative_budget_unavailable_before_baseline(
+        tmp_path, monkeypatch):
+    tracer = _RecordingTracer([
+        _summary(1, 2, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE, runs=2),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    executor.representative_budget = 2
+    rows: list[str] = []
+    executor.save_progress = rows.append
+
+    executor.run_binradar()
+
+    assert len(tracer.summaries) == 1
+    assert tracer.started is False
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[reason representative-budget-unavailable]" in stop
+    assert "[attempt 0] [remaining unknown]" in stop
+    assert "[representative-runs 0]" in stop
+    assert "[representative-runs-partial false]" in stop
+    assert "[representative-budget 2]" in stop
+    assert "[representative-budget-remaining 2]" in stop
+    assert "[representative-reservation 3]" in stop
+    assert "[mutation-portfolio replacement]" in stop
+
+
+def test_binradar_rejects_reply_above_complete_attempt_reservation(
+        tmp_path, monkeypatch):
+    tracer = _RecordingTracer([
+        _summary(1, 2, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE, runs=4),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    executor.representative_budget = 10
+
+    with pytest.raises(RuntimeError, match="more representative runs"):
+        executor.run_binradar()
+
+
+def test_binradar_representative_budget_stops_between_complete_attempts(
+        tmp_path, monkeypatch):
+    tracer = _RecordingTracer([
+        _summary(1, 2, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE, runs=2),
+        _summary(2, 1, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE, runs=2),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    executor.representative_budget = 4
+    rows: list[str] = []
+    executor.save_progress = rows.append
+
+    executor.run_binradar()
+
+    assert len(tracer.summaries) == 1
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[reason representative-budget-reached]" in stop
+    assert "[attempt 1] [remaining 2]" in stop
+    assert "[representative-runs 2]" in stop
+    assert "[representative-runs-partial false]" in stop
+    assert "[representative-budget 4]" in stop
+    assert "[representative-budget-remaining 2]" in stop
+    assert "[planned 2] [attempted 1]" in stop
+    assert "[mutation-attempted 0]" in stop
+
+
 def test_binradar_loop_reports_baseline_unavailable(tmp_path, monkeypatch):
     tracer = _RecordingTracer([
         _summary(1, 0, binradar_runtime.AttemptResult.TIMEOUT,
@@ -716,7 +791,7 @@ def test_binradar_loop_records_resource_failure_before_raising(
 def test_advisor_profile_metrics_and_budget_traceability(tmp_path):
     """Preserve the tracer's independently reported profile for trial joins.
 
-    Settings v2 records the orchestrator's effective request; `[config]` and
+    Settings v3 records the orchestrator's effective request; `[config]` and
     `[profile]` independently show what the tracer configured and measured. A
     missing profile row is reported as unknown, never as a zero.
     """

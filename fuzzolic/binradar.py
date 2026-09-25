@@ -672,6 +672,9 @@ class BinRadarExecutor:
     # "existing" | "retained-first".  Explicit for the same reason as the
     # mode: an inherited environment must not select an experiment.
     symbolic_schedule: str
+    # P4c C1 family portfolio and Python-owned complete-attempt budget.
+    mutation_portfolio: str
+    representative_budget: int
     # Effective advisor budgets, resolved before the run starts: the tracer
     # must receive exactly the values recorded in the settings row.
     symbolic_budgets: binradar_config.SymbolicBudgets
@@ -711,6 +714,8 @@ class BinRadarExecutor:
         self.feedback_mode = config.feedback_mode
         self.symbolic_mutation_mode = config.symbolic_mutation_mode
         self.symbolic_schedule = config.symbolic_schedule
+        self.mutation_portfolio = config.mutation_portfolio
+        self.representative_budget = config.representative_budget
         self.symbolic_budgets = config.symbolic_budgets
         self.requested_candidate_scope = config.requested_candidate_scope
         self.candidate_scope_status = config.candidate_scope_status
@@ -911,6 +916,8 @@ class BinRadarExecutor:
                 feedback=self.feedback_mode,
                 symbolic_mutation_mode=self.symbolic_mutation_mode,
                 symbolic_schedule=self.symbolic_schedule,
+                mutation_portfolio=self.mutation_portfolio,
+                representative_budget=self.representative_budget,
                 symbolic_max_work=self.symbolic_budgets.max_work,
                 symbolic_max_bytes=self.symbolic_budgets.max_bytes,
                 symbolic_deadline_ms=self.symbolic_budgets.deadline_ms,
@@ -1473,6 +1480,11 @@ class BinRadarExecutor:
             resource.RUSAGE_CHILDREN).ru_maxrss
         session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
         timed_out = False
+        budget_stop_reason: Optional[str] = None
+        # One complete forkserver attempt runs patch 0 plus at most every
+        # currently active candidate.  Reservation uses this worst case;
+        # accounting below charges the actual v4 reply count.
+        representative_reservation = 1 + len(self.filter_result)
         summary = None
         committed = 0
         discarded = 0
@@ -1554,6 +1566,12 @@ class BinRadarExecutor:
                     tracer_binary, testcase, binradar_env, session.deadline)
                 if session.deadline.expired():
                     timed_out = True
+                elif (self.representative_budget > 0 and
+                      representative_reservation > self.representative_budget):
+                    # The complete-attempt reservation is known before the
+                    # solver/forkserver exists.  Do not launch processes for a
+                    # trial that cannot admit even baseline attempt 1.
+                    budget_stop_reason = "representative-budget-unavailable"
                 else:
                     session.shared_memory(binradar_env, include_patch_key=True)
                     session.start_solver(
@@ -1568,13 +1586,34 @@ class BinRadarExecutor:
                         if session.deadline.expired():
                             timed_out = True
                             break
+                        if (self.representative_budget > 0 and
+                                representative_runs +
+                                representative_reservation >
+                                self.representative_budget):
+                            budget_stop_reason = (
+                                "representative-budget-unavailable"
+                                if attempted == 0
+                                else "representative-budget-reached")
+                            break
                         active_attempt = (
                             tracer.iter + 1 if tracer.forkserver_mode else 0)
                         attempted += 1
                         summary = tracer.run()
                         ingest_tracer_diagnostics()
                         active_attempt = None
+                        if (summary.representative_runs >
+                                representative_reservation):
+                            raise RuntimeError(
+                                "BinRadar forkserver reported more "
+                                "representative runs than the complete-attempt "
+                                "reservation")
                         representative_runs += summary.representative_runs
+                        if (self.representative_budget > 0 and
+                                representative_runs >
+                                self.representative_budget):
+                            raise RuntimeError(
+                                "BinRadar representative-run budget "
+                                "overshot its complete-attempt reservation")
                         if not tracer.forkserver_mode:
                             planned = 0
                         elif summary.attempt == 1:
@@ -1631,9 +1670,11 @@ class BinRadarExecutor:
             logger.error(f"Error during binradar execution: {exc}")
             raise
 
-        if summary is not None or timed_out:
+        if summary is not None or timed_out or budget_stop_reason is not None:
             if timed_out:
                 stop_reason = "wall-time-reached"
+            elif budget_stop_reason is not None:
+                stop_reason = budget_stop_reason
             else:
                 assert summary is not None
                 stop_reason = binradar_runtime.protocol_enum_name(
@@ -1680,6 +1721,9 @@ class BinRadarExecutor:
             memcheck = ("true" if memcheck_value == "1" else
                         "false" if memcheck_value == "0" else "unknown")
             representative_runs_partial = in_flight_attempt
+            representative_budget_remaining = (
+                "unlimited" if self.representative_budget == 0
+                else str(self.representative_budget - representative_runs))
             scheduled_bins = _scheduled_plan_bins(queue_bins_row)
             plan_funnel = _build_plan_funnel(
                 mutation_diagnostics, scheduled_bins, stop_remaining,
@@ -1710,6 +1754,12 @@ class BinRadarExecutor:
                 f"[representative-runs {representative_runs}] "
                 f"[representative-runs-partial "
                 f"{str(representative_runs_partial).lower()}] "
+                f"[representative-budget {self.representative_budget}] "
+                f"[representative-budget-remaining "
+                f"{representative_budget_remaining}] "
+                f"[representative-reservation "
+                f"{representative_reservation}] "
+                f"[mutation-portfolio {self.mutation_portfolio}] "
                 f"[planned {planned_text}] "
                 f"[attempted {attempted}] "
                 f"[mutation-attempted {mutation_attempted}] "
@@ -2032,6 +2082,22 @@ def main():
               "permutes the same finite plan set; it never changes its "
               "membership or contents"))
     parser.add_argument(
+        "--mutation-portfolio", dest="mutation_portfolio",
+        choices=binradar_config.MUTATION_PORTFOLIOS,
+        default=None,
+        help=("mutation-family portfolio for the BinRadar tracer phase "
+              "(default: replacement, or BINRADAR_MUTATION_PORTFOLIO from "
+              "binradar.env); mixed retains generic primitive alternatives "
+              "beside surviving boundary families and requires boundary "
+              "mode, existing scheduling, and a representative budget"))
+    parser.add_argument(
+        "--binradar-representative-budget",
+        dest="representative_budget", default=None,
+        help=("maximum forkserver representative children for the BinRadar "
+              "phase; 0 disables the limit, while mixed portfolio requires "
+              "a nonzero value.  Attempts start only when their complete "
+              "worst-case sweep fits"))
+    parser.add_argument(
         "--symbolic-max-work", dest="symbolic_max_work", default=None,
         help=("symbolic boundary advisor work budget for the BinRadar tracer "
               "phase (default: 1000000, or BINRADAR_SYMBOLIC_MAX_WORK from "
@@ -2109,6 +2175,32 @@ def main():
             else env.get(
                 "BINRADAR_SYMBOLIC_SCHEDULE",
                 binradar_config.SYMBOLIC_SCHEDULE_DEFAULT))
+    env["BINRADAR_MUTATION_PORTFOLIO"] = \
+        binradar_config.validate_mutation_portfolio(
+            args.mutation_portfolio
+            if args.mutation_portfolio is not None
+            else env.get(
+                "BINRADAR_MUTATION_PORTFOLIO",
+                binradar_config.MUTATION_PORTFOLIO_DEFAULT))
+    representative_budget = binradar_config.parse_bounded_unsigned_decimal(
+        "BINRADAR_REPRESENTATIVE_BUDGET",
+        args.representative_budget
+        if args.representative_budget is not None
+        else env.get("BINRADAR_REPRESENTATIVE_BUDGET",
+                     binradar_config.REPRESENTATIVE_BUDGET_DEFAULT),
+        binradar_config.REPRESENTATIVE_BUDGET_MAX)
+    env["BINRADAR_REPRESENTATIVE_BUDGET"] = str(representative_budget)
+    if env["BINRADAR_MUTATION_PORTFOLIO"] == "mixed":
+        if env["BINRADAR_SYMBOLIC_MUTATION_MODE"] != "boundary":
+            parser.error("--mutation-portfolio mixed requires "
+                         "--symbolic-mutation-mode boundary")
+        if env["BINRADAR_SYMBOLIC_SCHEDULE"] != \
+                binradar_config.SYMBOLIC_SCHEDULE_DEFAULT:
+            parser.error("--mutation-portfolio mixed requires "
+                         "--symbolic-schedule existing")
+        if representative_budget == 0:
+            parser.error("--mutation-portfolio mixed requires a nonzero "
+                         "--binradar-representative-budget")
     # Budgets resolve once, here, with CLI > binradar.env > default
     # precedence.  The resolved values are written back so every phase
     # environment and the settings row agree on one effective configuration.

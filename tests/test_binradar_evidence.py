@@ -603,3 +603,48 @@ def test_discarded_attempt_never_reports_complete_coverage(tmp_path, reason,
     report = (tmp_path / "final.sbsv").read_text()
     assert f"[binradar-coverage {expected}]" in report
     assert "[binradar-coverage complete]" not in report
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("representative-budget-unavailable", "unavailable"),
+    ("representative-budget-reached", "partial"),
+])
+def test_representative_budget_cutoff_is_never_complete_coverage(tmp_path,
+                                                                 reason,
+                                                                 expected):
+    """A C1 budget stop never reports complete coverage.
+
+    `unavailable` and `partial` are different claims: an unavailable stop
+    happens before the first attempt, so the phase published no BinRadar
+    evidence, while a reached stop ends a sweep that already ran real
+    attempts with a known remaining count. Neither is a drained queue.
+    """
+    run_dir = tmp_path / "trial-00000"
+    run_dir.mkdir()
+    frames = [
+        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 3, 2)
+        + _group(0, 1, 0, [0], [0])
+        + _group(1, 1, 0, [1], [1]),
+    ]
+    _write_binradar_frames(run_dir / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(
+        run_dir / "verifier.br",
+        [binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=0, total_evidences=0,
+            observations={})])
+    (tmp_path / "progress.sbsv").write_text(
+        f"[binradar] [stop] [prefix trial] [id 0] [reason {reason}] "
+        "[attempt 2] [remaining 0] [committed 2] [discarded 0] "
+        "[representative-runs 4] [representative-runs-partial false] "
+        "[representative-budget 4] [representative-budget-remaining 0] "
+        "[representative-reservation 2] [mutation-portfolio mixed] "
+        "[planned 1] [attempted 2] [mutation-attempted 1] "
+        "[mutation-discarded 0] [mutation-committed 1] "
+        "[mutation-pending 0] [queued 0]\n")
+    binradar_results.write_final_result(_final_request(
+        run_dir, [1],
+        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (run_dir / "final.sbsv").read_text()
+    assert f"[binradar-coverage {expected}]" in report
+    assert "[binradar-coverage complete]" not in report

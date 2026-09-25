@@ -15,6 +15,15 @@ SYMBOLIC_SCHEDULE_DEFAULT = "existing"
 SYMBOLIC_SCHEDULES = ("existing", "retained-first")
 SYMBOLIC_SCHEDULE_LAYOUT_WIDTH = max(map(len, SYMBOLIC_SCHEDULES))
 SYMBOLIC_SCHEDULE_LAYOUT_PAD_KEY = "BINRADAR_SYMBOLIC_SCHEDULE_LAYOUT_PAD"
+# P4c C1 portfolio.  `replacement` preserves the historical suppression
+# contract; `mixed` is experimental and requires an explicit representative
+# budget in the orchestrator.
+MUTATION_PORTFOLIO_DEFAULT = "replacement"
+MUTATION_PORTFOLIOS = ("replacement", "mixed")
+MUTATION_PORTFOLIO_LAYOUT_WIDTH = max(map(len, MUTATION_PORTFOLIOS))
+MUTATION_PORTFOLIO_LAYOUT_PAD_KEY = "BINRADAR_MUTATION_PORTFOLIO_LAYOUT_PAD"
+REPRESENTATIVE_BUDGET_DEFAULT = 0
+REPRESENTATIVE_BUDGET_MAX = 2 ** 64 - 1
 SYMBOLIC_MAX_WORK_DEFAULT = 1_000_000
 SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
 SYMBOLIC_DEADLINE_MS_DEFAULT = 100
@@ -62,6 +71,16 @@ def validate_symbolic_schedule(value: str) -> str:
         raise ValueError(
             f"invalid symbolic schedule {value!r}; expected one of "
             f"{', '.join(SYMBOLIC_SCHEDULES)}")
+    return normalized
+
+
+def validate_mutation_portfolio(value: str) -> str:
+    """Normalize and validate the P4c mutation-family portfolio."""
+    normalized = str(value).strip().lower()
+    if normalized not in MUTATION_PORTFOLIOS:
+        raise ValueError(
+            f"invalid mutation portfolio {value!r}; expected one of "
+            f"{', '.join(MUTATION_PORTFOLIOS)}")
     return normalized
 
 
@@ -155,6 +174,8 @@ class RunConfig:
     forkserver_child_timeout: int
     symbolic_mutation_mode: str
     symbolic_schedule: str
+    mutation_portfolio: str
+    representative_budget: int
     symbolic_budgets: SymbolicBudgets
     requested_candidate_scope: str
     candidate_scope_status: str
@@ -188,6 +209,31 @@ class RunConfig:
                 retained[key] = env[key]
 
         total_patches = int(env["TOTAL_PATCHES"])
+        symbolic_mode = validate_symbolic_mutation_mode(env.get(
+            "BINRADAR_SYMBOLIC_MUTATION_MODE",
+            SYMBOLIC_MUTATION_MODE_DEFAULT))
+        symbolic_schedule = validate_symbolic_schedule(env.get(
+            "BINRADAR_SYMBOLIC_SCHEDULE", SYMBOLIC_SCHEDULE_DEFAULT))
+        mutation_portfolio = validate_mutation_portfolio(env.get(
+            "BINRADAR_MUTATION_PORTFOLIO", MUTATION_PORTFOLIO_DEFAULT))
+        representative_budget = parse_bounded_unsigned_decimal(
+            "BINRADAR_REPRESENTATIVE_BUDGET",
+            env.get("BINRADAR_REPRESENTATIVE_BUDGET",
+                    REPRESENTATIVE_BUDGET_DEFAULT),
+            REPRESENTATIVE_BUDGET_MAX)
+        if mutation_portfolio == "mixed":
+            if symbolic_mode != "boundary":
+                raise ValueError(
+                    "mixed mutation portfolio requires symbolic mutation "
+                    "mode boundary")
+            if symbolic_schedule != SYMBOLIC_SCHEDULE_DEFAULT:
+                raise ValueError(
+                    "mixed mutation portfolio requires symbolic schedule "
+                    "existing")
+            if representative_budget == 0:
+                raise ValueError(
+                    "mixed mutation portfolio requires a nonzero "
+                    "representative budget")
         return cls(
             workdir=os.path.abspath(workdir),
             outdir=os.path.abspath(env["BINRADAR_OUTDIR"]),
@@ -210,12 +256,10 @@ class RunConfig:
             feedback_mode=(
                 env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"),
             forkserver_child_timeout=child_timeout,
-            symbolic_mutation_mode=validate_symbolic_mutation_mode(env.get(
-                "BINRADAR_SYMBOLIC_MUTATION_MODE",
-                SYMBOLIC_MUTATION_MODE_DEFAULT)),
-            symbolic_schedule=validate_symbolic_schedule(env.get(
-                "BINRADAR_SYMBOLIC_SCHEDULE",
-                SYMBOLIC_SCHEDULE_DEFAULT)),
+            symbolic_mutation_mode=symbolic_mode,
+            symbolic_schedule=symbolic_schedule,
+            mutation_portfolio=mutation_portfolio,
+            representative_budget=representative_budget,
             # CLI overrides arrive pre-merged into `env`, so the effective
             # value here is already the resolved one.
             symbolic_budgets=SymbolicBudgets.from_mapping(
@@ -244,6 +288,7 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "BINRADAR_SYMBOLIC_MUTATION_MODE": config.symbolic_mutation_mode,
         "BINRADAR_SYMBOLIC_SCHEDULE": config.symbolic_schedule,
+        "BINRADAR_MUTATION_PORTFOLIO": config.mutation_portfolio,
         "SYMBOLIC_TESTCASE_NAME": config.resolved_poc_input(),
         "PLT_INFO_FILE": plt_info_file,
     }
@@ -328,6 +373,17 @@ def build_phase_environment(
     environment["BINRADAR_SYMBOLIC_SCHEDULE"] = effective_schedule
     environment[SYMBOLIC_SCHEDULE_LAYOUT_PAD_KEY] = (
         "_" * (SYMBOLIC_SCHEDULE_LAYOUT_WIDTH - len(effective_schedule)))
+    requested_portfolio = validate_mutation_portfolio(
+        base_environment.get(
+            "BINRADAR_MUTATION_PORTFOLIO",
+            environment.get("BINRADAR_MUTATION_PORTFOLIO",
+                            MUTATION_PORTFOLIO_DEFAULT)))
+    effective_portfolio = (
+        requested_portfolio if mode == "binradar"
+        else MUTATION_PORTFOLIO_DEFAULT)
+    environment["BINRADAR_MUTATION_PORTFOLIO"] = effective_portfolio
+    environment[MUTATION_PORTFOLIO_LAYOUT_PAD_KEY] = (
+        "_" * (MUTATION_PORTFOLIO_LAYOUT_WIDTH - len(effective_portfolio)))
     environment["BINRADAR_TRACER_LOG_FILE"] = phase_log_file(mode, run_dir)
 
     # Explicit crash-detection policy.

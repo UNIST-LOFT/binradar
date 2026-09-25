@@ -642,6 +642,8 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
         "[binradar] [stop] [prefix run] [id 0] "
         "[reason wall-time-reached] [attempt 3] [remaining 4] "
         "[representative-runs 12] [representative-runs-partial true] "
+        "[representative-budget 20] [representative-budget-remaining 8] "
+        "[representative-reservation 5] [mutation-portfolio mixed] "
         "[planned 20] [attempted 2] "
         "[discarded 0] [committed 2] [queued 4] [memcheck true] "
         "[mutation-attempted 3] [mutation-discarded 1] "
@@ -660,13 +662,13 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     (run_dir / "binradar.log").write_text(
         "[FINAL] Processed 99 complete BINRADAR evidence iteration(s); "
         "rejected 3 patch(es).\n")
-    # Settings v2 records the effective advisor budgets.  They are read from
-    # the settings row, so a trial can be matched against the tracer's own
-    # `[config]`/`[profile]` rows after the fact.
+    # Settings v3 records the effective advisor and portfolio budgets.  They
+    # remain available when a stop row omits fallback configuration fields.
     (run_dir / "binradar-setting.sbsv").write_text(
-        '[binradar-setting] [version 2] [run-prefix "run"] [run-id 0] '
+        '[binradar-setting] [version 3] [run-prefix "run"] [run-id 0] '
         '[symbolic-mutation-mode "boundary"] [symbolic-max-work "500000"] '
-        '[symbolic-max-bytes "16777216"] [symbolic-deadline-ms "500"]\n')
+        '[symbolic-max-bytes "16777216"] [symbolic-deadline-ms "500"] '
+        '[mutation-portfolio "mixed"] [representative-budget "20"]\n')
     confidence_rows = "".join(
         f"[final] [confidence] [patch {patch}] [score {1.0 - patch / 10}] "
         f"[accept-evidences 1] [total-evidences 1]\n"
@@ -711,6 +713,10 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert run.binradar_queued == 4
     assert run.binradar_representative_runs == 12
     assert run.binradar_representative_runs_partial is True
+    assert run.binradar_representative_budget == 20
+    assert run.binradar_representative_budget_remaining == "8"
+    assert run.binradar_representative_reservation == 5
+    assert run.binradar_mutation_portfolio == "mixed"
     assert run.binradar_stop_attempt == 3
     assert run.binradar_planned == 20
     assert run.binradar_tracer_attempts == 2
@@ -752,6 +758,10 @@ def test_collect_partial_coverage_and_runtime_metrics_ignore_top_limit(tmp_path)
     assert row["binradar_rejection_ids_truncated"] == "False"
     assert row["binradar_stop_reason"] == "wall-time-reached"
     assert row["binradar_representative_runs_partial"] == "True"
+    assert row["binradar_representative_budget"] == "20"
+    assert row["binradar_representative_budget_remaining"] == "8"
+    assert row["binradar_representative_reservation"] == "5"
+    assert row["binradar_mutation_portfolio"] == "mixed"
     assert row["binradar_memcheck_enabled"] == "True"
     assert row["binradar_baseline_reproduced"] == "True"
     assert row["binradar_mutation_attempted"] == "3"

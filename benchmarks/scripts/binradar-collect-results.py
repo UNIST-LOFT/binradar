@@ -261,6 +261,10 @@ class RunResult:
     binradar_queued: int = -1
     binradar_representative_runs: int = -1
     binradar_representative_runs_partial: Optional[bool] = None
+    binradar_representative_budget: int = -1
+    binradar_representative_budget_remaining: str = ""
+    binradar_representative_reservation: int = -1
+    binradar_mutation_portfolio: str = ""
     binradar_planned: int = -1
     binradar_tracer_attempts: int = -1
     binradar_stop_reason: str = ""
@@ -289,7 +293,7 @@ class RunResult:
         default_factory=dict)
     binradar_plan_funnel: Dict[str, Dict[str, str]] = field(
         default_factory=dict)
-    # Effective advisor budgets from a settings v2 row; -1 means the run
+    # Effective advisor budgets present since settings v2; -1 means the run
     # predates budget provenance.
     binradar_advisor_max_work: int = -1
     binradar_advisor_max_bytes: int = -1
@@ -1384,6 +1388,14 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                 stop.get("representative-runs"))
             run_res.binradar_representative_runs_partial = _optional_bool(
                 stop.get("representative-runs-partial"))
+            run_res.binradar_representative_budget = _optional_int(
+                stop.get("representative-budget"))
+            run_res.binradar_representative_budget_remaining = stop.get(
+                "representative-budget-remaining", "")
+            run_res.binradar_representative_reservation = _optional_int(
+                stop.get("representative-reservation"))
+            run_res.binradar_mutation_portfolio = stop.get(
+                "mutation-portfolio", "")
             run_res.binradar_planned = _optional_int(stop.get("planned"))
             run_res.binradar_stop_reason = stop.get("reason", "")
             run_res.binradar_stop_attempt = _optional_int(stop.get("attempt"))
@@ -1412,6 +1424,7 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                 key: value for key, value in stop.items()
                 if key.startswith("advisor-") or
                 key.startswith("mutation-") or
+                key.startswith("representative-") or
                 key.startswith("plan-funnel-")
             })
         plan_attempts = runtime.get("plan_attempts", {})
@@ -1453,6 +1466,21 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                             "symbolic-schedule":
                         run_res.binradar_advisor_schedule = value
                         break
+            if not run_res.binradar_mutation_portfolio:
+                for key, value in settings.items():
+                    if key.lower().replace("_", "-") == \
+                            "mutation-portfolio":
+                        run_res.binradar_mutation_portfolio = value
+                        break
+            if run_res.binradar_representative_budget < 0:
+                for key, value in settings.items():
+                    if key.lower().replace("_", "-") != \
+                            "representative-budget":
+                        continue
+                    if str(value).strip().lower() != "unknown":
+                        run_res.binradar_representative_budget = \
+                            _optional_int(value)
+                    break
             # A settings v1 row carries no advisor budgets.  Missing values
             # stay absent rather than being reported as the built-in default,
             # which would look like a measured configuration.
@@ -2120,6 +2148,10 @@ CSV_COLUMNS = [
     "binradar_queued",
     "binradar_representative_runs",
     "binradar_representative_runs_partial",
+    "binradar_representative_budget",
+    "binradar_representative_budget_remaining",
+    "binradar_representative_reservation",
+    "binradar_mutation_portfolio",
     "binradar_planned",
     "binradar_tracer_attempts",
     "binradar_stop_reason",
@@ -2253,6 +2285,10 @@ def format_results_csv(all_results: List[ExperimentResult],
                     ("binradar_queued", run_res.binradar_queued),
                     ("binradar_representative_runs",
                      run_res.binradar_representative_runs),
+                    ("binradar_representative_budget",
+                     run_res.binradar_representative_budget),
+                    ("binradar_representative_reservation",
+                     run_res.binradar_representative_reservation),
                     ("binradar_planned", run_res.binradar_planned),
                     ("binradar_tracer_attempts",
                      run_res.binradar_tracer_attempts),
@@ -2262,6 +2298,10 @@ def format_results_csv(all_results: List[ExperimentResult],
                 str(run_res.binradar_representative_runs_partial)
                 if run_res.binradar_representative_runs_partial is not None
                 else "")
+            row["binradar_representative_budget_remaining"] = \
+                run_res.binradar_representative_budget_remaining
+            row["binradar_mutation_portfolio"] = \
+                run_res.binradar_mutation_portfolio
             row["binradar_stop_reason"] = run_res.binradar_stop_reason
             row["binradar_memcheck_enabled"] = (
                 str(run_res.binradar_memcheck_enabled)

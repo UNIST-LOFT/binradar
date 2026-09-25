@@ -259,6 +259,38 @@ def test_symbolic_schedule_validator_and_phase_scope():
         assert environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off"
 
 
+def test_mutation_portfolio_validator_layout_and_phase_scope():
+    with pytest.raises(ValueError):
+        binradar_config.validate_mutation_portfolio("combined")
+    assert binradar_config.validate_mutation_portfolio(" Mixed ") == "mixed"
+    phase = binradar_config.PhaseEnvironmentConfig(
+        timeout=60, forkserver_child_timeout=30,
+        reverse_directed=False, probe_patch_hit_count=1,
+        active_patch_count=1)
+    mixed = binradar_config.build_phase_environment(
+        "binradar", "/tmp/run",
+        {"BINRADAR_MUTATION_PORTFOLIO": "mixed",
+         "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"}, phase)
+    replacement = binradar_config.build_phase_environment(
+        "binradar", "/tmp/run",
+        {"BINRADAR_MUTATION_PORTFOLIO": "replacement",
+         "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"}, phase)
+    pad_key = binradar_config.MUTATION_PORTFOLIO_LAYOUT_PAD_KEY
+    assert mixed["BINRADAR_MUTATION_PORTFOLIO"] == "mixed"
+    assert replacement["BINRADAR_MUTATION_PORTFOLIO"] == "replacement"
+    assert (len(mixed["BINRADAR_MUTATION_PORTFOLIO"]) +
+            len(mixed[pad_key])) == (
+                len(replacement["BINRADAR_MUTATION_PORTFOLIO"]) +
+                len(replacement[pad_key]))
+    for mode in ("fuzzolic", "directed", "other"):
+        environment = binradar_config.build_phase_environment(
+            mode, "/tmp/run",
+            {"BINRADAR_MUTATION_PORTFOLIO": "mixed",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"}, phase)
+        assert environment["BINRADAR_MUTATION_PORTFOLIO"] == "replacement"
+        assert environment[pad_key] == ""
+
+
 def test_symbolic_budget_cli_precedence_and_zero_normalization():
     """CLI wins over binradar.env, which wins over the built-in default."""
     loaded = {"BINRADAR_SYMBOLIC_DEADLINE_MS": "250",

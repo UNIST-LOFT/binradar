@@ -144,6 +144,8 @@ def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
     executor.feedback_mode = run_config.feedback_mode
     executor.symbolic_mutation_mode = run_config.symbolic_mutation_mode
     executor.symbolic_schedule = run_config.symbolic_schedule
+    executor.mutation_portfolio = run_config.mutation_portfolio
+    executor.representative_budget = run_config.representative_budget
     executor.symbolic_budgets = run_config.symbolic_budgets
     executor.forkserver_child_timeout = run_config.forkserver_child_timeout
     executor.invocation = run_config.invocation
