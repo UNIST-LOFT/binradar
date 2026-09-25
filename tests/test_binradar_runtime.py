@@ -20,6 +20,54 @@ binradar = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar)
 
 
+def test_shared_memory_keys_are_named_distinct_and_fixed_width(monkeypatch):
+    generated = iter((0, 0xA, 0xA, 0xFFFFFFFF, 1, 2))
+    monkeypatch.setattr(
+        binradar_runtime.random, "getrandbits", lambda _width: next(generated))
+    environment = {}
+    manager = binradar_runtime.SharedMemoryManager(environment)
+
+    manager.assign_random_keys()
+    manager.assign_random_key_for_binradar()
+
+    values = [environment[key] for key in binradar_runtime.SHM_KEYS]
+    values.append(environment["BINRADAR_PATCH_SHM_KEY"])
+    assert values == ["0x0000000a", "0xffffffff", "0x00000001",
+                      "0x00000002"]
+    assert {len(value) for value in values} == {10}
+    assert [int(value, 0) for value in values] == manager.shm_keys
+    assert 0 not in manager.shm_keys
+    assert len(set(manager.shm_keys)) == len(manager.shm_keys)
+
+
+def test_shared_memory_key_seed_is_private_and_reproducible():
+    def generated_keys(seed):
+        environment = {binradar_runtime.SHM_KEY_SEED_ENV: seed}
+        manager = binradar_runtime.SharedMemoryManager(environment)
+        manager.assign_random_keys()
+        manager.assign_random_key_for_binradar()
+        return environment, manager.shm_keys
+
+    first_environment, first_keys = generated_keys("0x0123456789abcdef")
+    second_environment, second_keys = generated_keys("0x0123456789abcdef")
+    other_environment, other_keys = generated_keys("0x0123456789abcdee")
+
+    assert binradar_runtime.SHM_KEY_SEED_ENV not in first_environment
+    assert binradar_runtime.SHM_KEY_SEED_ENV not in second_environment
+    assert binradar_runtime.SHM_KEY_SEED_ENV not in other_environment
+    assert first_keys == second_keys
+    assert first_keys != other_keys
+    assert all(0 < key <= 0xFFFFFFFF for key in first_keys)
+    assert len(set(first_keys)) == len(first_keys)
+
+
+def test_shared_memory_key_seed_rejects_invalid_values():
+    environment = {binradar_runtime.SHM_KEY_SEED_ENV: "0xnot-a-seed"}
+    with pytest.raises(ValueError, match="must be 16 lowercase hex digits"):
+        binradar_runtime.SharedMemoryManager(environment)
+    assert environment == {}
+
+
 def test_advisor_report_counts_applied_children_not_only_proposals(tmp_path):
     log = tmp_path / "tracer.log"
     log.write_text(

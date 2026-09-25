@@ -13,6 +13,8 @@ SYMBOLIC_MUTATION_MODES = ("off", "shadow", "boundary")
 # order and the default; `retained-first` is the one P4b B2 experiment.
 SYMBOLIC_SCHEDULE_DEFAULT = "existing"
 SYMBOLIC_SCHEDULES = ("existing", "retained-first")
+SYMBOLIC_SCHEDULE_LAYOUT_WIDTH = max(map(len, SYMBOLIC_SCHEDULES))
+SYMBOLIC_SCHEDULE_LAYOUT_PAD_KEY = "BINRADAR_SYMBOLIC_SCHEDULE_LAYOUT_PAD"
 SYMBOLIC_MAX_WORK_DEFAULT = 1_000_000
 SYMBOLIC_MAX_BYTES_DEFAULT = 16 * 1024 * 1024
 SYMBOLIC_DEADLINE_MS_DEFAULT = 100
@@ -317,9 +319,15 @@ def build_phase_environment(
             environment.get("BINRADAR_SYMBOLIC_SCHEDULE",
                             SYMBOLIC_SCHEDULE_DEFAULT)))
     # The schedule only permutes mutation plans, which exist only in this
-    # phase; every other phase would inherit a meaningless value.
-    environment["BINRADAR_SYMBOLIC_SCHEDULE"] = (
+    # phase; every other phase would inherit a meaningless value.  Keep the
+    # combined schedule+padding value width fixed so an A/B policy spelling
+    # cannot shift the guest's initial stack and manufacture different plan
+    # addresses before the scheduler runs.
+    effective_schedule = (
         requested_schedule if mode == "binradar" else SYMBOLIC_SCHEDULE_DEFAULT)
+    environment["BINRADAR_SYMBOLIC_SCHEDULE"] = effective_schedule
+    environment[SYMBOLIC_SCHEDULE_LAYOUT_PAD_KEY] = (
+        "_" * (SYMBOLIC_SCHEDULE_LAYOUT_WIDTH - len(effective_schedule)))
     environment["BINRADAR_TRACER_LOG_FILE"] = phase_log_file(mode, run_dir)
 
     # Explicit crash-detection policy.

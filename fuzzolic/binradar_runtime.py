@@ -27,6 +27,8 @@ TRACER_BIN = str(SCRIPT_DIR / "../tracer/build/x86_64-linux-user/qemu-x86_64")
 SOLVER_WAIT_TIME_AT_STARTUP = 1.0
 SOLVER_TIMEOUT = 10.0
 SHM_KEYS = ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY")
+SHM_KEY_SEED_ENV = "BINRADAR_SHM_KEY_SEED"
+SHM_KEY_DRAW_LIMIT = 1024
 # Protocol v4 handshake word.  Mirrors BINRADAR_FORKSERVER_PROTOCOL_V4 in
 # tracer/linux-user/binradar-forkserver.h; tests/test_binradar_forkserver_protocol.py
 # pins both sides so a half-migrated deployment fails the handshake rather
@@ -164,17 +166,42 @@ class SharedMemoryManager:
         self.env = env
         self.libc = ctypes.CDLL("libc.so.6")
         self.shm_keys: List[int] = []
+        # This host-only test control is consumed before the environment reaches
+        # solver/tracer/guest processes.  Normal runs retain system-seeded keys.
+        seed_text = env.pop(SHM_KEY_SEED_ENV, None)
+        self._key_random = random
+        if seed_text is not None:
+            if (len(seed_text) != 18 or not seed_text.startswith("0x") or
+                    any(char not in "0123456789abcdef"
+                        for char in seed_text[2:])):
+                raise ValueError(
+                    f"{SHM_KEY_SEED_ENV} must be 16 lowercase hex digits")
+            self._key_random = random.Random(int(seed_text, 16))
+
+    @staticmethod
+    def _format_key(shm_key: int) -> str:
+        # These values enter the guest environment.  Fixed width prevents a
+        # random leading-zero count from shifting the guest's initial stack.
+        return f"0x{shm_key:08x}"
+
+    def _assign_random_key(self, name: str) -> None:
+        # SysV key 0 means IPC_PRIVATE rather than a shareable named segment.
+        # Reusing one key for two transports aliases incompatible layouts.
+        for _ in range(SHM_KEY_DRAW_LIMIT):
+            shm_key = self._key_random.getrandbits(32)
+            if shm_key != 0 and shm_key not in self.shm_keys:
+                self.env[name] = self._format_key(shm_key)
+                self.shm_keys.append(shm_key)
+                return
+        raise RuntimeError(
+            "Could not generate a distinct nonzero shared-memory key")
 
     def assign_random_keys(self) -> None:
         for key in SHM_KEYS:
-            shm_key = random.getrandbits(32)
-            self.env[key] = hex(shm_key)
-            self.shm_keys.append(shm_key)
+            self._assign_random_key(key)
 
     def assign_random_key_for_binradar(self) -> None:
-        shm_key = random.getrandbits(32)
-        self.env["BINRADAR_PATCH_SHM_KEY"] = hex(shm_key)
-        self.shm_keys.append(shm_key)
+        self._assign_random_key("BINRADAR_PATCH_SHM_KEY")
 
     def cleanup(self) -> None:
         ipc_rmid = 0

@@ -228,6 +228,23 @@ def test_symbolic_schedule_validator_and_phase_scope():
             reverse_directed=False, probe_patch_hit_count=1,
             active_patch_count=1))
     assert environment["BINRADAR_SYMBOLIC_SCHEDULE"] == "retained-first"
+    pad_key = binradar_config.SYMBOLIC_SCHEDULE_LAYOUT_PAD_KEY
+    existing_pad = "_" * (
+        binradar_config.SYMBOLIC_SCHEDULE_LAYOUT_WIDTH - len("existing"))
+    assert environment[pad_key] == ""
+    existing_environment = binradar_config.build_phase_environment(
+        "binradar", "/tmp/run",
+        {"BINRADAR_SYMBOLIC_SCHEDULE": "existing",
+         "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+        binradar_config.PhaseEnvironmentConfig(
+            timeout=60, forkserver_child_timeout=30,
+            reverse_directed=False, probe_patch_hit_count=1,
+            active_patch_count=1))
+    assert existing_environment[pad_key] == existing_pad
+    assert (len(environment["BINRADAR_SYMBOLIC_SCHEDULE"])
+            + len(environment[pad_key])) == (
+                len(existing_environment["BINRADAR_SYMBOLIC_SCHEDULE"])
+                + len(existing_environment[pad_key]))
     for mode in ("fuzzolic", "directed", "other"):
         environment = binradar_config.build_phase_environment(
             mode, "/tmp/run",
@@ -238,6 +255,7 @@ def test_symbolic_schedule_validator_and_phase_scope():
                 reverse_directed=False, probe_patch_hit_count=1,
                 active_patch_count=1))
         assert environment["BINRADAR_SYMBOLIC_SCHEDULE"] == "existing"
+        assert environment[pad_key] == existing_pad
         assert environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] == "off"
 
 
