@@ -796,8 +796,8 @@ def test_concolic_solver_deadline_is_graceful(
     executor.save_progress = progress.append
 
     class FakeShm:
-        def __init__(self, env):
-            pass
+        def __init__(self, env, identity=""):
+            del env, identity
 
         def assign_random_keys(self):
             pass
@@ -869,8 +869,8 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
     executor.save_progress = lambda row: None
 
     class FakeShm:
-        def __init__(self, env):
-            pass
+        def __init__(self, env, identity=""):
+            del env, identity
 
         def assign_random_keys(self):
             pass

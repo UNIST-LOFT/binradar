@@ -2,6 +2,7 @@
 
 import ctypes
 import enum
+import hashlib
 import os
 import random
 import select
@@ -162,7 +163,7 @@ def abort_handler(signo, stackframe) -> None:
 
 
 class SharedMemoryManager:
-    def __init__(self, env: Dict[str, str]):
+    def __init__(self, env: Dict[str, str], identity: str = ""):
         self.env = env
         self.libc = ctypes.CDLL("libc.so.6")
         self.shm_keys: List[int] = []
@@ -176,7 +177,16 @@ class SharedMemoryManager:
                         for char in seed_text[2:])):
                 raise ValueError(
                     f"{SHM_KEY_SEED_ENV} must be 16 lowercase hex digits")
-            self._key_random = random.Random(int(seed_text, 16))
+            # One seed reaches every concurrent phase, and each phase opens its
+            # own expression pool, query queue and bitmaps.  Deriving the stream
+            # from the phase identity keeps one seed reproducible per phase
+            # without letting two live phases alias the same SysV segments.
+            seed = int(seed_text, 16)
+            if identity:
+                seed = int.from_bytes(hashlib.sha256(
+                    seed_text.encode() + b"\0" + identity.encode()
+                ).digest()[:8], "big")
+            self._key_random = random.Random(seed)
 
     @staticmethod
     def _format_key(shm_key: int) -> str:
@@ -783,7 +793,10 @@ class PhaseSession:
     def shared_memory(
             self, env: Dict[str, str], include_patch_key: bool = False
     ) -> SharedMemoryManager:
-        manager = SharedMemoryManager(env)
+        # The phase mode scopes a seeded key stream: one driver seed covers
+        # concurrent producer phases, and each phase must still receive
+        # distinct SysV segments.
+        manager = SharedMemoryManager(env, identity=self.mode)
         self.own("shared memory", manager.cleanup)
         manager.assign_random_keys()
         if include_patch_key:

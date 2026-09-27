@@ -68,6 +68,31 @@ def test_shared_memory_key_seed_rejects_invalid_values():
     assert environment == {}
 
 
+def test_seeded_keys_are_distinct_across_concurrent_phases():
+    # One driver seed reaches every producer phase, which run concurrently and
+    # each open their own expression pool, query queue and bitmaps.  Aliasing a
+    # key between two live phases makes the solver attach another phase's
+    # segments, corrupting the query stream.
+    def keys_for(mode):
+        environment = {binradar_runtime.SHM_KEY_SEED_ENV: "0x0123456789abcdef"}
+        manager = binradar_runtime.SharedMemoryManager(
+            environment, identity=mode)
+        manager.assign_random_keys()
+        manager.assign_random_key_for_binradar()
+        return manager.shm_keys
+
+    by_mode = {mode: keys_for(mode)
+               for mode in ("fuzzolic", "directed", "binradar")}
+    for mode, keys in by_mode.items():
+        assert keys, mode
+        assert len(set(keys)) == len(keys), mode
+        assert all(0 < key <= 0xFFFFFFFF for key in keys), mode
+        assert binradar_runtime.SHM_KEY_SEED_ENV not in keys, mode
+    combined = [key for keys in by_mode.values() for key in keys]
+    assert len(set(combined)) == len(combined)
+    assert keys_for("directed") == by_mode["directed"]
+
+
 def test_advisor_report_counts_applied_children_not_only_proposals(tmp_path):
     log = tmp_path / "tracer.log"
     log.write_text(
@@ -398,8 +423,8 @@ def _install_runtime_fakes(monkeypatch, solver_start_delay=0):
     deadlines = []
 
     class FakeShm:
-        def __init__(self, env):
-            del env
+        def __init__(self, env, identity=""):
+            del env, identity
 
         def assign_random_keys(self):
             pass
