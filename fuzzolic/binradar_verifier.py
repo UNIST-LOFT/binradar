@@ -801,10 +801,15 @@ class BinRadarQemuRunner:
             return None
         return BinRadarProbeResult.from_log(result.stderr)
     
-    def test_with_file_trace(self, testcase: str, patch_func_entry: int, verbose: bool = True):
-        command = self.get_qemu_stacktrace_command(False, testcase, patch_func_entry=patch_func_entry)
+    def test_with_file_trace(
+        self, testcase: str, patch_func_entry: int, verbose: bool = True,
+        timeout: float = 60.0,
+    ) -> Optional[BinRadarProbeResult]:
+        command = self.get_qemu_stacktrace_command(
+            False, testcase, patch_func_entry=patch_func_entry)
         env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
-        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
+        result = binradar_utils.execute(
+            command, cwd=self.dir, verbose=verbose, env=env, timeout=timeout)
         if not result.success:
             logger.error(f"Failed to run test_with_file_trace on testcase {testcase}: "
                          f"exit status {result.decode_status()}; "

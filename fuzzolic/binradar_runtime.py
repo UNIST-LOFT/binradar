@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
+from typing import BinaryIO, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import binradar_utils
 import logger
@@ -416,6 +416,50 @@ class TracerExecutor:
     def phase_deadline_reached(self) -> bool:
         return self.deadline.expired()
 
+    def _forkserver_startup_diagnostics(self) -> str:
+        log_path = self.env.get("BINRADAR_TRACER_LOG_FILE")
+        if not log_path:
+            return "tracer log not configured"
+        path = Path(log_path)
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 65536), os.SEEK_SET)
+                text = stream.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            return f"tracer log {path} unavailable: {exc}"
+
+        selected: List[str] = []
+        markers = (
+            "[snapshot] [crash]", "[snapshot] [exit]",
+            "[forkserver]", "[osprey] [fatal]")
+        for line in reversed(text.splitlines()):
+            if any(marker in line for marker in markers):
+                selected.append(line.strip())
+                if len(selected) == 3:
+                    break
+        if not selected:
+            selected = [line.strip() for line in text.splitlines()
+                        if line.strip()][-3:]
+        else:
+            selected.reverse()
+        if not selected:
+            return f"tracer log {path} is empty"
+        return f"tracer log {path}: " + "; ".join(selected)
+
+    def _raise_forkserver_startup_failure(
+            self, error: BaseException, timeout: float) -> NoReturn:
+        status = self.process.poll() if self.process is not None else None
+        process_state = "still running" if status is None else f"exit status {status}"
+        message = (
+            f"[TRACER] [{self.mode}] Did not reach BINRADAR_ENTRYPOINT/"
+            f"forkserver handshake within {timeout:g}s ({process_state}); "
+            f"{self._forkserver_startup_diagnostics()}")
+        if isinstance(error, TimeoutError):
+            raise TimeoutError(message) from error
+        raise EOFError(message) from error
+
     def start(self) -> None:
         self._process_cleanup_started = False
         self._process_cleanup_done = False
@@ -441,8 +485,14 @@ class TracerExecutor:
         self.transport.close_child_ends()
 
         logger.info(f"[TRACER] [{self.mode}] Started tracer {' '.join(self.command)}")
-        banner = self.transport.read_u32(
-            self.deadline.remaining(self.forkserver_init_timeout))
+        startup_timeout = self.forkserver_init_timeout
+        startup_wait = self.deadline.remaining(startup_timeout)
+        try:
+            banner = self.transport.read_u32(startup_wait)
+        except (EOFError, TimeoutError) as exc:
+            effective_timeout = startup_wait \
+                if startup_wait is not None else startup_timeout
+            self._raise_forkserver_startup_failure(exc, effective_timeout)
         if banner != HANDSHAKE_EXPECTED:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")

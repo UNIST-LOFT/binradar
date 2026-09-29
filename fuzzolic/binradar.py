@@ -1179,8 +1179,13 @@ class BinRadarExecutor:
             logger.info(
                 f"[PROBE] Tracer fault reference unavailable "
                 f"(afl-qemu-trace fault address: {probe_result.fault_addr:#x})")
-        file_trace_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
-        file_trace_result = file_trace_runner.test_with_file_trace(self.resolved_poc_input(), patch_func_entry=probe_result.patch_func_entry, verbose=True)
+        file_trace_runner = binradar_verifier.BinRadarQemuRunner.from_env(
+            self.workdir, config)
+        file_trace_result = file_trace_runner.test_with_file_trace(
+            self.resolved_poc_input(),
+            patch_func_entry=probe_result.patch_func_entry,
+            verbose=True,
+            timeout=probe_timeout)
         if file_trace_result is None:
             logger.info("[PROBE] Failed to get file trace result. Check if patch location is set or qemu_stacktrace is available.")
             sys.exit(1)

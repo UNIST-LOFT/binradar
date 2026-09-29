@@ -96,6 +96,9 @@ def run_summaries(summaries):
 if mode == "close_before_banner":
     os.close(stat)
     raise SystemExit(0)
+if mode == "stall_before_banner":
+    time.sleep(3)
+    raise SystemExit(0)
 
 send(version)
 if mode == "close_during_handshake":
@@ -272,6 +275,31 @@ def test_protocol_eof_is_fatal(monkeypatch, tmp_path, fake_script, mode, phase):
                 executor.run()
     finally:
         stop_executor(executor)
+    assert time.monotonic() - started < 1.5
+
+
+def test_missing_banner_reports_tracer_state_at_configured_timeout(
+        monkeypatch, tmp_path, fake_script):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="stall_before_banner")
+    tracer_log = tmp_path / "binradar-tracer-msg.log"
+    tracer_log.write_text(
+        "[snapshot] [crash] [pc 403160] [signal 11]\n"
+        "[snapshot] [exit] [entrypoint-hit 0] [reason guest-signal]\n",
+        encoding="ascii")
+    executor.env["BINRADAR_TRACER_LOG_FILE"] = str(tracer_log)
+    executor.forkserver_init_timeout = 0.1
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError) as failure:
+            executor.start()
+    finally:
+        stop_executor(executor)
+    message = str(failure.value)
+    assert "within 0.1s" in message
+    assert "BINRADAR_ENTRYPOINT/forkserver handshake" in message
+    assert "[entrypoint-hit 0]" in message
+    assert "[pc 403160]" in message
     assert time.monotonic() - started < 1.5
 
 
