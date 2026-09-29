@@ -22,6 +22,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import binradar_utils
+import binradar_verifier
 from binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
@@ -657,6 +658,14 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
         proc_env["PLT_INFO_FILE"] = plt_info
     result = binradar_utils.execute(
         command, cwd=workdir, env=proc_env, timeout=timeout, verbose=False)
+    # A process killed by an external termination signal is reported as a
+    # success by execute()/execute_await, and the tracer's signal path can
+    # salvage the interrupted guest pc as a valid-looking v2 fault reference
+    # at its kill PC. That is not this subject's observed crash, so treat the
+    # run as failed rather than reading the salvaged row. A genuine guest
+    # SIGSEGV re-raised by QEMU stays usable.
+    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+        result.success = False
     fault_addr = extract_tracer_fault_addr(result.stderr) if result.success else None
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""
     repro = format_repro_command(workdir, command, proc_env)
@@ -788,6 +797,11 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
         import shutil
         shutil.rmtree(run_dir, ignore_errors=True)
 
+    # As in run_tracer_probe: an externally terminated tracer is reported as
+    # success but may have salvaged the interrupted pc as a fault reference.
+    # Treat the cancellation as a failed probe instead of reading it.
+    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+        result.success = False
     entry_hits = extract_tracer_entrypoint_hit(
         result.stderr) if result.success else -1
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""

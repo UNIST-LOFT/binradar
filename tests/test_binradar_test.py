@@ -24,6 +24,36 @@ def test_tracer_reference_requires_explicit_valid_v2_row():
     assert binradar_test.extract_tracer_fault_addr(normalized) == 0
 
 
+def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path):
+    """`execute` reports success for a process killed by an external
+    termination signal, and the tracer can salvage the interrupted guest pc
+    as a valid-looking v2 reference at its kill PC. That is not the subject's
+    observed crash, so the probe must report it as failed rather than
+    returning the salvaged address."""
+    import binradar_utils
+    from binradar_verifier import tracer_execution_cancelled
+    import signal as signal_module
+
+    salvaged = (
+        "[snapshot] [fault-reference] [version 2] [valid true] "
+        "[source guest-signal] [address 4000affb90]\n")
+
+    def fake_execute(command, **kwargs):
+        return binradar_utils.ExecutionResult(
+            success=True, exit_code=-int(signal_module.SIGTERM),
+            stdout="", stderr=salvaged)
+
+    monkeypatch.setattr(binradar_test.binradar_utils, "execute", fake_execute)
+    workdir = str(tmp_path)
+    (tmp_path / "guest.orig").write_bytes(b"")
+    fault_addr, exit_str, result, _ = binradar_test.run_tracer_probe(
+        workdir, {"BINARY": "guest", "TEST_CMD": "@@"}, "poc", 5.0)
+    assert fault_addr is None
+    assert exit_str == ""
+    assert result.success is False
+    assert tracer_execution_cancelled(result.exit_code)
+
+
 def test_valgrind_interceptor_uses_target_return_address():
     log = """
 ==1== Invalid write of size 1

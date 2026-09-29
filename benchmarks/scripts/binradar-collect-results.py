@@ -867,7 +867,7 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
     """
     telemetry: Dict[str, object] = {
         "stop": {}, "baseline_status": "", "baseline_artifact": "",
-        "tracer_attempts": -1, "advisor": {}, "settings": {},
+        "tracer_attempts": -1, "settings": {},
         "plan_attempts": {}, "plan_funnel": {}, "queue_bins": {},
     }
     active_run: Optional[Tuple[str, str]] = None
@@ -875,7 +875,6 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
     plan_attempts: Dict[str, Dict[str, str]] = {}
     plan_funnel: Dict[str, Dict[str, str]] = {}
     queue_bins: Dict[str, str] = {}
-    advisor: Dict[str, str] = {}
     if os.path.isfile(progress_path):
         with open(progress_path, "r", encoding="utf-8") as stream:
             for line in stream:
@@ -894,7 +893,6 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
                     scoped = active_run == (prefix, str(run_id))
                 if payload.startswith("[binradar] [start]") and scoped:
                     tracer_rows.clear()
-                    advisor.clear()
                     telemetry["stop"] = {}
                     telemetry["baseline_status"] = ""
                     telemetry["baseline_artifact"] = ""
@@ -915,9 +913,6 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
                 elif payload.startswith("[binradar] [queue-bins]") and scoped:
                     if fields.get("version") == "1":
                         queue_bins.update(fields)
-                elif payload.startswith("[binradar] [advisor]") and scoped:
-                    advisor.update({key: value for key, value in fields.items()
-                                    if key not in ("binradar", "advisor")})
                 elif payload.startswith("[binradar] [stop]") and (
                         fields.get("prefix") == prefix and
                         fields.get("id") == str(run_id)):
@@ -934,7 +929,6 @@ def parse_binradar_runtime_telemetry(progress_path: str, run_dir: str,
                             "artifact", "")
 
     telemetry["tracer_attempts"] = len(tracer_rows) if tracer_rows else -1
-    telemetry["advisor"] = advisor
     tracer_by_attempt = {
         fields["attempt"]: fields for fields in tracer_rows
         if fields.get("attempt", "").isdigit()
@@ -1497,9 +1491,6 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
                     run_res.binradar_advisor_telemetry[
                         key] = str(value)
                     break
-        advisor = runtime.get("advisor", {})
-        if isinstance(advisor, dict):
-            run_res.binradar_advisor_telemetry.update(advisor)
 
         if final_entry:
             remaining = final_entry.get("remaining_patches", "N/A")

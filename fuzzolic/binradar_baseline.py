@@ -191,6 +191,17 @@ def _classify(artifact: str, result, reference, relocation_records, ranges,
         reason = "timeout" if result.timed_out else result.decode_status()
         return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
                              f"execution unusable ({reason})")
+    # `execute_await` reports success for a process killed by an external
+    # termination signal, and the tracer's signal path can salvage the
+    # interrupted guest pc as a valid-looking fault reference (or emit a
+    # normal row) at its kill PC.  That is not this artifact's baseline
+    # identity, so reject the cancellation before reading the log even when
+    # the salvaged rows look usable.  A genuine guest SIGSEGV re-raised by
+    # QEMU stays usable.
+    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+        return BaselineCheck(
+            artifact, BaselineStatus.UNUSABLE, None,
+            f"tracer cancelled on signal {-result.exit_code}")
     log = result.stderr or ""
     observed = _parse_reference(log)
     if observed is None:

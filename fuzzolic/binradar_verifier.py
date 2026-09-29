@@ -36,6 +36,28 @@ TRACER_FAULT_VALID_SOURCES = frozenset(("guest-signal", "provenance-access"))
 TRACER_FAULT_SOURCES = frozenset((*TRACER_FAULT_VALID_SOURCES, "unavailable",
                                   "legacy-unvalidated"))
 
+#: Host signals that mean the tracer process was cancelled rather than
+#: reporting a genuine guest fault.  QEMU re-raises a guest fault as a
+#: negative return code too (SIGSEGV/SIGBUS/SIGABRT), so a negative code
+#: alone is not a cancellation; only these externally delivered
+#: termination signals are.
+TRACER_CANCELLATION_SIGNALS = frozenset((
+    signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
+    signal.SIGQUIT, signal.SIGKILL))
+
+
+def tracer_execution_cancelled(exit_code: int) -> bool:
+    """True when ``exit_code`` is a host cancellation signal.
+
+    ``execute_await`` reports ``success=True`` for a process terminated by an
+    external signal, and the tracer's signal path can salvage the interrupted
+    guest pc as a valid-looking ``guest-signal`` reference at its kill PC.
+    That is not a fault identity, so a caller must reject the run explicitly
+    instead of reading whatever the salvaged output happens to claim.  A
+    genuine guest SIGSEGV must stay usable and is not cancelled here.
+    """
+    return exit_code < 0 and -exit_code in TRACER_CANCELLATION_SIGNALS
+
 # Version 1 is the historical probe row. Version 2 deliberately stores the
 # reference's validity and provenance separately, so address zero is no longer
 # overloaded as an unavailable value.

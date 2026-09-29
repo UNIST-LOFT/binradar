@@ -287,6 +287,21 @@ def test_queue_bins_and_attempts_preserve_mixed_advisor_source_counts(tmp_path):
             **{"source-retained": "false"}), outcome="other-crash",
             result="completed", representative_runs=4, elapsed_ms=7),
     ]
+    # A clean between-attempt cutoff retains exact per-bin pending counts,
+    # including zero for bins absent from the compact queue-row spelling.
+    partial = binradar._build_plan_funnel(records[:1], scheduled, "1", False)
+    partial_by_key = {
+        (item["advisor"], item["source-kind"]): item for item in partial}
+    assert partial_by_key[("generic", "primitive")]["pending"] == "0"
+    assert partial_by_key[("symbolic", "pointer")]["pending"] == "1"
+    assert sum(int(item["pending"]) for item in partial) == 1
+
+    # In-flight work and a mismatched queue depth cannot use that subtraction.
+    for remaining, pending in (("unknown", True), ("2", False)):
+        uncertain = binradar._build_plan_funnel(
+            records[:1], scheduled, remaining, pending)
+        assert all(item["pending"] == "unknown" for item in uncertain)
+
     funnel = binradar._build_plan_funnel(records, scheduled, "0", False)
     by_key = {(item["advisor"], item["source-kind"]): item for item in funnel}
 

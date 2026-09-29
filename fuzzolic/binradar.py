@@ -397,7 +397,15 @@ def _scheduled_plan_bins(
     """Decode exact v1 plan and retained-source denominators."""
     if row is None or row.get("version") != "1":
         return None
-    counts: Dict[Tuple[str, str], Dict[str, Optional[int]]] = {}
+    # The producer folds any missing advisor/source identity into one unknown
+    # bin. All other impossible combinations are measured zero once the entire
+    # queue row validates; leaving them absent makes pending accounting fail
+    # while traversing the fixed advisor × source-kind output grid.
+    counts: Dict[Tuple[str, str], Dict[str, Optional[int]]] = {
+        (advisor, source_kind): {"scheduled": 0, "retained": 0}
+        for advisor in _PLAN_FUNNEL_ADVISORS
+        for source_kind in _PLAN_FUNNEL_SOURCE_KINDS
+    }
     specs = (
         ("generic", ("primitive", "pointer", "argument-primitive",
                      "argument-pointer")),
@@ -420,12 +428,6 @@ def _scheduled_plan_bins(
                 "retained": retained,
             }
             scheduled_total += value
-    # OSPREY and symbolic only produce primitive and pointer plans.
-    for advisor in ("osprey", "symbolic"):
-        for source_kind in ("argument-primitive", "argument-pointer"):
-            counts[(advisor, source_kind)] = {
-                "scheduled": 0, "retained": 0,
-            }
     unknown = _unsigned_diagnostic_value(row.get("unknown", ""))
     total = _unsigned_diagnostic_value(row.get("total", ""))
     if unknown is None or total is None or scheduled_total + unknown != total:
@@ -1141,9 +1143,8 @@ class BinRadarExecutor:
                 "was killed; no normalized fault reference is published from a "
                 "killed run (its salvaged SIGTERM fault identity would name the "
                 "kill PC, not the fault).")
-        elif tracer_result.exit_code in (
-                -signal.SIGTERM, -signal.SIGINT, -signal.SIGHUP,
-                -signal.SIGQUIT, -signal.SIGKILL):
+        elif binradar_verifier.tracer_execution_cancelled(
+                tracer_result.exit_code):
             # QEMU self-signals on genuine guest faults (including SIGSEGV),
             # so a negative return code alone is not a host cancellation.
             # Ignore the external cancellation signals that can salvage the

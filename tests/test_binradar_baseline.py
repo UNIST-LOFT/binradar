@@ -16,6 +16,7 @@ observable contract:
   configuration.
 """
 
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -128,6 +129,35 @@ def test_timeout_is_unusable():
         success=False, timed_out=True, exit_code=-9))
     assert check.status is binradar_baseline.BaselineStatus.UNUSABLE
     assert "timeout" in check.detail
+
+
+def test_external_termination_signal_never_validates_a_baseline():
+    """`execute_await` reports success for a process killed by an external
+    termination signal, and the tracer can salvage the interrupted guest pc
+    as a valid-looking fault reference (or emit a normal row) at its kill PC.
+    Neither is this artifact's baseline identity, so both must be `unusable`
+    even though the run reports `success`."""
+    crash_log = _log(_reference_row(0x44eced), CRASH_ROW)
+    for signal_number in sorted(binradar_verifier.TRACER_CANCELLATION_SIGNALS):
+        killed = _result(exit_code=-int(signal_number), stderr=crash_log)
+        check = _classify(crash_log, result=killed)
+        assert check.status is binradar_baseline.BaselineStatus.UNUSABLE
+        normal_killed = _result(exit_code=-int(signal_number),
+                                stderr=_log(NORMAL_ROW))
+        assert _classify(_log(NORMAL_ROW), result=normal_killed).status \
+            is binradar_baseline.BaselineStatus.UNUSABLE
+
+
+def test_genuine_guest_fault_signal_is_not_a_cancellation():
+    """QEMU re-raises a genuine guest fault as a negative return code. Those
+    must stay usable; only the external termination signals are rejected."""
+    for signal_number in (signal.SIGSEGV, signal.SIGBUS, signal.SIGABRT):
+        assert not binradar_verifier.tracer_execution_cancelled(-signal_number)
+    crash_log = _log(_reference_row(0x44eced), CRASH_ROW)
+    check = _classify(
+        crash_log,
+        result=_result(exit_code=-int(signal.SIGSEGV), stderr=crash_log))
+    assert check.status is binradar_baseline.BaselineStatus.REPRODUCED
 
 
 def test_controlled_environment_keeps_policy_and_drops_descriptors():
