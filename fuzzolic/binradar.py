@@ -964,7 +964,6 @@ class BinRadarExecutor:
                 timeout=self.timeout,
                 forkserver_child_timeout=self.forkserver_child_timeout,
                 reverse_directed=self.reverse_directed,
-                probe_patch_hit_count=self.probe_result.patch_func_hit_cnt,
                 active_patch_count=len(self.filter_result),
                 e9_exclude_ranges=exclude_ranges,
                 e9_relocated_calls=relocated_calls,

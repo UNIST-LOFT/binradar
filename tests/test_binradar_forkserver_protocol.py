@@ -152,6 +152,76 @@ while True:
 
 
 @pytest.fixture
+def reentered_guest(tmp_path):
+    """A guest whose entrypoint executes three times in one process."""
+    if not Path(binradar_runtime.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for entrypoint integration")
+    source = tmp_path / "reentered.c"
+    source.write_text(r'''
+#include <fcntl.h>
+#include <unistd.h>
+
+static unsigned char visits;
+
+int main(int argc, char **argv)
+{
+    unsigned char visit = ++visits;
+    int fd = open(argv[1], O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0 || write(fd, &visit, 1) != 1) return 1;
+    close(fd);
+    return visit < 3 ? main(argc, argv) : 0;
+}
+''', encoding="ascii")
+    guest = tmp_path / "reentered"
+    subprocess.run(
+        ["cc", "-O0", "-fno-pie", "-no-pie", "-o", str(guest), str(source)],
+        check=True, capture_output=True)
+    symbols = subprocess.run(
+        ["nm", str(guest)], check=True, capture_output=True, text=True)
+    entrypoint = next(line.split()[0] for line in symbols.stdout.splitlines()
+                      if line.split()[-1] == "main")
+    return guest, entrypoint
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_real_forkserver_starts_before_first_entrypoint_body(
+        tmp_path, reentered_guest, enabled):
+    """Enable controls snapshotting; re-entry never starts another server."""
+    guest, entrypoint = reentered_guest
+    marker = tmp_path / "visits"
+    env = {
+        "PATH": os.environ["PATH"],
+        "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1" if enabled else "0",
+        "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "5",
+        "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_TRACE_FILE": "none",
+        "BINRADAR_TRACER_LOG_FILE": str(tmp_path / "tracer.log"),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+        "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+    }
+    executor = binradar_runtime.TracerExecutor(
+        "directed", env, str(tmp_path), str(tmp_path), str(guest),
+        str(marker), "/dev/null", binradar_runtime.Deadline.from_timeout(10))
+    try:
+        executor.start()
+        if enabled:
+            # The banner must arrive before *any* entrypoint body runs.
+            assert not marker.exists()
+        summary = executor.run()
+        assert marker.read_bytes() == b"\x01\x02\x03"
+        if enabled:
+            assert summary.representative_runs == 1
+            assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+            assert summary.stop_reason == binradar_runtime.StopReason.EXHAUSTED
+        else:
+            assert executor.run_result.exit_code == 0
+    finally:
+        executor.stop()
+
+
+@pytest.fixture
 def fake_script(tmp_path):
     path = tmp_path / "fake_forkserver.py"
     path.write_text(FAKE_FORKSERVER, encoding="utf-8")

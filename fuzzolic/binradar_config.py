@@ -325,7 +325,6 @@ class PhaseEnvironmentConfig:
     timeout: int
     forkserver_child_timeout: int
     reverse_directed: bool
-    probe_patch_hit_count: int
     active_patch_count: int
     e9_exclude_ranges: str = ""
     e9_relocated_calls: str = ""
@@ -402,7 +401,6 @@ def build_phase_environment(
         environment["BINRADAR_PROBE_FILE"] = os.path.join(
             run_dir, "probe-result-fuzzolic.sbsv")
         environment["BINRADAR_FORKSERVER_ENABLE"] = "0"
-        environment["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = "0"
         environment["BINRADAR_TRACE_FILE"] = "none"
         return environment
 
@@ -425,18 +423,14 @@ def build_phase_environment(
     environment["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(child_timeout))
     environment["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] = str(
         int(child_timeout))
-    environment["BINRADAR_FORKSERVER_TARGET_HIT_COUNT"] = str(
-        phase.probe_patch_hit_count)
     if mode == "directed":
         environment["BINRADAR_REVERSE_DIRECTED"] = (
             "1" if phase.reverse_directed else "0")
         environment["BINRADAR_QUERY_WINDOW_FILE"] = os.path.join(
             run_dir, "binradar-query-window.sbsv")
-        environment["BINRADAR_PRESERVE_CHILD_QUERIES"] = "1"
         environment["BINRADAR_TRACE_FILE"] = "none"
     else:
         environment["BINRADAR_TRACE_FILE"] = "none"
-        environment["BINRADAR_PRESERVE_CHILD_QUERIES"] = "0"
         environment["PATCH_ID"] = "123456"
         environment["BINRADAR_PATCH_CNT"] = str(phase.active_patch_count)
         environment["BINRADAR_EVIDENCE_FILE"] = os.path.join(
