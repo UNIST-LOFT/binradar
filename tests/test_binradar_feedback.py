@@ -54,7 +54,7 @@ def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version
         f"[tracer-fault-source {'guest-signal' if exit_info == 'crash' else 'unavailable'}] "
         f"[tracer-fault-addr {fault_addr if exit_info == 'crash' else 0:x}] "
         + ("[tracer-fault-image none] [tracer-fault-image-offset 0] "
-           "[memcheck-policy coverage-v1] " if version == 3 else "")
+           "[memcheck-policy coverage-v2] " if version == 3 else "")
         + "[patch-func-candidates []] "
         "[stacktrace []] [pid 0] [br [0]] [time 1]\n"
     )

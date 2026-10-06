@@ -86,18 +86,18 @@ def _write_legacy_probe(tmp_path: Path, address: int) -> Path:
 
 def test_new_policy_restoration_preserves_valid_pc_zero(tmp_path):
     original = _probe(binradar_verifier.TracerFaultReference(0, "guest-signal"))
-    original.memcheck_policy = "coverage-v1"
+    original.memcheck_policy = "coverage-v2"
     path = tmp_path / "current.sbsv"
     path.write_text("[probe-info] " + original.serialize()
                     + "\n[file-trace] [need-file-hook false]\n")
     restored = binradar_verifier.BinRadarProbeResult.from_sbsv(str(path))
     restored.require_current_memcheck_policy()
-    assert restored.memcheck_policy == "coverage-v1"
+    assert restored.memcheck_policy == "coverage-v2"
     assert restored.tracer_fault_reference == original.tracer_fault_reference
     assert restored._probe_serialization_version == 3
 
 
-@pytest.mark.parametrize("policy", [None, "older-policy", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "older-policy", "unavailable"])
 def test_freshness_rejects_unacknowledged_or_mismatched_policy(policy):
     probe = _probe(binradar_verifier.TracerFaultReference(0, "guest-signal"))
     probe.memcheck_policy = policy

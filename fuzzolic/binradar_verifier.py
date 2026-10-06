@@ -74,7 +74,7 @@ PROBE_RESULT_SCHEMA_V2 = (
     "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
 
 
-MEMCHECK_POLICY = "coverage-v1"
+MEMCHECK_POLICY = "coverage-v2"
 PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
     "[tracer-fault-addr: hex]", "[tracer-fault-addr: hex] "
     "[tracer-fault-image: str] [tracer-fault-image-offset: hex] "

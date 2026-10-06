@@ -192,7 +192,7 @@ def _classify(artifact: str, result, reference, relocation_records, ranges,
     if not binradar_verifier.tracer_memcheck_policy_acknowledged(log):
         return BaselineCheck(
             artifact, BaselineStatus.UNUSABLE, None,
-            "tracer did not acknowledge memcheck policy coverage-v1")
+            f"tracer did not acknowledge memcheck policy {binradar_verifier.MEMCHECK_POLICY}")
     try:
         observed = _parse_reference(log)
     except ValueError as exc:

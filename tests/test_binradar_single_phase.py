@@ -100,7 +100,7 @@ def _make_workdir(tmp_path):
         "[func-entry 2000] [patch-hit 1] [func-hit 1] [fault-addr 1234] "
         "[tracer-fault-valid false] [tracer-fault-source unavailable] "
         "[tracer-fault-addr 0] [tracer-fault-image none] "
-        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v1] "
+        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v2] "
         "[patch-func-candidates []] [stacktrace []]\n"
         "[file-trace] [need-file-hook false]\n")
     # Already-produced testcases (as the fuzzolic producer phase would leave).
@@ -111,7 +111,7 @@ def _make_workdir(tmp_path):
     return workdir, rundir
 
 
-@pytest.mark.parametrize("policy", [None, "old", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "old", "unavailable"])
 def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, policy):
     workdir, rundir = _make_workdir(tmp_path)
     probe_file = rundir / "probe-results.sbsv"
@@ -120,10 +120,10 @@ def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, pol
         "[tracer-fault-valid true] [tracer-fault-source guest-signal]")
     if policy is None:
         row = row.replace("[version 3]", "[version 2]").replace(
-            "[memcheck-policy coverage-v1] ", "").replace(
+            "[memcheck-policy coverage-v2] ", "").replace(
             "[tracer-fault-image none] [tracer-fault-image-offset 0] ", "")
     else:
-        row = row.replace("[memcheck-policy coverage-v1]", f"[memcheck-policy {policy}]")
+        row = row.replace("[memcheck-policy coverage-v2]", f"[memcheck-policy {policy}]")
     probe_file.write_text(row)
     executor = _build_executor(workdir)
     with pytest.raises(SystemExit, match="--run-id n"):

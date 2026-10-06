@@ -1158,7 +1158,7 @@ class BinRadarExecutor:
             tracer_result.stderr or "")
         if not policy_acknowledged:
             sys.exit(
-                "ERROR: tracer did not acknowledge memcheck policy coverage-v1; "
+                f"ERROR: tracer did not acknowledge memcheck policy {binradar_verifier.MEMCHECK_POLICY}; "
                 "use an updated tracer and start a fresh run with --run-id n.")
         probe_result.memcheck_policy = binradar_verifier.MEMCHECK_POLICY
         if tracer_result.timed_out:
