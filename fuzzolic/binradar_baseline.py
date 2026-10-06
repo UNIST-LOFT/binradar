@@ -20,9 +20,6 @@ TRACER_BIN = os.path.join(
     os.path.dirname(os.path.realpath(__file__)),
     "..", "tracer", "build", "x86_64-linux-user", "qemu-x86_64")
 
-_SCHEMA = (
-    "[snapshot] [fault-reference] [version: int] [valid: bool] "
-    "[source: str] [address: hex]")
 _EXIT_SCHEMA = (
     "[snapshot] [exit] [normal] [entrypoint-hit: int]")
 _PARSER: Optional[sbsv.parser] = None
@@ -81,7 +78,6 @@ def _parser() -> sbsv.parser:
     global _PARSER
     if _PARSER is None:
         parser = sbsv.parser()
-        parser.add_schema(_SCHEMA)
         parser.add_schema(_EXIT_SCHEMA)
         _PARSER = parser
     return _PARSER
@@ -110,6 +106,8 @@ def _controlled_environment(config: Dict[str, str], *,
     ):
         environment.pop(key, None)
     environment["BINRADAR_FORKSERVER_ENABLE"] = "0"
+    environment["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    environment["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
     environment["BINRADAR_TRACE_FILE"] = "none"
     environment["BINRADAR_OSPREY_ENABLE"] = "0"
     environment["BINRADAR_SYMBOLIC_MUTATION_MODE"] = "off"
@@ -122,17 +120,7 @@ def _controlled_environment(config: Dict[str, str], *,
 
 
 def _parse_reference(log: str) -> Optional[binradar_verifier.TracerFaultReference]:
-    parser = _parser()
-    result = parser.loads(log)
-    rows = result["snapshot"]["fault-reference"]
-    if not rows:
-        return None
-    row = rows[-1]
-    if (row["version"] == 2 and row["valid"]
-            and row["source"] in binradar_verifier.TRACER_FAULT_VALID_SOURCES):
-        return binradar_verifier.TracerFaultReference(
-            row["address"], row["source"])
-    return None
+    return binradar_verifier.read_snapshot_fault_reference(log)
 
 
 def _is_normal_exit(log: str) -> bool:
@@ -201,7 +189,15 @@ def _classify(artifact: str, result, reference, relocation_records, ranges,
             artifact, BaselineStatus.UNUSABLE, None,
             f"tracer cancelled on signal {-result.exit_code}")
     log = result.stderr or ""
-    observed = _parse_reference(log)
+    if not binradar_verifier.tracer_memcheck_policy_acknowledged(log):
+        return BaselineCheck(
+            artifact, BaselineStatus.UNUSABLE, None,
+            "tracer did not acknowledge memcheck policy coverage-v1")
+    try:
+        observed = _parse_reference(log)
+    except ValueError as exc:
+        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
+                             f"invalid fault identity ({exc})")
     if observed is None:
         # Normal is observable even when PROBE has no fault reference.
         if _is_normal_exit(log):
@@ -214,6 +210,12 @@ def _classify(artifact: str, result, reference, relocation_records, ranges,
         return BaselineCheck(artifact, BaselineStatus.UNUSABLE, observed,
                              "PROBE has no validated fault identity")
 
+    if observed.image_id is not None or reference.image_id is not None:
+        status = (BaselineStatus.REPRODUCED
+                  if observed.identity_key == reference.identity_key
+                  else BaselineStatus.DIFFERENT_FAULT)
+        return BaselineCheck(artifact, status, observed,
+                             f"fault identity {observed.identity_key!r}")
     site = binradar_verifier.e9_relocated_call_site(observed.address,
                                                     relocation_records)
     normalized_address = site if site is not None else observed.address
@@ -246,9 +248,15 @@ def validate_patch_zero_baseline(
         timeout: float,
         phase_deadline: Optional[float] = None,
         metadata: Dict[str, Tuple[str, Sequence[str]]],
+        probe_policy: Optional[str] = None,
 ) -> BaselineResult:
     """Validate the POC on `.orig`, `.brpatched`, and `.brcached` patch 0.
     """
+    if probe_policy != binradar_verifier.MEMCHECK_POLICY:
+        raise ValueError(
+            "PROBE memcheck policy is old, absent, or mismatched; "
+            "start a fresh run with --run-id n")
+
     def metadata_for(path: str) -> Tuple[str, Sequence[str]]:
         for suffix in (".brpatched", ".brcached", ".orig"):
             if path.endswith(suffix):

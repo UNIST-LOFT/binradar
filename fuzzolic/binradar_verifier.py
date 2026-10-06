@@ -74,18 +74,52 @@ PROBE_RESULT_SCHEMA_V2 = (
     "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
 
 
+MEMCHECK_POLICY = "coverage-v1"
+PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
+    "[tracer-fault-addr: hex]", "[tracer-fault-addr: hex] "
+    "[tracer-fault-image: str] [tracer-fault-image-offset: hex] "
+    "[memcheck-policy: str]")
+
+
+def tracer_memcheck_policy_acknowledged(log: str) -> bool:
+    """Require the runtime acknowledgement, not an inherited configuration."""
+    parser = sbsv.parser()
+    parser.add_schema("[memcheck] [policy: str]")
+    rows = parser.loads(log)["memcheck"]
+    return bool(rows) and all(row["policy"] == MEMCHECK_POLICY for row in rows)
+
+
 @dataclass(frozen=True)
 class TracerFaultReference:
     """Tracer-observed instruction identity used by BINRADAR FINAL."""
 
     address: int
     source: str
+    image_id: Optional[str] = None
+    image_offset: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.source not in TRACER_FAULT_SOURCES:
             raise ValueError(f"unsupported tracer fault source: {self.source!r}")
         if self.address < 0:
             raise ValueError("tracer fault address must be non-negative")
+        if (self.image_id is None) != (self.image_offset is None):
+            raise ValueError("fault image and offset must be supplied together")
+        if self.image_id is not None:
+            if (len(self.image_id) != 64
+                    or any(c not in "0123456789abcdef" for c in self.image_id)):
+                raise ValueError("fault image must be 64 lowercase hex digits")
+            if (not isinstance(self.image_offset, int)
+                    or isinstance(self.image_offset, bool)
+                    or not 0 <= self.image_offset <= 0xffffffffffffffff):
+                raise ValueError("fault image offset must be an unsigned u64")
+            if not self.valid:
+                raise ValueError("unavailable fault reference cannot carry an image")
+
+    @property
+    def identity_key(self) -> tuple:
+        return (("image", self.image_id, self.image_offset)
+                if self.image_id is not None else ("main", self.address))
 
     @property
     def valid(self) -> bool:
@@ -98,6 +132,68 @@ def _row_field(row: Any, name: str, default: Any = None) -> Any:
         return row[name]
     except (KeyError, TypeError):
         return default
+
+
+def decode_fault_image_fields(row: Any, image_field: str = "image",
+                              offset_field: str = "image-offset", *,
+                              required: bool = True) -> Tuple[Optional[str], Optional[int]]:
+    image = _row_field(row, image_field)
+    offset = _row_field(row, offset_field)
+    if image is None and offset is None and not required:
+        return None, None
+    if image is None or offset is None:
+        raise ValueError("missing fault image/offset pair")
+    if image == "none":
+        if offset != 0:
+            raise ValueError("main fault reference must use image-offset zero")
+        return None, None
+    reference = TracerFaultReference(0, "provenance-access", image, offset)
+    return reference.image_id, reference.image_offset
+
+
+def decode_snapshot_fault_reference(row: Any) -> Optional[TracerFaultReference]:
+    version = _row_field(row, "version")
+    if version not in (2, 3):
+        raise ValueError(f"unsupported snapshot fault reference version: {version!r}")
+    if version == 2 and (_row_field(row, "image") is not None
+                         or _row_field(row, "image-offset") is not None):
+        raise ValueError("historical snapshot cannot carry fault image fields")
+    image, offset = decode_fault_image_fields(row, required=version == 3)
+    if not row["valid"]:
+        if row["address"] != 0 or image is not None:
+            raise ValueError("invalid snapshot fault reference carries identity")
+        return None
+    reference = TracerFaultReference(row["address"], row["source"], image, offset)
+    if not reference.valid:
+        raise ValueError("invalid snapshot fault reference source")
+    return reference
+
+
+def read_snapshot_fault_reference(log: str, *, require_current: bool = False) -> Optional[TracerFaultReference]:
+    """Dispatch on the wire version before applying its exact field schema."""
+    prefix = "[snapshot] [fault-reference]"
+    header = sbsv.parser()
+    header.add_schema(prefix + " [version: int]")
+    historical = sbsv.parser()
+    historical.add_schema(prefix + " [version: int] [valid: bool] "
+                          "[source: str] [address: hex]")
+    current = sbsv.parser()
+    current.add_schema(prefix + " [version: int] [valid: bool] "
+                       "[source: str] [address: hex] [image: str] [image-offset: hex]")
+    reference = None
+    for line in log.splitlines():
+        if not line.strip().startswith(prefix):
+            continue
+        version = header.parse_line_detached(line)["version"]
+        if version not in (2, 3):
+            raise ValueError(f"unsupported snapshot fault reference version: {version!r}")
+        if require_current and version != 3:
+            raise ValueError("historical snapshot cannot authorize current memcheck policy; start a fresh run")
+        if version == 2 and ("[image " in line or "[image-offset " in line):
+            raise ValueError("historical snapshot cannot carry fault image fields")
+        row = (current if version == 3 else historical).parse_line_detached(line)
+        reference = decode_snapshot_fault_reference(row)
+    return reference
 
 
 def _stacktrace_from_row(entries: List[Any]) -> List[Tuple[int, str]]:
@@ -116,19 +212,27 @@ def _stacktrace_from_row(entries: List[Any]) -> List[Tuple[int, str]]:
 def _decode_tracer_fault_reference(row: Any) -> Optional[TracerFaultReference]:
     """Decode v2 fields, rejecting invalid claims rather than promoting them."""
     version = _row_field(row, "version")
-    if version != 2:
+    if version not in (2, 3):
         raise ValueError(f"unsupported probe result version: {version!r}")
     valid = bool(_row_field(row, "tracer-fault-valid", False))
     source = _row_field(row, "tracer-fault-source", "unavailable")
     address = int(_row_field(row, "tracer-fault-addr", 0))
+    if version == 2 and (_row_field(row, "tracer-fault-image") is not None
+                         or _row_field(row, "tracer-fault-image-offset") is not None):
+        raise ValueError("historical probe cannot carry fault image fields")
+    image_id, image_offset = decode_fault_image_fields(
+        row, "tracer-fault-image", "tracer-fault-image-offset",
+        required=version == 3)
     if not valid:
+        if image_id is not None:
+            raise ValueError("invalid tracer reference carries a fault image")
         if address != 0:
             raise ValueError(
                 "invalid tracer fault reference must use address zero")
         return None
     if source not in TRACER_FAULT_VALID_SOURCES:
         raise ValueError(f"invalid tracer fault source for valid row: {source!r}")
-    return TracerFaultReference(address, source)
+    return TracerFaultReference(address, source, image_id, image_offset)
 
 
 def _decode_legacy_tracer_fault_reference(address: int) -> Optional[TracerFaultReference]:
@@ -265,8 +369,11 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
 
 class BinRadarProbeResult:
     line_parser: sbsv.parser = sbsv.parser()
-    line_parser.add_schema(PROBE_RESULT_SCHEMA_V2)
+    line_parser.add_schema(PROBE_RESULT_SCHEMA_V3)
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
+    v2_line_parser: sbsv.parser = sbsv.parser()
+    v2_line_parser.add_schema(PROBE_RESULT_SCHEMA_V2)
+    v2_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     legacy_line_parser: sbsv.parser = sbsv.parser()
     legacy_line_parser.add_schema(PROBE_RESULT_SCHEMA_V1)
     legacy_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
@@ -276,7 +383,8 @@ class BinRadarProbeResult:
             stacktrace: List[Tuple[int, str]], exit_info: str,
             patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int,
             patch_func_candidates: List[Tuple[int, int]],
-            tracer_fault_reference: Optional[TracerFaultReference] = None):
+            tracer_fault_reference: Optional[TracerFaultReference] = None,
+            memcheck_policy: Optional[str] = None):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
         self.stacktrace = stacktrace
@@ -286,9 +394,19 @@ class BinRadarProbeResult:
         self.fault_addr = fault_addr
         self.patch_func_candidates = patch_func_candidates
         self.tracer_fault_reference = tracer_fault_reference
-        self._probe_serialization_version = 2
+        self.memcheck_policy = memcheck_policy
+        self._probe_serialization_version = 3
         self.need_file_hook = False
     
+    def require_current_memcheck_policy(self) -> None:
+        """Historical probes are readable, but cannot authorize live phases."""
+        if (self._probe_serialization_version != 3
+                or self.memcheck_policy != MEMCHECK_POLICY):
+            raise ValueError(
+                "probe has an old, absent, or mismatched memcheck policy; "
+                "start a fresh run with --run-id n to regenerate PROBE "
+                "without rewriting historical data")
+
     @staticmethod
     def get_parser() -> sbsv.parser:
         parser = sbsv.parser()
@@ -381,12 +499,18 @@ class BinRadarProbeResult:
     def from_sbsv(sbsv_file: str) -> Optional["BinRadarProbeResult"]:
         with open(sbsv_file, "r", encoding="utf-8") as f:
             data = f.read()
-        try:
-            result = BinRadarProbeResult.line_parser.loads(data)
-        except ValueError:
-            result = None
-        if result is None or len(result["probe-info"]) == 0:
-            result = BinRadarProbeResult.legacy_line_parser.loads(data)
+        result = None
+        for parser in (BinRadarProbeResult.line_parser,
+                       BinRadarProbeResult.v2_line_parser,
+                       BinRadarProbeResult.legacy_line_parser):
+            try:
+                result = parser.loads(data)
+            except ValueError:
+                continue
+            if result["probe-info"]:
+                break
+        if result is None:
+            raise ValueError("unreadable probe result")
         if len(result["probe-info"]) == 0:
             logger.error("Probe info not found in the log.")
             return None
@@ -398,7 +522,7 @@ class BinRadarProbeResult:
         if version is None:
             tracer_fault_reference = _decode_legacy_tracer_fault_reference(
                 probe_info["tracer-fault-addr"])
-        elif version == 2:
+        elif version in (2, 3):
             tracer_fault_reference = _decode_tracer_fault_reference(probe_info)
         else:
             raise ValueError(f"unsupported probe result version: {version}")
@@ -418,9 +542,11 @@ class BinRadarProbeResult:
             fault_addr=probe_info["fault-addr"],
             patch_func_candidates=patch_func_candidates,
             tracer_fault_reference=tracer_fault_reference,
+            memcheck_policy=(_row_field(probe_info, "memcheck-policy")
+                             if version == 3 else None),
         )
         probe_result.need_file_hook = result["file-trace"][-1]["need-file-hook"]
-        probe_result._probe_serialization_version = 2 if version == 2 else 1
+        probe_result._probe_serialization_version = version or 1
         return probe_result
         
     def update_with_file_trace(self, log: str):
@@ -479,18 +605,21 @@ class BinRadarProbeResult:
                                 break
 
     def serialize(self) -> str:
-        if getattr(self, "_probe_serialization_version", 2) != 2:
+        if getattr(self, "_probe_serialization_version", 1) != 3:
             raise ValueError(
                 "legacy probe results cannot be serialized as fresh data")
         valid, source, address = _probe_reference_fields(
             self.tracer_fault_reference)
         valid_text = "true" if valid else "false"
         return (
-            f"[version 2] [exit {self.exit_info}] [patch-loc {self.patch_loc:x}] "
+            f"[version 3] [exit {self.exit_info}] [patch-loc {self.patch_loc:x}] "
             f"[func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] "
             f"[func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] "
             f"[tracer-fault-valid {valid_text}] [tracer-fault-source {source}] "
             f"[tracer-fault-addr {address:x}] "
+            f"[tracer-fault-image {self.tracer_fault_reference.image_id if valid and self.tracer_fault_reference.image_id is not None else 'none'}] "
+            f"[tracer-fault-image-offset {self.tracer_fault_reference.image_offset if valid and self.tracer_fault_reference.image_offset is not None else 0:x}] "
+            f"[memcheck-policy {self.memcheck_policy or 'unavailable'}] "
             f"[patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] "
             f"[stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]")
 
@@ -500,15 +629,15 @@ class BinRadarProbeResult:
     @classmethod
     def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
         for line in data.splitlines():
-            try:
-                res = cls.line_parser.parse_line_detached(line)
-            except ValueError:
-                res = None
-            if res is None:
+            res = None
+            for parser in (cls.line_parser, cls.v2_line_parser,
+                           cls.legacy_line_parser):
                 try:
-                    res = cls.legacy_line_parser.parse_line_detached(line)
+                    res = parser.parse_line_detached(line)
                 except ValueError:
-                    res = None
+                    continue
+                if res is not None:
+                    break
             if res is None:
                 continue
             if res.get_name() == "probe-info":
@@ -516,7 +645,7 @@ class BinRadarProbeResult:
                 if version is None:
                     tracer_fault_reference = _decode_legacy_tracer_fault_reference(
                         res["tracer-fault-addr"])
-                elif version == 2:
+                elif version in (2, 3):
                     tracer_fault_reference = _decode_tracer_fault_reference(res)
                 else:
                     raise ValueError(f"unsupported probe result version: {version}")
@@ -536,9 +665,11 @@ class BinRadarProbeResult:
                     fault_addr=res["fault-addr"],
                     patch_func_candidates=patch_func_candidates,
                     tracer_fault_reference=tracer_fault_reference,
+                    memcheck_policy=(_row_field(res, "memcheck-policy")
+                                     if version == 3 else None),
                 )
                 probe_result._probe_serialization_version = (
-                    2 if version == 2 else 1)
+                    version or 1)
                 return probe_result
             if res.get_name() == "file-trace":
                 tmp = cls(

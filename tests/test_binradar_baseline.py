@@ -35,7 +35,7 @@ RECORDS = ["0x6ffffff6:0x4d60a5:0x4d60aa"]
 
 
 def _log(*rows: str) -> str:
-    return "\n".join(rows) + "\n"
+    return "[memcheck] [policy coverage-v1]\n" + "\n".join(rows) + "\n"
 
 
 def _reference_row(address: int, source: str = "provenance-access",
@@ -79,8 +79,30 @@ def _classify(log, *, reference=REFERENCE, records=RECORDS, ranges="",
         reference, records, ranges, patch_loc)
 
 
-def test_matching_identity_is_reproduced():
-    check = _classify(_log(_reference_row(0x44eced), CRASH_ROW))
+@pytest.mark.parametrize("ack", ["", "[memcheck] [policy old]\n"])
+@pytest.mark.parametrize("outcome", [NORMAL_ROW, _reference_row(REFERENCE.address)])
+def test_missing_or_mismatched_policy_ack_is_unusable(ack, outcome):
+    check = _classify(ack + outcome + "\n")
+    assert check.status is binradar_baseline.BaselineStatus.UNUSABLE
+    assert check.reference is None
+
+
+@pytest.mark.parametrize("policy", [None, "old", "unavailable"])
+def test_stale_probe_policy_prevents_baseline_execution(tmp_path, monkeypatch, policy):
+    calls = []
+    monkeypatch.setattr(binradar_baseline, "_run_tracer", lambda *a: calls.append(a))
+    with pytest.raises(ValueError, match="--run-id n"):
+        binradar_baseline.validate_patch_zero_baseline(
+            str(tmp_path), {}, original="guest.orig", probe_reference=REFERENCE,
+            selected_binary="guest.brpatched", patch_loc="0x1000", test_cmd="@@",
+            testcase="poc", timeout=1, metadata={}, probe_policy=policy)
+    assert calls == []
+
+
+@pytest.mark.parametrize("address", [0, REFERENCE.address])
+def test_matching_identity_is_reproduced(address):
+    reference = binradar_verifier.TracerFaultReference(address, "guest-signal")
+    check = _classify(_log(_reference_row(address), CRASH_ROW), reference=reference)
     assert check.status is binradar_baseline.BaselineStatus.REPRODUCED
 
 
@@ -162,7 +184,8 @@ def test_genuine_guest_fault_signal_is_not_a_cancellation():
 
 def test_controlled_environment_keeps_policy_and_drops_descriptors():
     phase = {
-        "BINRADAR_MEMCHECK_ENABLE": "1",
+        "BINRADAR_MEMCHECK_ENABLE": "0",
+        "BINRADAR_MEMCHECK_POLICY": "wrong",
         "PLT_INFO_FILE": "/w/plt_info.txt",
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "SYMBOLIC_TESTCASE_NAME": "/w/poc",
@@ -185,8 +208,9 @@ def test_controlled_environment_keeps_policy_and_drops_descriptors():
         phase, e9_ranges="0x6ffff000-0x70005000",
         relocated_calls="0x6ffffff6:0x4d60a5:0x4d60aa")
 
-    # policy preserved
+    # Checker policy is pinned even when inherited configuration disagrees.
     assert env["BINRADAR_MEMCHECK_ENABLE"] == "1"
+    assert env["BINRADAR_MEMCHECK_POLICY"] == "coverage-v1"
     assert env["PLT_INFO_FILE"] == "/w/plt_info.txt"
     assert env["SYMBOLIC_INJECT_INPUT_MODE"] == "FROM_FILE"
     assert env["E9_EXCLUDE_RANGES"] == "0x6ffff000-0x70005000"
@@ -222,7 +246,8 @@ def test_clean_original_is_normal_not_unusable(tmp_path, monkeypatch):
         str(tmp_path), {}, original=str(original), probe_reference=None,
         selected_binary=str(patched), patch_loc="0x401000",
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        metadata={".orig": ("", ()), ".brpatched": ("", ())})
+        metadata={".orig": ("", ()), ".brpatched": ("", ())},
+        probe_policy="coverage-v1")
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
 
 
@@ -239,7 +264,8 @@ def test_matching_artifacts_do_not_override_a_different_probe(tmp_path, monkeypa
         str(tmp_path), {}, original=str(original), probe_reference=REFERENCE,
         selected_binary=str(patched), patch_loc="0x401000",
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        metadata={".orig": ("", ()), ".brpatched": ("", ())})
+        metadata={".orig": ("", ()), ".brpatched": ("", ())},
+        probe_policy="coverage-v1")
     assert result.reference == REFERENCE
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.DIFFERENT_FAULT
     assert result.selected.status is binradar_baseline.BaselineStatus.DIFFERENT_FAULT
@@ -259,7 +285,8 @@ def test_artifact_match_cannot_hide_normal_original(tmp_path, monkeypatch):
         str(tmp_path), {}, original=str(original), probe_reference=REFERENCE,
         selected_binary=str(patched), patch_loc="0x401000",
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        metadata={".orig": ("", ()), ".brpatched": ("", ())})
+        metadata={".orig": ("", ()), ".brpatched": ("", ())},
+        probe_policy="coverage-v1")
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
     assert result.selected.status is binradar_baseline.BaselineStatus.UNUSABLE
 
@@ -281,7 +308,8 @@ def test_preflight_deadline_skips_later_artifact(tmp_path, monkeypatch):
         selected_binary=str(patched), patch_loc="0x401000",
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=10,
         phase_deadline=1.0,
-        metadata={".orig": ("", ()), ".brpatched": ("", ())})
+        metadata={".orig": ("", ()), ".brpatched": ("", ())},
+        probe_policy="coverage-v1")
     assert calls == [(str(original), 1.0)]
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.REPRODUCED
     assert result.selected.status is binradar_baseline.BaselineStatus.UNUSABLE

@@ -33,6 +33,17 @@ class FinalResultRequest:
     record_wall_time_reached: Callable[[], None]
 
 
+def _fault_identity_key(result: dict) -> tuple:
+    image = result.get("image_id")
+    offset = result.get("image_offset")
+    if (image is None) != (offset is None):
+        raise ValueError("missing result fault image/offset pair")
+    if image is not None:
+        return binradar_verifier.TracerFaultReference(
+            result.get("fault_addr", 0), "provenance-access", image, offset).identity_key
+    return ("main", result.get("fault_addr"))
+
+
 def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
     """Stream old per-patch SBSV traces one iteration at a time."""
     parser = sbsv.parser()
@@ -40,6 +51,11 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
         "[binradar] [crash] [iter: int] [patch: int] "
         "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
         "[host_fault_addr: hex]")
+    site_parser = sbsv.parser()
+    site_parser.add_schema(
+        "[binradar] [crash] [iter: int] [patch: int] "
+        "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
+        "[host_fault_addr: hex] [image: str] [image-offset: hex]")
     parser.add_schema("[binradar] [normal] [iter: int] [patch: int]")
     parser.add_schema(
         "[binradar] [commit] [iter: int] [patch: int] [br: str]")
@@ -47,7 +63,10 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
     current: dict[int, dict] = {}
     with open(trace_file, "r", encoding="utf-8") as stream:
         for line in stream:
-            result = parser.parse_line_detached(line)
+            has_site_fields = "[image " in line or "[image-offset " in line
+            if has_site_fields and line.strip().startswith("[binradar] [normal]"):
+                raise ValueError("normal BINRADAR outcome carries fault site")
+            result = (site_parser if has_site_fields else parser).parse_line_detached(line)
             if result is None:
                 continue
             iteration = result["iter"]
@@ -65,6 +84,10 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
             if result.schema_name == "binradar$crash":
                 patch_result["result"] = "crash"
                 patch_result["fault_addr"] = result["fault_addr"]
+                image, offset = binradar_verifier.decode_fault_image_fields(
+                    result, required=False)
+                patch_result["image_id"] = image
+                patch_result["image_offset"] = offset
             elif result.schema_name == "binradar$normal":
                 patch_result["result"] = "normal"
             else:
@@ -225,7 +248,7 @@ def write_final_result(request: FinalResultRequest) -> None:
     fault_reference = request.tracer_fault_reference
     fault_reference_valid = (
         fault_reference is not None and fault_reference.valid)
-    poc_fault_loc = fault_reference.address if fault_reference_valid else None
+    poc_fault_loc = fault_reference.identity_key if fault_reference_valid else None
     if not skip_binradar_analysis and not fault_reference_valid:
         logger.warning(
             "[FINAL] No validated tracer fault reference; BINRADAR hard-crash "
@@ -252,10 +275,14 @@ def write_final_result(request: FinalResultRequest) -> None:
                                   if 0 in group.members)
             original = {"result": original_group.outcome,
                         "br": original_group.branches,
-                        "fault_addr": original_group.fault_addr}
+                        "fault_addr": original_group.fault_addr,
+                        "image_id": original_group.image_id,
+                        "image_offset": original_group.image_offset}
             groups = ((group.members,
                        {"result": group.outcome, "br": group.branches,
-                        "fault_addr": group.fault_addr})
+                        "fault_addr": group.fault_addr,
+                        "image_id": group.image_id,
+                        "image_offset": group.image_offset})
                       for group in frame.groups)
         else:
             assert not isinstance(frame, binradar_evidence.BinradarIteration)
@@ -272,7 +299,7 @@ def write_final_result(request: FinalResultRequest) -> None:
         if original["result"] == "normal":
             original_normal += 1
         elif fault_reference_valid:
-            if original.get("fault_addr") == poc_fault_loc:
+            if _fault_identity_key(original) == poc_fault_loc:
                 original_poc_crash += 1
             else:
                 original_other_crash += 1
@@ -284,12 +311,12 @@ def write_final_result(request: FinalResultRequest) -> None:
             same_crash = (original["result"] == "crash"
                           and patch_result["result"] == "crash"
                           and fault_reference_valid
-                          and original.get("fault_addr") == poc_fault_loc
-                          and patch_result.get("fault_addr") == poc_fault_loc)
+                          and _fault_identity_key(original) == poc_fault_loc
+                          and _fault_identity_key(patch_result) == poc_fault_loc)
             introduced_crash = (original["result"] == "normal"
                                 and patch_result["result"] == "crash"
                                 and fault_reference_valid
-                                and patch_result.get("fault_addr") == poc_fault_loc)
+                                and _fault_identity_key(patch_result) == poc_fault_loc)
             same_branch = original["br"] == patch_result["br"]
             for patch in members:
                 if patch not in expected_candidates:
@@ -442,9 +469,11 @@ def write_final_result(request: FinalResultRequest) -> None:
             "available" if fault_reference_valid and not skip_binradar_analysis
             else "unavailable")
         result_file.write(
-            f"[final] [fault-reference] [version 2] "
+            f"[final] [fault-reference] [version 3] "
             f"[valid {str(fault_reference_valid).lower()}] "
             f"[source {reference_source}] [address {reference_address:x}] "
+            f"[image {fault_reference.image_id if fault_reference_valid and fault_reference.image_id is not None else 'none'}] "
+            f"[image-offset {fault_reference.image_offset if fault_reference_valid and fault_reference.image_offset is not None else 0:x}] "
             f"[hard-crash-classification {crash_classification}]\n")
         result_file.write(coverage_row + "\n")
         result_file.write(rejection_sets_row + "\n")

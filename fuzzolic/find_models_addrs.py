@@ -8,13 +8,15 @@ import re
 
 MODELS_LIBC = ["malloc", "free", "realloc", "calloc", "printf", "fprintf", "vfprintf", "fputc", "_IO_printf"]
 MODELS = [
-    "strcmp",   # indirect call, offset in libc.so is not useful
-    "strncmp",  # indirect call
-    "strlen",   # indirect call
-    "strnlen",  # indirect call
-    "memchr",   # indirect call
-    "memcmp",   # indirect call
-    "memmove",  # indirect call
+    # PLT entries and ordinary T/W definitions are usable.  IFUNC resolver
+    # offsets are deliberately excluded by process_plt_libc.
+    "strcmp",
+    "strncmp",
+    "strlen",
+    "strnlen",
+    "memchr",
+    "memcmp",
+    "memmove",
     "__printf_chk",
     "__memmove_chk",
     "memset",
@@ -67,12 +69,15 @@ def process_plt_libc(binary, outfile=None):
         if len(split) != 3:
             continue
         addr = int(split[0], 16) - base_address
-        name = split[2]
+        name = split[2].split('@', 1)[0]
         type = split[1]
         if type not in ["T", "W"]:
             continue
         # print(name)
-        if name in MODELS_LIBC:
+        # Only ordinary defined entries are dispatch PCs.  GNU IFUNC ('i')
+        # values designate resolvers, not implementations; the tracer learns
+        # actual implementations from completed guest PLT/GOT resolution.
+        if name in MODELS_LIBC or name in MODELS:
             if outfile is None:
                 print("%s,%s,0x%x" % (os.path.basename(binary), name, addr))
             else:

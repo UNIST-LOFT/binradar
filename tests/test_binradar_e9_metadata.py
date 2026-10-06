@@ -956,7 +956,7 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["env"] = env
         return binradar.binradar_utils.ExecutionResult(
-            success=True, exit_code=0, stdout="", stderr="")
+            success=True, exit_code=0, stdout="", stderr="[memcheck] [policy coverage-v1]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
 
@@ -1049,13 +1049,15 @@ def test_extract_relocated_call_jumps_synthetic(tmp_path):
 # PROBE normalized-fault-reference run budget
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("policy_ack", [
+    "[memcheck] [policy coverage-v1]\n", "", "[memcheck] [policy old]\n"])
 @pytest.mark.parametrize(("success", "timed_out", "exit_code", "expected"), [
     (False, True, -signal.SIGTERM, None),  # managed timeout with salvage
     (True, False, -signal.SIGTERM, None),  # external SIGTERM after communicate
     (True, False, -signal.SIGSEGV, 0x4000affb90),  # real guest crash self-signals
 ])
 def test_probe_reference_discriminates_guest_and_termination_signals(
-        tmp_path, monkeypatch, success, timed_out, exit_code, expected):
+        tmp_path, monkeypatch, success, timed_out, exit_code, expected, policy_ack):
     """Ignore cancellation salvage but retain a real guest-signal fault.
 
     QEMU re-raises real guest faults through a host signal too; blanket
@@ -1081,8 +1083,8 @@ def test_probe_reference_discriminates_guest_and_termination_signals(
         return SimpleNamespace(
             success=success, timed_out=timed_out, exit_code=exit_code,
             stdout="",
-            stderr="[snapshot] [fault-reference] [version 2] [valid true] "
-                   "[source guest-signal] [address 4000affb90]\n")
+            stderr=policy_ack + "[snapshot] [fault-reference] [version 3] [valid true] "
+                   "[source guest-signal] [address 4000affb90] [image none] [image-offset 0]\n")
 
     def fake_file_trace(
             self, testcase, patch_func_entry=0, verbose=True, timeout=60.0):
@@ -1108,6 +1110,12 @@ def test_probe_reference_discriminates_guest_and_termination_signals(
         binradar.binradar_verifier.BinRadarQemuRunner,
         "test_with_file_trace", fake_file_trace)
 
+    if policy_ack != "[memcheck] [policy coverage-v1]\n":
+        with pytest.raises(SystemExit, match="fresh run"):
+            executor.run_probe()
+        assert not (Path(executor.run_dir) / "probe-results.sbsv").exists()
+        assert "file_trace_timeout" not in captured
+        return
     executor.run_probe()
 
     # The default 900 s child cap is above the 600 s floor; neither PROBE
@@ -1149,7 +1157,7 @@ def test_probe_run_budget_respects_floor_and_child_cap(
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["reference_timeout"] = timeout
         return SimpleNamespace(success=True, timed_out=False, exit_code=0,
-                               stdout="", stderr="")
+                               stdout="", stderr="[memcheck] [policy coverage-v1]\n")
 
     def fake_file_trace(
             self, testcase, patch_func_entry=0, verbose=True, timeout=60.0):

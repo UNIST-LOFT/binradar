@@ -443,9 +443,6 @@ def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
 
 _TRACER_PARSER = sbsv.parser()
 _TRACER_PARSER.add_schema(
-    "[snapshot] [fault-reference] [version: int] [valid: bool] "
-    "[source: str] [address: hex]")
-_TRACER_PARSER.add_schema(
     "[snapshot] [crash] [hit-count: int] [reason: str] [guest_pc: hex] "
     "[guest_cs_base: hex] [fault_addr: hex] [host_fault_addr: hex]")
 _TRACER_PARSER.add_schema("[snapshot] [exit] [crash] [entrypoint-hit: int]")
@@ -457,24 +454,9 @@ _TRACER_PARSER.add_schema(
     "[kind: int] [last_writer: hex] [is_uaf: int] [ea_reg: int]")
 
 
-def extract_tracer_fault_addr(log: str) -> Optional[int]:
-    """Return a valid normalized fault-reference address, if published.
-
-    Live standalone comparisons consume only the explicit v2 normalized row.
-    The historical ``snapshot/crash`` exit row is intentionally not a fallback:
-    its address can be an exit PC, and an unavailable host signal is not a
-    valid guest instruction identity. Provenance-finalized accesses publish
-    the same normalized address in this row with source ``provenance-access``.
-    """
-    for line in log.splitlines():
-        row = _TRACER_PARSER.parse_line_detached(line)
-        if row is None or row.get_name() != "snapshot$fault-reference":
-            continue
-        if (row["version"] == 2 and row["valid"]
-                and row["source"] in ("guest-signal", "provenance-access")):
-            return row["address"]
-        return None
-    return None
+def extract_tracer_fault_reference(log: str) -> Optional[binradar_verifier.TracerFaultReference]:
+    """Read explicit typed identity, never promote a diagnostic crash PC."""
+    return binradar_verifier.read_snapshot_fault_reference(log)
 
 
 def extract_tracer_exit(log: str) -> str:
@@ -614,7 +596,7 @@ def run_qasan_probe(workdir: str, env: Dict[str, str], use_patched: bool,
 def run_tracer_probe(workdir: str, env: Dict[str, str],
                      testcase: str, timeout: float):
     """Run the fuzzolic tracer on <binary>.orig (no -symbolic) and parse
-    its explicit v2 normalized fault reference. Returns (fault_addr,
+    its explicit typed normalized fault reference. Returns (fault_reference,
     exit_str, result, repro); unavailable references return ``None``.
     Historical crash rows are not used as a fallback.
     """
@@ -666,7 +648,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     # SIGSEGV re-raised by QEMU stays usable.
     if binradar_verifier.tracer_execution_cancelled(result.exit_code):
         result.success = False
-    fault_addr = extract_tracer_fault_addr(result.stderr) if result.success else None
+    fault_addr = extract_tracer_fault_reference(result.stderr) if result.success else None
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""
     repro = format_repro_command(workdir, command, proc_env)
     return fault_addr, exit_str, result, repro
@@ -807,7 +789,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""
     crash_reason = extract_tracer_crash_reason(
         result.stderr) if result.success else ""
-    fault_addr = extract_tracer_fault_addr(
+    fault_addr = extract_tracer_fault_reference(
         result.stderr) if result.success else None
     prov_finding = extract_tracer_prov_finding(
         result.stderr) if result.success else None
@@ -1132,9 +1114,15 @@ def run_tracer_subject(exp_dir: str, workdir_name: str,
         result.detail = f"tracer did not record a crash (exit: {tracer_exit or 'none'})"
         return result
 
-    result.tracer_fault_addr = hex(tracer_addr)
+    result.tracer_fault_addr = (
+        f"image:{tracer_addr.image_id}+{tracer_addr.image_offset:#x}"
+        if tracer_addr.image_id is not None else hex(tracer_addr.address))
 
-    if tracer_addr != afl_addr:
+    if tracer_addr.image_id is not None:
+        result.status = Status.BASELINE
+        result.detail = "DSO identity comparison unavailable: QASAN reports only a raw PC"
+        return result
+    if tracer_addr.address != afl_addr:
         result.status = Status.FAIL
         result.detail = "fault address differs"
         return result
@@ -1223,7 +1211,9 @@ def run_memcheck_reach_subject(exp_dir: str, workdir_name: str,
     result.entrypoint_hit = str(entry_hits)
     result.crash_reason = crash_reason
     if fault_addr is not None:
-        result.fault_addr = hex(fault_addr)
+        result.fault_addr = (
+            f"image:{fault_addr.image_id}+{fault_addr.image_offset:#x}"
+            if fault_addr.image_id is not None else hex(fault_addr.address))
 
     if exit_str == "crash" and entry_hits == 0:
         result.status = Status.FAIL

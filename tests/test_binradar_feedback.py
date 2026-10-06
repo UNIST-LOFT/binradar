@@ -34,7 +34,10 @@ def _feedback_executor(tmp_path):
     executor.artifacts = SimpleNamespace(
         original=str(workdir / "target.orig"))
     executor.poc_input = "poc/input"
-    executor.probe_result = SimpleNamespace(fault_addr=0x1234)
+    executor.probe_result = SimpleNamespace(
+        fault_addr=0x1234,
+        tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
+            0x1234, "guest-signal"))
     executor.run_prefix = "run"
     executor.run_id = 0
     progress = []
@@ -42,13 +45,17 @@ def _feedback_executor(tmp_path):
     return executor, run_dir, progress
 
 
-def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1):
+def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version=3):
     return (
         f"[testcase] [result] [id {testcase_id}] [file {filename}] "
-        f"[version 2] [exit {exit_info}] [patch-loc 1000] [func-entry 2000] "
+        f"[version {version}] [exit {exit_info}] [patch-loc 1000] [func-entry 2000] "
         f"[patch-hit {patch_hit}] [func-hit 1] [fault-addr {fault_addr:x}] "
-        "[tracer-fault-valid false] [tracer-fault-source unavailable] "
-        "[tracer-fault-addr 0] [patch-func-candidates []] "
+        f"[tracer-fault-valid {'true' if exit_info == 'crash' else 'false'}] "
+        f"[tracer-fault-source {'guest-signal' if exit_info == 'crash' else 'unavailable'}] "
+        f"[tracer-fault-addr {fault_addr if exit_info == 'crash' else 0:x}] "
+        + ("[tracer-fault-image none] [tracer-fault-image-offset 0] "
+           "[memcheck-policy coverage-v1] " if version == 3 else "")
+        + "[patch-func-candidates []] "
         "[stacktrace []] [pid 0] [br [0]] [time 1]\n"
     )
 
@@ -89,12 +96,15 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
     # applied plan, including the synthesized value, so the copy must preserve
     # every mutation row byte for byte and not just the header.
     symbolic_sidecar = (
-        "[binradar-feedback] [version 2] [iteration 2] [patch 1] "
+        "[binradar-feedback] [version 3] [iteration 2] [patch 1] "
         "[snapshot-file iteration-00000002-patch-00000001.brch] "
         "[snapshot-count 1] [branches 1] [outcome normal] [fault-addr 0] "
         "[fault-valid false] [fault-source unavailable] "
+        "[fault-image none] [fault-image-offset 0] "
         "[poc-fault-addr 1234] [poc-fault-valid true] "
-        "[poc-fault-source guest-signal] [same-fault false] [result benign] "
+        "[poc-fault-source guest-signal] "
+        "[poc-fault-image none] [poc-fault-image-offset 0] "
+        "[same-fault false] [result benign] "
         "[mutation-writes 1]\n"
         "[binradar-mutation] [index 0] [kind bytes] [addr 404080] [size 4] "
         "[value 00100000] [target-extent 0]\n"
@@ -103,7 +113,7 @@ def test_feedback_uses_minimizer_baseline_rows_only_and_deduplicates(tmp_path):
         symbolic_sidecar)
 
     (run_dir / "minimizer.sbsv").write_text(
-        _full_row(0, "0_benign", "ok", 0)
+        _full_row(0, "0_benign", "ok", 0, version=2)
         + _full_row(1, "1_malicious", "crash", 0x1234)
         + _full_row(2, "2_other-fault", "crash", 0x5678)
         + _full_row(3, "3_duplicate", "ok", 0)

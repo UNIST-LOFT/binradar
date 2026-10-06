@@ -106,7 +106,9 @@ def _write_binradar(path: Path, output: TextIO,
                         f"[binradar] [crash] [iter {iteration.iteration}] "
                         f"[patch {patch}] [guest_pc 0] [guest_cs_base 0] "
                         f"[fault_addr {group.fault_addr:x}] "
-                        f"[host_fault_addr 0]\n")
+                        f"[host_fault_addr 0] "
+                        f"[image {group.image_id or 'none'}] "
+                        f"[image-offset {group.image_offset or 0:x}]\n")
                 else:
                     output.write(
                         f"[binradar] [normal] [iter {iteration.iteration}] "

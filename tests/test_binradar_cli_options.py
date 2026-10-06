@@ -231,7 +231,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
 
     parser = binradar.sbsv.parser()
     parser.add_schema(
-        "[binradar-setting] [version: int] [invocation: str] "
+        "[binradar-setting] [version: int] [memcheck-policy: str] [invocation: str] "
         "[execution-mode: str] [workdir: str] [outdir: str] "
         "[run-prefix: str] [run-id: int] [timeout: int] "
         "[target-patches: str] [target-patches-status: str] "
@@ -255,9 +255,9 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert row["effective-patches"] == 41
     assert row["disable-binradar"] is False
     assert row["symbolic-mutation-mode"] == "off"
-    # Settings v3 retains the v2 advisor budgets and adds the C1 controls, so a
-    # reader can match a trial against both orchestrator and tracer telemetry.
-    assert row["version"] == 3
+    # Settings preserve the effective checker policy independently of intent.
+    assert row["version"] == 4
+    assert row["memcheck-policy"] == "coverage-v1"
     assert row["mutation-portfolio"] == "replacement"
     assert row["representative-budget"] == "1234"
     assert row["symbolic-max-work"] == "500000"

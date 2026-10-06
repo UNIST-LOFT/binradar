@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import binradar_utils
+import binradar_verifier
 
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 SYMBOLIC_MUTATION_MODE_DEFAULT = "off"
@@ -388,6 +389,10 @@ def build_phase_environment(
     # Explicit crash-detection policy.
     environment["BINRADAR_MEMCHECK_ENABLE"] = (
         "1" if mode in MEMCHECK_ENABLED_MODES else "0")
+    if mode in MEMCHECK_ENABLED_MODES:
+        environment["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
+    else:
+        environment.pop("BINRADAR_MEMCHECK_POLICY", None)
 
     # Original-binary phases must not inherit patched E9 metadata.
     environment["E9_EXCLUDE_RANGES"] = ""

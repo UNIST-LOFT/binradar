@@ -16,12 +16,12 @@ def test_tracer_reference_requires_explicit_valid_v2_row():
         "[snapshot] [crash] [hit-count 1] [reason memcheck] "
         "[guest_pc dead] [guest_cs_base 0] [fault_addr dead] "
         "[host_fault_addr 0]\n")
-    assert binradar_test.extract_tracer_fault_addr(old_row) is None
+    assert binradar_test.extract_tracer_fault_reference(old_row) is None
 
     normalized = (
         "[snapshot] [fault-reference] [version 2] [valid true] "
         "[source provenance-access] [address 0]\n")
-    assert binradar_test.extract_tracer_fault_addr(normalized) == 0
+    assert binradar_test.extract_tracer_fault_reference(normalized).identity_key == ("main", 0)
 
 
 def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path):

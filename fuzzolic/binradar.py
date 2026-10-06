@@ -33,9 +33,6 @@ import sbsv
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
 FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
-TRACER_FAULT_REFERENCE_SCHEMA = (
-    "[snapshot] [fault-reference] [version: int] [valid: bool] "
-    "[source: str] [address: hex]")
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 # Floor for the PROBE normalized-fault-reference tracer run.  The reference
@@ -263,8 +260,8 @@ def _hex_diagnostic_value(value: str) -> Optional[int]:
 
 
 def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
-    """Validate and normalize one complete tracer plan-attempt v1 row."""
-    if fields.get("version") != "1":
+    """Validate and normalize one complete tracer plan-attempt row."""
+    if fields.get("version") not in ("1", "2"):
         return None
     attempt = _unsigned_diagnostic_value(fields.get("attempt", ""))
     if attempt is None or attempt == 0:
@@ -277,6 +274,9 @@ def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
         "attempt-result", "committed", "source-retained",
     )
     if any(name not in fields for name in required):
+        return None
+    if fields["version"] == "2" and any(name not in fields for name in (
+            "patch0-fault-image", "patch0-fault-image-offset")):
         return None
 
     def number_or_unknown(name: str) -> str:
@@ -301,7 +301,7 @@ def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
         return "unknown"
 
     normalized = {
-        "version": "1",
+        "version": fields["version"],
         "epoch": number_or_unknown("epoch"),
         "attempt": str(attempt),
         "advisor-id": number_or_unknown("advisor-id"),
@@ -326,6 +326,9 @@ def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
         "committed": bool_or_unknown("committed"),
         "source-retained": bool_or_unknown("source-retained"),
     }
+    for name in ("patch0-fault-image", "patch0-fault-image-offset"):
+        if name in fields:
+            normalized[name] = fields[name]
     if normalized["patch0-fault-source"] not in (
             "guest-signal", "provenance-access", "unavailable", "unknown"):
         normalized["patch0-fault-source"] = "unknown"
@@ -353,6 +356,21 @@ def _classify_plan_attempt_outcome(
     address = _hex_diagnostic_value(row.get("patch0-fault-addr", ""))
     if address is None:
         return "unclassified-crash"
+    image = row.get("patch0-fault-image")
+    offset_text = row.get("patch0-fault-image-offset")
+    if reference.image_id is not None or image is not None or offset_text is not None:
+        if image is None or offset_text is None:
+            return "unclassified-crash"
+        offset = _hex_diagnostic_value(offset_text)
+        try:
+            image, offset = binradar_verifier.decode_fault_image_fields(
+                {"image": image, "image-offset": offset})
+            observed = binradar_verifier.TracerFaultReference(
+                address, row["patch0-fault-source"], image, offset)
+        except ValueError:
+            return "unclassified-crash"
+        return ("poc-crash" if observed.identity_key == reference.identity_key
+                else "other-crash")
     if address == reference.address:
         return "poc-crash"
     return "other-crash"
@@ -927,6 +945,7 @@ class BinRadarExecutor:
                 reverse_directed=self.reverse_directed,
                 less_strict=self.less_strict,
                 forkserver_child_timeout=self.forkserver_child_timeout,
+                memcheck_policy=binradar_verifier.MEMCHECK_POLICY,
             ),
         )
 
@@ -1017,6 +1036,7 @@ class BinRadarExecutor:
                 dict(phase_environment),
                 original=self.artifacts.original,
                 probe_reference=self.probe_result.tracer_fault_reference,
+                probe_policy=self.probe_result.memcheck_policy,
                 selected_binary=tracer_binary,
                 patch_loc=self.patch_loc,
                 test_cmd=self.test_cmd,
@@ -1070,11 +1090,10 @@ class BinRadarExecutor:
                 sys.exit(
                     "ERROR: existing probe result is unreadable; start a fresh "
                     "run with --run-id n instead of overwriting it.")
-            if getattr(self.probe_result, "_probe_serialization_version", 1) != 2:
-                sys.exit(
-                    "ERROR: existing probe result uses the legacy fault "
-                    "reference format; start a fresh run with --run-id n "
-                    "to regenerate PROBE without rewriting historical data.")
+            try:
+                self.probe_result.require_current_memcheck_policy()
+            except ValueError as exc:
+                sys.exit(f"ERROR: {exc}")
             self.set_config("BINRADAR_ENTRYPOINT",
                             hex(self.probe_result.patch_func_entry))
             logger.info(
@@ -1118,6 +1137,7 @@ class BinRadarExecutor:
         tracer_env["E9_EXCLUDE_RANGES"] = ""
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+        tracer_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")
         # The reference run instruments the whole original binary with the
         # memcheck/provenance policy, so on a slow subject it costs far more
@@ -1133,9 +1153,14 @@ class BinRadarExecutor:
         tracer_result = binradar_utils.execute(
             tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=probe_timeout,
             verbose=False)
-        parser = sbsv.parser()
-        parser.add_schema(TRACER_FAULT_REFERENCE_SCHEMA)
         tracer_fault_reference = None
+        policy_acknowledged = binradar_verifier.tracer_memcheck_policy_acknowledged(
+            tracer_result.stderr or "")
+        if not policy_acknowledged:
+            sys.exit(
+                "ERROR: tracer did not acknowledge memcheck policy coverage-v1; "
+                "use an updated tracer and start a fresh run with --run-id n.")
+        probe_result.memcheck_policy = binradar_verifier.MEMCHECK_POLICY
         if tracer_result.timed_out:
             logger.warning(
                 f"[PROBE] Tracer reference run exceeded {probe_timeout:g}s and "
@@ -1153,15 +1178,8 @@ class BinRadarExecutor:
                 "signal; no normalized fault reference is published from "
                 "its salvaged output.")
         elif tracer_result.success:
-            result = parser.loads(tracer_result.stderr)
-            rows = result["snapshot"]["fault-reference"]
-            if rows:
-                row = rows[-1]
-                if row["version"] == 2 and row["valid"] \
-                        and row["source"] in binradar_verifier.TRACER_FAULT_VALID_SOURCES:
-                    tracer_fault_reference = (
-                        binradar_verifier.TracerFaultReference(
-                            row["address"], row["source"]))
+            tracer_fault_reference = binradar_verifier.read_snapshot_fault_reference(
+                tracer_result.stderr, require_current=True)
 
         if tracer_fault_reference is None:
             logger.warning(
@@ -1463,6 +1481,12 @@ class BinRadarExecutor:
                     "1" if reference_valid else "0")
                 binradar_env["BINRADAR_POC_FAULT_SOURCE"] = (
                     reference.source if reference_valid else "unavailable")
+                binradar_env["BINRADAR_POC_FAULT_IMAGE_OFFSET"] = hex(
+                    reference.image_offset if reference_valid and reference.image_id is not None else 0)
+                if reference_valid and reference.image_id is not None:
+                    binradar_env["BINRADAR_POC_FAULT_IMAGE"] = reference.image_id
+                else:
+                    binradar_env.pop("BINRADAR_POC_FAULT_IMAGE", None)
                 if reference_valid:
                     binradar_env["BINRADAR_POC_FAULT_ADDR"] = hex(
                         reference.address)
@@ -1843,7 +1867,7 @@ class BinRadarExecutor:
                 run_dir=self.run_dir,
                 original_binary=self.artifacts.original,
                 poc_source=self.resolved_poc_input(),
-                poc_fault_addr=self.probe_result.fault_addr,
+                poc_fault_reference=self.probe_result.tracer_fault_reference,
                 run_prefix=self.run_prefix,
                 run_id=self.run_id,
                 save_progress=self.save_progress,
@@ -1963,7 +1987,7 @@ class BinRadarExecutor:
             reference = self.probe_result.tracer_fault_reference
             legacy_probe = (
                 getattr(self.probe_result, "_probe_serialization_version", 1)
-                != 2)
+                != 3)
             if legacy_probe:
                 if reference is None:
                     probe_summary = "legacy probe (fault reference unavailable)"

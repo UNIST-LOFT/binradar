@@ -96,10 +96,12 @@ def _make_workdir(tmp_path):
     poc.write_bytes(b"poc")
     # Probe results as run_probe() itself serializes them.
     (rundir / "probe-results.sbsv").write_text(
-        "[probe-info] [version 2] [exit crash] [patch-loc 1000] "
+        "[probe-info] [version 3] [exit crash] [patch-loc 1000] "
         "[func-entry 2000] [patch-hit 1] [func-hit 1] [fault-addr 1234] "
         "[tracer-fault-valid false] [tracer-fault-source unavailable] "
-        "[tracer-fault-addr 0] [patch-func-candidates []] [stacktrace []]\n"
+        "[tracer-fault-addr 0] [tracer-fault-image none] "
+        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v1] "
+        "[patch-func-candidates []] [stacktrace []]\n"
         "[file-trace] [need-file-hook false]\n")
     # Already-produced testcases (as the fuzzolic producer phase would leave).
     testcases = rundir / "fuzzolic-tests"
@@ -107,6 +109,26 @@ def _make_workdir(tmp_path):
     (testcases / "tc_0.dat").write_bytes(b"aaa")
     (testcases / "tc_1.dat").write_bytes(b"bbb")
     return workdir, rundir
+
+
+@pytest.mark.parametrize("policy", [None, "old", "unavailable"])
+def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, policy):
+    workdir, rundir = _make_workdir(tmp_path)
+    probe_file = rundir / "probe-results.sbsv"
+    row = probe_file.read_text().replace(
+        "[tracer-fault-valid false] [tracer-fault-source unavailable]",
+        "[tracer-fault-valid true] [tracer-fault-source guest-signal]")
+    if policy is None:
+        row = row.replace("[version 3]", "[version 2]").replace(
+            "[memcheck-policy coverage-v1] ", "").replace(
+            "[tracer-fault-image none] [tracer-fault-image-offset 0] ", "")
+    else:
+        row = row.replace("[memcheck-policy coverage-v1]", f"[memcheck-policy {policy}]")
+    probe_file.write_text(row)
+    executor = _build_executor(workdir)
+    with pytest.raises(SystemExit, match="--run-id n"):
+        executor.run_single_phase("run", "0", binradar.BinRadarPhase.PROBE)
+    assert probe_file.read_text() == row
 
 
 def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":

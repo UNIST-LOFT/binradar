@@ -108,12 +108,14 @@ class RunSettings:
     symbolic_max_work: Optional[int] = None
     symbolic_max_bytes: Optional[int] = None
     symbolic_deadline_ms: Optional[int] = None
+    memcheck_policy: Optional[str] = None
 
 
 # Settings row schema version.  Version 1 rows carry no advisor budgets;
 # version 2 carries P4a/B fields; version 3 adds the C1 portfolio and
-# representative budget.
-RUN_SETTINGS_VERSION = 3
+# representative budget. Version 4 records the selected memcheck policy;
+# actual tracer acknowledgement is persisted separately in the v3 probe.
+RUN_SETTINGS_VERSION = 4
 
 
 class RunRecordStore:
@@ -164,6 +166,7 @@ class RunRecordStore:
         fields = [
             "[binradar-setting]",
             f"[version {RUN_SETTINGS_VERSION}]",
+            field("memcheck-policy", settings.memcheck_policy or "unavailable"),
             field("invocation", settings.invocation),
             field("execution-mode", settings.execution_mode),
             field("workdir", settings.workdir),

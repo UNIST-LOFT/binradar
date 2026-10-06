@@ -272,7 +272,7 @@ def main():
         probe_result = run_probe(workdir, env, probe_file)
     reference = probe_result.tracer_fault_reference
     legacy_probe = (
-        getattr(probe_result, "_probe_serialization_version", 1) != 2)
+        getattr(probe_result, "_probe_serialization_version", 1) != 3)
     if legacy_probe:
         if reference is None:
             probe_summary = "[legacy probe (fault reference unavailable)]"
