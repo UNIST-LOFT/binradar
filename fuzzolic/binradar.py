@@ -1139,6 +1139,15 @@ class BinRadarExecutor:
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")
+        # The reference pass must use the same executable window as the
+        # BINRADAR forkserver children: those resume at the patch function
+        # entry, so a finding published before that entry can never be
+        # reproduced by the sweep.  Declaring the entrypoint makes the tracer
+        # exclude such pre-window events from the reference identity (they are
+        # still reported as `[prov] [prefix-finding]` diagnostics) instead of
+        # publishing an identity that makes `same-fault` unreachable.
+        if probe_result.patch_func_entry:
+            tracer_env["BINRADAR_ENTRYPOINT"] = hex(probe_result.patch_func_entry)
         # The reference run instruments the whole original binary with the
         # memcheck/provenance policy, so on a slow subject it costs far more
         # than the un-instrumented PROBE. A short timeout can kill it before it
