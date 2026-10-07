@@ -1877,6 +1877,8 @@ class BinRadarExecutor:
                 original_binary=self.artifacts.original,
                 poc_source=self.resolved_poc_input(),
                 poc_fault_reference=self.probe_result.tracer_fault_reference,
+                poc_concrete_fault_addr=self.probe_result.concrete_fault_addr,
+                poc_memcheck_policy=self.probe_result.memcheck_policy,
                 run_prefix=self.run_prefix,
                 run_id=self.run_id,
                 save_progress=self.save_progress,

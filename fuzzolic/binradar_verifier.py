@@ -81,6 +81,15 @@ PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
     "[memcheck-policy: str]")
 
 
+# Independent of tracer memcheck policy and wire version: this observation is
+# emitted by the QASAN runner, never inferred from a tracer finding. Historical
+# v3 rows without these fields remain readable but cannot authorize concrete
+# malicious feedback.
+CONCRETE_ORACLE = "qasan-main-v1"
+CONCRETE_ORACLE_FIELDS = (
+    "[concrete-oracle: str] [concrete-fault-valid: bool]")
+
+
 def tracer_memcheck_policy_acknowledged(log: str) -> bool:
     """Require the runtime acknowledgement, not an inherited configuration."""
     parser = sbsv.parser()
@@ -368,6 +377,9 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
 
 
 class BinRadarProbeResult:
+    current_line_parser: sbsv.parser = sbsv.parser()
+    current_line_parser.add_schema(PROBE_RESULT_SCHEMA_V3 + " " + CONCRETE_ORACLE_FIELDS)
+    current_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_schema(PROBE_RESULT_SCHEMA_V3)
     line_parser.add_schema("[file-trace] [need-file-hook: bool]")
@@ -384,7 +396,9 @@ class BinRadarProbeResult:
             patch_hit_cnt: int, patch_func_hit_cnt: int, fault_addr: int,
             patch_func_candidates: List[Tuple[int, int]],
             tracer_fault_reference: Optional[TracerFaultReference] = None,
-            memcheck_policy: Optional[str] = None):
+            memcheck_policy: Optional[str] = None,
+            concrete_oracle: Optional[str] = None,
+            concrete_fault_valid: bool = False):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
         self.stacktrace = stacktrace
@@ -395,8 +409,19 @@ class BinRadarProbeResult:
         self.patch_func_candidates = patch_func_candidates
         self.tracer_fault_reference = tracer_fault_reference
         self.memcheck_policy = memcheck_policy
+        self.concrete_oracle = concrete_oracle
+        self.concrete_fault_valid = concrete_fault_valid
         self._probe_serialization_version = 3
         self.need_file_hook = False
+
+    @property
+    def concrete_fault_addr(self) -> Optional[int]:
+        """QASAN main-image instruction identity, not a tracer reference."""
+        if (self.concrete_oracle == CONCRETE_ORACLE
+                and self.concrete_fault_valid and self.exit_info == "crash"
+                and 0 <= self.fault_addr <= 0xffffffffffffffff):
+            return self.fault_addr
+        return None
     
     def require_current_memcheck_policy(self) -> None:
         """Historical probes are readable, but cannot authorize live phases."""
@@ -483,7 +508,16 @@ class BinRadarProbeResult:
         if len(result["fault-addr"]) != 0:
             fault_addr_info = result["fault-addr"][-1]
             fault_addr = fault_addr_info["addr"]
-        
+        # binradar-trace.c emits fault-addr only for a resolved main-image
+        # instruction/caller. Require its runtime exit acknowledgment too;
+        # an absent address is not a valid PC-zero observation.
+        expected_kind = {"crash": "crash", "ok": "end"}.get(exit_result)
+        acknowledged = (bool(result["qemu-exit"]) and expected_kind is not None
+                        and result["qemu-exit"][-1]["kind"] == expected_kind)
+        concrete_oracle = CONCRETE_ORACLE if acknowledged else None
+        concrete_fault_valid = (acknowledged and exit_result == "crash"
+                                and bool(result["fault-addr"]))
+
         return BinRadarProbeResult(
             patch_loc=patch_loc,
             patch_func_entry=patch_func_entry,
@@ -492,7 +526,9 @@ class BinRadarProbeResult:
             patch_hit_cnt=patch_hit_cnt,
             patch_func_hit_cnt=patch_func_hit_cnt,
             fault_addr=fault_addr,
-            patch_func_candidates=patch_func_candidates
+            patch_func_candidates=patch_func_candidates,
+            concrete_oracle=concrete_oracle,
+            concrete_fault_valid=concrete_fault_valid,
         )
     
     @staticmethod
@@ -500,7 +536,8 @@ class BinRadarProbeResult:
         with open(sbsv_file, "r", encoding="utf-8") as f:
             data = f.read()
         result = None
-        for parser in (BinRadarProbeResult.line_parser,
+        for parser in (BinRadarProbeResult.current_line_parser,
+                       BinRadarProbeResult.line_parser,
                        BinRadarProbeResult.v2_line_parser,
                        BinRadarProbeResult.legacy_line_parser):
             try:
@@ -544,6 +581,10 @@ class BinRadarProbeResult:
             tracer_fault_reference=tracer_fault_reference,
             memcheck_policy=(_row_field(probe_info, "memcheck-policy")
                              if version == 3 else None),
+            concrete_oracle=(_row_field(probe_info, "concrete-oracle")
+                             if version == 3 else None),
+            concrete_fault_valid=(_row_field(probe_info, "concrete-fault-valid", False)
+                                  if version == 3 else False),
         )
         probe_result.need_file_hook = result["file-trace"][-1]["need-file-hook"]
         probe_result._probe_serialization_version = version or 1
@@ -621,7 +662,9 @@ class BinRadarProbeResult:
             f"[tracer-fault-image-offset {self.tracer_fault_reference.image_offset if valid and self.tracer_fault_reference.image_offset is not None else 0:x}] "
             f"[memcheck-policy {self.memcheck_policy or 'unavailable'}] "
             f"[patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] "
-            f"[stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]]")
+            f"[stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]] "
+            f"[concrete-oracle {self.concrete_oracle or 'unavailable'}] "
+            f"[concrete-fault-valid {'true' if self.concrete_fault_addr is not None else 'false'}]")
 
     def serialize_file_trace_result(self) -> str:
         return f"[need-file-hook {self.need_file_hook}]"
@@ -630,8 +673,8 @@ class BinRadarProbeResult:
     def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
         for line in data.splitlines():
             res = None
-            for parser in (cls.line_parser, cls.v2_line_parser,
-                           cls.legacy_line_parser):
+            for parser in (cls.current_line_parser, cls.line_parser,
+                           cls.v2_line_parser, cls.legacy_line_parser):
                 try:
                     res = parser.parse_line_detached(line)
                 except ValueError:
@@ -667,6 +710,10 @@ class BinRadarProbeResult:
                     tracer_fault_reference=tracer_fault_reference,
                     memcheck_policy=(_row_field(res, "memcheck-policy")
                                      if version == 3 else None),
+                    concrete_oracle=(_row_field(res, "concrete-oracle")
+                                     if version == 3 else None),
+                    concrete_fault_valid=(_row_field(res, "concrete-fault-valid", False)
+                                          if version == 3 else False),
                 )
                 probe_result._probe_serialization_version = (
                     version or 1)

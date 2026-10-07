@@ -190,22 +190,23 @@ def test_baseline_compares_dso_sites_across_aslr(image, offset, expected):
     assert check.status == expected
 
 
-def test_feedback_exports_only_matching_dso_sites(tmp_path):
+def test_feedback_keeps_concrete_and_dso_tracer_oracles_separate(tmp_path):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     executor.probe_result.tracer_fault_reference = verifier.TracerFaultReference(
         0x7000123, "provenance-access", IMAGE, 0x123)
     rows = []
-    for index, (image, offset, pc) in enumerate([
-            (IMAGE, 0x123, 0x9000123), (OTHER_IMAGE, 0x123, 0x7000123),
-            (IMAGE, 0x124, 0x7000123)]):
+    for index, (image, pc) in enumerate([
+            (OTHER_IMAGE, 0x1234), (IMAGE, 0x5678), (IMAGE, 0x7000123)]):
         name = f"{index}_site"
         (run_dir / "minimized" / name).write_bytes(bytes([index]))
         rows.append(_full_row(index, name, "crash", pc).replace(
+            "[tracer-fault-valid false] [tracer-fault-source unavailable] [tracer-fault-addr 0]",
+            "[tracer-fault-valid true] [tracer-fault-source provenance-access] [tracer-fault-addr 9000123]").replace(
             "[tracer-fault-image none] [tracer-fault-image-offset 0]",
-            f"[tracer-fault-image {image}] [tracer-fault-image-offset {offset:x}]"))
+            f"[tracer-fault-image {image}] [tracer-fault-image-offset 123]"))
     (run_dir / "minimizer.sbsv").write_text("".join(rows))
     executor.run_feedback()
-    assert [p.name for p in (run_dir / "feedback" / "concrete" / "malicious").iterdir()] == ["0_site"]
+    assert {p.name for p in (run_dir / "feedback/concrete/malicious").iterdir()} == {"0_site"}
 
 
 def test_plan_diagnostics_compare_sites_and_preserve_main_history():
