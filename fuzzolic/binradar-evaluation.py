@@ -268,20 +268,28 @@ def main():
         if probe_result is None:
             sys.exit(f"ERROR: failed to parse probe result: {probe_file}")
         logger.info(f"[PROBE] Loaded existing probe result: {probe_file}")
+        if getattr(probe_result, "_probe_serialization_version", 1) \
+                != binradar_verifier.CURRENT_PROBE_RESULT_VERSION:
+            # A legacy probe carries no current concrete oracle: every crash
+            # row would be dropped as an unevaluable fault address, and
+            # candidates could be emitted as verified with zero evidence.
+            # Regenerate the evaluation probe instead of silently proceeding;
+            # evaluation outputs are replaceable and need no legacy backup.
+            logger.warning(
+                f"[PROBE] Existing probe {probe_file} predates concrete "
+                f"oracle version {binradar_verifier.CURRENT_PROBE_RESULT_VERSION}; "
+                "running a fresh probe")
+            probe_file = os.path.join(eval_dir, "probe-results.sbsv")
+            probe_result = run_probe(workdir, env, probe_file)
     else:
         probe_result = run_probe(workdir, env, probe_file)
     reference = probe_result.tracer_fault_reference
-    legacy_probe = (
-        getattr(probe_result, "_probe_serialization_version", 1) != 3)
-    if legacy_probe:
-        if reference is None:
-            probe_summary = "[legacy probe (fault reference unavailable)]"
-        else:
-            probe_summary = (
-                f"[legacy reference {reference.address:#x} "
-                f"({reference.source})]")
+    if reference is None:
+        probe_summary = "[probe (fault reference unavailable)]"
     else:
-        probe_summary = probe_result.serialize()
+        probe_summary = (
+            f"[reference {reference.address:#x} "
+            f"({reference.source})]")
     logger.info(f"[PROBE] {probe_summary}")
 
     # 1b. Filter: keep only patches that do not crash at the original fault

@@ -598,13 +598,35 @@ def test_verifier_capture_drains_text_and_cached_channels(tmp_path, monkeypatch)
         "import os\n"
         "os.write(int(os.environ['PATCH_FD']), b'[patch] [id 0] [br 1] [v 0]\\n')\n"
         "os.write(int(os.environ['PATCH_CACHED_FD']), b'BRCH-snapshot')\n")
+    # A patched-artifact capture validates its E9 identity map before any
+    # execution, so the fixture carries a bound artifact/original pair.
+    import hashlib
+    import json
+    import struct
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 32, 64)
+    struct.pack_into("<HH", header, 54, 56, 1)
+    (tmp_path / "subject.orig").write_bytes(
+        bytes(header)
+        + struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, 0, 0x1000, 0x1000))
+    binary = tmp_path / "subject.brcached"
+    binary.write_bytes(b"cache")
+    (tmp_path / "subject.brcached.e9map.json").write_text(json.dumps({
+        "version": 1,
+        "artifact-sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "original-sha256": hashlib.sha256(
+            (tmp_path / "subject.orig").read_bytes()).hexdigest(),
+        "instructions": [],
+    }))
     runner = binradar.binradar_verifier.BinRadarQemuRunner(
         dir=str(tmp_path), binary="subject", test_cmd="",
-        patch_loc="0x401000")
+        patch_loc="0x400000",
+        e9_metadata={"brcached": ("0x6000-0x7000", [])})
     monkeypatch.setattr(
         runner, "get_qemu_stacktrace_command_for_binary",
         lambda _binary, _testcase: [sys.executable, str(helper)])
-    probe = SimpleNamespace(fault_addr=0)
+    probe = SimpleNamespace(fault_addr=0, concrete_fault_valid=False)
     monkeypatch.setattr(
         binradar.binradar_verifier.BinRadarProbeResult, "from_log",
         lambda _log: probe)
@@ -992,6 +1014,18 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
 # Relocated-call extraction on synthetic artifacts (fixture guard)
 # ---------------------------------------------------------------------------
 
+def _write_original_instruction(path, instruction, address=0x401000):
+    """Minimal ELF64 executable with one file-backed executable segment."""
+    data = bytearray(PAGE * 2)
+    data[:16] = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16,
+                     2, 62, 1, address, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+    struct.pack_into("<IIQQQQQQ", data, 64,
+                     1, 5, PAGE, address, address, PAGE, PAGE, PAGE)
+    data[PAGE:PAGE + len(instruction)] = instruction
+    path.write_bytes(data)
+
+
 def _write_call_artifacts(tmp_path):
     """Original with one direct call; patched with refactor + trampoline.
 
@@ -1001,14 +1035,14 @@ def _write_call_artifacts(tmp_path):
               ``push 0x401005; jmp 0x401105`` (the E9 call-emulation pair).
     """
     original = tmp_path / "bin.orig"
-    original.write_bytes(b"\xe8\x00\x01\x00\x00" + b"\x00" * 0xFFB)
+    _write_original_instruction(original, b"\xe8\x00\x01\x00\x00")
 
     metadata = tmp_path / "bin.brpatched.json"
     metadata.write_text(
         '{"jsonrpc":"2.0","method":"instruction","params":'
-        '{"address":"0x401000","length":5,"offset":0},"id":1}\n'
+        '{"address":"0x401000","length":5,"offset":4096},"id":1}\n'
         '{"jsonrpc":"2.0","method":"patch","params":{"trampoline":"$tmp_0",'
-        '"metadata":{},"offset":0},"id":2}\n')
+        '"metadata":{},"offset":4096},"id":2}\n')
 
     patched = tmp_path / "bin.brpatched"
     _write_synthetic_e9_binary(
@@ -1033,6 +1067,178 @@ def _write_call_artifacts(tmp_path):
     return original, metadata, patched
 
 
+@pytest.mark.parametrize("instruction,moved", [
+    (b"\xff\x14\x24", b"\xff\x64\x24\x08"),
+    (b"\xff\x54\x24\xf8", b"\xff\x24\x24"),  # disp8 -> disp0
+    (b"\xff\x54\x24\x77", b"\xff\x64\x24\x7f"),
+    (b"\xff\x54\x24\x78", b"\xff\xa4\x24\x80\x00\x00\x00"),
+    (b"\xff\x94\x24\x78\xff\xff\xff", b"\xff\x64\x24\x80"),
+    (b"\xff\x94\x24\xf8\xff\xff\xff", b"\xff\x24\x24"),
+    (b"\xff\x94\x24\x00\x01\x00\x00", b"\xff\xa4\x24\x08\x01\x00\x00"),
+    (b"\xff\x14\xcc", b"\xff\x64\xcc\x08"),  # rsp + rcx*8
+    (b"\x42\xff\x14\x64", b"\x42\xff\x64\x64\x08"),  # rsp + r12*2
+    (b"\x67\xff\x14\x24", b"\x67\xff\x64\x24\x08"),
+    (b"\x64\xff\x14\x24", b"\x64\xff\x64\x24\x08"),
+    (b"\x41\xff\x14\x24", b"\x41\xff\x24\x24"),  # r12 is not rsp
+])
+def test_rsp_memory_call_exact_identity(tmp_path, instruction, moved):
+    import json
+    prefix = b"\x68" + struct.pack("<I", 0x401000 + len(instruction))
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=moved, prefix=prefix)
+    runtime = binradar_setup.extract_e9_runtime_metadata(
+        patched, metadata, original, 0x401000)
+    assert runtime.relocated_calls == ((pc, 0x401000, 0x401000 + len(instruction)),)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == [
+        {"relocated": pc, "original": 0x401000}]
+
+
+@pytest.mark.parametrize("instruction,moved", [
+    (b"\xff\x14\x24", b"\xff\x24\x24"),  # missing adjustment
+    (b"\xff\x14\x24", b"\xff\x64\x24\x10"),
+    (b"\xff\x14\xcc", b"\xff\x64\xd4\x08"),  # wrong base
+    (b"\xff\x14\xcc", b"\xff\x64\xc4\x08"),  # wrong index
+    (b"\xff\x14\xcc", b"\xff\x64\x8c\x08"),  # wrong scale
+    (b"\x67\xff\x14\x24", b"\xff\x64\x24\x08"),
+    (b"\x41\xff\x14\x24", b"\x41\xff\x64\x24\x08"),
+])
+def test_rsp_memory_call_mismatch_rejects_identity(tmp_path, instruction, moved):
+    prefix = b"\x68" + struct.pack("<I", 0x401000 + len(instruction))
+    original, metadata, patched, _ = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=moved, prefix=prefix)
+    sidecar = Path(str(patched) + ".e9map.json")
+    sidecar.write_text("stale")
+    with pytest.raises(ValueError, match="expected one proved"):
+        binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert not sidecar.exists()
+
+
+def test_original_call_at_executable_segment_end(tmp_path):
+    import json
+    original, metadata, patched = _write_call_artifacts(tmp_path)
+    data = bytearray(original.read_bytes())
+    struct.pack_into("<QQ", data, 64 + 32, 5, 5)
+    original.write_bytes(data)
+    runtime = binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert runtime.relocated_calls == ((0x54b005, 0x401000, 0x401005),)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == [
+        {"relocated": 0x54b005, "original": 0x401000}]
+    # The fifth byte physically exists, but is outside executable file bytes.
+    struct.pack_into("<QQ", data, 64 + 32, 4, 4)
+    original.write_bytes(data)
+    assert binradar_setup._original_instruction_run(bytes(data), 0x401000) == []
+    with pytest.raises(ValueError, match="original ELF address"):
+        binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert not Path(str(patched) + ".e9map.json").exists()
+
+
+def _install_trap_records(patched, records, *, table_offset=512, trap_sites=(0x401000,)):
+    data = bytearray(patched.read_bytes())
+    fields = list(binradar_setup.E9_CONFIG_STRUCT.unpack_from(data))
+    fields[20:22] = [len(records), table_offset]
+    binradar_setup.E9_CONFIG_STRUCT.pack_into(data, 0, *fields)
+    for index, record in enumerate(records):
+        struct.pack_into("<qq", data, table_offset + index * 16, *record)
+    for site in trap_sites:
+        data[PAGE + site - 0x401000] = 0x27
+    patched.write_bytes(data)
+
+
+@pytest.mark.parametrize("is_call", [False, True])
+@pytest.mark.parametrize("chain", ["trap", "trap-jump", "jump-trap", "trap-trap"])
+def test_trap_executed_instruction_identity(tmp_path, is_call, chain):
+    import json
+    if is_call:
+        original, metadata, patched = _write_call_artifacts(tmp_path)
+        pc, ret = 0x54b005, 0x401005
+    else:
+        original, metadata, patched, pc = _write_instruction_artifacts(tmp_path, b"\x80\x38\x03")
+    if chain == "trap":
+        _install_trap_records(patched, [(0x401000, 0x54b000)])
+    elif chain == "trap-trap":
+        _install_trap_records(patched, [(0x401000, 0x401010), (0x401010, 0x54b000)],
+                              trap_sites=(0x401000, 0x401010))
+    else:
+        data = bytearray(patched.read_bytes())
+        source, target = ((0x401010, 0x54b000) if chain == "trap-jump"
+                          else (0x401000, 0x401010))
+        position = PAGE + source - 0x401000
+        data[position:position + 5] = b"\xe9" + struct.pack("<i", target - source - 5)
+        patched.write_bytes(data)
+        trap_source, trap_target = ((0x401000, 0x401010) if chain == "trap-jump"
+                                    else (0x401010, 0x54b000))
+        _install_trap_records(patched, [(trap_source, trap_target)], trap_sites=(trap_source,))
+    runtime = binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert runtime.relocated_calls == (((pc, 0x401000, ret),) if is_call else ())
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == [
+        {"relocated": pc, "original": 0x401000}]
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_unresolvable_trap_entry_never_uses_dead_copy(tmp_path, recorded):
+    import json
+    original, metadata, patched, _ = _write_instruction_artifacts(tmp_path, b"\x80\x38\x03")
+    records = [(0x401000, 0x401010), (0x401010, 0x401000)] if recorded else []
+    if recorded:
+        _install_trap_records(patched, records, trap_sites=(0x401000, 0x401010))
+    else:
+        data = bytearray(patched.read_bytes())
+        data[PAGE] = 0x27
+        patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == []
+
+
+@pytest.mark.parametrize("encoded", [b"\x48", b"\x66", b"\xff", b"\xe8\x00\x01\x00"])
+def test_original_run_rejects_incomplete_segment_tail(tmp_path, encoded):
+    original = tmp_path / "bin.orig"
+    _write_original_instruction(original, encoded)
+    data = bytearray(original.read_bytes())
+    struct.pack_into("<QQ", data, 64 + 32, len(encoded), len(encoded))
+    assert binradar_setup._original_instruction_run(bytes(data), 0x401000) == []
+
+
+@pytest.mark.parametrize("defect", ["past-loader", "past-file", "header", "duplicate",
+                                    "unsorted", "wrong-byte", "wrong-site", "wrong-target", "negative"])
+def test_invalid_artifact_trap_records_remove_stale_map(tmp_path, defect):
+    original, metadata, patched = _write_call_artifacts(tmp_path)
+    records = [(0x401000, 0x54b000)]
+    offset = 512
+    trap_sites = (0x401000,)
+    if defect == "duplicate":
+        records.append((0x401000, 0x54b010))
+    elif defect == "unsorted":
+        records = [(0x401010, 0x54b000), (0x401000, 0x54b000)]
+        trap_sites = (0x401000, 0x401010)
+    elif defect == "wrong-byte":
+        trap_sites = ()
+    elif defect == "wrong-site":
+        records = [(0x402000, 0x54b000)]
+    elif defect == "wrong-target":
+        records = [(0x401000, 0xdeadbeef)]
+    elif defect == "negative":
+        records = [(-1, 0x54b000)]
+    elif defect == "header":
+        offset = 16
+    elif defect == "past-loader":
+        offset = PAGE - 8
+    elif defect == "past-file":
+        offset = 3 * PAGE - 8
+    if defect == "past-file":
+        data = bytearray(patched.read_bytes())
+        data.extend(b"\0" * 16)
+        patched.write_bytes(data)
+    _install_trap_records(patched, records, table_offset=offset, trap_sites=trap_sites)
+    if defect == "past-file":
+        data = patched.read_bytes()[:3 * PAGE]
+        patched.write_bytes(data)
+    sidecar = Path(str(patched) + ".e9map.json")
+    sidecar.write_text("stale")
+    with pytest.raises(ValueError):
+        binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert not sidecar.exists()
+
+
 def test_extract_relocated_call_jumps_synthetic(tmp_path):
     """One instrumented direct call maps to its trampoline jump (guard).
 
@@ -1043,6 +1249,512 @@ def test_extract_relocated_call_jumps_synthetic(tmp_path):
     jumps = binradar_setup.extract_relocated_call_jumps(
         patched, metadata, original, 0x401000)
     assert jumps == [(0x54b005, 0x401000, 0x401005)]
+    import json
+    runtime = binradar_setup.extract_e9_runtime_metadata(
+        patched, metadata, original, 0x401000)
+    assert runtime.relocated_calls == tuple(jumps)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": 0x54b005, "original": 0x401000}]
+
+
+def _write_instruction_artifacts(tmp_path, instruction, *, relocated=None,
+                                 trampoline_address=0x54b000, prefix=b"",
+                                 suffix="brpatched"):
+    original = tmp_path / "bin.orig"
+    patched = tmp_path / f"bin.{suffix}"
+    metadata = tmp_path / f"bin.{suffix}.json"
+    _write_original_instruction(original, instruction)
+    metadata.write_text(
+        '{"method":"instruction","params":{"address":"0x401000",'
+        f'"length":{len(instruction)},"offset":4096}}}}\n'
+        '{"method":"patch","params":{"offset":4096}}\n')
+    _write_synthetic_e9_binary(
+        patched, loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[(0x401000, PAGE, PAGE, REFACTOR, False),
+              (trampoline_address, 2 * PAGE, PAGE, TRAMPOLINE, False)])
+    data = bytearray(patched.read_bytes())
+    data.extend(b"\xcc" * (3 * PAGE - len(data)))
+    # Match E9's actual prefixed entry transfer (48 e9), not only bare E9.
+    data[PAGE:PAGE + 6] = b"\x48\xe9" + struct.pack(
+        "<i", trampoline_address - 0x401006)
+    code = instruction if relocated is None else relocated
+    relocated_pc = trampoline_address + len(prefix)
+    tail = b"\xe9" + struct.pack(
+        "<i", 0x401000 + len(instruction) - relocated_pc - len(code) - 5)
+    data[2 * PAGE:2 * PAGE + len(prefix + code + tail)] = prefix + code + tail
+    patched.write_bytes(data)
+    return original, metadata, patched, relocated_pc
+
+
+@pytest.mark.parametrize("instruction", [
+    b"\x80\x38\x03",  # cmp byte ptr [rax],3: observed 14940 shape
+    b"\x48\x8b\x00",  # mov rax,[rax]
+    b"\xf7\x30",      # div dword ptr [rax]
+    b"\xff\x20",      # jmp qword ptr [rax]
+])
+def test_exact_noncall_instruction_map(tmp_path, instruction):
+    import hashlib
+    import json
+    original, metadata, patched, relocated_pc = _write_instruction_artifacts(
+        tmp_path, instruction)
+    result = binradar_setup.extract_e9_runtime_metadata(
+        patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload == {
+        "version": 1,
+        "artifact-sha256": hashlib.sha256(patched.read_bytes()).hexdigest(),
+        "original-sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+        "instructions": [{"relocated": relocated_pc, "original": 0x401000}],
+    }
+    assert result.relocated_calls == ()
+    assert all(row["relocated"] != relocated_pc + 1 for row in payload["instructions"])
+
+
+@pytest.mark.parametrize("opcode", [b"\x48\x8b\x05", b"\xff\x15"])
+def test_rip_relative_instruction_adjustment(tmp_path, opcode):
+    import json
+    target = 0x402100
+    original_code = opcode + struct.pack("<i", target - 0x401000 - len(opcode) - 4)
+    if opcode == b"\xff\x15":
+        prefix = b"\x68" + struct.pack("<I", 0x401006)
+        relocated_pc = 0x54b005
+        relocated_opcode = b"\xff\x25"
+    else:
+        prefix = b""
+        relocated_pc = 0x54b000
+        relocated_opcode = opcode
+    moved = relocated_opcode + struct.pack("<i", target - relocated_pc - len(opcode) - 4)
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, original_code, relocated=moved, prefix=prefix)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": pc, "original": 0x401000}]
+
+
+@pytest.mark.parametrize("defect", ["operand", "continuation", "rip-target"])
+def test_unproved_instruction_semantics_are_omitted(tmp_path, defect):
+    import json
+    instruction = b"\x80\x38\x03"
+    moved = b"\x80\x38\x04" if defect == "operand" else instruction
+    if defect == "rip-target":
+        instruction = b"\x48\x8b\x05" + struct.pack("<i", 0x402100 - 0x401007)
+        moved = b"\x48\x8b\x05" + struct.pack("<i", 0x402101 - 0x54b007)
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=moved)
+    if defect == "continuation":
+        data = bytearray(patched.read_bytes())
+        # A helper can have exactly the original bytes, but a different
+        # continuation is not the relocated original instruction.
+        struct.pack_into("<i", data, 2 * PAGE + len(moved) + 1,
+                         0x401100 - pc - len(moved) - 5)
+        patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == []
+
+
+@pytest.mark.parametrize("opcode", [b"\xe9", b"\x0f\x85"])
+def test_relocated_direct_branch_preserves_target(tmp_path, opcode):
+    import json
+    target = 0x402100
+    instruction = opcode + struct.pack("<i", target - 0x401000 - len(opcode) - 4)
+    moved = opcode + struct.pack("<i", target - 0x54b000 - len(opcode) - 4)
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=moved)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == [
+        {"relocated": pc, "original": 0x401000}]
+
+
+def test_dead_instruction_copy_does_not_map(tmp_path):
+    import json
+    instruction = b"\x80\x38\x03"
+    original, metadata, patched, pc = _write_instruction_artifacts(tmp_path, instruction)
+    data = bytearray(patched.read_bytes())
+    dead_pc = pc + 0x100
+    duplicate = instruction + b"\xe9" + struct.pack("<i", 0x401003 - dead_pc - 8)
+    data[2 * PAGE + 0x100:2 * PAGE + 0x100 + len(duplicate)] = duplicate
+    patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": pc, "original": 0x401000}]
+
+
+def test_ambiguous_reachable_instruction_copies_are_omitted(tmp_path):
+    import json
+    instruction = b"\x80\x38\x03"
+    # Both arms are reachable and both reproduce the instruction and its
+    # continuation. No address-order tiebreaker is an identity proof.
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, prefix=b"\x74\x0e")
+    data = bytearray(patched.read_bytes())
+    duplicate_pc = 0x54b010
+    duplicate = instruction + b"\xe9" + struct.pack("<i", 0x401003 - duplicate_pc - 8)
+    data[2 * PAGE + 0x10:2 * PAGE + 0x10 + len(duplicate)] = duplicate
+    patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert json.loads(Path(str(patched) + ".e9map.json").read_text())["instructions"] == []
+
+
+@pytest.mark.parametrize("defect", ["wrong-length", "wrong-address", "conflict", "past-end"])
+def test_invalid_producer_evidence_removes_stale_map(tmp_path, defect):
+    original, metadata, patched, _ = _write_instruction_artifacts(tmp_path, b"\x80\x38\x03")
+    sidecar = Path(str(patched) + ".e9map.json")
+    sidecar.write_text('{"version":1,"instructions":[]}')
+    evidence = metadata.read_text()
+    if defect == "wrong-length":
+        evidence = evidence.replace('"length":3', '"length":2')
+    elif defect == "wrong-address":
+        evidence = evidence.replace('"address":"0x401000"', '"address":"0x401001"')
+    elif defect == "past-end":
+        evidence = evidence.replace('"offset":4096', '"offset":999999')
+    else:
+        evidence += '{"method":"instruction","params":{"address":"0x401000","length":4,"offset":4096}}\n'
+    metadata.write_text(evidence)
+    with pytest.raises(ValueError):
+        binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    assert not sidecar.exists()
+
+
+def test_artifacts_have_independent_refreshed_instruction_maps(tmp_path):
+    import json
+    original, metadata, patched, pc = _write_instruction_artifacts(tmp_path, b"\x80\x38\x03")
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    first = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    original, cached_metadata, cached, cached_pc = _write_instruction_artifacts(
+        tmp_path, b"\x80\x38\x03", trampoline_address=0x64b000, suffix="brcached")
+    binradar_setup.extract_e9_runtime_metadata(cached, cached_metadata, original, 0x401000)
+    second = json.loads(Path(str(cached) + ".e9map.json").read_text())
+    assert first["instructions"] == [{"relocated": pc, "original": 0x401000}]
+    assert second["instructions"] == [{"relocated": cached_pc, "original": 0x401000}]
+    assert first["artifact-sha256"] != second["artifact-sha256"]
+    binradar_setup._remove_cached_artifact(tmp_path, {"BINARY": "bin"})
+    assert not cached.exists()
+    assert not Path(str(cached) + ".e9map.json").exists()
+    assert Path(str(patched) + ".e9map.json").exists()
+
+
+def test_missing_specialized_metadata_emits_empty_bound_map(tmp_path):
+    import json
+    original, _, patched, _ = _write_instruction_artifacts(tmp_path, b"\x80\x38\x03")
+    binradar_setup.extract_e9_runtime_metadata(patched, None, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == []
+    assert len(payload["artifact-sha256"]) == len(payload["original-sha256"]) == 64
+
+
+def _write_block_copy_artifacts(tmp_path, original_run, copied_run, *,
+                                site_length, suffix="brpatched"):
+    """E9 block relocation: refactor hops to a trampoline holding a run.
+
+    ``original_run`` is the original byte sequence at the site;
+    ``copied_run`` is its trampoline copy, with PC-relative operands
+    re-encoded by E9 exactly as the real artifact does.  ``site_length`` is
+    the decoded length of the first instruction, which is what e9tool records
+    for the instrumented site.
+    """
+    original = tmp_path / "bin.orig"
+    patched = tmp_path / f"bin.{suffix}"
+    metadata = tmp_path / f"bin.{suffix}.json"
+    _write_original_instruction(original, original_run)
+    metadata.write_text(
+        '{"method":"instruction","params":{"address":"0x401000",'
+        f'"length":{site_length},"offset":4096}}}}\n'
+        '{"method":"patch","params":{"offset":4096}}\n')
+    _write_synthetic_e9_binary(
+        patched, loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[(0x401000, PAGE, PAGE, REFACTOR, False),
+              (0x54b000, 2 * PAGE, PAGE, TRAMPOLINE, False)])
+    data = bytearray(patched.read_bytes())
+    data.extend(b"\xcc" * (3 * PAGE - len(data)))
+    data[PAGE:PAGE + 6] = b"\x48\xe9" + struct.pack("<i", 0x54b000 - 0x401006)
+    data[2 * PAGE:2 * PAGE + len(copied_run)] = copied_run
+    patched.write_bytes(data)
+    return original, metadata, patched
+
+
+def test_block_copy_run_with_original_branch_target_maps_every_instruction(
+        tmp_path):
+    """E9 may copy a run whose exit is a branch to the original address.
+
+    Observed on libming/CVE-2018-8806: the trampoline copy of the site's
+    ``mov r12,[rax+rdx*8]`` is followed by the copied ``movzx`` and
+    ``test``/``je`` pair, whose ``je`` still targets the original image.
+    The whole run proves one identity per original instruction.
+    """
+    import json
+    head = b"\x48\x8b\x24\xd0" + b"\x41\x0f\xb6\x1c\x24" + b"\x84\xdb"
+    branch_at = len(head)
+    original_run = head + b"\x0f\x85" + struct.pack(
+        "<i", 0x401100 - (0x401000 + branch_at) - 6)
+    # The copied branch keeps the original target, re-encoded from the copy.
+    copied_run = head + b"\x0f\x85" + struct.pack(
+        "<i", 0x401100 - (0x54b000 + branch_at) - 6)
+    original, metadata, patched = _write_block_copy_artifacts(
+        tmp_path, original_run, copied_run, site_length=4)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original,
+                                               0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [
+        {"relocated": 0x54b000, "original": 0x401000},
+        {"relocated": 0x54b004, "original": 0x401004},
+        {"relocated": 0x54b009, "original": 0x401009},
+        {"relocated": 0x54b00b, "original": 0x40100b},
+    ]
+
+
+def test_register_indirect_call_emulation_maps_exact_jump(tmp_path):
+    """A non-RIP indirect call site maps through its emulated jmp copy.
+
+    Observed on libjpeg/CVE-2018-14498: original ``call [rbx+0x8]`` is
+    rewritten as ``push <ret>; jmp [rbx+0x8]`` in the trampoline.  Objdump
+    pads the rewritten ``jmp``/``call`` mnemonic column differently, so a
+    whitespace-sensitive text comparison rejected the exact same operand
+    encoding and aborted setup for every such subject.
+    """
+    import hashlib
+    import json
+    # call QWORD PTR [rbx+0x8]; ret = 0x401003
+    instruction = b"\xff\x53\x08"
+    # Trampoline: push 0x401003 ; jmp QWORD PTR [rbx+0x8]
+    prefix = b"\x68" + struct.pack("<I", 0x401003)
+    relocated = b"\xff\x63\x08"
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=relocated, prefix=prefix)
+    jumps = binradar_setup.extract_relocated_call_jumps(
+        patched, metadata, original, 0x401000)
+    assert jumps == [(pc, 0x401000, 0x401003)]
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload == {
+        "version": 1,
+        "artifact-sha256": hashlib.sha256(patched.read_bytes()).hexdigest(),
+        "original-sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+        "instructions": [{"relocated": pc, "original": 0x401000}],
+    }
+
+
+def test_pure_register_indirect_call_emulation_maps(tmp_path):
+    """``call rax`` (FF /2 with ModRM 0xD0) emulates through ``jmp rax``."""
+    import json
+    instruction = b"\xff\xd0"
+    prefix = b"\x68" + struct.pack("<I", 0x401002)
+    relocated = b"\xff\xe0"
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=relocated, prefix=prefix)
+    jumps = binradar_setup.extract_relocated_call_jumps(
+        patched, metadata, original, 0x401000)
+    assert jumps == [(pc, 0x401000, 0x401002)]
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": pc, "original": 0x401000}]
+
+
+def _write_diverged_execution_artifacts(tmp_path, *, second_trampoline):
+    """Executed copy mutated; optionally a second, unreachable trampoline.
+
+    The second trampoline holds the only byte-identical copy plus a jump
+    back to the original continuation, but no edge reaches it.
+    """
+    instruction = b"\x80\x38\x03"
+    original = tmp_path / "bin.orig"
+    metadata = tmp_path / "bin.brpatched.json"
+    _write_original_instruction(original, instruction)
+    metadata.write_text(
+        '{"method":"instruction","params":{"address":"0x401000",'
+        f'"length":{len(instruction)},"offset":4096}}}}\n'
+        '{"method":"patch","params":{"offset":4096}}\n')
+    maps = [(0x401000, PAGE, PAGE, REFACTOR, False),
+            (0x54b000, 2 * PAGE, PAGE, TRAMPOLINE, False)]
+    if second_trampoline:
+        maps.append((0x64b000, 3 * PAGE, PAGE, TRAMPOLINE, False))
+    patched = tmp_path / "bin.brpatched"
+    _write_synthetic_e9_binary(
+        patched, loader_base=0x20e9e9000, loader_size=PAGE, maps=maps)
+    data = bytearray(patched.read_bytes())
+    data.extend(b"\xcc" * (4 * PAGE - len(data)))
+    data[PAGE:PAGE + 6] = b"\x48\xe9" + struct.pack("<i", 0x54b000 - 0x401006)
+    # Mutate the executed copy's operand so it no longer matches.
+    data[2 * PAGE:2 * PAGE + 3] = b"\x80\x38\x04"
+    data[2 * PAGE + 3:2 * PAGE + 8] = b"\xe9" + struct.pack(
+        "<i", 0x401003 - (0x54b000 + 8))
+    if second_trampoline:
+        second = 3 * PAGE
+        data[second:second + 3] = instruction
+        data[second + 3:second + 8] = b"\xe9" + struct.pack(
+            "<i", 0x401003 - (0x64b000 + 8))
+    patched.write_bytes(data)
+    return original, metadata, patched
+
+
+@pytest.mark.parametrize("second_trampoline", [False, True])
+def test_dead_copy_is_never_an_identity(tmp_path, second_trampoline):
+    """Only the executed copy can be an instruction identity.
+
+    When the executed trampoline copy diverges, the earlier code fell back
+    to a unique byte-identical copy — reachable-code or not — and published
+    that dead address as a proved identity.  Both shapes must stay
+    unmapped: a diverged executed copy, with or without a second
+    trampoline holding the only matching copy.
+    """
+    import json
+    original, metadata, patched = _write_diverged_execution_artifacts(
+        tmp_path, second_trampoline=second_trampoline)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == []
+
+
+def test_run_length_rejects_mid_instruction_decode():
+    """A branch entry decoded inside another instruction is not a run step.
+
+    ``instruction_at`` merges branch-entry decodes into the sorted list; the
+    run proof must require each matched instruction to start exactly where
+    the previous one ended, and the jump-back proof must start where the
+    matched instruction ends.  A mid-instruction decode that happens to
+    match the next original instruction must not be accepted as its copy.
+    """
+    head = b"\xb8" + struct.pack("<I", 0x90008b)
+    second = b"\x8b\x00"
+    original_run = [
+        (0x401000, head, "mov    eax,0x90008b"),
+        (0x401005, second, "mov    eax,QWORD PTR [rax]"),
+        (0x401007, b"\xe9\x00\x00\x00\x00", "jmp    0x402000"),
+    ]
+    in_e9 = lambda address: 0x54b000 <= address < 0x54d000
+    # Sorted list with a branch-entry decode at 0x54b002 (inside the mov's
+    # immediate) that matches the second original instruction, followed by a
+    # jump back to the original continuation.
+    non_contiguous = [
+        (0x54b000, head, "mov    eax,0x90008b"),
+        (0x54b002, second, "mov    eax,QWORD PTR [rax]"),
+        (0x54b007, b"\xe9" + struct.pack("<i", 0x401007 - 0x54b00c),
+         "jmp    0x401007"),
+    ]
+    assert binradar_setup._relocated_run_length(
+        original_run, non_contiguous, 0, in_e9) is None
+    # The genuine contiguous copy still proves the same run length.
+    contiguous = [
+        (0x54b000, head, "mov    eax,0x90008b"),
+        (0x54b005, second, "mov    eax,QWORD PTR [rax]"),
+        (0x54b007, b"\xe9" + struct.pack("<i", 0x401007 - 0x54b00c),
+         "jmp    0x401007"),
+    ]
+    assert binradar_setup._relocated_run_length(
+        original_run, contiguous, 0, in_e9) == 2
+
+
+def test_prefixed_transfers_do_not_create_fall_through_edges():
+    """A prefixed jump stays terminal; its following bytes are not reachable.
+
+    E9 may preserve original prefix bytes ahead of its own transfer
+    (``f2 e9`` renders as ``bnd jmp``, ``26 e9`` as ``es jmp``, a stray REX
+    byte as ``rex.W``).  Treating those as non-terminal would add a false
+    fall-through edge into dead bytes and let them reachable-publish.
+    """
+    assert binradar_setup._mnemonic("bnd jmp 0x402000") == "jmp"
+    assert binradar_setup._mnemonic("es jmp 0x6239ac7") == "jmp"
+    assert binradar_setup._mnemonic("rex.W") == ""
+    assert binradar_setup._direct_jump_target("es jmp 0x6239ac7") == 0x6239ac7
+    assert binradar_setup._direct_jump_target("bnd jmp 0x402000") == 0x402000
+    assert binradar_setup._mnemonic("jmp    0x402000") == "jmp"
+    # Every control-flow decision classifies through the same prefix-aware
+    # rule: branch-condition comparison, terminality, and call emulation.
+    original = (0x401000, b"\xeb\x02", "jmp    0x401004")
+    prefixed = (0x54b000, b"\xf2\xeb\x02", "bnd jmp 0x401004")
+    assert binradar_setup._same_instruction(original, prefixed)
+    assert not binradar_setup._same_instruction(
+        original, (0x54b000, b"\xf2\x75\x02", "bnd jne 0x401004"))
+    assert binradar_setup._semantic_tokens("bnd jmp 0x401004") == [
+        "jmp", "0x401004"]
+    call = (0x401000, b"\xf2\xff\xd0", "call   rax")
+    emulated = (0x54b000, b"\xf2\xff\xe0", "bnd jmp rax")
+    assert binradar_setup._same_instruction(call, emulated, call_emulation=True)
+    # A different indirect target is still rejected after the same rewrite:
+    # the relocated bytes must differ from the original only at the opcode.
+    assert not binradar_setup._same_instruction(
+        call, (0x54b000, b"\xf2\xff\xe3", "bnd jmp rbx"), call_emulation=True)
+
+
+def test_prefixed_site_copy_still_resolves_the_trampoline_entry(tmp_path):
+    """A site copy may keep an original prefix byte before its own transfer.
+
+    Observed on binutils/CVE-2017-6966: the rewritten copy of the site
+    instruction decodes as ``rex.W`` followed by ``es jmp <trampoline>``.
+    The entry resolver must skip the prefix rather than read the first
+    decoded row, which is not a jump at all.
+    """
+    import json
+    instruction = b"\x80\x38\x03"
+    original = tmp_path / "bin.orig"
+    metadata = tmp_path / "bin.brpatched.json"
+    patched = tmp_path / "bin.brpatched"
+    _write_original_instruction(original, instruction)
+    metadata.write_text(
+        '{"method":"instruction","params":{"address":"0x401000",'
+        f'"length":{len(instruction)},"offset":4096}}}}\n'
+        '{"method":"patch","params":{"offset":4096}}\n')
+    _write_synthetic_e9_binary(
+        patched, loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[(0x401000, PAGE, PAGE, REFACTOR, False),
+              (0x54b000, 2 * PAGE, PAGE, TRAMPOLINE, False)])
+    data = bytearray(patched.read_bytes())
+    data.extend(b"\xcc" * (4 * PAGE - len(data)))
+    # REFACTOR copy: preserved '48' prefix byte, then '26 e9' (es jmp) into
+    # the trampoline — the real 6966 layout.
+    hop = 0x54b000 - (0x401001 + 6)
+    data[PAGE:PAGE + 1] = b"\x48"
+    data[PAGE + 1:PAGE + 7] = b"\x26\xe9" + struct.pack("<i", hop)
+    tail = b"\xe9" + struct.pack("<i", 0x401003 - 0x54b008)
+    data[2 * PAGE:2 * PAGE + len(instruction) + len(tail)] = instruction + tail
+    patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original, 0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": 0x54b000, "original": 0x401000}]
+
+
+def test_two_hop_rewrite_chain_reaches_the_trampoline(tmp_path):
+    """The site copy may jump to a second rewritten location, not directly.
+
+    Observed on libming/CVE-2018-8964: the refactor site jumps to 0xf407660,
+    another rewritten page, which jumps into the real trampoline.  A single
+    hop lookup would miss the executed copy entirely.
+    """
+    import json
+    instruction = b"\x80\x38\x03"
+    # Build the fixture with the intermediate page registered as a REFACTOR
+    # map, exactly like the real libming/CVE-2018-8964 artifact: E9 rewrites
+    # the site page, whose copy jumps to a second REFACTOR page that jumps
+    # into the trampoline.  An unregistered page would not be followable.
+    original = tmp_path / "bin.orig"
+    metadata = tmp_path / "bin.brpatched.json"
+    _write_original_instruction(original, instruction)
+    metadata.write_text(
+        '{"method":"instruction","params":{"address":"0x401000",'
+        f'"length":{len(instruction)},"offset":4096}}}}\n'
+        '{"method":"patch","params":{"offset":4096}}\n')
+    _write_synthetic_e9_binary(
+        patched := tmp_path / "bin.brpatched",
+        loader_base=0x20e9e9000, loader_size=PAGE,
+        maps=[(0x401000, PAGE, PAGE, REFACTOR, False),
+              (0x64b000, 3 * PAGE, PAGE, REFACTOR, False),
+              (0x54b000, 2 * PAGE, PAGE, TRAMPOLINE, False)])
+    data = bytearray(patched.read_bytes())
+    data.extend(b"\xcc" * (4 * PAGE - len(data)))
+    # Trampoline copy of the site instruction plus its continuation jump.
+    tail = b"\xe9" + struct.pack("<i", 0x401003 - (0x54b000 + 8))
+    data[2 * PAGE:2 * PAGE + len(instruction) + len(tail)] = instruction + tail
+    # Second rewritten page at 0x64b000: jmp into the trampoline.
+    data[3 * PAGE:3 * PAGE + 5] = b"\xe9" + struct.pack(
+        "<i", 0x54b000 - 0x64b005)
+    # Site copy now hops to that page instead of the trampoline.
+    data[PAGE:PAGE + 6] = b"\x48\xe9" + struct.pack("<i", 0x64b000 - 0x401006)
+    pc = 0x54b000
+    patched.write_bytes(data)
+    binradar_setup.extract_e9_runtime_metadata(patched, metadata, original,
+                                               0x401000)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": pc, "original": 0x401000}]
+
 
 
 # ---------------------------------------------------------------------------

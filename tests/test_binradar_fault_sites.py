@@ -87,8 +87,9 @@ def test_precise_identity_roundtrip_and_domains():
     {}, {"tracer-fault-image": IMAGE}, {"tracer-fault-image-offset": 1},
     {"tracer-fault-image": "none", "tracer-fault-image-offset": 1},
 ])
-def test_probe_v3_requires_complete_site_fields(fields):
-    row = {"version": 3, "tracer-fault-valid": True,
+@pytest.mark.parametrize("version", [3, 4])
+def test_probe_current_tracer_fields_require_complete_site_fields(fields, version):
+    row = {"version": version, "tracer-fault-valid": True,
            "tracer-fault-source": "provenance-access", "tracer-fault-addr": 0}
     row.update(fields)
     with pytest.raises(ValueError):

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import enum
+import hashlib
+import json
 import multiprocessing
 import os
 import re
@@ -12,7 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
@@ -225,6 +227,7 @@ def _remove_cached_artifact(workdir: Path,
                             binradar_env: Dict[str, str]) -> None:
     binary = binradar_env["BINARY"]
     for name in (f"{binary}.brcached", f"{binary}.brcached.json",
+                 f"{binary}.brcached.e9map.json",
                  "brpatch-cached.c", "brpatches.json"):
         (workdir / name).unlink(missing_ok=True)
     for key in binradar_utils.e9_metadata_keys("brcached"):
@@ -422,6 +425,8 @@ def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, by
             "-m",
             "i386:x86-64",
             "-Mintel",
+            "--insn-width=16",
+            "-z",
             f"--adjust-vma=0x{address:x}",
             str(map_path),
         ]
@@ -439,7 +444,11 @@ def _parse_objdump_instructions(data: bytes, address: int) -> List[Tuple[int, by
                 continue
             insn_address = int(match.group(1), 16)
             insn_bytes = bytes.fromhex(match.group(2))
-            instructions.append((insn_address, insn_bytes, match.group(3).strip()))
+            text = match.group(3).strip()
+            # E9 deliberately prefixes direct transfers with an inert REX
+            # byte (e.g. ``48 e9``). Objdump prints it as a pseudo mnemonic.
+            text = re.sub(r"^rex(?:\.[WRXB]+)?\s+(?=j)", "", text)
+            instructions.append((insn_address, insn_bytes, text))
         return instructions
     finally:
         map_path.unlink(missing_ok=True)
@@ -471,6 +480,10 @@ def _parse_e9tool_patch_metadata(path: Path) -> Tuple[List[int], Dict[int, Tuple
                 address = int(match.group(1), 16)
                 length = int(match.group(2))
                 offset = int(match.group(3))
+                if not 1 <= length <= 15 or not 0 <= address < 2**64:
+                    raise ValueError("invalid e9tool instruction address/length")
+                if offset in instructions and instructions[offset] != (address, length):
+                    raise ValueError("conflicting e9tool instruction records")
                 instructions[offset] = (address, length)
                 continue
             match = patch_re.search(line)
@@ -480,173 +493,610 @@ def _parse_e9tool_patch_metadata(path: Path) -> Tuple[List[int], Dict[int, Tuple
     return patch_offsets, instructions
 
 
-def _find_executed_trampoline_map(cfg: Dict, site_address: int,
-                                  brpatched_binary: Path) -> Optional[Dict]:
-    """Return the trampoline map that the refactored code at site_address
-    jumps to, or None when the site is not in a refactored region.
-
-    E9Patch -O0 rewrites the code containing a patch site into a REFACTOR
-    map whose copy of the site is a ``jmp <trampoline-entry>``.  The
-    executed call-emulation pair lives in the trampoline map containing
-    that entry; the other trampoline copies of the same bytes are dead.
-    """
-    for mapping in cfg["maps"]:
-        if mapping["type"] != E9MapType.REFACTOR:
-            continue
-        if not (mapping["address"] <= site_address
-                < mapping["address"] + mapping["size"]):
-            continue
-        with brpatched_binary.open("rb") as f:
-            f.seek(mapping["file_offset"])
-            data = f.read(mapping["size"])
-        if len(data) != mapping["size"]:
-            raise ValueError("refactor mapping extends past the patched binary")
-        for address, _, text in _parse_objdump_instructions(
-                data, mapping["address"]):
-            if address != site_address:
-                continue
-            match = re.match(r"jmp\s+(?:0x)?([0-9a-fA-F]+)", text)
-            if match is None:
-                return None
-            entry = int(match.group(1), 16)
-            for trampoline in cfg["maps"]:
-                if trampoline["type"] != E9MapType.TRAMPOLINE:
-                    continue
-                if trampoline["address"] <= entry \
-                        < trampoline["address"] + trampoline["size"]:
-                    return trampoline
-            return None
+def _elf_executable_window(data: bytes, address: int):
+    """Return the unique executable file offset and remaining segment bytes."""
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
         return None
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    entsize, count = struct.unpack_from("<HH", data, 54)
+    if entsize < 56 or phoff + entsize * count > len(data):
+        raise ValueError("malformed ELF program headers")
+    offsets = []
+    for index in range(count):
+        kind, flags, offset, vaddr, _, filesz, _, _ = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + entsize * index)
+        if kind == 1 and flags & 1 and vaddr <= address < vaddr + filesz:
+            file_offset = offset + address - vaddr
+            remaining = min(vaddr + filesz - address, len(data) - file_offset)
+            if remaining > 0:
+                offsets.append((file_offset, remaining))
+    return offsets[0] if len(offsets) == 1 else None
+
+
+def _elf_file_offset(data: bytes, address: int, length: int) -> Optional[int]:
+    """Resolve a file-backed executable ELF64 address, never a byte search."""
+    window = _elf_executable_window(data, address)
+    return window[0] if window is not None and length <= window[1] else None
+
+
+#: Prefix tokens objdump prints before the mnemonic.  E9 may preserve leading
+#: prefix bytes of the original instruction before its own jump (a stray REX
+#: decodes as ``rex.W``; legacy prefixes render as e.g. ``es jmp``), so every
+#: control-flow decision must skip them.
+_INSTRUCTION_PREFIXES = frozenset((
+    "lock", "rep", "repz", "repnz", "repe", "repne", "bnd", "notrack",
+    "data16", "addr16", "addr32", "cs", "ds", "es", "fs", "gs", "ss"))
+
+_REX_PREFIX = re.compile(r"rex(?:\.[a-z]+)?$")
+
+
+def _is_prefix_token(token: str) -> bool:
+    """True for an objdump prefix token (``rex.W``, ``es:``, ``bnd``...)."""
+    token = token.rstrip(":").lower()
+    return token in _INSTRUCTION_PREFIXES or bool(_REX_PREFIX.fullmatch(token))
+
+
+def _mnemonic(text: str) -> str:
+    """Return the instruction mnemonic with legacy-prefix tokens removed."""
+    tokens = text.split()
+    index = 0
+    while index < len(tokens) and _is_prefix_token(tokens[index]):
+        index += 1
+    return tokens[index] if index < len(tokens) else ""
+
+
+def _direct_jump_target(text: str) -> Optional[int]:
+    """Direct-branch target of ``text``, tolerating legacy-prefix tokens."""
+    tokens = text.split()
+    index = 0
+    while index < len(tokens) and _is_prefix_token(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None
+    mnemonic = tokens[index]
+    if not (mnemonic == "jmp" or re.fullmatch(r"j[a-z]+", mnemonic)
+            or re.fullmatch(r"loop[a-z]*", mnemonic)):
+        return None
+    if index + 1 >= len(tokens):
+        return None
+    match = re.fullmatch(r"(?:0x)?([0-9a-fA-F]+)", tokens[index + 1])
+    return int(match.group(1), 16) if match else None
+
+
+def _semantic_tokens(text: str) -> List[str]:
+    """Objdump tokens with legacy prefixes dropped and mnemonic padding folded.
+
+    Objdump pads the mnemonic column, so the relocated ``jmp``->``call``
+    rewrite shifts operand padding by one space; a preserved prefix token is
+    not a semantics difference either.  Every other token is kept verbatim.
+    """
+    tokens = text.split()
+    index = 0
+    while index < len(tokens) and _is_prefix_token(tokens[index]):
+        index += 1
+    return tokens[index:]
+
+
+def _rsp_call_jump(encoded: bytes) -> Optional[bytes]:
+    """Encode E9's exact FF /2 RSP-memory -> FF /4 transformation.
+
+    The pushed return address moves RSP by eight. E9 adjusts the signed
+    displacement and selects disp0/8/32 afresh, preserving every prefix and
+    SIB bit (including index/scale). REX.B selects R12, not RSP. Address-size
+    overrides are retained: the backend also adjusts ESP-based operands.
+    """
+    i, rex = 0, 0
+    legacy = (0x67, 0xf0, 0xf2, 0xf3, 0x2e, 0x36, 0x3e, 0x26,
+              0x64, 0x65, 0x66)
+    while i < len(encoded):
+        byte = encoded[i]
+        if 0x40 <= byte <= 0x4f:
+            rex = byte
+        elif byte not in legacy:
+            break
+        i += 1
+    if i + 2 >= len(encoded) or encoded[i] != 0xff or rex & 1:
+        return None
+    modrm, sib = encoded[i + 1:i + 3]
+    mod = modrm >> 6
+    if mod == 3 or modrm & 0x3f != 0x14 or sib & 7 != 4:
+        return None
+    width = (0, 1, 4)[mod]
+    if len(encoded) != i + 3 + width:
+        return None
+    displacement = int.from_bytes(encoded[i + 3:], 'little', signed=True) if width else 0
+    displacement += 8
+    if not -(2**31) <= displacement < 2**31:
+        # No signed disp32 can prove the original effective address. Do not
+        # fall back to the unadjusted FF opcode-only comparison.
+        return b""
+    new_width = 0 if displacement == 0 else 1 if -128 <= displacement <= 127 else 4
+    new_mod = {0: 0, 1: 1, 4: 2}[new_width]
+    return (encoded[:i + 1] + bytes(((modrm & 7) | 0x20 | (new_mod << 6), sib))
+            + displacement.to_bytes(new_width, 'little', signed=True))
+
+
+def _same_instruction(original, relocated, call_emulation=False) -> bool:
+    """Compare encoded semantics, allowing only proved PC-relative adjustment.
+
+    Objdump resolves RIP-relative memory operands in its comment. The
+    displacement is the only encoding field permitted to differ; the
+    effective target and every other encoded byte must remain identical.
+    """
+    oa, ob, ot = original
+    ra, rb, rt = relocated
+    if call_emulation:
+        adjusted = _rsp_call_jump(ob)
+        if adjusted is not None:
+            return (_mnemonic(ot) == "call" and _mnemonic(rt) == "jmp"
+                    and rb == adjusted)
+        # FF /2 call -> FF /4 jmp, preserving prefixes/addressing exactly.
+        rb = bytearray(rb)
+        i = next((i for i, value in enumerate(rb) if value == 0xff), -1)
+        if i < 0 or i + 1 >= len(rb) or (rb[i + 1] >> 3) & 7 != 4:
+            return False
+        rb[i + 1] = (rb[i + 1] & ~0x38) | 0x10
+        rb = bytes(rb)
+        # Rewrite E9's ``jmp`` back to the original ``call`` mnemonic, keeping
+        # any preserved prefix token ahead of it (`bnd jmp`, `es jmp`, ...).
+        tokens = rt.split()
+        prefix_count = 0
+        while prefix_count < len(tokens) and _is_prefix_token(tokens[prefix_count]):
+            prefix_count += 1
+        if prefix_count < len(tokens) and tokens[prefix_count] == "jmp":
+            tokens[prefix_count] = "call"
+            rt = " ".join(tokens)
+    # A control transfer is excluded from the byte-equality fast path: two
+    # identical encodings at different addresses resolve to different target
+    # text, so equal bytes do not imply equal text.  Classify through the
+    # prefix-aware mnemonic; a preserved `es`/`bnd`/... token must not hide a
+    # branch from this guard.
+    mnemonic = _mnemonic(ot)
+    is_branch = mnemonic.startswith(("j", "loop")) or mnemonic == "call"
+    if ob == rb and "rip" not in ot and not is_branch:
+        return ot == rt
+    if "rip" in ot and "rip" in rt and len(ob) == len(rb):
+        om = re.search(r"#\s*(?:0x)?([0-9a-fA-F]+)", ot)
+        rm = re.search(r"#\s*(?:0x)?([0-9a-fA-F]+)", rt)
+        if om is None or rm is None or int(om[1], 16) != int(rm[1], 16):
+            return False
+        # Remove only the RIP displacement, retaining mnemonic, width,
+        # registers, immediates, and segment overrides.  Objdump pads
+        # mnemonics to a fixed column, so the `jmp`->`call` rewrite above
+        # shifts the operand padding by one space; collapse runs of
+        # whitespace before comparing.
+        normalize = lambda text: re.sub(
+            r"\s+", " ",
+            re.sub(r"\[rip(?:[+-]0x[0-9a-f]+)?\]", "[rip]",
+                   text.split("#")[0])).strip()
+        if normalize(ot) != normalize(rt):
+            return False
+        old_disp = struct.pack("<i", int(om[1], 16) - oa - len(ob))
+        new_disp = struct.pack("<i", int(rm[1], 16) - ra - len(rb))
+        positions = [i for i in range(len(ob) - 3)
+                     if ob[i:i + 4] == old_disp and rb[i:i + 4] == new_disp
+                     and ob[:i] == rb[:i] and ob[i + 4:] == rb[i + 4:]]
+        return len(positions) == 1
+    target = _direct_jump_target(ot)
+    if target is not None and target == _direct_jump_target(rt):
+        # Short/near encodings may differ, but branch condition must not; a
+        # preserved legacy prefix (`bnd`/`notrack`/`es`/...) is not a
+        # condition difference.
+        return _mnemonic(ot) == _mnemonic(rt)
+    # Objdump pads mnemonics to a fixed column: rewriting the relocated
+    # ``jmp`` back to ``call`` above shifts the operand padding by one space,
+    # so compare token-wise.  Encoded bytes and operands have already been
+    # checked, so whitespace alone must not reject a match; a preserved legacy
+    # prefix token is likewise not a semantics difference.
+    return ob == rb and _semantic_tokens(ot) == _semantic_tokens(rt)
+
+
+_TERMINAL_MNEMONICS = frozenset(
+    ("jmp", "ret", "retq", "iret", "iretq", "ud2", "hlt", "int", "int3",
+     "syscall", "sysenter"))
+
+
+def _relocated_run_length(original_run, insns, index, in_e9) -> Optional[int]:
+    """Prove how many leading original instructions a trampoline copy holds.
+
+    Returns the number of consecutive matched instructions whose control flow
+    is also proved, or None when the copy diverges.  Two exact proofs are
+    accepted:
+
+    - the instruction after the matched run is a direct jump back to the
+      original continuation address (the single-instruction move the earlier
+      extractor recognized); or
+    - a matched direct branch keeps its original target and that target is
+      outside every E9 mapping, so both copies leave the instrumented code
+      along the same original edge.
+
+    Anything else (altered operand, different target, indirect transfer into
+    E9 pages, decode gap) ends the proof; the remaining instructions stay
+    unmapped rather than being guessed.
+    """
+    k = 0
+    j = index
+    while k < len(original_run) and j < len(insns):
+        if j > index and insns[j][0] != insns[j - 1][0] + len(insns[j - 1][1]):
+            # ``insns`` is a sorted PC list over merged decodes: a branch
+            # entry may decode an address inside another instruction.  Such
+            # an entry is not the k-th copied instruction of a contiguous
+            # run; accepting it would publish a mid-instruction address as
+            # an original-instruction identity.
+            return None
+        if not _same_instruction(original_run[k], insns[j]):
+            return None
+        continuation = original_run[k][0] + len(original_run[k][1])
+        following = insns[j + 1] if j + 1 < len(insns) else None
+        if (following is not None and _mnemonic(following[2]) == "jmp"
+                and following[0] == insns[j][0] + len(insns[j][1])
+                and _direct_jump_target(following[2]) == continuation):
+            # The jump-back must start exactly where the matched instruction
+            # ends; a jump that merely happens to target the continuation is
+            # not proof that this copy holds the run.
+            return k + 1
+        original_target = _direct_jump_target(original_run[k][2])
+        copied_target = _direct_jump_target(insns[j][2])
+        if (original_target is not None and copied_target == original_target
+                and not in_e9(copied_target)):
+            return k + 1
+        if _mnemonic(original_run[k][2]) in _TERMINAL_MNEMONICS:
+            # The original flow ends here; a later instruction is not part of
+            # this run and must not be compared.
+            return None
+        k += 1
+        j += 1
     return None
 
 
-def extract_relocated_call_jumps(
-    brpatched_binary: Path,
-    metadata_path: Path,
-    original_binary: Path,
-    patch_addr: int,
-) -> List[Tuple[int, int, int]]:
-    """Find E9Patch's jumps used to emulate every instrumented original call.
+def _original_instruction_run(original_data: bytes, address: int,
+                              limit: int = 8):
+    """Decode the original fall-through run starting at an instruction."""
+    run = []
+    pc = address
+    for _ in range(limit):
+        window = _elf_executable_window(original_data, pc)
+        if window is None:
+            break
+        offset, remaining = window
+        decoded = _parse_objdump_instructions(
+            original_data[offset:offset + min(15, remaining)], pc)
+        if not decoded:
+            break
+        entry = decoded[0]
+        if (entry[0] != pc or "(bad)" in entry[2] or ".byte" in entry[2]
+                or not _mnemonic(entry[2]) or len(entry[1]) > remaining):
+            break
+        run.append(entry)
+        if _mnemonic(entry[2]) in _TERMINAL_MNEMONICS:
+            break
+        pc = entry[0] + len(entry[1])
+    return run
 
-    With the default backend option ``-Ocall=false``, a relocated direct call
-    is emitted as ``push original_next; jmp target`` inside an E9Patch
-    trampoline.  For a direct call the jump target is unambiguous; for an
-    indirect call the rewritten instruction is an indirect jmp preceded by
-    the return-address setup.
 
-    Every patched original call must map to exactly one trampoline jump
-    (the executed copy, identified through the refactored region); the
-    requested patch address must resolve to exactly one instrumented site.
+def _e9_trap_entries(data: bytes, cfg, mapping_at):
+    """Read only the config's loader-relative, bounded e9_trap_s table."""
+    pos = data.find(E9_CONFIG_MAGIC)
+    if pos < 0 or pos + E9_CONFIG_STRUCT.size > len(data):
+        raise ValueError("malformed E9 trap config")
+    fields = E9_CONFIG_STRUCT.unpack_from(data, pos)
+    count, offset = fields[20:22]
+    if not count:
+        if offset:
+            raise ValueError("E9 trap offset without records")
+        return {}
+    if (offset < E9_CONFIG_STRUCT.size or offset + count * 16 > cfg["loader_size"]
+            or pos + offset + count * 16 > len(data)):
+        raise ValueError("E9 trap table extends past loader")
+    traps = {}
+    previous = -1
+    for index in range(count):
+        source, target = struct.unpack_from("<qq", data, pos + offset + index * 16)
+        if not 0 <= source < cfg["loader_base"] or target < 0 or source <= previous:
+            raise ValueError("invalid or conflicting E9 trap records")
+        previous = source
+        mapping = mapping_at(source, E9MapType.REFACTOR)
+        file_offset = (mapping["file_offset"] + source - mapping["address"]
+                       if mapping is not None else _elf_file_offset(data, source, 1))
+        destination = (mapping_at(target, E9MapType.TRAMPOLINE)
+                       or mapping_at(target, E9MapType.REFACTOR))
+        if (file_offset is None or file_offset >= len(data) or data[file_offset] != 0x27
+                or destination is None or "x" not in destination["prot"]):
+            raise ValueError("E9 trap record does not match executable artifact")
+        traps[source] = target
+    return traps
+
+
+def _trampoline_entry(mapping_at, instruction_at, address: int, traps=None) -> Optional[int]:
+    """Follow E9's own jump chain from ``address`` into a trampoline.
+
+    E9 may rewrite the site once (refactor copy jumps to the trampoline) or
+    twice (the site copy jumps to another rewritten location that then jumps
+    to the trampoline).  Only the artifact's own mapping records are followed,
+    and the chain is bounded so a loop cannot be mistaken for an entry.
     """
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"e9tool metadata not found: {metadata_path}")
+    current = address
+    seen = set()
+    for _ in range(4):
+        if current in seen:
+            return None
+        seen.add(current)
+        if traps and current in traps:
+            current = traps[current]
+            continue
+        if mapping_at(current, E9MapType.TRAMPOLINE) is not None:
+            return current
+        mapping = mapping_at(current, E9MapType.REFACTOR)
+        if mapping is None:
+            return None
+        instruction = instruction_at(current, mapping)
+        if instruction is None:
+            return None
+        target = _direct_jump_target(instruction[2])
+        if target is None or target == current:
+            return None
+        current = target
+    return None
 
-    patch_offsets, instructions = _parse_e9tool_patch_metadata(metadata_path)
-    if not patch_offsets:
-        raise ValueError("no patch records in e9tool metadata")
-    sites: List[Tuple[int, int, int]] = []
-    for offset in patch_offsets:
-        site = instructions.get(offset)
-        if site is None:
-            raise ValueError(
-                f"patch offset {offset} has no instruction record in "
-                f"e9tool metadata")
-        sites.append((offset, site[0], site[1]))
 
-    # Require the requested patch address to exist exactly once.
+def _extract_instruction_relocations(patched_binary: Path, metadata_path: Path,
+                                     original_binary: Path, patch_addr: int):
+    """Prove instruction identities on the executed site trampoline.
+
+    Each instrumented original instruction is located inside the executed
+    trampoline by matching the original fall-through run and proving that the
+    copy's control flow leaves along the same original edge.  Copies that are
+    not reachable from the site's own entry, or that are ambiguous for one
+    original instruction, stay unmapped.
+    """
+    offsets, metadata = _parse_e9tool_patch_metadata(metadata_path)
+    sites = []
+    for offset in offsets:
+        if offset not in metadata:
+            raise ValueError(f"patch offset {offset} has no instruction record in e9tool metadata")
+        sites.append((offset, *metadata[offset]))
     patch_sites = [site for site in sites if site[1] == patch_addr]
     if len(patch_sites) != 1:
-        raise ValueError(
-            f"requested patch address 0x{patch_addr:x} resolves to "
-            f"{len(patch_sites)} instrumented site(s); expected exactly one")
-
-    # Deduplicate sites: one address may carry several hooks.
-    unique_sites: List[Tuple[int, int, int]] = []
-    seen = set()
+        raise ValueError(f"requested patch address 0x{patch_addr:x} resolves to {len(patch_sites)} instrumented site(s); expected exactly one")
+    unique = {}
     for site in sites:
-        if site[1] not in seen:
-            seen.add(site[1])
-            unique_sites.append(site)
-
-    cfg = parse_e9patch_config(brpatched_binary)
-    trampoline_insns: List[Tuple[Dict, List[Tuple[int, bytes, str]]]] = []
-    for mapping in cfg["maps"]:
-        if mapping["type"] != E9MapType.TRAMPOLINE:
-            continue
-        with brpatched_binary.open("rb") as f:
-            f.seek(mapping["file_offset"])
-            data = f.read(mapping["size"])
+        if site[1] in unique and unique[site[1]] != site:
+            raise ValueError("conflicting instruction site metadata")
+        unique[site[1]] = site
+    original_data = original_binary.read_bytes()
+    patched_data = patched_binary.read_bytes()
+    cfg = parse_e9patch_config(patched_binary)
+    maps = [m for m in cfg["maps"] if m["type"] in
+            (E9MapType.TRAMPOLINE, E9MapType.REFACTOR)]
+    decoded = {}
+    for mapping in maps:
+        start = mapping["file_offset"]
+        data = patched_data[start:start + mapping["size"]]
         if len(data) != mapping["size"]:
-            raise ValueError("trampoline mapping extends past the patched binary")
-        trampoline_insns.append(
-            (mapping, _parse_objdump_instructions(data, mapping["address"])))
+            raise ValueError("E9 mapping extends past the patched binary")
+        decoded[id(mapping)] = {a: (a, b, t) for a, b, t in
+                                _parse_objdump_instructions(data, mapping["address"])}
 
-    records: List[Tuple[int, int, int]] = []
-    with original_binary.open("rb") as f:
-        for offset, address, length in unique_sites:
-            f.seek(offset)
-            original_instruction = f.read(length)
-            call_kind, direct_displacement = _decode_call_site(
-                original_instruction)
-            if call_kind == "other":
-                continue
-            ret_addr = address + length
-            direct_target: Optional[int] = None
-            if call_kind == "direct":
-                if direct_displacement is None:
-                    raise ValueError("direct call has no rel32 displacement")
-                direct_target = ret_addr + direct_displacement
+    def mapping_at(address, kind):
+        matches = [m for m in maps if m["type"] == kind and
+                   m["address"] <= address < m["address"] + m["size"]]
+        return matches[0] if len(matches) == 1 else None
 
-            # The executed copy: the trampoline map the refactored site
-            # jumps to (used to prefer the right copy for indirect calls).
-            executed = _find_executed_trampoline_map(cfg, address,
-                                                     brpatched_binary)
+    def instruction_at(address, mapping):
+        insns = decoded[id(mapping)]
+        if address not in insns:
+            # A branch entry may lie after embedded data. Decode from that
+            # proved entry, not from a searched-for byte sequence.
+            start = mapping["file_offset"] + address - mapping["address"]
+            end = mapping["file_offset"] + mapping["size"]
+            insns.update({a: (a, b, t) for a, b, t in
+                          _parse_objdump_instructions(patched_data[start:end], address)})
+        return insns.get(address)
 
-            matches: List[Tuple[int, int, int]] = []
-            for mapping, insns in trampoline_insns:
-                for index, (jump_addr, _, text) in enumerate(insns):
-                    if not text.startswith("jmp"):
-                        continue
-                    operand = text[len("jmp"):].strip()
-                    target_match = re.match(r"(?:0x)?([0-9a-fA-F]+)", operand)
-                    jump_target = int(target_match.group(1), 16) \
-                        if target_match else None
-                    if call_kind == "direct":
-                        if jump_target != direct_target:
-                            continue
-                    elif jump_target is not None:
-                        continue
-                    # Exact return-address setup: the preceding instruction
-                    # pushes the original return address.
-                    if index == 0 \
-                            or not insns[index - 1][2].startswith("push"):
-                        continue
-                    push_operand = insns[index - 1][2][len("push"):].strip()
-                    push_match = re.match(r"(?:0x)?([0-9a-fA-F]+)",
-                                          push_operand)
-                    if push_match is None \
-                            or int(push_match.group(1), 16) != ret_addr:
-                        continue
-                    matches.append((jump_addr, address, ret_addr))
+    ranges = [(m["address"], m["address"] + m["size"])
+              for m in cfg["maps"]
+              if m["type"] in (E9MapType.TRAMPOLINE, E9MapType.RESERVE)]
+    ranges.append((cfg["loader_base"], cfg["loader_base"] + cfg["loader_size"]))
+    ranges = normalize_address_ranges(ranges)
 
-            if not matches:
+    def in_e9(address: int) -> bool:
+        return any(entry.start <= address < entry.end for entry in ranges)
+
+    traps = _e9_trap_entries(patched_data, cfg, mapping_at)
+    calls, pairs = [], []
+    for offset, address, length in unique.values():
+        raw = original_data[offset:offset + length]
+        if len(raw) != length:
+            raise ValueError("instruction record extends past original binary")
+        if _elf_file_offset(original_data, address, length) != offset:
+            raise ValueError("instruction metadata does not match original ELF address")
+        original = _parse_objdump_instructions(raw, address)
+        if len(original) != 1 or len(original[0][1]) != length or "(bad)" in original[0][2]:
+            raise ValueError("instruction metadata does not describe one original instruction")
+        refactor = mapping_at(address, E9MapType.REFACTOR)
+        if refactor is not None:
+            site = instruction_at(address, refactor)
+            site_start = refactor["file_offset"] + address - refactor["address"]
+            site_insns = _parse_objdump_instructions(
+                patched_data[site_start:site_start + 16], address)
+        else:
+            file_offset = _elf_file_offset(patched_data, address, 5)
+            site_insns = (_parse_objdump_instructions(patched_data[file_offset:file_offset + 15], address)
+                          if file_offset is not None else [])
+            site = site_insns[0] if site_insns else None
+
+        # The site's rewritten copy is the executable entry into the
+        # instrumented trampoline; a two-hop rewrite is followed explicitly.
+        # E9 may keep leading prefix bytes of the original instruction before
+        # its own transfer (decoded as `rex.W` / `es jmp` / ...), so the first
+        # control-flow instruction in the decoded window is the entry.
+        executed_entry = None
+        if address in traps:
+            executed_entry = _trampoline_entry(
+                mapping_at, instruction_at, address, traps)
+        elif site is not None:
+            entry_insn = next(
+                (insn for insn in site_insns
+                 if _mnemonic(insn[2]) != ""), None)
+            if entry_insn is not None and _mnemonic(entry_insn[2]) == "jmp":
+                entry = _direct_jump_target(entry_insn[2])
+                if entry is not None:
+                    executed_entry = _trampoline_entry(
+                        mapping_at, instruction_at, entry, traps)
+
+        reachable = {}
+        if executed_entry is not None:
+            pending = [executed_entry]
+            while pending:
+                pc = pending.pop()
+                if pc in reachable:
+                    continue
+                mapping = mapping_at(pc, E9MapType.TRAMPOLINE)
+                if mapping is None:
+                    continue
+                insn = instruction_at(pc, mapping)
+                if insn is None or "(bad)" in insn[2]:
+                    continue
+                reachable[pc] = insn
+                _, encoded, text = insn
+                mnemonic = _mnemonic(text)
+                target = _direct_jump_target(text)
+                if target is not None:
+                    pending.append(target)
+                if mnemonic not in _TERMINAL_MNEMONICS:
+                    pending.append(pc + len(encoded))
+
+        original_run = _original_instruction_run(original_data, address)
+        if not original_run:
+            continue
+        ret = address + length
+        kind, displacement = _decode_call_site(raw)
+
+        if kind != "other":
+            # Relocated call emulation: push the original return address, then
+            # jump to the original target (direct) or to the copied indirect
+            # target (indirect).
+            if executed_entry is None:
                 raise ValueError(
                     f"no relocated call-equivalent jump found for patched "
                     f"original call at 0x{address:x}")
+            matches = []
+            for pc, insn in reachable.items():
+                if _mnemonic(insn[2]) != "jmp":
+                    continue
+                pushes = []
+                for prev in reachable.values():
+                    if prev[0] + len(prev[1]) != pc:
+                        continue
+                    if _mnemonic(prev[2]) != "push":
+                        continue
+                    operand = prev[2].split()[-1]
+                    if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", operand) \
+                            and int(operand, 16) == ret:
+                        pushes.append(prev)
+                if len(pushes) != 1:
+                    continue
+                if kind == "direct":
+                    equivalent = _direct_jump_target(insn[2]) == ret + displacement
+                else:
+                    equivalent = _same_instruction(original[0], insn, call_emulation=True)
+                if equivalent:
+                    matches.append(pc)
+            if len(matches) == 1:
+                pairs.append((matches[0], address))
+                calls.append((matches[0], address, ret))
+            else:
+                raise ValueError(
+                    f"expected one proved relocated call-equivalent jump for "
+                    f"original call at 0x{address:x}; found {len(matches)}")
+            continue
 
-            # Deduplicate by (site, ret): the same trampoline pages can be
-            # mapped at several VAs, and relative jumps resolve differently
-            # per mapping.  For direct calls the target match already selects
-            # the executed copy; for indirect calls prefer the executed map.
-            if executed is not None:
-                executed_matches = [m for m in matches
-                                    if executed["address"] <= m[0]
-                                    < executed["address"] + executed["size"]]
-                if executed_matches:
-                    matches = executed_matches
-            records.append(sorted(matches)[0])
+        # Non-call instruction: prove the copied run in every trampoline, then
+        # keep only the executed copy for each original instruction.  When the
+        # executed entry cannot be resolved, no copy is provably this site's
+        # own, so the instruction stays unmapped rather than guessing a
+        # byte-identical dead copy.
+        candidates: Dict[int, List[int]] = {}
+        for mapping in maps:
+            if mapping["type"] != E9MapType.TRAMPOLINE:
+                continue
+            insns = decoded[id(mapping)]
+            ordered = [insns[key] for key in sorted(insns)]
+            for index, (pc, _encoded, _text) in enumerate(ordered):
+                if not _same_instruction(original_run[0], ordered[index]):
+                    continue
+                proved = _relocated_run_length(original_run, ordered, index,
+                                               in_e9)
+                if proved is None:
+                    continue
+                for k in range(proved):
+                    # The k-th original instruction's copy is the k-th
+                    # instruction of this proved run, not the run's start.
+                    candidates.setdefault(
+                        original_run[k][0], []).append(ordered[index + k][0])
+        for original_pc, copies in candidates.items():
+            unique_copies = sorted(set(copies))
+            if not reachable:
+                # Without a proved executed entry, no copy is provably the
+                # site's own: a byte-identical copy elsewhere in the
+                # trampoline may be dead code for a different path.  An
+                # identity must be executed, never merely unique.
+                continue
+            executed = [pc for pc in unique_copies if pc in reachable]
+            if len(executed) != 1:
+                # The executed copy either diverged from the original run
+                # (leaving only dead copies) or is ambiguous; both stay
+                # unmapped rather than falling back to a unique copy.
+                continue
+            pairs.append((executed[0], original_pc))
+    # A copy shared by two byte-identical original instructions is ambiguous;
+    # such identities are omitted, never guessed.  Calls are already exact
+    # (push-site plus target match), so a non-call conflict cannot invalidate
+    # them.
+    owners: Dict[int, int] = {}
+    conflicting: Set[int] = set()
+    for relocated, original in pairs:
+        if relocated in owners and owners[relocated] != original:
+            conflicting.add(relocated)
+        owners.setdefault(relocated, original)
+    for relocated in conflicting:
+        owners.pop(relocated, None)
+    calls = [record for record in calls if record[0] not in conflicting]
+    return sorted(set(calls)), sorted(owners.items())
 
-    return sorted(set(records))
+
+def extract_relocated_call_jumps(brpatched_binary: Path, metadata_path: Path,
+                                  original_binary: Path, patch_addr: int
+                                  ) -> List[Tuple[int, int, int]]:
+    """Extract exact executed call-emulation jumps for tracer stack handling."""
+    calls, _ = _extract_instruction_relocations(
+        brpatched_binary, metadata_path, original_binary, patch_addr)
+    return calls
+
+
+def _persist_instruction_map(patched_binary: Path, original_binary: Path,
+                             instructions) -> None:
+    payload = {"version": 1,
+               "artifact-sha256": hashlib.sha256(patched_binary.read_bytes()).hexdigest(),
+               "original-sha256": hashlib.sha256(original_binary.read_bytes()).hexdigest(),
+               "instructions": [{"relocated": relocated, "original": original}
+                                for relocated, original in instructions]}
+    destination = Path(str(patched_binary) + ".e9map.json")
+    with tempfile.NamedTemporaryFile(mode="w", dir=destination.parent,
+                                     prefix=destination.name + ".", delete=False) as f:
+        temporary = Path(f.name)
+        try:
+            json.dump(payload, f, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _decode_call_site(data: bytes) -> Tuple[str, Optional[int]]:
@@ -771,6 +1221,9 @@ def extract_e9_runtime_metadata(
     flag set is rejected: the current setup only emits relative mappings,
     and applying load_bias to an absolute address would be wrong.
     """
+    # Invalidate first: malformed or stale producer evidence must never
+    # leave an earlier sidecar available to a consumer.
+    Path(str(patched_binary) + ".e9map.json").unlink(missing_ok=True)
     cfg = parse_e9patch_config(patched_binary)
     loader_base = cfg["loader_base"]
     loader_size = cfg["loader_size"]
@@ -792,9 +1245,10 @@ def extract_e9_runtime_metadata(
     print(f"E9 exclude ranges: {serialize_exclude_ranges(exclude_ranges)}")
 
     relocated_calls: Tuple[Tuple[int, int, int], ...] = ()
+    instruction_pairs = []
     if metadata_path is not None and original_binary is not None \
             and patch_addr is not None:
-        call_jumps = extract_relocated_call_jumps(
+        call_jumps, instruction_pairs = _extract_instruction_relocations(
             patched_binary,
             metadata_path,
             original_binary,
@@ -807,6 +1261,8 @@ def extract_e9_runtime_metadata(
         else:
             print("No relocated call-equivalent jump found for the patch site")
 
+    if original_binary is not None:
+        _persist_instruction_map(patched_binary, original_binary, instruction_pairs)
     return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 

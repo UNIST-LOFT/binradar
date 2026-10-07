@@ -1998,7 +1998,7 @@ class BinRadarExecutor:
             reference = self.probe_result.tracer_fault_reference
             legacy_probe = (
                 getattr(self.probe_result, "_probe_serialization_version", 1)
-                != 3)
+                != binradar_verifier.CURRENT_PROBE_RESULT_VERSION)
             if legacy_probe:
                 if reference is None:
                     probe_summary = "legacy probe (fault reference unavailable)"

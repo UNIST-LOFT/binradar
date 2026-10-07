@@ -94,7 +94,7 @@ def test_new_policy_restoration_preserves_valid_pc_zero(tmp_path):
     restored.require_current_memcheck_policy()
     assert restored.memcheck_policy == "coverage-v2"
     assert restored.tracer_fault_reference == original.tracer_fault_reference
-    assert restored._probe_serialization_version == 3
+    assert restored._probe_serialization_version == 4
 
 
 @pytest.mark.parametrize("policy", [None, "coverage-v1", "older-policy", "unavailable"])
@@ -109,7 +109,7 @@ def test_freshness_rejects_unacknowledged_or_mismatched_policy(policy):
 
 def test_v2_valid_reference_is_historical_read_only(tmp_path):
     original = _probe(binradar_verifier.TracerFaultReference(0, "guest-signal"))
-    row = original.serialize().replace("[version 3]", "[version 2]").replace(
+    row = original.serialize().replace("[version 4]", "[version 2]").replace(
         "[memcheck-policy unavailable] ", "").replace(
         "[tracer-fault-image none] [tracer-fault-image-offset 0] ", "")
     path = tmp_path / "historical.sbsv"
@@ -124,6 +124,122 @@ def test_v2_valid_reference_is_historical_read_only(tmp_path):
             restored.require_current_memcheck_policy()
         with pytest.raises(ValueError, match="fresh data"):
             restored.serialize()
+
+
+def _identity_runner(tmp_path, entries=None, *, artifact="brpatched"):
+    import hashlib
+    import json
+    original = tmp_path / "target.orig"
+    binary = tmp_path / ("target." + artifact)
+    import struct
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 32, 64)
+    struct.pack_into("<HH", header, 54, 56, 1)
+    original.write_bytes(bytes(header) + struct.pack("<IIQQQQQQ", 1, 5, 0, 0x1000, 0x1000, 0, 0x3000, 0x1000))
+    binary.write_bytes(artifact.encode())
+    data = {"version": 1,
+            "artifact-sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "original-sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+            "instructions": entries if entries is not None else
+            [{"relocated": 0x9000, "original": 0x1000}]}
+    sidecar = Path(str(binary) + ".e9map.json")
+    sidecar.write_text(json.dumps(data))
+    runner = binradar_verifier.BinRadarQemuRunner(
+        str(tmp_path), "target", "", "0x1000",
+        e9_metadata={artifact: ("0x9000-0xa000", ["0x9010:0x1000:0x1003"])})
+    return runner, str(binary), sidecar, data
+
+
+def _concrete_probe(pc, outcome="crash"):
+    return binradar_verifier.BinRadarProbeResult.from_log(
+        "[patch-info] [set true] [location 1000]\n"
+        "[patch-cov] [location 1000] [covered true] [hits 1]\n"
+        f"[qemu-exit] [kind {'crash' if outcome == 'crash' else 'end'}] [detail target]\n"
+        f"[exit] [result {outcome}]\n"
+        + (f"[fault-addr] [idx 0] [addr {pc:x}] [symbol target]\n" if pc is not None else ""))
+
+
+@pytest.mark.parametrize("raw,canonical,source", [
+    (0, 0, "native"), (0x1000, 0x1000, "native"),
+    (0x9000, 0x1000, "relocated"), (0x9010, None, "unavailable"),
+    (0x9001, None, "unavailable"), (0xb000, None, "unavailable")])
+def test_exact_concrete_normalization_roundtrip(tmp_path, raw, canonical, source):
+    runner, binary, _, _ = _identity_runner(tmp_path)
+    probe = _concrete_probe(raw)
+    runner._normalize_probe(probe, binary)
+    restored = binradar_verifier.BinRadarProbeResult.deserialize("[probe-info] " + probe.serialize())
+    assert restored.raw_fault_addr == raw
+    assert restored.concrete_fault_source == source
+    assert restored.concrete_fault_addr == canonical
+    # Call triples are not an instruction-identity fallback at helper PC 9010.
+    assert restored.fault_addr == (raw if canonical is None else canonical)
+
+
+@pytest.mark.parametrize("defect", ["missing", "artifact", "original", "cross-artifact", "conflict", "bool", "outside"])
+def test_concrete_map_rejects_missing_stale_and_malformed(tmp_path, defect):
+    import json
+    runner, binary, sidecar, data = _identity_runner(tmp_path)
+    if defect == "missing":
+        sidecar.unlink()
+    elif defect == "artifact":
+        Path(binary).write_bytes(b"changed")
+    elif defect == "original":
+        (tmp_path / "target.orig").write_bytes(b"changed")
+    elif defect == "cross-artifact":
+        binary = str(tmp_path / "target.brcached")
+        Path(binary).write_bytes(b"cached")
+        Path(binary + ".e9map.json").write_text(json.dumps(data))
+    else:
+        data["instructions"] = {
+            "conflict": [{"relocated": 0x9000, "original": 0x1000}, {"relocated": 0x9000, "original": 0x2000}],
+            "bool": [{"relocated": True, "original": 0x1000}],
+            "outside": [{"relocated": 0x1000, "original": 0x2000}],
+        }[defect]
+        sidecar.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="rerun binradar-setup"):
+        runner.concrete_fault_identity(0x9000, binary)
+
+
+def test_original_does_not_require_map_and_loaded_artifact_is_cached(tmp_path):
+    runner, binary, sidecar, _ = _identity_runner(tmp_path)
+    assert runner.concrete_fault_identity(0, runner.original_binary()) == (0, "native")
+    assert runner.concrete_fault_identity(0x9000, binary) == (0x1000, "relocated")
+    sidecar.unlink()
+    assert runner.concrete_fault_identity(0x9000, binary) == (0x1000, "relocated")
+
+
+@pytest.mark.parametrize("raw,outcome,rejected", [(0x9000, "crash", True), (0x9010, "crash", False), (0x9000, "ok", False)])
+def test_verifier_requires_proved_same_fault(tmp_path, raw, outcome, rejected):
+    import logging
+    runner, binary, _, _ = _identity_runner(tmp_path)
+    verifier = binradar_verifier.BinRadarConcreteVerifier.__new__(binradar_verifier.BinRadarConcreteVerifier)
+    verifier.probe_result = _concrete_probe(0x1000)
+    verifier.logger = logging.getLogger("concrete-identity-test")
+    verifier.observation_counts = {}
+    verifier.accept_evidences = {}
+    verifier.total_evidences = {}
+    verifier.security_rejected = set()
+    verifier.feedback_hard_rejected = set()
+    verifier.feedback_mode = False
+    probe = _concrete_probe(raw, outcome)
+    runner._normalize_probe(probe, binary)
+    testcase = binradar_verifier.Testcase(0, "poc", "crash", 0x1000, [0])
+    assert verifier._test_result(1, testcase, probe, binradar_verifier.BinRadarPatchResult(1, [0])) is rejected
+    assert (1 in verifier.security_rejected) is rejected
+    assert (verifier._testcase_from_result_row({"id": 0, "file": "poc", "exit": "crash", "fault-addr": 0x1000, "br": [0]}) is None)
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_historical_probe_cannot_claim_current_concrete_oracle(version):
+    probe = _concrete_probe(0)
+    row = "[probe-info] " + probe.serialize().replace("[version 4]", f"[version {version}]")
+    if version == 2:
+        row = row.replace("[tracer-fault-image none] [tracer-fault-image-offset 0] ", "").replace("[memcheck-policy unavailable] ", "")
+    restored = binradar_verifier.BinRadarProbeResult.deserialize(row)
+    assert restored.concrete_fault_addr is None
+    with pytest.raises(ValueError, match="fresh data"):
+        restored.serialize()
 
 
 def test_concrete_only_probe_does_not_claim_tracer_policy():

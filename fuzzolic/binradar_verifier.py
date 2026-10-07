@@ -1,4 +1,7 @@
 import subprocess
+import hashlib
+import json
+import struct
 import os
 import signal
 import shlex
@@ -85,9 +88,70 @@ PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
 # emitted by the QASAN runner, never inferred from a tracer finding. Historical
 # v3 rows without these fields remain readable but cannot authorize concrete
 # malicious feedback.
-CONCRETE_ORACLE = "qasan-main-v1"
+CONCRETE_ORACLE = "qasan-main-v2"
 CONCRETE_ORACLE_FIELDS = (
     "[concrete-oracle: str] [concrete-fault-valid: bool]")
+PROBE_RESULT_SCHEMA_V4 = (PROBE_RESULT_SCHEMA_V3 + " " + CONCRETE_ORACLE_FIELDS
+                          + " [raw-fault-addr: hex] [concrete-fault-source: str]")
+
+#: Serialization version of a freshly written ``[probe-info]`` row.  Readers
+#: must compare against this constant instead of a literal so a future bump
+#: cannot leave a "legacy" branch behind.
+CURRENT_PROBE_RESULT_VERSION = 4
+
+
+def concrete_fault_addr_from_row(row: Any) -> Optional[int]:
+    """Only current, explicitly proved concrete instruction identities qualify."""
+    if (_row_field(row, "version") != 4
+            or _row_field(row, "exit") != "crash"
+            or _row_field(row, "concrete-oracle") != CONCRETE_ORACLE
+            or _row_field(row, "concrete-fault-valid") is not True):
+        return None
+    source = _row_field(row, "concrete-fault-source")
+    address = _row_field(row, "fault-addr")
+    raw = _row_field(row, "raw-fault-addr")
+    if (source not in ("native", "relocated")
+            or type(address) is not int or type(raw) is not int
+            or not 0 <= address <= 0xffffffffffffffff
+            or not 0 <= raw <= 0xffffffffffffffff
+            or (source == "native" and address != raw)):
+        return None
+    return address
+
+
+def concrete_result_parsers() -> Tuple[sbsv.parser, ...]:
+    parsers = []
+    for schema in (PROBE_RESULT_SCHEMA_V4,
+                   PROBE_RESULT_SCHEMA_V3 + " " + CONCRETE_ORACLE_FIELDS,
+                   PROBE_RESULT_SCHEMA_V3, PROBE_RESULT_SCHEMA_V2,
+                   PROBE_RESULT_SCHEMA_V1):
+        parser = sbsv.parser()
+        parser.add_schema("[testcase] [result] [id: int] [file: str] "
+                          + schema.removeprefix("[probe-info] ")
+                          + " [pid: int] [br: list[int]]")
+        parsers.append(parser)
+    for schema in ("[exit: str] [fault-addr: hex] [pid: int] [br: list[int]]",
+                   "[exit: str] [fault-addr: hex]"):
+        parser = sbsv.parser()
+        parser.add_schema("[testcase] [result] [id: int] [file: str] " + schema)
+        parsers.append(parser)
+    return tuple(parsers)
+
+
+def parse_concrete_result_row(line: str, parsers: Sequence[sbsv.parser]) -> Any:
+    """Try historical schemas without treating malformed evidence as absent."""
+    parse_error = None
+    for parser in parsers:
+        try:
+            row = parser.parse_line_detached(line)
+        except ValueError as exc:
+            parse_error = exc
+            continue
+        if row is not None and row.schema_name == "testcase$result":
+            return row
+    if parse_error is not None:
+        raise ValueError("Malformed concrete testcase result") from parse_error
+    return None
 
 
 def tracer_memcheck_policy_acknowledged(log: str) -> bool:
@@ -162,12 +226,12 @@ def decode_fault_image_fields(row: Any, image_field: str = "image",
 
 def decode_snapshot_fault_reference(row: Any) -> Optional[TracerFaultReference]:
     version = _row_field(row, "version")
-    if version not in (2, 3):
+    if version not in (2, 3, 4):
         raise ValueError(f"unsupported snapshot fault reference version: {version!r}")
     if version == 2 and (_row_field(row, "image") is not None
                          or _row_field(row, "image-offset") is not None):
         raise ValueError("historical snapshot cannot carry fault image fields")
-    image, offset = decode_fault_image_fields(row, required=version == 3)
+    image, offset = decode_fault_image_fields(row, required=version in (3, 4))
     if not row["valid"]:
         if row["address"] != 0 or image is not None:
             raise ValueError("invalid snapshot fault reference carries identity")
@@ -194,7 +258,7 @@ def read_snapshot_fault_reference(log: str, *, require_current: bool = False) ->
         if not line.strip().startswith(prefix):
             continue
         version = header.parse_line_detached(line)["version"]
-        if version not in (2, 3):
+        if version not in (2, 3, 4):
             raise ValueError(f"unsupported snapshot fault reference version: {version!r}")
         if require_current and version != 3:
             raise ValueError("historical snapshot cannot authorize current memcheck policy; start a fresh run")
@@ -221,7 +285,7 @@ def _stacktrace_from_row(entries: List[Any]) -> List[Tuple[int, str]]:
 def _decode_tracer_fault_reference(row: Any) -> Optional[TracerFaultReference]:
     """Decode v2 fields, rejecting invalid claims rather than promoting them."""
     version = _row_field(row, "version")
-    if version not in (2, 3):
+    if version not in (2, 3, 4):
         raise ValueError(f"unsupported probe result version: {version!r}")
     valid = bool(_row_field(row, "tracer-fault-valid", False))
     source = _row_field(row, "tracer-fault-source", "unavailable")
@@ -231,7 +295,7 @@ def _decode_tracer_fault_reference(row: Any) -> Optional[TracerFaultReference]:
         raise ValueError("historical probe cannot carry fault image fields")
     image_id, image_offset = decode_fault_image_fields(
         row, "tracer-fault-image", "tracer-fault-image-offset",
-        required=version == 3)
+        required=version in (3, 4))
     if not valid:
         if image_id is not None:
             raise ValueError("invalid tracer reference carries a fault image")
@@ -378,7 +442,10 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
 
 class BinRadarProbeResult:
     current_line_parser: sbsv.parser = sbsv.parser()
-    current_line_parser.add_schema(PROBE_RESULT_SCHEMA_V3 + " " + CONCRETE_ORACLE_FIELDS)
+    current_line_parser.add_schema(PROBE_RESULT_SCHEMA_V4)
+    v3_oracle_line_parser: sbsv.parser = sbsv.parser()
+    v3_oracle_line_parser.add_schema(PROBE_RESULT_SCHEMA_V3 + " " + CONCRETE_ORACLE_FIELDS)
+    v3_oracle_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     current_line_parser.add_schema("[file-trace] [need-file-hook: bool]")
     line_parser: sbsv.parser = sbsv.parser()
     line_parser.add_schema(PROBE_RESULT_SCHEMA_V3)
@@ -398,7 +465,9 @@ class BinRadarProbeResult:
             tracer_fault_reference: Optional[TracerFaultReference] = None,
             memcheck_policy: Optional[str] = None,
             concrete_oracle: Optional[str] = None,
-            concrete_fault_valid: bool = False):
+            concrete_fault_valid: bool = False,
+            raw_fault_addr: Optional[int] = None,
+            concrete_fault_source: str = "unavailable"):
         self.patch_loc = patch_loc
         self.patch_func_entry = patch_func_entry
         self.stacktrace = stacktrace
@@ -411,13 +480,20 @@ class BinRadarProbeResult:
         self.memcheck_policy = memcheck_policy
         self.concrete_oracle = concrete_oracle
         self.concrete_fault_valid = concrete_fault_valid
-        self._probe_serialization_version = 3
+        self.raw_fault_addr = fault_addr if raw_fault_addr is None else raw_fault_addr
+        self.concrete_fault_source = concrete_fault_source
+        self._probe_serialization_version = 4
         self.need_file_hook = False
 
     @property
     def concrete_fault_addr(self) -> Optional[int]:
         """QASAN main-image instruction identity, not a tracer reference."""
-        if (self.concrete_oracle == CONCRETE_ORACLE
+        if (self._probe_serialization_version == 4
+                and self.concrete_fault_source in ("native", "relocated")
+                and (self.concrete_fault_source != "native"
+                     or self.fault_addr == self.raw_fault_addr)
+                and 0 <= self.raw_fault_addr <= 0xffffffffffffffff
+                and self.concrete_oracle == CONCRETE_ORACLE
                 and self.concrete_fault_valid and self.exit_info == "crash"
                 and 0 <= self.fault_addr <= 0xffffffffffffffff):
             return self.fault_addr
@@ -425,7 +501,7 @@ class BinRadarProbeResult:
     
     def require_current_memcheck_policy(self) -> None:
         """Historical probes are readable, but cannot authorize live phases."""
-        if (self._probe_serialization_version != 3
+        if (self._probe_serialization_version != 4
                 or self.memcheck_policy != MEMCHECK_POLICY):
             raise ValueError(
                 "probe has an old, absent, or mismatched memcheck policy; "
@@ -529,6 +605,8 @@ class BinRadarProbeResult:
             patch_func_candidates=patch_func_candidates,
             concrete_oracle=concrete_oracle,
             concrete_fault_valid=concrete_fault_valid,
+            raw_fault_addr=fault_addr,
+            concrete_fault_source="native" if concrete_fault_valid else "unavailable",
         )
     
     @staticmethod
@@ -537,6 +615,7 @@ class BinRadarProbeResult:
             data = f.read()
         result = None
         for parser in (BinRadarProbeResult.current_line_parser,
+                       BinRadarProbeResult.v3_oracle_line_parser,
                        BinRadarProbeResult.line_parser,
                        BinRadarProbeResult.v2_line_parser,
                        BinRadarProbeResult.legacy_line_parser):
@@ -559,7 +638,7 @@ class BinRadarProbeResult:
         if version is None:
             tracer_fault_reference = _decode_legacy_tracer_fault_reference(
                 probe_info["tracer-fault-addr"])
-        elif version in (2, 3):
+        elif version in (2, 3, 4):
             tracer_fault_reference = _decode_tracer_fault_reference(probe_info)
         else:
             raise ValueError(f"unsupported probe result version: {version}")
@@ -580,11 +659,13 @@ class BinRadarProbeResult:
             patch_func_candidates=patch_func_candidates,
             tracer_fault_reference=tracer_fault_reference,
             memcheck_policy=(_row_field(probe_info, "memcheck-policy")
-                             if version == 3 else None),
+                             if version in (3, 4) else None),
             concrete_oracle=(_row_field(probe_info, "concrete-oracle")
-                             if version == 3 else None),
-            concrete_fault_valid=(_row_field(probe_info, "concrete-fault-valid", False)
-                                  if version == 3 else False),
+                             if version in (3, 4) else None),
+concrete_fault_valid=(_row_field(probe_info, "concrete-fault-valid", False)
+if version in (3, 4) else False),
+                    raw_fault_addr=_row_field(probe_info, "raw-fault-addr", probe_info["fault-addr"]),
+                    concrete_fault_source=_row_field(probe_info, "concrete-fault-source", "unavailable"),
         )
         probe_result.need_file_hook = result["file-trace"][-1]["need-file-hook"]
         probe_result._probe_serialization_version = version or 1
@@ -646,14 +727,14 @@ class BinRadarProbeResult:
                                 break
 
     def serialize(self) -> str:
-        if getattr(self, "_probe_serialization_version", 1) != 3:
+        if getattr(self, "_probe_serialization_version", 1) != 4:
             raise ValueError(
                 "legacy probe results cannot be serialized as fresh data")
         valid, source, address = _probe_reference_fields(
             self.tracer_fault_reference)
         valid_text = "true" if valid else "false"
         return (
-            f"[version 3] [exit {self.exit_info}] [patch-loc {self.patch_loc:x}] "
+            f"[version 4] [exit {self.exit_info}] [patch-loc {self.patch_loc:x}] "
             f"[func-entry {self.patch_func_entry:x}] [patch-hit {self.patch_hit_cnt}] "
             f"[func-hit {self.patch_func_hit_cnt}] [fault-addr {self.fault_addr:x}] "
             f"[tracer-fault-valid {valid_text}] [tracer-fault-source {source}] "
@@ -664,7 +745,9 @@ class BinRadarProbeResult:
             f"[patch-func-candidates [{'] ['.join([f'{entry:x}:{hits}' for entry, hits in self.patch_func_candidates])}]] "
             f"[stacktrace [{'] ['.join([f'{addr:x}:{symbol}' for addr, symbol in self.stacktrace])}]] "
             f"[concrete-oracle {self.concrete_oracle or 'unavailable'}] "
-            f"[concrete-fault-valid {'true' if self.concrete_fault_addr is not None else 'false'}]")
+            f"[concrete-fault-valid {'true' if self.concrete_fault_addr is not None else 'false'}] "
+            f"[raw-fault-addr {self.raw_fault_addr:x}] "
+            f"[concrete-fault-source {self.concrete_fault_source}]")
 
     def serialize_file_trace_result(self) -> str:
         return f"[need-file-hook {self.need_file_hook}]"
@@ -673,7 +756,7 @@ class BinRadarProbeResult:
     def deserialize(cls, data: str) -> Optional["BinRadarProbeResult"]:
         for line in data.splitlines():
             res = None
-            for parser in (cls.current_line_parser, cls.line_parser,
+            for parser in (cls.current_line_parser, cls.v3_oracle_line_parser, cls.line_parser,
                            cls.v2_line_parser, cls.legacy_line_parser):
                 try:
                     res = parser.parse_line_detached(line)
@@ -688,7 +771,7 @@ class BinRadarProbeResult:
                 if version is None:
                     tracer_fault_reference = _decode_legacy_tracer_fault_reference(
                         res["tracer-fault-addr"])
-                elif version in (2, 3):
+                elif version in (2, 3, 4):
                     tracer_fault_reference = _decode_tracer_fault_reference(res)
                 else:
                     raise ValueError(f"unsupported probe result version: {version}")
@@ -709,11 +792,13 @@ class BinRadarProbeResult:
                     patch_func_candidates=patch_func_candidates,
                     tracer_fault_reference=tracer_fault_reference,
                     memcheck_policy=(_row_field(res, "memcheck-policy")
-                                     if version == 3 else None),
+                                     if version in (3, 4) else None),
                     concrete_oracle=(_row_field(res, "concrete-oracle")
-                                     if version == 3 else None),
-                    concrete_fault_valid=(_row_field(res, "concrete-fault-valid", False)
-                                          if version == 3 else False),
+                                     if version in (3, 4) else None),
+concrete_fault_valid=(_row_field(res, "concrete-fault-valid", False)
+if version in (3, 4) else False),
+                    raw_fault_addr=_row_field(res, "raw-fault-addr", res["fault-addr"]),
+                    concrete_fault_source=_row_field(res, "concrete-fault-source", "unavailable"),
                 )
                 probe_result._probe_serialization_version = (
                     version or 1)
@@ -839,6 +924,8 @@ class BinRadarQemuRunner:
         self.patch_kind = patch_kind
         self.brcache_stack_size = brcache_stack_size
         self.run_results = None
+        self._concrete_maps: Dict[str, Dict[int, int]] = {}
+        self._concrete_native_ranges: Dict[str, List[Tuple[int, int]]] = {}
     
     @staticmethod
     def from_workdir(dir: str) -> "BinRadarQemuRunner":
@@ -904,38 +991,144 @@ class BinRadarQemuRunner:
             env["AFL_QEMU_INST_RANGES"] = ranges
         return env
 
+    def _original_executable_ranges(self) -> List[Tuple[int, int]]:
+        """Read original ELF load segments once per loaded patched artifact."""
+        with open(self.original_binary(), "rb") as stream:
+            header = stream.read(64)
+            if len(header) < 52 or header[:4] != b"\x7fELF" or header[5] not in (1, 2):
+                raise ValueError("original binary has no valid ELF header")
+            endian = "<" if header[5] == 1 else ">"
+            if header[4] == 2:
+                if len(header) != 64:
+                    raise ValueError("truncated ELF64 header")
+                phoff = struct.unpack_from(endian + "Q", header, 32)[0]
+                size, count = struct.unpack_from(endian + "HH", header, 54)
+                fmt = endian + "IIQQQQQQ"
+            elif header[4] == 1:
+                phoff = struct.unpack_from(endian + "I", header, 28)[0]
+                size, count = struct.unpack_from(endian + "HH", header, 42)
+                fmt = endian + "IIIIIIII"
+            else:
+                raise ValueError("unsupported original ELF class")
+            if size < struct.calcsize(fmt) or count == 0 or count == 0xffff:
+                raise ValueError("unsupported original ELF program headers")
+            ranges = []
+            for index in range(count):
+                stream.seek(phoff + index * size)
+                record = stream.read(struct.calcsize(fmt))
+                if len(record) != struct.calcsize(fmt):
+                    raise ValueError("truncated original ELF program header")
+                fields = struct.unpack(fmt, record)
+                if header[4] == 2:
+                    kind, flags, _, address, _, _, length, _ = fields
+                else:
+                    kind, _, address, _, _, length, flags, _ = fields
+                if kind == 1 and flags & 1 and length:
+                    if address + length > 0x10000000000000000:
+                        raise ValueError("overflowed original executable segment")
+                    ranges.append((address, address + length))
+            if not ranges:
+                raise ValueError("original binary has no executable segments")
+            return ranges
+
+    def _load_concrete_map(self, binary: str) -> Dict[int, int]:
+        """Validate each artifact and its original once, before any execution."""
+        key = os.path.abspath(binary)
+        if key in self._concrete_maps:
+            return self._concrete_maps[key]
+        try:
+            def unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+                result = {}
+                for name, value in pairs:
+                    if name in result:
+                        raise ValueError(f"duplicate E9 map field: {name}")
+                    result[name] = value
+                return result
+
+            with open(binary + ".e9map.json", encoding="utf-8") as stream:
+                data = json.load(stream, object_pairs_hook=unique_object)
+            if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+                raise ValueError("unsupported E9 instruction map version")
+            for field, path in (("artifact-sha256", binary),
+                                ("original-sha256", self.original_binary())):
+                digest = data.get(field)
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(c not in "0123456789abcdef" for c in digest)):
+                    raise ValueError(f"invalid {field}")
+                with open(path, "rb") as stream:
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                    actual = hasher.hexdigest()
+                if actual != digest:
+                    raise ValueError(f"{field} mismatch")
+            native_ranges = self._original_executable_ranges()
+            entries = data.get("instructions")
+            if not isinstance(entries, list):
+                raise ValueError("instructions must be a list")
+            mapping: Dict[int, int] = {}
+            ranges, _ = self.e9_metadata_for_binary(binary)
+            if not ranges:
+                raise ValueError("artifact E9 ranges missing")
+            for interval in ranges.split(","):
+                bounds = interval.strip().split("-")
+                if len(bounds) != 2:
+                    raise ValueError("malformed artifact E9 ranges")
+                start, end = (int(bound, 16) for bound in bounds)
+                if not 0 <= start < end <= 0x10000000000000000:
+                    raise ValueError("invalid artifact E9 ranges")
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {"relocated", "original"}:
+                    raise ValueError("malformed instruction identity")
+                relocated, original = entry["relocated"], entry["original"]
+                if any(type(pc) is not int or not 0 <= pc <= 0xffffffffffffffff
+                       for pc in (relocated, original)):
+                    raise ValueError("instruction PCs must be uint64 integers")
+                if (not addr_in_e9_ranges(relocated, ranges)
+                        or addr_in_e9_ranges(original, ranges)
+                        or not any(start <= original < end for start, end in native_ranges)):
+                    raise ValueError("instruction identity disagrees with artifact E9 ranges")
+                if relocated in mapping:
+                    raise ValueError("duplicate or conflicting instruction identity")
+                mapping[relocated] = original
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"E9 concrete identity metadata unavailable for {binary}: {exc}; "
+                "rerun binradar-setup to regenerate the artifact and its .e9map.json") from exc
+        self._concrete_native_ranges[key] = native_ranges
+        self._concrete_maps[key] = mapping
+        return mapping
+
+    def concrete_fault_identity(self, fault_addr: int,
+                                binary: Optional[str] = None) -> Tuple[int, str]:
+        """Return exact canonical PC and proof source; never borrow call metadata."""
+        binary = binary if binary is not None else self.patched_binary()
+        if not binary.endswith((".brpatched", ".brcached")):
+            return fault_addr, "native"
+        mapping = self._load_concrete_map(binary)
+        if fault_addr in mapping:
+            return mapping[fault_addr], "relocated"
+        ranges, _ = self.e9_metadata_for_binary(binary)
+        if (not addr_in_e9_ranges(fault_addr, ranges)
+                and (fault_addr == 0 or any(start <= fault_addr < end
+                     for start, end in self._concrete_native_ranges[os.path.abspath(binary)]))):
+            return fault_addr, "native"
+        return fault_addr, "unavailable"
+
     def normalize_fault_addr(self, fault_addr: int,
                              binary: Optional[str] = None) -> int:
-        """Attribute a crash pc inside the artifact's E9 trampoline/reserve
-        pages to the patch site.
+        """Canonical PC for diagnostics; decisions must also require provenance."""
+        return self.concrete_fault_identity(fault_addr, binary)[0]
 
-        With the no-patch path the only relevant code running in the E9
-        pages is the re-executed relocated copy of the patch-site
-        instruction, so a crash whose fault pc lands there was caused by
-        the site instruction and must be compared against PATCH_LOC (same
-        rule as binradar-test.py's qasan probes).  Without this, a
-        non-fixing patch's crash would be classified as "crash elsewhere"
-        (ignored) instead of "crash at the original fault address".
-        Original binaries have no E9 metadata, so they are unchanged.
+    def _normalize_probe(self, probe: BinRadarProbeResult, binary: str) -> None:
+        probe.raw_fault_addr = probe.fault_addr
+        if probe.concrete_fault_valid:
+            probe.fault_addr, probe.concrete_fault_source = self.concrete_fault_identity(
+                probe.raw_fault_addr, binary)
+            probe.concrete_fault_valid = probe.concrete_fault_source != "unavailable"
+        else:
+            probe.concrete_fault_source = "unavailable"
 
-        Only the artifact's own relocated-call records are used as
-        identity proof: a pc that merely lies inside the E9 ranges but is
-        not a recorded relocated jump of this patch site is left
-        unnormalized, so an unrelated trampoline/reserve crash can never be
-        silently folded onto the patch site."""
-        ranges, relocated_calls = self.e9_metadata_for_binary(
-            binary if binary is not None else self.patched_binary())
-        if fault_addr is None:
-            return fault_addr
-        site = e9_relocated_call_site(fault_addr, relocated_calls)
-        if site is not None:
-            return site
-        # Inside an E9 map with no relocation record, or outside every E9
-        # map: not provably the patch-site instruction.  Keep the raw pc so
-        # the comparison reports the real identity instead of folding an
-        # unrelated crash onto the patch site.
-        return fault_addr
-    
     def original_binary(self) -> str:
         return os.path.join(self.dir, f"{self.binary}.orig")
 
@@ -1011,6 +1204,8 @@ class BinRadarQemuRunner:
         additionally write binary BRCH records to PATCH_CACHED_FD; keeping the
         channels separate makes partial reads unambiguous.
         """
+        if binary.endswith((".brpatched", ".brcached")):
+            self._load_concrete_map(binary)
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         patch_rfd, patch_wfd = os.pipe()
         cache_rfd = cache_wfd = None
@@ -1051,12 +1246,7 @@ class BinRadarQemuRunner:
             return None, None, None
         probe = BinRadarProbeResult.from_log(result.stderr)
         if probe is not None:
-            # A crash with the fault pc inside the artifact's E9 trampoline/
-            # reserve pages is the re-executed relocated copy of the patch-
-            # site instruction: attribute it to the patch site so the filter
-            # and verifier comparisons against the .orig fault address work.
-            probe.fault_addr = self.normalize_fault_addr(probe.fault_addr,
-                                                         binary)
+            self._normalize_probe(probe, binary)
         cached_data = b"".join(cache_chunks) if capture_cached else None
         return probe, b"".join(patch_chunks), cached_data
 
@@ -1382,7 +1572,9 @@ class BinRadarConcreteVerifier:
         filename = row["file"]
         exit = row["exit"]
         fault_addr = row["fault-addr"]
-        if exit == "crash" and fault_addr != self.probe_result.fault_addr:
+        if exit == "crash" and (concrete_fault_addr_from_row(row) is None
+                                or self.probe_result.concrete_fault_addr is None
+                                or fault_addr != self.probe_result.concrete_fault_addr):
             self.logger.debug(f"[testcase] [skip-fault-diff] [id {id}] [file {filename}] [fault-addr {fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
             return None
         return Testcase(
@@ -1498,7 +1690,9 @@ class BinRadarConcreteVerifier:
             return True
         if testcase.exit == "crash":
             if result.is_crash():
-                if result.fault_addr != self.probe_result.fault_addr:
+                if (result.concrete_fault_addr is None
+                        or self.probe_result.concrete_fault_addr is None
+                        or result.concrete_fault_addr != self.probe_result.concrete_fault_addr):
                     self._record_observation(patch, "crash-skip-diff-addr")
                     detail(
                         f"[verifier] [crash-skip-diff-addr] [patch {patch}] "
@@ -1527,7 +1721,9 @@ class BinRadarConcreteVerifier:
                 return False
         else:
             if result.is_crash():
-                if result.fault_addr != self.probe_result.fault_addr:
+                if (result.concrete_fault_addr is None
+                        or self.probe_result.concrete_fault_addr is None
+                        or result.concrete_fault_addr != self.probe_result.concrete_fault_addr):
                     self._record_observation(
                         patch, "no-crash-skip-diff-addr")
                     detail(
@@ -1795,7 +1991,7 @@ class BinRadarConcreteVerifier:
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         parser = sbsv.parser()
-        parser.add_schema("[testcase] [result] [id: int] [file: str] [exit: str] [fault-addr: hex] [pid: int] [br: list[int]]")
+        result_parsers = concrete_result_parsers()
         parser.add_schema("[minimizer] [done] [time: int]")
         parser.add_schema(
             "[minimizer] [stopped] [reason: str] [time: int]")
@@ -1842,7 +2038,9 @@ class BinRadarConcreteVerifier:
                     offset = f.tell()
                     fcntl.flock(f, fcntl.LOCK_UN)
                     for line in data.split("\n"):
-                        row = parser.parse_line_detached(line)
+                        row = parse_concrete_result_row(line, result_parsers)
+                        if row is None:
+                            row = parser.parse_line_detached(line)
                         if row is None:
                             continue
                         if row.schema_name == "testcase$result":

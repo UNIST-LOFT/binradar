@@ -47,17 +47,19 @@ def _feedback_executor(tmp_path):
     return executor, run_dir, progress
 
 
-def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version=3):
+def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version=4):
     return (
         f"[testcase] [result] [id {testcase_id}] [file {filename}] "
         f"[version {version}] [exit {exit_info}] [patch-loc 1000] [func-entry 2000] "
         f"[patch-hit {patch_hit}] [func-hit 1] [fault-addr {fault_addr:x}] "
         "[tracer-fault-valid false] [tracer-fault-source unavailable] [tracer-fault-addr 0] "
         + ("[tracer-fault-image none] [tracer-fault-image-offset 0] "
-           "[memcheck-policy unavailable] " if version == 3 else "")
+           "[memcheck-policy unavailable] " if version in (3, 4) else "")
         + "[patch-func-candidates []] [stacktrace []] "
-        + (f"[concrete-oracle qasan-main-v1] [concrete-fault-valid {'true' if exit_info == 'crash' else 'false'}] "
-           if version == 3 else "")
+        + (f"[concrete-oracle {'qasan-main-v2' if version == 4 else 'qasan-main-v1'}] [concrete-fault-valid {'true' if exit_info == 'crash' else 'false'}] "
+           if version in (3, 4) else "")
+        + (f"[raw-fault-addr {fault_addr:x}] [concrete-fault-source {'native' if exit_info == 'crash' else 'unavailable'}] "
+           if version == 4 else "")
         + "[pid 0] [br [0]] [time 1]\n")
 
 
@@ -123,15 +125,17 @@ def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(
     executor, run_dir, _ = _feedback_executor(tmp_path)
     executor.probe_result.tracer_fault_reference = None
     cases = [
-        ("benign", "ok", 0, 1, 2), ("malicious", "crash", 0x1234, 1, 3),
-        ("other", "crash", 0x5678, 1, 3), ("duplicate", "ok", 0, 1, 3),
-        ("no-hit", "ok", 0, 0, 3), ("timeout", "timeout", 0, 1, 3),
+        ("benign", "ok", 0, 1, 4), ("malicious", "crash", 0x1234, 1, 4),
+        ("other", "crash", 0x5678, 1, 4), ("duplicate", "ok", 0, 1, 4),
+        ("no-hit", "ok", 0, 0, 4), ("timeout", "timeout", 0, 1, 4),
         ("old-crash", "crash", 0x1234, 1, 2)]
     rows = []
     for index, (name, outcome, fault, hit, version) in enumerate(cases):
         filename = f"{index}_{name}"
         (run_dir / "minimized" / filename).write_bytes(b"benign" if name == "duplicate" else name.encode())
         rows.append(_full_row(index, filename, outcome, fault, hit, version))
+    rows.insert(0, _full_row(99, "1_malicious", "crash", 0x1234).replace(
+        "[fault-addr 1234]", "[fault-addr nothex]"))
     (run_dir / "minimizer.sbsv").write_text("".join(rows))
     executor.run_feedback()
     concrete = run_dir / "feedback" / "concrete"
@@ -149,13 +153,37 @@ def test_concrete_feedback_requires_both_oracle_observations(tmp_path, oracle, v
     executor.probe_result.concrete_fault_addr = poc
     (run_dir / "minimized" / "input").write_bytes(b"fault")
     row = _full_row(0, "input", "crash", 0x1234)
-    extension = "[concrete-oracle qasan-main-v1] [concrete-fault-valid true] "
+    extension = "[concrete-oracle qasan-main-v2] [concrete-fault-valid true] "
     row = row.replace(extension, "" if oracle is None else
                       f"[concrete-oracle {oracle}] [concrete-fault-valid {valid}] ")
     # A matching valid tracer reference cannot authorize this concrete row.
     (run_dir / "minimizer.sbsv").write_text(row)
     executor.run_feedback()
     assert list((run_dir / "feedback/concrete/malicious").iterdir()) == []
+
+
+def test_feedback_only_exports_current_proved_identity_and_retains_raw(tmp_path):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    rows = []
+    cases = [("mapped", 4, "relocated", 0x9000),
+             ("helper", 4, "unavailable", 0x9010),
+             ("invalid-native", 4, "native", 0x9000),
+             ("historical-crash", 3, None, 0x1234),
+             ("historical-normal", 3, None, 0)]
+    for index, (name, version, source, raw) in enumerate(cases):
+        (run_dir / "minimized" / name).write_bytes(name.encode())
+        outcome = "ok" if name == "historical-normal" else "crash"
+        row = _full_row(index, name, outcome, 0x1234, version=version)
+        if source is not None:
+            row = row.replace("[raw-fault-addr 1234]", f"[raw-fault-addr {raw:x}]").replace(
+                "[concrete-fault-source native]", f"[concrete-fault-source {source}]")
+        rows.append(row)
+    (run_dir / "minimizer.sbsv").write_text("".join(rows))
+    executor.run_feedback()
+    concrete = run_dir / "feedback/concrete"
+    assert {p.name for p in (concrete / "malicious").iterdir()} == {"mapped"}
+    assert list((concrete / "benign").iterdir()) == []
+    assert "[raw-fault-addr 9000] [concrete-fault-source relocated]" in (concrete / "results.sbsv").read_text()
 
 
 def test_explicit_qasan_pc_zero_exports_but_absent_address_does_not(tmp_path):

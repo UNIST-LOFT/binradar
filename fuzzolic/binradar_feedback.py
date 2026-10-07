@@ -30,38 +30,15 @@ class FeedbackExportRequest:
 
 
 def _result_parsers():
-    full_parsers = []
-    for schema in (binradar_verifier.PROBE_RESULT_SCHEMA_V3 + " "
-                   + binradar_verifier.CONCRETE_ORACLE_FIELDS,
-                   binradar_verifier.PROBE_RESULT_SCHEMA_V3,
-                   binradar_verifier.PROBE_RESULT_SCHEMA_V2,
-                   binradar_verifier.PROBE_RESULT_SCHEMA_V1):
-        parser = sbsv.parser()
-        parser.add_schema(
-            "[testcase] [result] [id: int] [file: str] "
-            + schema.removeprefix("[probe-info] ")
-            + " [pid: int] [br: list[int]]")
-        full_parsers.append(parser)
-    legacy_parser = sbsv.parser()
-    legacy_parser.add_schema(
-        "[testcase] [result] [id: int] [file: str] [exit: str] "
-        "[fault-addr: hex] [pid: int] [br: list[int]]")
-    minimal_parser = sbsv.parser()
-    minimal_parser.add_schema(
-        "[testcase] [result] [id: int] [file: str] [exit: str] "
-        "[fault-addr: hex]")
-    return *full_parsers, legacy_parser, minimal_parser
+    return binradar_verifier.concrete_result_parsers()
 
 
-def _parse_result_row(line: str, parsers) -> sbsv.SbsvData | None:
-    for parser in parsers:
-        try:
-            row = parser.parse_line_detached(line)
-        except ValueError:
-            continue
-        if row is not None and row.schema_name == "testcase$result":
-            return row
-    return None
+def _parse_result_row(line, parsers):
+    try:
+        return binradar_verifier.parse_concrete_result_row(line, parsers)
+    except ValueError:
+        # Export may omit malformed observations; verification must fail instead.
+        return None
 
 
 def _validate_feedback_identity(line: str) -> None:
@@ -322,6 +299,9 @@ def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
                 continue
 
             exit_info = row["exit"]
+            if (row.data.get("version") != 4
+                    or row.data.get("concrete-oracle") != binradar_verifier.CONCRETE_ORACLE):
+                continue
             if exit_info == "ok":
                 category = "benign"
             elif exit_info == "crash":
@@ -330,9 +310,7 @@ def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
                 # observations; never promote a historical bare fault-addr or
                 # use a tracer finding to attest a concrete crash.
                 if (request.poc_concrete_fault_addr is None
-                        or row.data.get("version") != 3
-                        or row.data.get("concrete-oracle") != binradar_verifier.CONCRETE_ORACLE
-                        or row.data.get("concrete-fault-valid") is not True
+                        or binradar_verifier.concrete_fault_addr_from_row(row) is None
                         or row["fault-addr"] != request.poc_concrete_fault_addr):
                     continue
                 category = "malicious"
@@ -361,6 +339,8 @@ def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
                 destination = os.path.join(
                     destination_dir, f"{row['id']}_{filename}")
             shutil.copyfile(source, destination)
+            with open(os.path.join(concrete_dir, "results.sbsv"), "a", encoding="utf-8") as diagnostics:
+                diagnostics.write(line if line.endswith("\n") else line + "\n")
             copied_hashes.add(digest)
             copied_counts[category] += 1
 

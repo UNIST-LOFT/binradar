@@ -27,7 +27,6 @@ from binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
     QEMU_STACKTRACE_RELEASE,
-    e9_relocated_call_site,
 )
 
 LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
@@ -425,20 +424,19 @@ def extract_qasan_fault_addr(log: str) -> Optional[Tuple[int, str]]:
 
 def normalize_patched_fault_addr(fault_addr: int, runner: BinRadarQemuRunner,
                                  binary_path: str) -> Tuple[int, bool]:
-    """Map a fault pc onto the original patch-site instruction.
+    """Map a fault pc onto its proved original instruction identity.
 
     With PATCH_ID=0 the patch stub takes the no-patch path and re-executes
     the relocated copy of the original patch-site instruction inside the E9
     trampoline pages, so a crash caused by that instruction reports the
-    trampoline address instead of the in-binary site.  Only the artifact's
-    own relocated-call record proves that relation: a pc that merely lies
-    inside the E9 exclude ranges is *not* attributed, because an unrelated
-    trampoline/reserve crash must not be folded onto the patch site."""
-    _, relocated_calls = runner.e9_metadata_for_binary(binary_path)
-    site = e9_relocated_call_site(fault_addr, relocated_calls)
-    if site is not None:
-        return site, True
-    return fault_addr, False
+    trampoline address instead of the in-binary site.  The artifact's own
+    version-1 instruction map is the only proof: an E9 pc with no map entry
+    is *not* attributed, because an unrelated trampoline/reserve or helper
+    crash must not be folded onto the patch site.  Returns
+    ``(canonical_addr, relocated True)``; unavailable identities keep the raw
+    pc so the caller reports the real observed address."""
+    canonical, source = runner.concrete_fault_identity(fault_addr, binary_path)
+    return canonical, source == "relocated"
 
 
 _TRACER_PARSER = sbsv.parser()
@@ -863,12 +861,17 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
     result.patched_fault_addr_raw = hex(patched_probe.fault_addr)
 
     patched_addr = patched_probe.fault_addr
-    # A PATCH_ID=0 crash inside the E9 trampoline pages is the re-executed
-    # copy of the patch-site instruction: attribute it to the patch site.
-    # The csv/tsv columns report the attributed address (what the verdict
-    # compares), not the raw trampoline pc.
-    patched_addr, e9_norm = normalize_patched_fault_addr(
-        patched_addr, runner, patched_bin)
+    # A PATCH_ID=0 crash in the E9 trampoline pages is the re-executed copy
+    # of the moved original instruction: attribute it only through the
+    # artifact's own instruction map.  The csv/tsv columns report the
+    # attributed address (what the verdict compares), not the raw pc.
+    try:
+        patched_addr, e9_norm = normalize_patched_fault_addr(
+            patched_addr, runner, patched_bin)
+    except ValueError as e:
+        result.status = Status.FAIL
+        result.detail = f"unusable E9 identity metadata ({e})"
+        return result
     result.patched_fault_addr = hex(patched_addr)
     if e9_norm:
         result.patched_fault_addr_raw = (f"{result.patched_fault_addr_raw} "
@@ -904,8 +907,14 @@ def run_qasan_subject(exp_dir: str, workdir_name: str,
             return result
         result.cached_exit = cached_probe.exit_info
         result.cached_fault_addr_raw = hex(cached_probe.fault_addr)
-        cached_addr, cached_e9_norm = normalize_patched_fault_addr(
-            cached_probe.fault_addr, runner, cached_bin)
+        try:
+            cached_addr, cached_e9_norm = normalize_patched_fault_addr(
+                cached_probe.fault_addr, runner, cached_bin)
+        except ValueError as e:
+            result.status = Status.FAIL
+            detail = f"unusable E9 identity metadata ({e})"
+            result.detail = f"{result.detail}; {detail}" if result.detail else detail
+            return result
         result.cached_fault_addr = hex(cached_addr)
         if cached_e9_norm:
             result.cached_fault_addr_raw = (f"{result.cached_fault_addr_raw} "
