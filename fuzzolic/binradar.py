@@ -2161,7 +2161,7 @@ def main():
     parser.add_argument("--fuzzer-only", action="store_true",
         help=("run probe, AFL++ fuzzer, minimizer/verifier, and final; "
               "skip fuzzolic, directed, and binradar"))
-    parser.add_argument("--target-patches", choices=["top-30", "all"], default="top-30")
+    parser.add_argument("--target-patches", choices=["top-30", "all"], default="all")
     parser.add_argument("--forkserver-child-timeout", type=positive_int,
                         default=binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT,
                         help=("per-iteration cap in seconds for one forkserver "
