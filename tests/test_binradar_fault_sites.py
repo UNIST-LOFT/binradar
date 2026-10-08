@@ -183,11 +183,11 @@ def test_final_compares_dso_site_not_raw_pc(tmp_path, image, offset, expected):
 ])
 def test_baseline_compares_dso_sites_across_aslr(image, offset, expected):
     result = SimpleNamespace(success=True, exit_code=-11, stderr=(
-        "[memcheck] [policy coverage-v2]\n"
+        f"[memcheck] [policy {verifier.MEMCHECK_POLICY}]\n"
         "[snapshot] [fault-reference] [version 3] [valid true] "
         f"[source provenance-access] [address 9000123] [image {image}] [image-offset {offset:x}]\n"))
     reference = verifier.TracerFaultReference(0x7000123, "provenance-access", IMAGE, 0x123)
-    check = binradar_baseline._classify(".orig", result, reference, [], "", 0)
+    check = binradar_baseline._classify(".orig", result, reference)
     assert check.status == expected
 
 

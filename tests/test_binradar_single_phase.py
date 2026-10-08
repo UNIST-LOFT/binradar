@@ -27,11 +27,18 @@ _spec.loader.exec_module(binradar)
 
 
 def _probe(exit_info="ok", fault_addr=0x1234):
+    # Current probe identity: a crash carries the current concrete oracle and
+    # a native provenance whose raw pc equals the canonical pc.
+    crash = exit_info == "crash"
     return binradar_verifier.BinRadarProbeResult(
         patch_loc=0x1000, patch_func_entry=0x2000, stacktrace=[],
         exit_info=exit_info, patch_hit_cnt=1, patch_func_hit_cnt=1,
         fault_addr=fault_addr, patch_func_candidates=[],
-        tracer_fault_reference=None)
+        tracer_fault_reference=None,
+        concrete_oracle=(binradar_verifier.CONCRETE_ORACLE if crash else None),
+        concrete_fault_valid=crash,
+        raw_fault_addr=fault_addr,
+        concrete_fault_source="native" if crash else "unavailable")
 
 
 def _patch_result():
@@ -96,12 +103,14 @@ def _make_workdir(tmp_path):
     poc.write_bytes(b"poc")
     # Probe results as run_probe() itself serializes them.
     (rundir / "probe-results.sbsv").write_text(
-        "[probe-info] [version 3] [exit crash] [patch-loc 1000] "
+        "[probe-info] [version 4] [exit crash] [patch-loc 1000] "
         "[func-entry 2000] [patch-hit 1] [func-hit 1] [fault-addr 1234] "
         "[tracer-fault-valid false] [tracer-fault-source unavailable] "
         "[tracer-fault-addr 0] [tracer-fault-image none] "
-        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v2] "
-        "[patch-func-candidates []] [stacktrace []]\n"
+        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v3] "
+        "[patch-func-candidates []] [stacktrace []] "
+        "[concrete-oracle qasan-main-v2] [concrete-fault-valid true] "
+        "[raw-fault-addr 1234] [concrete-fault-source native]\n"
         "[file-trace] [need-file-hook false]\n")
     # Already-produced testcases (as the fuzzolic producer phase would leave).
     testcases = rundir / "fuzzolic-tests"
@@ -111,7 +120,7 @@ def _make_workdir(tmp_path):
     return workdir, rundir
 
 
-@pytest.mark.parametrize("policy", [None, "coverage-v1", "old", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "old", "unavailable"])
 def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, policy):
     workdir, rundir = _make_workdir(tmp_path)
     probe_file = rundir / "probe-results.sbsv"
@@ -119,11 +128,14 @@ def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, pol
         "[tracer-fault-valid false] [tracer-fault-source unavailable]",
         "[tracer-fault-valid true] [tracer-fault-source guest-signal]")
     if policy is None:
-        row = row.replace("[version 3]", "[version 2]").replace(
-            "[memcheck-policy coverage-v2] ", "").replace(
+        row = row.replace("[version 4]", "[version 2]").replace(
+            "[memcheck-policy coverage-v3] ", "").replace(
             "[tracer-fault-image none] [tracer-fault-image-offset 0] ", "")
+        row = row.replace(
+            "[concrete-oracle qasan-main-v2] [concrete-fault-valid true] "
+            "[raw-fault-addr 1234] [concrete-fault-source native] ", "")
     else:
-        row = row.replace("[memcheck-policy coverage-v2]", f"[memcheck-policy {policy}]")
+        row = row.replace("[memcheck-policy coverage-v3]", f"[memcheck-policy {policy}]")
     probe_file.write_text(row)
     executor = _build_executor(workdir)
     with pytest.raises(SystemExit, match="--run-id n"):

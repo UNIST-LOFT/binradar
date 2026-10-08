@@ -77,7 +77,7 @@ PROBE_RESULT_SCHEMA_V2 = (
     "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
 
 
-MEMCHECK_POLICY = "coverage-v2"
+MEMCHECK_POLICY = "coverage-v3"
 PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
     "[tracer-fault-addr: hex]", "[tracer-fault-addr: hex] "
     "[tracer-fault-image: str] [tracer-fault-image-offset: hex] "
@@ -354,31 +354,6 @@ def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
         except ValueError:
             continue
     return False
-
-
-def e9_relocated_call_site(fault_addr: int, relocated_calls: Sequence[str]) -> Optional[int]:
-    """Return the original call-site address when ``fault_addr`` is the
-    *exact* E9 relocated-call jump that re-implements it, else None.
-
-    ``relocated_calls`` records are ``jump:call-site:return`` triples
-    produced by setup's ``extract_relocated_call_jumps``: the jump address
-    is the trampoline jump E9Patch emits to emulate one original call, and
-    the record proves that this exact PC denotes that one original
-    instruction.  This is the identity relation -- never a range -- so an
-    unrelated trampoline/reserve crash can never be silently folded onto
-    the patch site.
-    """
-    for record in relocated_calls:
-        fields = record.split(":")
-        if len(fields) != 3:
-            continue
-        try:
-            jump, site = int(fields[0], 0), int(fields[1], 0)
-        except ValueError:
-            continue
-        if jump == fault_addr:
-            return site
-    return None
 
 
 class CachedPredicateSet(NamedTuple):
@@ -924,8 +899,8 @@ class BinRadarQemuRunner:
         self.patch_kind = patch_kind
         self.brcache_stack_size = brcache_stack_size
         self.run_results = None
-        self._concrete_maps: Dict[str, Dict[int, int]] = {}
-        self._concrete_native_ranges: Dict[str, List[Tuple[int, int]]] = {}
+        self._instruction_maps: Dict[str, Dict[int, int]] = {}
+        self._instruction_native_ranges: Dict[str, List[Tuple[int, int]]] = {}
     
     @staticmethod
     def from_workdir(dir: str) -> "BinRadarQemuRunner":
@@ -1031,11 +1006,11 @@ class BinRadarQemuRunner:
                 raise ValueError("original binary has no executable segments")
             return ranges
 
-    def _load_concrete_map(self, binary: str) -> Dict[int, int]:
+    def load_instruction_map(self, binary: str) -> Dict[int, int]:
         """Validate each artifact and its original once, before any execution."""
         key = os.path.abspath(binary)
-        if key in self._concrete_maps:
-            return self._concrete_maps[key]
+        if key in self._instruction_maps:
+            return self._instruction_maps[key]
         try:
             def unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
                 result = {}
@@ -1093,11 +1068,18 @@ class BinRadarQemuRunner:
                 mapping[relocated] = original
         except (OSError, ValueError, TypeError) as exc:
             raise ValueError(
-                f"E9 concrete identity metadata unavailable for {binary}: {exc}; "
+                f"E9 instruction identity metadata unavailable for {binary}: {exc}; "
                 "rerun binradar-setup to regenerate the artifact and its .e9map.json") from exc
-        self._concrete_native_ranges[key] = native_ranges
-        self._concrete_maps[key] = mapping
+        self._instruction_native_ranges[key] = native_ranges
+        self._instruction_maps[key] = mapping
         return mapping
+
+    def tracer_instruction_pairs(self, binary: str) -> str:
+        """Prepare artifact-bound exact identities before constructing an environment."""
+        if not binary.endswith((".brpatched", ".brcached")):
+            return ""
+        return ",".join(f"{raw:x}:{original:x}" for raw, original in
+                        sorted(self.load_instruction_map(binary).items()))
 
     def concrete_fault_identity(self, fault_addr: int,
                                 binary: Optional[str] = None) -> Tuple[int, str]:
@@ -1105,13 +1087,13 @@ class BinRadarQemuRunner:
         binary = binary if binary is not None else self.patched_binary()
         if not binary.endswith((".brpatched", ".brcached")):
             return fault_addr, "native"
-        mapping = self._load_concrete_map(binary)
+        mapping = self.load_instruction_map(binary)
         if fault_addr in mapping:
             return mapping[fault_addr], "relocated"
         ranges, _ = self.e9_metadata_for_binary(binary)
         if (not addr_in_e9_ranges(fault_addr, ranges)
                 and (fault_addr == 0 or any(start <= fault_addr < end
-                     for start, end in self._concrete_native_ranges[os.path.abspath(binary)]))):
+                     for start, end in self._instruction_native_ranges[os.path.abspath(binary)]))):
             return fault_addr, "native"
         return fault_addr, "unavailable"
 
@@ -1205,7 +1187,7 @@ class BinRadarQemuRunner:
         channels separate makes partial reads unambiguous.
         """
         if binary.endswith((".brpatched", ".brcached")):
-            self._load_concrete_map(binary)
+            self.load_instruction_map(binary)
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         patch_rfd, patch_wfd = os.pipe()
         cache_rfd = cache_wfd = None

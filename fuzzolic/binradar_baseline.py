@@ -86,6 +86,7 @@ def _parser() -> sbsv.parser:
 def _controlled_environment(config: Dict[str, str], *,
                             e9_ranges: str = "",
                             relocated_calls: str = "",
+                            relocated_instructions: str = "",
                             patch_fd: Optional[int] = None) -> Dict[str, str]:
     """Environment for one baseline tracer run."""
     environment = dict(config)
@@ -114,6 +115,7 @@ def _controlled_environment(config: Dict[str, str], *,
     environment["PATCH_ID"] = "0"
     environment["E9_EXCLUDE_RANGES"] = e9_ranges
     environment["E9_RELOCATED_CALL_JUMPS"] = relocated_calls
+    environment["E9_RELOCATED_INSTRUCTIONS"] = relocated_instructions
     if patch_fd is not None:
         environment["PATCH_FD"] = str(patch_fd)
     return environment
@@ -167,8 +169,7 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
             reader.join(timeout=5)
 
 
-def _classify(artifact: str, result, reference, relocation_records, ranges,
-              patch_loc: int) -> BaselineCheck:
+def _classify(artifact: str, result, reference) -> BaselineCheck:
     """Classify one artifact's patch-0 observation against `reference`."""
     if result is None:
         return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
@@ -216,17 +217,7 @@ def _classify(artifact: str, result, reference, relocation_records, ranges,
                   else BaselineStatus.DIFFERENT_FAULT)
         return BaselineCheck(artifact, status, observed,
                              f"fault identity {observed.identity_key!r}")
-    site = binradar_verifier.e9_relocated_call_site(observed.address,
-                                                    relocation_records)
-    normalized_address = site if site is not None else observed.address
-    if (site is None and ranges
-            and binradar_verifier.addr_in_e9_ranges(observed.address, ranges)):
-        return BaselineCheck(
-            artifact, BaselineStatus.UNUSABLE, observed,
-            f"fault pc {observed.address:#x} lies in the E9 trampoline/"
-            f"reserve pages with no relocation record proving it is the "
-            f"relocated copy of the patch site ({patch_loc:#x})")
-    if normalized_address == reference.address:
+    if observed.identity_key == reference.identity_key:
         return BaselineCheck(artifact, BaselineStatus.REPRODUCED, observed,
                              f"{observed.source} at {observed.address:#x}")
     return BaselineCheck(
@@ -242,12 +233,11 @@ def validate_patch_zero_baseline(
         original: str,
         probe_reference: Optional[binradar_verifier.TracerFaultReference],
         selected_binary: str,
-        patch_loc: str,
         test_cmd: str,
         testcase: str,
         timeout: float,
         phase_deadline: Optional[float] = None,
-        metadata: Dict[str, Tuple[str, Sequence[str]]],
+        identity_runner: binradar_verifier.BinRadarQemuRunner,
         probe_policy: Optional[str] = None,
 ) -> BaselineResult:
     """Validate the POC on `.orig`, `.brpatched`, and `.brcached` patch 0.
@@ -257,11 +247,16 @@ def validate_patch_zero_baseline(
             "PROBE memcheck policy is old, absent, or mismatched; "
             "start a fresh run with --run-id n")
 
+    # Validate every artifact before the first tracer launch. Each path uses
+    # its own bound map, never a union or the selected phase's inherited data.
+    instruction_pairs = {original: ""}
+    for suffix in (".brpatched", ".brcached"):
+        path = original[:-len(".orig")] + suffix
+        if os.path.exists(path):
+            instruction_pairs[path] = identity_runner.tracer_instruction_pairs(path)
+
     def metadata_for(path: str) -> Tuple[str, Sequence[str]]:
-        for suffix in (".brpatched", ".brcached", ".orig"):
-            if path.endswith(suffix):
-                return metadata.get(suffix, ("", ()))
-        return "", ()
+        return identity_runner.e9_metadata_for_binary(path)
 
     def suffix_of(path: str) -> str:
         for suffix in (".brpatched", ".brcached", ".orig"):
@@ -279,6 +274,7 @@ def validate_patch_zero_baseline(
             workdir, path,
             _controlled_environment(config, e9_ranges=ranges,
                                     relocated_calls=",".join(records),
+                                    relocated_instructions=instruction_pairs[path],
                                     patch_fd=-1 if patched else None),
             test_cmd, testcase, remaining)
 
@@ -292,8 +288,7 @@ def validate_patch_zero_baseline(
     if os.path.exists(original):
         ranges, records = metadata_for(original)
         result = run_artifact(original, ranges, records, False)
-        original_check = _classify(".orig", result, reference, records, ranges,
-                                   int(patch_loc, 0))
+        original_check = _classify(".orig", result, reference)
         checks.append(original_check)
     else:
         return BaselineResult(
@@ -307,8 +302,7 @@ def validate_patch_zero_baseline(
             continue
         ranges, records = metadata_for(path)
         result = run_artifact(path, ranges, records, True)
-        check = _classify(suffix, result, reference, records, ranges,
-                          int(patch_loc, 0))
+        check = _classify(suffix, result, reference)
         if (check.status is BaselineStatus.REPRODUCED
                 and original_check.status is not BaselineStatus.REPRODUCED):
             check = BaselineCheck(

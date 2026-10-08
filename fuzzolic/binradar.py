@@ -964,12 +964,15 @@ class BinRadarExecutor:
 
         exclude_ranges = ""
         relocated_calls = ""
+        relocated_instructions = ""
         if mode == "binradar":
             if artifact is None:
                 raise RuntimeError(
                     "BinRadar phase environment requires an artifact selection")
             exclude_ranges, relocated_calls = binradar_utils.get_e9_metadata(
                 self.config, artifact.metadata_prefix)
+            relocated_instructions = self._identity_runner().tracer_instruction_pairs(
+                artifact.path)
 
         log_file = binradar_config.phase_log_file(mode, run_dir)
         if os.path.exists(log_file):
@@ -986,27 +989,19 @@ class BinRadarExecutor:
                 active_patch_count=len(self.filter_result),
                 e9_exclude_ranges=exclude_ranges,
                 e9_relocated_calls=relocated_calls,
+                e9_relocated_instructions=relocated_instructions,
             ),
             forkserver_read_timeout=binradar_runtime.TracerExecutor.forkserver_timeout,
             forkserver_analyze_margin=binradar_runtime.TracerExecutor.forkserver_analyze_margin,
         )
 
-    def _artifact_e9_metadata(self) -> Dict[str, Tuple[str, List[str]]]:
-        """Every artifact's own E9 metadata, keyed by binary suffix.
-
-        Each artifact is validated with the metadata of the artifact being
-        executed, never another artifact's: `.brpatched` and `.brcached`
-        have distinct RESERVE/TRAMPOLINE maps and therefore distinct
-        exclusion ranges.
-        """
-        metadata: Dict[str, Tuple[str, List[str]]] = {".orig": ("", [])}
-        for suffix, prefix in ((".brpatched", "brpatched"),
-                               (".brcached", "brcached")):
-            ranges, calls = binradar_utils.get_e9_metadata(self.config, prefix)
-            metadata[suffix] = (
-                ranges,
-                [record for record in calls.split(",") if record.strip()])
-        return metadata
+    def _identity_runner(self) -> binradar_verifier.BinRadarQemuRunner:
+        """Share artifact-bound map validation across tracer preparations."""
+        if not hasattr(self, "_e9_identity_runner"):
+            self._e9_identity_runner = binradar_verifier.BinRadarQemuRunner.from_env(
+                self.workdir, {**self.config, "BINARY": self.binary,
+                               "TEST_CMD": self.test_cmd, "PATCH_LOC": self.patch_loc})
+        return self._e9_identity_runner
 
     def _validate_baseline(
             self, tracer_binary: str, testcase: str,
@@ -1023,6 +1018,11 @@ class BinRadarExecutor:
         # Bound the pre-flight by the same child-timeout rule the phase
         # environment uses, so a hanging baseline can never consume more
         # than one child's budget.
+        identity_runner = self._identity_runner()
+        for path in (self.artifacts.original[:-len(".orig")] + suffix
+                     for suffix in (".brpatched", ".brcached")):
+            if os.path.exists(path):
+                identity_runner.tracer_instruction_pairs(path)
         timeout = deadline.remaining(float(self.forkserver_child_timeout))
         if timeout <= 0:
             logger.warning(
@@ -1038,12 +1038,11 @@ class BinRadarExecutor:
                 probe_reference=self.probe_result.tracer_fault_reference,
                 probe_policy=self.probe_result.memcheck_policy,
                 selected_binary=tracer_binary,
-                patch_loc=self.patch_loc,
                 test_cmd=self.test_cmd,
                 testcase=testcase,
                 timeout=timeout,
                 phase_deadline=deadline.expires_at,
-                metadata=self._artifact_e9_metadata(),
+                identity_runner=identity_runner,
             )
         except Exception as exc:
             logger.warning(
@@ -1136,6 +1135,7 @@ class BinRadarExecutor:
         # The original binary has no E9 mappings and no relocated calls.
         tracer_env["E9_EXCLUDE_RANGES"] = ""
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
+        tracer_env["E9_RELOCATED_INSTRUCTIONS"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")

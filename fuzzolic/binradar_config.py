@@ -329,6 +329,7 @@ class PhaseEnvironmentConfig:
     active_patch_count: int
     e9_exclude_ranges: str = ""
     e9_relocated_calls: str = ""
+    e9_relocated_instructions: str = ""
 
 
 def phase_log_file(mode: str, run_dir: str) -> str:
@@ -397,9 +398,11 @@ def build_phase_environment(
     # Original-binary phases must not inherit patched E9 metadata.
     environment["E9_EXCLUDE_RANGES"] = ""
     environment["E9_RELOCATED_CALL_JUMPS"] = ""
+    environment["E9_RELOCATED_INSTRUCTIONS"] = ""
     if mode == "binradar":
         environment["E9_EXCLUDE_RANGES"] = phase.e9_exclude_ranges
         environment["E9_RELOCATED_CALL_JUMPS"] = phase.e9_relocated_calls
+        environment["E9_RELOCATED_INSTRUCTIONS"] = phase.e9_relocated_instructions
 
     environment["BINRADAR_REVERSE_DIRECTED"] = "0"
     if mode == "fuzzolic":

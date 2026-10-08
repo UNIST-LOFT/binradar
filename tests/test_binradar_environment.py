@@ -15,12 +15,18 @@ binradar = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(binradar)
 import binradar_artifacts
 import binradar_config
+from test_binradar_e9_metadata import _write_bound_identity_artifacts
 
 
 @pytest.fixture
 def executor(tmp_path):
+    _write_bound_identity_artifacts(tmp_path, "bin")
     instance = object.__new__(binradar.BinRadarExecutor)
-    instance.config = {}
+    instance.workdir = str(tmp_path)
+    instance.binary = "bin"
+    instance.test_cmd = "@@"
+    instance.patch_loc = "0x401000"
+    instance.config = {"BINARY": "bin", "TEST_CMD": "@@", "PATCH_LOC": "0x401000"}
     instance.probe_result = SimpleNamespace(patch_func_hit_cnt=3)
     instance.timeout = 17
     instance.reverse_directed = False
@@ -147,7 +153,7 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
         captured.update(kwargs["env"])
         return binradar.binradar_utils.ExecutionResult(
             success=False, exit_code=1, stdout="",
-            stderr="[memcheck] [policy coverage-v2]\n")
+            stderr="[memcheck] [policy coverage-v3]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", execute)
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")
@@ -155,7 +161,7 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
 
     instance.run_probe()
 
-    assert captured["BINRADAR_MEMCHECK_POLICY"] == "coverage-v2"
+    assert captured["BINRADAR_MEMCHECK_POLICY"] == "coverage-v3"
 
     assert captured["BINRADAR_FORKSERVER_ENABLE"] == "0"
     assert captured["BINRADAR_OSPREY_ENABLE"] == "0"
@@ -408,7 +414,7 @@ def test_memcheck_policy_overrides_inherited_disabled_value(
     monkeypatch.setenv("BINRADAR_MEMCHECK_POLICY", "wrong")
     environment = _phase_env(instance, "binradar", run_dir)
     assert environment["BINRADAR_MEMCHECK_ENABLE"] == "1"
-    assert environment["BINRADAR_MEMCHECK_POLICY"] == "coverage-v2"
+    assert environment["BINRADAR_MEMCHECK_POLICY"] == "coverage-v3"
     for mode in ("fuzzolic", "directed"):
         environment = _phase_env(instance, mode, run_dir / mode)
         assert environment["BINRADAR_MEMCHECK_ENABLE"] == "0"

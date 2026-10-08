@@ -185,7 +185,7 @@ def test_concrete_verifier_branch_difference_lowers_confidence_without_rejecting
 
     verifier = binradar.binradar_verifier.BinRadarConcreteVerifier(
         str(tmp_path), str(tmp_path), FakeRunner(),
-        SimpleNamespace(fault_addr=0xDEAD),
+        SimpleNamespace(fault_addr=0xDEAD, concrete_fault_addr=0xDEAD),
         str(tmp_path / "binary.brpatched"), [1])
     testcase = binradar.binradar_verifier.Testcase(
         0, "input", "ok", 0, [0])
@@ -193,6 +193,7 @@ def test_concrete_verifier_branch_difference_lowers_confidence_without_rejecting
     def execution(exit_kind, fault_addr=0):
         return SimpleNamespace(
             fault_addr=fault_addr,
+            concrete_fault_addr=(fault_addr if exit_kind == "crash" else None),
             is_crash=lambda: exit_kind == "crash",
             is_normal_exit=lambda: exit_kind == "ok",
             is_timeout=lambda: exit_kind == "timeout",

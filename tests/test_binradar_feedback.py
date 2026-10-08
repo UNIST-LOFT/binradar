@@ -37,7 +37,8 @@ def _feedback_executor(tmp_path):
     executor.artifacts = SimpleNamespace(original=str(workdir / "target.orig"))
     executor.poc_input = "poc/input"
     executor.probe_result = SimpleNamespace(
-        fault_addr=0x1234, concrete_fault_addr=0x1234, memcheck_policy="coverage-v2",
+        fault_addr=0x1234, concrete_fault_addr=0x1234,
+        memcheck_policy=binradar.binradar_verifier.MEMCHECK_POLICY,
         tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
             0x1234, "guest-signal"))
     executor.run_prefix = "run"
@@ -335,7 +336,7 @@ def test_malformed_committed_pair_preserves_source_and_previous_export(tmp_path,
         data[-1] ^= 1
         (run_dir / "binradar.br").write_bytes(data)
     else:
-        executor.probe_result.memcheck_policy = "coverage-v1"
+        executor.probe_result.memcheck_policy = "coverage-v2"
     existing = run_dir / "feedback"
     existing.mkdir()
     (existing / "keep").write_bytes(b"historical")

@@ -611,6 +611,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     # tracer treats missing/empty as "no E9 regions").
     proc_env["E9_EXCLUDE_RANGES"] = ""
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
+    proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
     # Look for plt_info.txt in the workdir's out directory.
@@ -697,6 +698,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     # tracer treats missing/empty as "no E9 regions").
     proc_env["E9_EXCLUDE_RANGES"] = ""
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
+    proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     if entrypoint:
         proc_env["BINRADAR_ENTRYPOINT"] = entrypoint

@@ -28,18 +28,26 @@ _spec.loader.exec_module(binradar)
 import binradar_artifacts
 import binradar_config
 import binradar_runtime
+from test_binradar_e9_metadata import _write_bound_identity_artifacts
 
 
 def _executor(
         tmp_path, timeout=21600,
         cap=binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT):
+    _write_bound_identity_artifacts(tmp_path, "bin")
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.workdir = str(tmp_path)
+    executor.binary = "bin"
+    executor.test_cmd = "@@"
+    executor.patch_loc = "0x401000"
     executor.timeout = timeout
     executor.forkserver_child_timeout = cap
     executor.probe_result = SimpleNamespace(patch_func_hit_cnt=1)
     executor.filter_result = [1, 2, 3]
     executor.reverse_directed = False
-    executor.config = {}
+    executor.config = {
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x70000000-0x70001000",
+    }
     executor.brpatched_total_patches = len(executor.filter_result)
     executor.outdir = str(tmp_path)
     executor.artifacts = binradar_artifacts.ArtifactSet(

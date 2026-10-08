@@ -862,7 +862,30 @@ def test_cmd_setup_builds_filters_then_rebuilds_erm(tmp_path, monkeypatch):
 # P0-2: relocated-call propagation to symbolic tracer runs
 # ---------------------------------------------------------------------------
 
+def _write_bound_identity_artifacts(tmp_path, binary="nm"):
+    """Minimal executable ELF plus two independently hash-bound empty maps."""
+    import hashlib
+    import json
+    original = tmp_path / f"{binary}.orig"
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 32, 64)
+    struct.pack_into("<HH", header, 54, 56, 1)
+    original.write_bytes(bytes(header) + struct.pack(
+        "<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, 0, 0x100000, 0x1000))
+    for suffix in ("brpatched", "brcached"):
+        artifact = tmp_path / f"{binary}.{suffix}"
+        artifact.write_bytes(suffix.encode())
+        artifact.with_name(artifact.name + ".e9map.json").write_text(json.dumps({
+            "version": 1,
+            "artifact-sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "original-sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+            "instructions": [],
+        }))
+
+
 def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
+    _write_bound_identity_artifacts(tmp_path)
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.workdir = str(tmp_path)
     executor.outdir = str(tmp_path / "out")
@@ -908,12 +931,14 @@ def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
     config = {
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000,0x2cc7000-0x2cc9000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
+        "E9_RELOCATED_INSTRUCTIONS": "dead:beef",
     }
     executor = _stub_executor(tmp_path, config=config)
     for mode in ("fuzzolic", "directed"):
         env = _phase_env(executor, mode, tmp_path)
         assert env["E9_RELOCATED_CALL_JUMPS"] == ""
         assert env["E9_EXCLUDE_RANGES"] == ""
+        assert env["E9_RELOCATED_INSTRUCTIONS"] == ""
     env = _phase_env(executor, "binradar", tmp_path)
     assert env["E9_RELOCATED_CALL_JUMPS"] == RECORDS
     assert env["E9_EXCLUDE_RANGES"] == \
@@ -939,14 +964,47 @@ def test_metadata_selection_is_artifact_scoped(tmp_path):
                                config=config)
     brcached = _stub_executor(tmp_path, e9_metadata_prefix="brcached",
                               config=config)
+    import json
+    for suffix, relocated in (("brpatched", 0x54b091), ("brcached", 0x7c254091)):
+        sidecar = tmp_path / f"nm.{suffix}.e9map.json"
+        data = json.loads(sidecar.read_text())
+        data["instructions"] = [{"relocated": relocated + 1, "original": 0x4585dd},
+                                {"relocated": relocated, "original": 0x4d60a5}]
+        sidecar.write_text(json.dumps(data))
     env_b = _phase_env(brpatched, "binradar", tmp_path)
     env_p = _phase_env(brcached, "binradar", tmp_path)
+    assert env_b["E9_RELOCATED_INSTRUCTIONS"] == "54b091:4d60a5,54b092:4585dd"
+    assert env_p["E9_RELOCATED_INSTRUCTIONS"] == "7c254091:4d60a5,7c254092:4585dd"
     assert env_b["E9_EXCLUDE_RANGES"] == "0x54b000-0x54c000"
     assert env_b["E9_RELOCATED_CALL_JUMPS"] == \
         "0x54b091:0x4d60a5:0x4d60aa"
     assert env_p["E9_EXCLUDE_RANGES"] == "0x7c254000-0x7c255000"
     assert env_p["E9_RELOCATED_CALL_JUMPS"] == \
         "0x7c254091:0x4d60a5:0x4d60aa"
+
+
+def test_selected_phase_rejects_missing_bound_map(tmp_path):
+    executor = _stub_executor(tmp_path, config={
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000"})
+    (tmp_path / "nm.brpatched.e9map.json").unlink()
+    with pytest.raises(ValueError, match="rerun binradar-setup"):
+        _phase_env(executor, "binradar", tmp_path)
+
+
+def test_preflight_map_error_is_not_an_ignorable_baseline_warning(tmp_path, monkeypatch):
+    executor = _stub_executor(tmp_path, config={
+        "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x7c254000-0x7c255000"})
+    environment = _phase_env(executor, "binradar", tmp_path)
+    # The selected map is already prepared, but preflight must independently
+    # reject the other artifact before its diagnostic exception handler.
+    (tmp_path / "nm.brcached.e9map.json").unlink()
+    recorded = []
+    monkeypatch.setattr(executor, "_record_baseline_result", recorded.append)
+    deadline = SimpleNamespace(remaining=lambda timeout: timeout, expires_at=None)
+    with pytest.raises(ValueError, match="rerun binradar-setup"):
+        executor._validate_baseline(executor.artifacts.patched, "poc", environment, deadline)
+    assert recorded == []
 
 
 def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
@@ -963,6 +1021,7 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
         tmp_path, config={
             "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000",
             "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
+            "E9_RELOCATED_INSTRUCTIONS": "dead:beef",
         })
     executor._worker_environment = lambda: {
         **executor.config,
@@ -978,7 +1037,7 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["env"] = env
         return binradar.binradar_utils.ExecutionResult(
-            success=True, exit_code=0, stdout="", stderr="[memcheck] [policy coverage-v2]\n")
+            success=True, exit_code=0, stdout="", stderr="[memcheck] [policy coverage-v3]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
 
@@ -1005,6 +1064,7 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
     env = captured["env"]
     assert env["E9_EXCLUDE_RANGES"] == ""
     assert env["E9_RELOCATED_CALL_JUMPS"] == ""
+    assert env["E9_RELOCATED_INSTRUCTIONS"] == ""
     for old_key in ("PATCH_RESERVE_RANGE", "E9_TRAMPOLINE_RANGE",
                     "E9_LOADER_RANGE"):
         assert old_key not in env, old_key
@@ -1762,7 +1822,8 @@ def test_two_hop_rewrite_chain_reaches_the_trampoline(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("policy_ack", [
-    "[memcheck] [policy coverage-v2]\n", "[memcheck] [policy coverage-v1]\n",
+    "[memcheck] [policy coverage-v3]\n", "[memcheck] [policy coverage-v2]\n",
+    "[memcheck] [policy coverage-v1]\n",
     "", "[memcheck] [policy old]\n"])
 @pytest.mark.parametrize(("success", "timed_out", "exit_code", "expected"), [
     (False, True, -signal.SIGTERM, None),  # managed timeout with salvage
@@ -1823,7 +1884,7 @@ def test_probe_reference_discriminates_guest_and_termination_signals(
         binradar.binradar_verifier.BinRadarQemuRunner,
         "test_with_file_trace", fake_file_trace)
 
-    if policy_ack != "[memcheck] [policy coverage-v2]\n":
+    if policy_ack != "[memcheck] [policy coverage-v3]\n":
         with pytest.raises(SystemExit, match="fresh run"):
             executor.run_probe()
         assert not (Path(executor.run_dir) / "probe-results.sbsv").exists()
@@ -1870,7 +1931,7 @@ def test_probe_run_budget_respects_floor_and_child_cap(
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["reference_timeout"] = timeout
         return SimpleNamespace(success=True, timed_out=False, exit_code=0,
-                               stdout="", stderr="[memcheck] [policy coverage-v2]\n")
+                               stdout="", stderr="[memcheck] [policy coverage-v3]\n")
 
     def fake_file_trace(
             self, testcase, patch_func_entry=0, verbose=True, timeout=60.0):

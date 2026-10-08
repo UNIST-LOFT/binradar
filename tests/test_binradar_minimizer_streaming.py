@@ -40,11 +40,19 @@ _spec_bin.loader.exec_module(binradar)
 
 
 def _probe(exit_info="ok", fault_addr=0x1234):
+    # Current probe/result identity: a crash must carry the current concrete
+    # oracle, a native provenance, and a raw pc equal to the canonical pc, or
+    # the verifier treats it as an unproved crash instead of a hard rejection.
+    crash = exit_info == "crash"
     return binradar_verifier.BinRadarProbeResult(
         patch_loc=0x1000, patch_func_entry=0x2000, stacktrace=[],
         exit_info=exit_info, patch_hit_cnt=1, patch_func_hit_cnt=1,
         fault_addr=fault_addr, patch_func_candidates=[],
-        tracer_fault_reference=None)
+        tracer_fault_reference=None,
+        concrete_oracle=(binradar_verifier.CONCRETE_ORACLE if crash else None),
+        concrete_fault_valid=crash,
+        raw_fault_addr=fault_addr,
+        concrete_fault_source="native" if crash else "unavailable")
 
 
 def _patch_result():
@@ -223,6 +231,33 @@ def test_standalone_minimizer_timeout_is_graceful_cutoff(tmp_path, monkeypatch):
     assert "[minimizer] [done]" not in minimizer_log
 
 
+@pytest.mark.parametrize("current_schema", [False, True])
+@pytest.mark.parametrize("field, replacement", [
+    ("[fault-addr 1234]", "[fault-addr nothex]"),
+    ("[id 0]", "[id invalid]"),
+    ("[file 0_case.dat] ", ""),
+])
+def test_malformed_testcase_cannot_finalize_verified_candidates(
+        tmp_path, current_schema, field, replacement):
+    run_dir = tmp_path / "run"
+    (run_dir / "minimized").mkdir(parents=True)
+    observation = (_probe(exit_info="crash").serialize() if current_schema
+                   else "[exit crash] [fault-addr 1234]")
+    row = ("[testcase] [result] [id 0] [file 0_case.dat] "
+           f"{observation} [pid 0] [br [0]]")
+    minimizer_log = run_dir / "minimizer.sbsv"
+    minimizer_log.write_text(
+        row.replace(field, replacement) + "\n[minimizer] [done] [time 0]\n")
+    verifier = _make_verifier(tmp_path)
+    verifier.probe_result = _probe(exit_info="crash")
+
+    with pytest.raises(ValueError):
+        verifier.run_verification_streaming(str(minimizer_log))
+
+    assert not (run_dir / "verifier.br").exists()
+    assert verifier.verdicts == {}
+
+
 def test_standalone_verifier_timeout_finalizes_partial_evidence(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -292,7 +327,7 @@ def test_standalone_verifier_replays_minimizer_timeout_cutoff(tmp_path):
     assert evidence.patches[1].total_evidences == 0
 
 
-def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path):
+def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     minimized = run_dir / "minimized"
@@ -308,20 +343,42 @@ def test_verifier_timeout_preserves_prior_hard_rejection(tmp_path):
         dir=str(tmp_path), binary="nm", test_cmd="-l @@",
         patch_loc="0x1000")
 
+    class _Clock:
+        """Deterministic monotonic clock; other time functions pass through.
+
+        A real sub-100ms wall-clock budget made the rejection race the
+        deadline under suite load: when patch 1 never ran, evidence was 0 and
+        the test failed for the wrong reason. Advancing the clock explicitly
+        from patch 2's probe keeps the claim — a cutoff after a hard rejection
+        preserves that rejection — independent of scheduling.
+        """
+        now = 1000.0
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(binradar_verifier, "time", clock)
+
     def timed_test(patch_id, testcase, verbose=False):
         if int(patch_id) == 1:
             return (_probe(exit_info="crash", fault_addr=0x1234),
                     binradar_verifier.BinRadarPatchResult(1, [0]))
-        time.sleep(0.05)
+        clock.now += 10.0
         return _probe(), binradar_verifier.BinRadarPatchResult(2, [0])
 
     runner.test_with_patched = timed_test
+    # The POC identity used for hard rejection is the crash probe: a normal
+    # row carries no concrete fault to compare against.
     verifier = binradar_verifier.BinRadarConcreteVerifier(
-        str(tmp_path), str(run_dir), runner, _probe(),
+        str(tmp_path), str(run_dir), runner, _probe(exit_info="crash"),
         "nm.brpatched", [1, 2])
 
     assert verifier.run_verification_streaming(
-        str(minimizer_log), timeout=0.01) is True
+        str(minimizer_log), timeout=0.5) is True
 
     evidence = _verifier_result(run_dir)
     assert not evidence.patches[1].verified

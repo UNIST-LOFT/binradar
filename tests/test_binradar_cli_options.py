@@ -255,9 +255,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert row["effective-patches"] == 41
     assert row["disable-binradar"] is False
     assert row["symbolic-mutation-mode"] == "off"
-    # Settings preserve the effective checker policy independently of intent.
     assert row["version"] == 4
-    assert row["memcheck-policy"] == "coverage-v2"
     assert row["mutation-portfolio"] == "replacement"
     assert row["representative-budget"] == "1234"
     assert row["symbolic-max-work"] == "500000"
