@@ -1037,7 +1037,7 @@ def test_original_binary_run_has_no_e9_metadata(tmp_path, monkeypatch):
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["env"] = env
         return binradar.binradar_utils.ExecutionResult(
-            success=True, exit_code=0, stdout="", stderr="[memcheck] [policy coverage-v3]\n")
+            success=True, exit_code=0, stdout="", stderr="[memcheck] [policy coverage-v4]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
 
@@ -1822,7 +1822,8 @@ def test_two_hop_rewrite_chain_reaches_the_trampoline(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("policy_ack", [
-    "[memcheck] [policy coverage-v3]\n", "[memcheck] [policy coverage-v2]\n",
+    "[memcheck] [policy coverage-v4]\n", "[memcheck] [policy coverage-v3]\n",
+    "[memcheck] [policy coverage-v2]\n",
     "[memcheck] [policy coverage-v1]\n",
     "", "[memcheck] [policy old]\n"])
 @pytest.mark.parametrize(("success", "timed_out", "exit_code", "expected"), [
@@ -1884,7 +1885,7 @@ def test_probe_reference_discriminates_guest_and_termination_signals(
         binradar.binradar_verifier.BinRadarQemuRunner,
         "test_with_file_trace", fake_file_trace)
 
-    if policy_ack != "[memcheck] [policy coverage-v3]\n":
+    if policy_ack != "[memcheck] [policy coverage-v4]\n":
         with pytest.raises(SystemExit, match="fresh run"):
             executor.run_probe()
         assert not (Path(executor.run_dir) / "probe-results.sbsv").exists()
@@ -1931,7 +1932,7 @@ def test_probe_run_budget_respects_floor_and_child_cap(
     def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
         captured["reference_timeout"] = timeout
         return SimpleNamespace(success=True, timed_out=False, exit_code=0,
-                               stdout="", stderr="[memcheck] [policy coverage-v3]\n")
+                               stdout="", stderr="[memcheck] [policy coverage-v4]\n")
 
     def fake_file_trace(
             self, testcase, patch_func_entry=0, verbose=True, timeout=60.0):

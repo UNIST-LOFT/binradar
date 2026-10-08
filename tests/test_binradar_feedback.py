@@ -311,7 +311,7 @@ def test_mutation_dso_identity_uses_image_offset_not_raw_poc_pc(tmp_path, commit
 
 @pytest.mark.parametrize("defect", [
     "partial-brch", "count", "branches", "filename", "writes", "classification",
-    "committed-outcome", "poc-reference", "checksum", "old-policy"])
+    "committed-outcome", "poc-reference", "checksum", "old-policy", "coverage-v3-policy"])
 def test_malformed_committed_pair_preserves_source_and_previous_export(tmp_path, defect):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     (run_dir / "minimizer.sbsv").write_text("")
@@ -336,7 +336,8 @@ def test_malformed_committed_pair_preserves_source_and_previous_export(tmp_path,
         data[-1] ^= 1
         (run_dir / "binradar.br").write_bytes(data)
     else:
-        executor.probe_result.memcheck_policy = "coverage-v2"
+        executor.probe_result.memcheck_policy = (
+            "coverage-v3" if defect == "coverage-v3-policy" else "coverage-v2")
     existing = run_dir / "feedback"
     existing.mkdir()
     (existing / "keep").write_bytes(b"historical")

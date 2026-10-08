@@ -107,7 +107,7 @@ def _make_workdir(tmp_path):
         "[func-entry 2000] [patch-hit 1] [func-hit 1] [fault-addr 1234] "
         "[tracer-fault-valid false] [tracer-fault-source unavailable] "
         "[tracer-fault-addr 0] [tracer-fault-image none] "
-        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v3] "
+        "[tracer-fault-image-offset 0] [memcheck-policy coverage-v4] "
         "[patch-func-candidates []] [stacktrace []] "
         "[concrete-oracle qasan-main-v2] [concrete-fault-valid true] "
         "[raw-fault-addr 1234] [concrete-fault-source native]\n"
@@ -120,7 +120,7 @@ def _make_workdir(tmp_path):
     return workdir, rundir
 
 
-@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "old", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "coverage-v3", "old", "unavailable"])
 def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, policy):
     workdir, rundir = _make_workdir(tmp_path)
     probe_file = rundir / "probe-results.sbsv"
@@ -129,13 +129,13 @@ def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, pol
         "[tracer-fault-valid true] [tracer-fault-source guest-signal]")
     if policy is None:
         row = row.replace("[version 4]", "[version 2]").replace(
-            "[memcheck-policy coverage-v3] ", "").replace(
+            "[memcheck-policy coverage-v4] ", "").replace(
             "[tracer-fault-image none] [tracer-fault-image-offset 0] ", "")
         row = row.replace(
             "[concrete-oracle qasan-main-v2] [concrete-fault-valid true] "
             "[raw-fault-addr 1234] [concrete-fault-source native] ", "")
     else:
-        row = row.replace("[memcheck-policy coverage-v3]", f"[memcheck-policy {policy}]")
+        row = row.replace("[memcheck-policy coverage-v4]", f"[memcheck-policy {policy}]")
     probe_file.write_text(row)
     executor = _build_executor(workdir)
     with pytest.raises(SystemExit, match="--run-id n"):

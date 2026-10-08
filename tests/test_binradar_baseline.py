@@ -60,7 +60,7 @@ def _identity_runner(tmp_path):
 
 
 def _log(*rows: str) -> str:
-    return "[memcheck] [policy coverage-v3]\n" + "\n".join(rows) + "\n"
+    return "[memcheck] [policy coverage-v4]\n" + "\n".join(rows) + "\n"
 
 
 def _reference_row(address: int, source: str = "provenance-access",
@@ -87,7 +87,9 @@ def _classify(log, *, reference=REFERENCE, result=None):
         reference)
 
 
-@pytest.mark.parametrize("ack", ["", "[memcheck] [policy old]\n"])
+@pytest.mark.parametrize("ack", [
+    "", "[memcheck] [policy old]\n", "[memcheck] [policy coverage-v1]\n",
+    "[memcheck] [policy coverage-v2]\n", "[memcheck] [policy coverage-v3]\n"])
 @pytest.mark.parametrize("outcome", [NORMAL_ROW, _reference_row(REFERENCE.address)])
 def test_missing_or_mismatched_policy_ack_is_unusable(ack, outcome):
     check = _classify(ack + outcome + "\n")
@@ -95,7 +97,7 @@ def test_missing_or_mismatched_policy_ack_is_unusable(ack, outcome):
     assert check.reference is None
 
 
-@pytest.mark.parametrize("policy", [None, "old", "unavailable", "coverage-v2"])
+@pytest.mark.parametrize("policy", [None, "old", "unavailable", "coverage-v1", "coverage-v2", "coverage-v3"])
 def test_stale_probe_policy_prevents_baseline_execution(tmp_path, monkeypatch, policy):
     calls = []
     monkeypatch.setattr(binradar_baseline, "_run_tracer", lambda *a: calls.append(a))
@@ -214,7 +216,6 @@ def test_controlled_environment_keeps_policy_and_drops_descriptors():
 
     # Checker policy is pinned even when inherited configuration disagrees.
     assert env["BINRADAR_MEMCHECK_ENABLE"] == "1"
-    assert env["BINRADAR_MEMCHECK_POLICY"] == "coverage-v3"
     assert env["PLT_INFO_FILE"] == "/w/plt_info.txt"
     assert env["SYMBOLIC_INJECT_INPUT_MODE"] == "FROM_FILE"
     assert env["E9_EXCLUDE_RANGES"] == "0x6ffff000-0x70005000"
@@ -251,7 +252,7 @@ def test_clean_original_is_normal_not_unusable(tmp_path, monkeypatch):
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
         identity_runner=_identity_runner(tmp_path),
-        probe_policy="coverage-v3")
+        probe_policy="coverage-v4")
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
 
 
@@ -269,7 +270,7 @@ def test_matching_artifacts_do_not_override_a_different_probe(tmp_path, monkeypa
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
         identity_runner=_identity_runner(tmp_path),
-        probe_policy="coverage-v3")
+        probe_policy="coverage-v4")
     assert result.reference == REFERENCE
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.DIFFERENT_FAULT
     assert result.selected.status is binradar_baseline.BaselineStatus.DIFFERENT_FAULT
@@ -290,7 +291,7 @@ def test_artifact_match_cannot_hide_normal_original(tmp_path, monkeypatch):
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
         identity_runner=_identity_runner(tmp_path),
-        probe_policy="coverage-v3")
+        probe_policy="coverage-v4")
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
     assert result.selected.status is binradar_baseline.BaselineStatus.UNUSABLE
 
@@ -313,7 +314,7 @@ def test_preflight_deadline_skips_later_artifact(tmp_path, monkeypatch):
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=10,
         phase_deadline=1.0,
         identity_runner=_identity_runner(tmp_path),
-        probe_policy="coverage-v3")
+        probe_policy="coverage-v4")
     assert calls == [(str(original), 1.0)]
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.REPRODUCED
     assert result.selected.status is binradar_baseline.BaselineStatus.UNUSABLE

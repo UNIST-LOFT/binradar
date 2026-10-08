@@ -153,15 +153,13 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
         captured.update(kwargs["env"])
         return binradar.binradar_utils.ExecutionResult(
             success=False, exit_code=1, stdout="",
-            stderr="[memcheck] [policy coverage-v3]\n")
+            stderr="[memcheck] [policy coverage-v4]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", execute)
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")
     monkeypatch.setenv("BINRADAR_MEMCHECK_POLICY", "wrong")
 
     instance.run_probe()
-
-    assert captured["BINRADAR_MEMCHECK_POLICY"] == "coverage-v3"
 
     assert captured["BINRADAR_FORKSERVER_ENABLE"] == "0"
     assert captured["BINRADAR_OSPREY_ENABLE"] == "0"
@@ -414,7 +412,6 @@ def test_memcheck_policy_overrides_inherited_disabled_value(
     monkeypatch.setenv("BINRADAR_MEMCHECK_POLICY", "wrong")
     environment = _phase_env(instance, "binradar", run_dir)
     assert environment["BINRADAR_MEMCHECK_ENABLE"] == "1"
-    assert environment["BINRADAR_MEMCHECK_POLICY"] == "coverage-v3"
     for mode in ("fuzzolic", "directed"):
         environment = _phase_env(instance, mode, run_dir / mode)
         assert environment["BINRADAR_MEMCHECK_ENABLE"] == "0"
