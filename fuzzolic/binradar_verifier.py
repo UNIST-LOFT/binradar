@@ -35,7 +35,7 @@ from binradar_taosc_predicates import (
     predicate_stack_bytes,
 )
 
-TRACER_FAULT_VALID_SOURCES = frozenset(("guest-signal", "provenance-access"))
+TRACER_FAULT_VALID_SOURCES = frozenset(("guest-signal", "provenance-access", "syscall-request"))
 TRACER_FAULT_SOURCES = frozenset((*TRACER_FAULT_VALID_SOURCES, "unavailable",
                                   "legacy-unvalidated"))
 
@@ -77,7 +77,7 @@ PROBE_RESULT_SCHEMA_V2 = (
     "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
 
 
-MEMCHECK_POLICY = "coverage-v4"
+MEMCHECK_POLICY = "coverage-v5"
 PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
     "[tracer-fault-addr: hex]", "[tracer-fault-addr: hex] "
     "[tracer-fault-image: str] [tracer-fault-image-offset: hex] "
@@ -220,8 +220,12 @@ def decode_fault_image_fields(row: Any, image_field: str = "image",
         if offset != 0:
             raise ValueError("main fault reference must use image-offset zero")
         return None, None
-    reference = TracerFaultReference(0, "provenance-access", image, offset)
-    return reference.image_id, reference.image_offset
+    if (not isinstance(image, str) or len(image) != 64
+            or any(c not in "0123456789abcdef" for c in image)):
+        raise ValueError("fault image must be 64 lowercase hex digits")
+    if type(offset) is not int or not 0 <= offset <= 0xffffffffffffffff:
+        raise ValueError("fault image offset must be an unsigned u64")
+    return image, offset
 
 
 def decode_snapshot_fault_reference(row: Any) -> Optional[TracerFaultReference]:

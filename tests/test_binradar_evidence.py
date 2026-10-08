@@ -39,7 +39,7 @@ def _frame(record_type: int, payload: bytes) -> bytes:
 
 
 def _group(representative: int, outcome: int, fault_addr: int,
-           branches, members) -> bytes:
+           branches, members, *, source=None) -> bytes:
     flags = 0 if branches is not None else 1
     branches = [] if branches is None else branches
     packed = bytearray((len(branches) + 3) // 4)
@@ -50,7 +50,8 @@ def _group(representative: int, outcome: int, fault_addr: int,
     for index, member in enumerate(members):
         member_bytes.extend(_uleb(member if index == 0 else member - previous))
         previous = member
-    return (struct.pack("<IBBHQII", representative, outcome, flags, 0,
+    return (struct.pack("<IBBHQII", representative, outcome, flags,
+                        {None: 0, "guest-signal": 1, "provenance-access": 2, "syscall-request": 3}[source],
                         fault_addr, len(branches), len(members))
             + packed + member_bytes)
 
@@ -132,7 +133,8 @@ def test_binradar_v2_accepts_gaps_but_rejects_bad_ids(tmp_path):
         binradar_evidence.EvidenceKind.BINRADAR
 
 
-def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
+@pytest.mark.parametrize("policy", ["coverage-v2", "coverage-v5"])
+def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
     _write_binradar(tmp_path / "binradar.br")
     binradar_evidence.write_verifier(
         tmp_path / "verifier.br",
@@ -147,6 +149,7 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
     executor.run_id = 0
     executor.filter_result = [1, 2, 300]
     executor.probe_result = SimpleNamespace(
+        memcheck_policy=policy,
         tracer_fault_reference=binradar_verifier.TracerFaultReference(
             address=0x1234, source="guest-signal"))
     executor.disable_binradar = False
@@ -156,6 +159,11 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path):
     executor.phase_failure_lock = threading.Lock()
     executor.save_progress = lambda _row: None
 
+    if policy == binradar_verifier.MEMCHECK_POLICY:
+        with pytest.raises(ValueError, match="canonical BINRADAR v4"):
+            executor.run_final()
+        assert not (tmp_path / "final.sbsv").exists()
+        return
     executor.run_final()
 
     final = (tmp_path / "final.sbsv").read_text()
@@ -204,6 +212,7 @@ def test_final_requires_valid_fault_identity(tmp_path, source, address,
          for patch in (1, 2, 3, 4)])
     binradar_results.write_final_result(binradar_results.FinalResultRequest(
         run_dir=str(tmp_path), run_prefix="regression", run_id=0,
+        probe_memcheck_policy="coverage-v1",
         candidates=[1, 2, 3, 4], tracer_fault_reference=reference,
         disable_binradar=False, binradar_failed=False, wall_time_reached=False,
         failed_phases=[], save_progress=lambda _: None,
@@ -257,6 +266,7 @@ def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
         "[attempt 4] [remaining 5] [committed 3] [discarded 1]\n")
     binradar_results.write_final_result(binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 3],
         tracer_fault_reference=binradar_verifier.TracerFaultReference(
             0x1234, "guest-signal"),
@@ -277,6 +287,7 @@ def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
         "[attempt 4] [remaining 0] [committed 3] [discarded 0]\n")
     binradar_results.write_final_result(binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 3],
         tracer_fault_reference=binradar_verifier.TracerFaultReference(
             0x1234, "guest-signal"),
@@ -299,6 +310,7 @@ def test_exhausted_queue_with_full_evidence_is_complete(
             total_evidences=0, observations={}) for patch in (1, 2, 300)])
     request = binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 300],
         tracer_fault_reference=binradar_verifier.TracerFaultReference(
             0x1234, "guest-signal"),
@@ -374,6 +386,7 @@ def _write_binradar_frames(path: Path, *, frames=()) -> None:
 def _final_request(run_dir: Path, candidates, reference):
     return binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        probe_memcheck_policy="coverage-v4",
         candidates=list(candidates), tracer_fault_reference=reference,
         disable_binradar=False, binradar_failed=False,
         wall_time_reached=False, failed_phases=[],
@@ -437,6 +450,7 @@ def test_final_reports_unavailable_coverage(tmp_path, disable,
         (tmp_path / "progress.sbsv").write_text(stop_row)
     request = binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
+        probe_memcheck_policy="coverage-v4",
         candidates=[1],
         tracer_fault_reference=binradar_verifier.TracerFaultReference(
             0x1234, "guest-signal"),
@@ -648,3 +662,94 @@ def test_representative_budget_cutoff_is_never_complete_coverage(tmp_path,
     report = (run_dir / "final.sbsv").read_text()
     assert f"[binradar-coverage {expected}]" in report
     assert "[binradar-coverage complete]" not in report
+
+
+def test_current_final_never_uses_source_bearing_text_as_canonical(tmp_path):
+    import dataclasses
+    (tmp_path / "binradar-tracer-msg.log").write_text(
+        "[binradar] [crash] [iter 1] [patch 0] [guest_pc 0] [guest_cs_base 0] "
+        "[fault_addr 0] [host_fault_addr 0] [source syscall-request] "
+        "[image none] [image-offset 0]\n[binradar] [commit] [iter 1] [patch 0] [br 0]\n")
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(1, True, 0, 0, {})])
+    request = dataclasses.replace(_final_request(tmp_path, [1],
+        binradar_verifier.TracerFaultReference(0, "syscall-request")),
+        probe_memcheck_policy=binradar_verifier.MEMCHECK_POLICY)
+    with pytest.raises(ValueError, match="canonical BINRADAR v4"):
+        binradar_results.write_final_result(request)
+    assert not (tmp_path / "final.sbsv").exists()
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("source", ["guest-signal", "provenance-access", "syscall-request"])
+def test_source_wire_history_and_rendering(tmp_path, version, source):
+    path = tmp_path / "source.br"
+    payload = struct.pack("<II", 1, 1) + _group(
+        0, 2, 0, [1], [0], source=source if version == 4 else None)
+    path.write_bytes(binradar_evidence.HEADER_STRUCT.pack(
+        binradar_evidence.MAGIC, version, 3, 0) + _frame(4, payload))
+    assert binradar_evidence.evidence_kind(path) == binradar_evidence.EvidenceKind.BINRADAR
+    assert binradar_evidence.evidence_version(path, binradar_evidence.EvidenceKind.BINRADAR) == version
+    group = next(binradar_evidence.read_binradar(path)).groups[0]
+    assert group.fault_addr == 0
+    assert group.source == (source if version == 4 else None)
+    output = subprocess.run(
+        [sys.executable, str(ROOT / "fuzzolic/binradar-evidence-to-text.py"), str(path)],
+        check=True, capture_output=True, text=True).stdout
+    assert f"[source {source if version == 4 else 'unknown'}]" in output
+
+
+@pytest.mark.parametrize("version,outcome,source", [
+    (4, 1, 1), (4, 1, 2), (4, 1, 3), (4, 2, 0), (4, 2, 4), (4, 2, 65535),
+    (1, 2, 1), (2, 2, 2), (3, 2, 3),
+])
+def test_invalid_source_outcome_pairs_with_valid_crc(tmp_path, version, outcome, source):
+    group = bytearray(_group(0, outcome, 0, [], [0]))
+    struct.pack_into("<H", group, 6, source)
+    path = tmp_path / "invalid.br"
+    path.write_bytes(binradar_evidence.HEADER_STRUCT.pack(
+        binradar_evidence.MAGIC, version, 3, 0)
+        + _frame(4, struct.pack("<II", 1, 1) + group))
+    with pytest.raises(binradar_evidence.EvidenceError, match="source|flags"):
+        list(binradar_evidence.read_binradar(path))
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_current_final_rejects_source_less_canonical_evidence(tmp_path, version):
+    import dataclasses
+    _write_binradar(tmp_path / "binradar.br", version=version)
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(patch, True, 0, 0, {})
+        for patch in (1, 2, 300)])
+    reference = binradar_verifier.TracerFaultReference(0x1234, "guest-signal")
+    request = dataclasses.replace(_final_request(tmp_path, [1, 2, 300], reference),
+                                  probe_memcheck_policy=binradar_verifier.MEMCHECK_POLICY)
+    with pytest.raises(ValueError, match="canonical BINRADAR v4"):
+        binradar_results.write_final_result(request)
+    assert not (tmp_path / "final.sbsv").exists()
+    request = dataclasses.replace(request, probe_memcheck_policy="coverage-v4",
+                                  tracer_fault_reference=binradar_verifier.TracerFaultReference(
+                                      0x1234, "syscall-request"))
+    with pytest.raises(ValueError, match="syscall-request FINAL"):
+        binradar_results.write_final_result(request)
+
+
+@pytest.mark.parametrize("reference_source", ["guest-signal", "provenance-access", "syscall-request"])
+def test_current_final_site_equality_remains_source_independent(tmp_path, reference_source):
+    import dataclasses
+    frames = [struct.pack("<II", 1, 1) + _group(
+        0, 2, 0, [0], [0], source="syscall-request"),
+        struct.pack("<II", 2, 2)
+        + _group(0, 2, 0, [0], [0], source="provenance-access")
+        + _group(1, 2, 0, [1], [1], source="guest-signal")]
+    (tmp_path / "binradar.br").write_bytes(binradar_evidence.HEADER_STRUCT.pack(
+        binradar_evidence.MAGIC, 4, 3, 0) + b"".join(_frame(4, frame) for frame in frames))
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(1, True, 0, 0, {})])
+    request = dataclasses.replace(_final_request(tmp_path, [1],
+        binradar_verifier.TracerFaultReference(0, reference_source)),
+        probe_memcheck_policy=binradar_verifier.MEMCHECK_POLICY)
+    binradar_results.write_final_result(request)
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[reason same-crash]" in report
+    assert f"[source {reference_source}]" in report

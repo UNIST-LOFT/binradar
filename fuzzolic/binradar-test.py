@@ -446,15 +446,16 @@ _TRACER_PARSER.add_schema(
 _TRACER_PARSER.add_schema("[snapshot] [exit] [crash] [entrypoint-hit: int]")
 _TRACER_PARSER.add_schema("[snapshot] [exit] [normal] [entrypoint-hit: int]")
 _TRACER_PARSER.add_schema(
-    "[prov] [finalize] [finding] [reason: str] [access_pc: hex] "
+    "[prov] [finalize] [finding] [reason: str] [origin: str] [access_pc: hex] "
+    "[actual_pc: hex] "
     "[access_addr: hex] [width: int] [obj_id: int] [gen: int] "
     "[obj_base: hex] [size: hex] [offset: int] [producer_pc: hex] "
     "[kind: int] [last_writer: hex] [is_uaf: int] [ea_reg: int]")
 
 
-def extract_tracer_fault_reference(log: str) -> Optional[binradar_verifier.TracerFaultReference]:
+def extract_tracer_fault_reference(log: str, *, require_current: bool = False) -> Optional[binradar_verifier.TracerFaultReference]:
     """Read explicit typed identity, never promote a diagnostic crash PC."""
-    return binradar_verifier.read_snapshot_fault_reference(log)
+    return binradar_verifier.read_snapshot_fault_reference(log, require_current=require_current)
 
 
 def extract_tracer_exit(log: str) -> str:
@@ -514,7 +515,9 @@ def extract_tracer_prov_finding(log: str) -> Optional[Dict[str, object]]:
         if row is not None and row.get_name() == "prov$finalize$finding":
             return {
                 "reason": row["reason"],
+                "origin": row["origin"],
                 "access_pc": row["access_pc"],
+                "actual_pc": row["actual_pc"],
                 "access_addr": row["access_addr"],
                 "width": row["width"],
                 "obj_id": row["obj_id"],
@@ -613,6 +616,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    proc_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
     # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
     # Look for plt_info.txt in the workdir's out directory.
     # Regenerate if it doesn't contain malloc/free entries.
@@ -645,9 +649,10 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     # at its kill PC. That is not this subject's observed crash, so treat the
     # run as failed rather than reading the salvaged row. A genuine guest
     # SIGSEGV re-raised by QEMU stays usable.
-    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+    if (binradar_verifier.tracer_execution_cancelled(result.exit_code)
+            or not binradar_verifier.tracer_memcheck_policy_acknowledged(result.stderr or "")):
         result.success = False
-    fault_addr = extract_tracer_fault_reference(result.stderr) if result.success else None
+    fault_addr = extract_tracer_fault_reference(result.stderr, require_current=True) if result.success else None
     exit_str = extract_tracer_exit(result.stderr) if result.success else ""
     repro = format_repro_command(workdir, command, proc_env)
     return fault_addr, exit_str, result, repro
@@ -700,6 +705,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    proc_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
     if entrypoint:
         proc_env["BINRADAR_ENTRYPOINT"] = entrypoint
     # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
@@ -782,7 +788,8 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     # As in run_tracer_probe: an externally terminated tracer is reported as
     # success but may have salvaged the interrupted pc as a fault reference.
     # Treat the cancellation as a failed probe instead of reading it.
-    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+    if (binradar_verifier.tracer_execution_cancelled(result.exit_code)
+            or not binradar_verifier.tracer_memcheck_policy_acknowledged(result.stderr or "")):
         result.success = False
     entry_hits = extract_tracer_entrypoint_hit(
         result.stderr) if result.success else -1
@@ -790,7 +797,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     crash_reason = extract_tracer_crash_reason(
         result.stderr) if result.success else ""
     fault_addr = extract_tracer_fault_reference(
-        result.stderr) if result.success else None
+        result.stderr, require_current=True) if result.success else None
     prov_finding = extract_tracer_prov_finding(
         result.stderr) if result.success else None
     repro = format_repro_command(workdir, command, proc_env)

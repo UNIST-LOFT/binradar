@@ -24,6 +24,49 @@ def test_tracer_reference_requires_explicit_valid_v2_row():
     assert binradar_test.extract_tracer_fault_reference(normalized).identity_key == ("main", 0)
 
 
+def test_standalone_current_request_reference_and_full_width_finding():
+    row = ("[snapshot] [fault-reference] [version 3] [valid true] "
+           "[source syscall-request] [address 0] [image none] [image-offset 0]\n")
+    reference = binradar_test.extract_tracer_fault_reference(row, require_current=True)
+    assert reference.source == "syscall-request"
+    assert reference.identity_key == ("main", 0)
+    finding = binradar_test.extract_tracer_prov_finding(
+        "[prov] [finalize] [finding] [reason out-of-bounds] [origin syscall-request] "
+        "[access_pc 0] [actual_pc 0] [access_addr 1000] [width 4294967297] "
+        "[obj_id 1] [gen 1] [obj_base 1000] [size 8] [offset 0] "
+        "[producer_pc 0] [kind 1] [last_writer 0] [is_uaf 0] [ea_reg 0]\n")
+    assert finding["origin"] == "syscall-request"
+    assert finding["width"] == 4294967297
+
+
+def test_standalone_live_probe_requires_current_policy(monkeypatch, tmp_path):
+    import binradar_utils
+    from binradar_verifier import MEMCHECK_POLICY
+    (tmp_path / "guest.orig").write_bytes(b"toy")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/plt_info.txt").write_text("malloc free")
+    for policy in ("coverage-v4", MEMCHECK_POLICY):
+        log = (f"[memcheck] [policy {policy}]\n"
+               "[snapshot] [fault-reference] [version 3] [valid true] "
+               "[source syscall-request] [address 0] [image none] [image-offset 0]\n"
+               "[snapshot] [exit] [crash] [entrypoint-hit 1]\n")
+        def fake_execute(command, **kwargs):
+            assert kwargs["env"]["BINRADAR_MEMCHECK_POLICY"] == MEMCHECK_POLICY
+            return binradar_utils.ExecutionResult(
+                success=True, exit_code=-11, stdout="", stderr=log)
+        monkeypatch.setattr(binradar_test.binradar_utils, "execute", fake_execute)
+        reference, exit_str, result, _ = binradar_test.run_tracer_probe(
+            str(tmp_path), {"BINARY": "guest", "TEST_CMD": "@@"}, "poc", 5.0)
+        assert result.success == (policy == MEMCHECK_POLICY)
+        if policy == MEMCHECK_POLICY:
+            assert reference.source == "syscall-request"
+            assert reference.address == 0
+            assert exit_str == "crash"
+        else:
+            assert reference is None
+            assert exit_str == ""
+
+
 def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path):
     """`execute` reports success for a process killed by an external
     termination signal, and the tracer can salvage the interrupted guest pc

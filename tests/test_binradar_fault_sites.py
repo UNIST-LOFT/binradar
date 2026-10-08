@@ -22,8 +22,8 @@ IMAGE = "ab" * 32
 OTHER_IMAGE = "cd" * 32
 
 
-def _site_group(pc, image=IMAGE, offset=0x123, *, outcome=2):
-    fixed = bytearray(_group(0, outcome, pc, [1], [0]))
+def _site_group(pc, image=IMAGE, offset=0x123, *, outcome=2, source=None):
+    fixed = bytearray(_group(0, outcome, pc, [1], [0], source=source))
     fixed[5] |= 2
     return (bytes(fixed[:evidence.BINRADAR_GROUP_STRUCT.size])
             + bytes.fromhex(image) + struct.pack("<Q", offset)
@@ -104,11 +104,14 @@ def test_old_evidence_rejects_site_flag(version, tmp_path):
         list(evidence.read_binradar(path))
 
 
-def test_evidence_converter_preserves_site_and_crc(tmp_path):
+@pytest.mark.parametrize("version", [3, 4])
+def test_evidence_converter_preserves_site_and_crc(tmp_path, version):
     path = tmp_path / "sites.br"
-    payload = struct.pack("<II", 1, 1) + _site_group(0x7000123)
-    _write(path, payload)
+    payload = struct.pack("<II", 1, 1) + _site_group(
+        0x7000123, source="syscall-request" if version == 4 else None)
+    _write(path, payload, version)
     group = next(evidence.read_binradar(path)).groups[0]
+    assert group.source == ("syscall-request" if version == 4 else None)
     assert (group.image_id, group.image_offset) == (IMAGE, 0x123)
     output = subprocess.run([sys.executable, str(ROOT / "fuzzolic" / "binradar-evidence-to-text.py"),
                              str(path)], check=True, text=True, capture_output=True).stdout
@@ -157,19 +160,24 @@ def test_normal_outcome_cannot_carry_site(tmp_path):
 @pytest.mark.parametrize("image,offset,expected", [
     (IMAGE, 0x123, True), (OTHER_IMAGE, 0x123, False), (IMAGE, 0x124, False),
 ])
-def test_final_compares_dso_site_not_raw_pc(tmp_path, image, offset, expected):
+@pytest.mark.parametrize("version", [3, 4])
+def test_final_compares_dso_site_not_raw_pc(tmp_path, image, offset, expected, version):
+    import dataclasses
+    source = "syscall-request" if version == 4 else None
     reference = verifier.TracerFaultReference(0x7000123, "provenance-access", IMAGE, 0x123)
-    baseline = struct.pack("<II", 1, 1) + _site_group(0x9000123)
-    child = bytearray(_site_group(reference.address, image, offset))
+    baseline = struct.pack("<II", 1, 1) + _site_group(0x9000123, source=source)
+    child = bytearray(_site_group(reference.address, image, offset, source=source))
     struct.pack_into("<I", child, 0, 1)
     child[-1] = 1
-    mutation = struct.pack("<II", 2, 2) + _site_group(0x9000123) + bytes(child)
+    mutation = struct.pack("<II", 2, 2) + _site_group(0x9000123, source=source) + bytes(child)
     (tmp_path / "binradar.br").write_bytes(
-        evidence.HEADER_STRUCT.pack(evidence.MAGIC, 3, 3, 0)
+        evidence.HEADER_STRUCT.pack(evidence.MAGIC, version, 3, 0)
         + _frame(4, baseline) + _frame(4, mutation))
     evidence.write_verifier(tmp_path / "verifier.br", [evidence.VerifierPatchResult(
         1, True, 0, 0, {})])
-    binradar_results.write_final_result(_final_request(tmp_path, [1], reference))
+    request = dataclasses.replace(_final_request(tmp_path, [1], reference),
+        probe_memcheck_policy=verifier.MEMCHECK_POLICY if version == 4 else "coverage-v4")
+    binradar_results.write_final_result(request)
     report = (tmp_path / "final.sbsv").read_text()
     assert ("[reason same-crash]" in report) is expected
     assert "[original-poc-crash 2]" in report
@@ -210,10 +218,11 @@ def test_feedback_keeps_concrete_and_dso_tracer_oracles_separate(tmp_path):
     assert {p.name for p in (run_dir / "feedback/concrete/malicious").iterdir()} == {"0_site"}
 
 
-def test_plan_diagnostics_compare_sites_and_preserve_main_history():
+@pytest.mark.parametrize("source", ["provenance-access", "syscall-request"])
+def test_plan_diagnostics_compare_sites_and_preserve_main_history(source):
     import binradar
     row = {"patch0-exit": "crash", "patch0-fault-valid": "true",
-           "patch0-fault-source": "provenance-access", "patch0-fault-addr": "9000123"}
+           "patch0-fault-source": source, "patch0-fault-addr": "9000123"}
     reference = verifier.TracerFaultReference(0x7000123, "provenance-access", IMAGE, 0x123)
     assert binradar._classify_plan_attempt_outcome(row, reference) == "unclassified-crash"
     row.update({"patch0-fault-image": IMAGE, "patch0-fault-image-offset": "123"})

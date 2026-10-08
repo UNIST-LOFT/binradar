@@ -153,7 +153,7 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
         captured.update(kwargs["env"])
         return binradar.binradar_utils.ExecutionResult(
             success=False, exit_code=1, stdout="",
-            stderr="[memcheck] [policy coverage-v4]\n")
+            stderr="[memcheck] [policy coverage-v5]\n")
 
     monkeypatch.setattr(binradar.binradar_utils, "execute", execute)
     monkeypatch.setenv("BINRADAR_OSPREY_ENABLE", "1")

@@ -205,7 +205,7 @@ _PLAN_ATTEMPT_WITNESSES = frozenset((
     "matched-value", "different-value", "unknown", "not-applicable"))
 _PLAN_ATTEMPT_SITES = frozenset(("yes", "no", "unknown"))
 _PLAN_ATTEMPT_FAULT_SOURCES = frozenset((
-    "guest-signal", "provenance-access", "unavailable", "unknown"))
+    "guest-signal", "provenance-access", "syscall-request", "unavailable", "unknown"))
 _PLAN_FUNNEL_ADVISORS = ("generic", "osprey", "symbolic", "unknown")
 _PLAN_FUNNEL_SOURCE_KINDS = (
     "primitive", "pointer", "argument-primitive", "argument-pointer",
@@ -330,7 +330,7 @@ def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
         if name in fields:
             normalized[name] = fields[name]
     if normalized["patch0-fault-source"] not in (
-            "guest-signal", "provenance-access", "unavailable", "unknown"):
+            "guest-signal", "provenance-access", "syscall-request", "unavailable", "unknown"):
         normalized["patch0-fault-source"] = "unknown"
     return normalized
 
@@ -1896,6 +1896,7 @@ class BinRadarExecutor:
                 run_prefix=self.run_prefix,
                 run_id=self.run_id,
                 candidates=self.filter_result,
+                probe_memcheck_policy=self.probe_result.memcheck_policy,
                 tracer_fault_reference=(
                     None if skip_binradar
                     else self.probe_result.tracer_fault_reference),

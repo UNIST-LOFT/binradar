@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 MAGIC = b"BRDATAB1"
-# FILTER and VERIFIER payloads stay at version 1. BINRADAR v3 adds paired
-# image SHA-256/RVA fault sites; v2/v3 attempt ids may have gaps because a
-# discarded attempt commits no frame. Historical v1 remains contiguous.
+# FILTER and VERIFIER stay at version 1. BINRADAR v4 retains explicit fault
+# source in the reserved u16; v3 adds paired image SHA-256/RVA fault sites.
+# Versions 2–4 allow discarded-attempt gaps; historical v1 is contiguous.
 VERSION = 1
-BINRADAR_VERSION = 3
+BINRADAR_VERSION = 4
 HEADER_STRUCT = struct.Struct("<8sHHI")
 FRAME_HEADER_STRUCT = struct.Struct("<IHH")
 FRAME_CRC_STRUCT = struct.Struct("<I")
@@ -118,6 +118,7 @@ class BinradarGroup:
     representative: int
     outcome: str
     fault_addr: int
+    source: str | None
     branches: list[int] | None
     members: list[int]
     image_id: str | None = None
@@ -182,7 +183,7 @@ def _open_frames(path: os.PathLike[str] | str, expected: EvidenceKind,
         magic, version, kind, reserved = HEADER_STRUCT.unpack(header)
         if magic != MAGIC:
             raise EvidenceError("invalid evidence magic")
-        accepted = ({BINRADAR_VERSION, 2, VERSION}
+        accepted = ({BINRADAR_VERSION, 3, 2, VERSION}
                     if expected == EvidenceKind.BINRADAR else {VERSION})
         if version not in accepted:
             raise EvidenceError(f"unsupported evidence version {version}")
@@ -428,9 +429,16 @@ def _parse_binradar_iteration(payload: bytes, version: int = BINRADAR_VERSION) -
             branch_count, member_count = BINRADAR_GROUP_STRUCT.unpack_from(
                 payload, offset)
         offset += BINRADAR_GROUP_STRUCT.size
-        allowed_flags = BINRADAR_GROUP_BRANCH_NULL | (2 if version == 3 else 0)
-        if reserved != 0 or group_flags & ~allowed_flags:
+        allowed_flags = BINRADAR_GROUP_BRANCH_NULL | (2 if version in (3, 4) else 0)
+        if (version < 4 and reserved != 0) or group_flags & ~allowed_flags:
             raise EvidenceError("invalid BINRADAR group flags")
+        source = None
+        if version == 4:
+            sources = {1: "guest-signal", 2: "provenance-access", 3: "syscall-request"}
+            if ((outcome_value == OUTCOME_NORMAL and reserved != 0)
+                    or (outcome_value == OUTCOME_CRASH and reserved not in sources)):
+                raise EvidenceError("invalid BINRADAR outcome/source pair")
+            source = sources.get(reserved)
         image_id = image_offset = None
         if group_flags & 2:
             if outcome_value != OUTCOME_CRASH:
@@ -472,6 +480,7 @@ def _parse_binradar_iteration(payload: bytes, version: int = BINRADAR_VERSION) -
             representative=representative,
             outcome="crash" if outcome_value == OUTCOME_CRASH else "normal",
             fault_addr=fault_addr,
+            source=source,
             branches=branches,
             members=members,
             image_id=image_id,
@@ -518,6 +527,15 @@ def read_binradar(path: os.PathLike[str] | str) -> Iterator[BinradarIteration]:
         yield iteration
 
 
+def evidence_version(path: os.PathLike[str] | str, expected: EvidenceKind) -> int:
+    """Validate the header before enforcing a consumer policy boundary."""
+    if evidence_kind(path) != expected:
+        raise EvidenceError("evidence kind mismatch")
+    with open(path, "rb") as stream:
+        _, version, _, _ = HEADER_STRUCT.unpack(stream.read(HEADER_STRUCT.size))
+    return version
+
+
 def evidence_kind(path: os.PathLike[str] | str) -> EvidenceKind:
     with open(path, "rb") as stream:
         header = stream.read(HEADER_STRUCT.size)
@@ -533,7 +551,7 @@ def evidence_kind(path: os.PathLike[str] | str) -> EvidenceKind:
     if version != _version_for(kind):
         # A version-1 BINRADAR file is the historical contiguous-id format and
         # stays readable; anything else is a header this reader cannot trust.
-        if not (kind == EvidenceKind.BINRADAR and version in (VERSION, 2)):
+        if not (kind == EvidenceKind.BINRADAR and version in (VERSION, 2, 3)):
             raise EvidenceError(
                 f"unsupported evidence version {version} for kind {raw_kind}")
     return kind

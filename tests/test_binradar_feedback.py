@@ -64,7 +64,9 @@ def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version
         + "[pid 0] [br [0]] [time 1]\n")
 
 
-def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fault=0, writes=True):
+def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fault=0, writes=True, source=None, poc_source="guest-signal"):
+    if outcome == "crash" and source is None:
+        raise ValueError("crash feedback fixture requires an explicit source")
     directory = run_dir / "binradar-feedback"
     directory.mkdir(exist_ok=True)
     stem = f"iteration-{iteration:08d}-patch-{patch:08d}"
@@ -75,7 +77,7 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
         for branch in branches or ())
     (directory / (stem + ".brch")).write_bytes(capture)
     same = outcome == "crash" and fault == 0x1234
-    valid = outcome == "crash" and fault != 0
+    valid = outcome == "crash"
     result = "benign" if outcome == "normal" else "malicious" if same else "ignored"
     header = (
         f"[binradar-feedback] [version 3] [iteration {iteration}] [patch {patch}] "
@@ -83,8 +85,8 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
         f"[branches {'none' if branches is None else ','.join(map(str, branches)) if branches else 'none'}] "
         f"[outcome {outcome}] [fault-addr {fault:x}] "
         f"[fault-valid {'true' if valid else 'false'}] "
-        f"[fault-source {'provenance-access' if valid else 'unavailable'}] "
-        "[poc-fault-addr 1234] [poc-fault-valid true] [poc-fault-source guest-signal] "
+        f"[fault-source {source if valid else 'unavailable'}] "
+        f"[poc-fault-addr 1234] [poc-fault-valid true] [poc-fault-source {poc_source}] "
         f"[same-fault {'true' if same else 'false'}] [result {result}] "
         f"[mutation-writes {int(writes)}] "
         "[fault-image none] [fault-image-offset 0] "
@@ -97,7 +99,7 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
 
 def _commits(run_dir, frames, *, truncated_tail=False):
     baseline = struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])
-    data = struct.pack("<8sHHI", b"BRDATAB1", 3, 3, 0) + _frame(4, baseline)
+    data = struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0) + _frame(4, baseline)
     for iteration, groups in frames:
         data += _frame(4, struct.pack("<II", iteration, len(groups)) + b"".join(groups))
     if truncated_tail:
@@ -233,8 +235,8 @@ def test_mutation_export_excludes_staging_splits_uncommitted_and_inferred_member
 def test_committed_empty_capture_is_a_complete_pair(tmp_path):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     (run_dir / "minimizer.sbsv").write_text("")
-    pair = _pair(run_dir, branches=(), outcome="crash", writes=False)
-    _commits(run_dir, [(2, [_group(1, 2, 0, [], [1])])])
+    pair = _pair(run_dir, branches=(), outcome="crash", source="provenance-access", writes=False)
+    _commits(run_dir, [(2, [_group(1, 2, 0, [], [1], source="provenance-access")])])
     executor.run_feedback()
     assert (run_dir / "feedback/binradar" / pair[0].name).read_bytes() == b""
     assert (run_dir / "feedback/binradar" / pair[1].name).exists()
@@ -269,8 +271,8 @@ def test_pair_copy_failure_never_publishes_split_export(tmp_path, monkeypatch):
 def test_committed_null_branch_vector_must_match(tmp_path, branches, group_branches, accepted):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     (run_dir / "minimizer.sbsv").write_text("")
-    pair = _pair(run_dir, branches=branches, outcome="crash", writes=False)
-    _commits(run_dir, [(2, [_group(1, 2, 0, group_branches, [1])])])
+    pair = _pair(run_dir, branches=branches, outcome="crash", source="provenance-access", writes=False)
+    _commits(run_dir, [(2, [_group(1, 2, 0, group_branches, [1], source="provenance-access")])])
     if accepted:
         executor.run_feedback()
         assert (run_dir / "feedback/binradar" / pair[1].name).exists()
@@ -287,15 +289,16 @@ def test_mutation_dso_identity_uses_image_offset_not_raw_poc_pc(tmp_path, commit
     image = "12" * 32
     executor.probe_result.tracer_fault_reference = binradar.binradar_verifier.TracerFaultReference(
         0x7000123, "provenance-access", image, 0x123)
-    brch, sidecar = _pair(run_dir, outcome="crash", fault=0x9000123)
+    brch, sidecar = _pair(run_dir, outcome="crash", source="provenance-access", fault=0x9000123)
     sidecar.write_text(sidecar.read_text().replace(
         "[fault-image none] [fault-image-offset 0]",
         f"[fault-image {image}] [fault-image-offset 123]").replace(
         "[poc-fault-addr 1234]", "[poc-fault-addr 7000123]").replace(
+        "[poc-fault-source guest-signal]", "[poc-fault-source provenance-access]").replace(
         "[poc-fault-image none] [poc-fault-image-offset 0]",
         f"[poc-fault-image {image}] [poc-fault-image-offset 123]").replace(
         "[same-fault false] [result ignored]", "[same-fault true] [result malicious]"))
-    group = bytearray(_group(1, 2, 0x9000123, [1], [1]))
+    group = bytearray(_group(1, 2, 0x9000123, [1], [1], source="provenance-access"))
     group[5] |= 2
     header_size = evidence.BINRADAR_GROUP_STRUCT.size
     group[header_size:header_size] = bytes.fromhex(image) + struct.pack("<Q", committed_offset)
@@ -330,7 +333,7 @@ def test_malformed_committed_pair_preserves_source_and_previous_export(tmp_path,
         }[defect]
         sidecar.write_text(sidecar.read_text().replace(old, new))
     elif defect == "committed-outcome":
-        _commits(run_dir, [(2, [_group(1, 2, 0x4321, [1], [1])])])
+        _commits(run_dir, [(2, [_group(1, 2, 0x4321, [1], [1], source="provenance-access")])])
     elif defect == "checksum":
         data = bytearray((run_dir / "binradar.br").read_bytes())
         data[-1] ^= 1
@@ -346,3 +349,53 @@ def test_malformed_committed_pair_preserves_source_and_previous_export(tmp_path,
         executor.run_feedback()
     assert (existing / "keep").read_bytes() == b"historical"
     assert (brch.read_bytes(), sidecar.read_bytes()) == sources
+
+
+def test_feedback_same_fault_is_spatial_while_sources_are_authenticated(tmp_path):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    (run_dir / "minimizer.sbsv").write_text("")
+    _, sidecar = _pair(run_dir, outcome="crash", fault=0x1234,
+                       source="syscall-request", poc_source="guest-signal")
+    _commits(run_dir, [(2, [_group(1, 2, 0x1234, [1], [1], source="syscall-request")])])
+    executor.run_feedback()
+    published = (run_dir / "feedback/binradar" / sidecar.name).read_text()
+    assert "[fault-source syscall-request]" in published
+    assert "[poc-fault-source guest-signal]" in published
+    assert "[same-fault true] [result malicious]" in published
+
+
+@pytest.mark.parametrize("source", ["guest-signal", "provenance-access", "syscall-request"])
+@pytest.mark.parametrize("tamper", [None, "child", "poc", "normal", "history", "coverage-v4"])
+def test_current_feedback_authenticates_source_separately_from_site(tmp_path, source, tamper):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    executor.probe_result.tracer_fault_reference = binradar.binradar_verifier.TracerFaultReference(0x1234, source)
+    (run_dir / "minimizer.sbsv").write_text("")
+    brch, sidecar = _pair(run_dir, outcome="crash", fault=0x1234,
+                          source=source, poc_source=source)
+    _commits(run_dir, [(2, [_group(1, 2, 0x1234, [1], [1], source=source)])])
+    other = "provenance-access" if source != "provenance-access" else "syscall-request"
+    if tamper in ("child", "poc"):
+        prefix = "poc-" if tamper == "poc" else ""
+        sidecar.write_text(sidecar.read_text().replace(
+            f"[{prefix}fault-source {source}]", f"[{prefix}fault-source {other}]"))
+    elif tamper == "normal":
+        sidecar.write_text(sidecar.read_text().replace("[outcome crash]", "[outcome normal]"))
+    elif tamper == "history":
+        baseline = struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])
+        mutation = struct.pack("<II", 2, 1) + _group(1, 2, 0x1234, [1], [1])
+        (run_dir / "binradar.br").write_bytes(evidence.HEADER_STRUCT.pack(
+            evidence.MAGIC, 3, 3, 0) + _frame(4, baseline) + _frame(4, mutation))
+    elif tamper == "coverage-v4":
+        executor.probe_result.memcheck_policy = "coverage-v4"
+    if tamper is None:
+        executor.run_feedback()
+        assert (run_dir / "feedback/binradar" / sidecar.name).read_bytes() == sidecar.read_bytes()
+    else:
+        previous = run_dir / "feedback"
+        previous.mkdir()
+        (previous / "keep").write_bytes(b"previous")
+        sources = brch.read_bytes(), sidecar.read_bytes()
+        with pytest.raises(ValueError):
+            executor.run_feedback()
+        assert (previous / "keep").read_bytes() == b"previous"
+        assert (brch.read_bytes(), sidecar.read_bytes()) == sources

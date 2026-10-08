@@ -53,8 +53,8 @@ def _validate_feedback_identity(line: str) -> None:
             "image-offset": int(fields[prefix + "fault-image-offset"], 16)})
         address = int(fields[prefix + "fault-addr"], 16)
         if valid == "false":
-            if image is not None or address != 0:
-                raise ValueError("unavailable feedback fault carries identity")
+            if image is not None or address != 0 or fields[prefix + "fault-source"] != "unavailable":
+                raise ValueError("unavailable feedback fault carries identity or source")
             return None
         result = binradar_verifier.TracerFaultReference(
             address, fields[prefix + "fault-source"], image, offset)
@@ -65,6 +65,9 @@ def _validate_feedback_identity(line: str) -> None:
     try:
         observed = reference("")
         poc = reference("poc-")
+        if (fields["outcome"] not in ("normal", "crash")
+                or (fields["outcome"] == "crash" and observed is None)):
+            raise ValueError("invalid feedback outcome/source pair")
         if fields["outcome"] == "normal" and observed is not None:
             raise ValueError("normal feedback outcome carries fault identity")
         expected = (fields["outcome"] == "crash" and observed is not None
@@ -111,11 +114,14 @@ def _validate_mutation_pair(request, pair, iteration, group, parser) -> None:
         expected_poc = request.poc_fault_reference
         expected_key = (expected_poc.identity_key
                         if expected_poc is not None and expected_poc.valid else None)
-        if (poc.identity_key if poc is not None else None) != expected_key:
+        if ((poc.identity_key if poc is not None else None) != expected_key
+                or (poc.source if poc is not None else None)
+                != (expected_poc.source if expected_key is not None else None)):
             raise ValueError(f"Mutation feedback POC reference mismatch: {sidecar_path}")
         expected_result = ("benign" if header["outcome"] == "normal" else
                            "malicious" if header["same-fault"] else "ignored")
         if (header["outcome"] != group.outcome or header["result"] != expected_result
+                or (observed.source if observed is not None else None) != group.source
                 or header["fault-addr"] != group.fault_addr
                 or (observed.image_id if observed is not None else None) != group.image_id
                 or (observed.image_offset if observed is not None else None) != group.image_offset):
@@ -202,8 +208,11 @@ def _committed_mutation_pairs(request: FeedbackExportRequest) -> list[tuple[str,
     parser = sbsv.parser()
     parser.add_schema(_FEEDBACK_SCHEMA)
     parser.add_schema(_MUTATION_SCHEMA)
+    evidence_path = os.path.join(request.run_dir, "binradar.br")
+    if binradar_evidence.evidence_version(evidence_path, binradar_evidence.EvidenceKind.BINRADAR) != 4:
+        raise ValueError("Mutation feedback requires canonical BINRADAR v4 evidence; use a fresh run")
     pairs = []
-    for frame in binradar_evidence.read_binradar(os.path.join(request.run_dir, "binradar.br")):
+    for frame in binradar_evidence.read_binradar(evidence_path):
         for group in frame.groups:
             pair = candidates.pop((frame.iteration, group.representative), None)
             if pair is not None:

@@ -122,7 +122,7 @@ def _controlled_environment(config: Dict[str, str], *,
 
 
 def _parse_reference(log: str) -> Optional[binradar_verifier.TracerFaultReference]:
-    return binradar_verifier.read_snapshot_fault_reference(log)
+    return binradar_verifier.read_snapshot_fault_reference(log, require_current=True)
 
 
 def _is_normal_exit(log: str) -> bool:

@@ -31,7 +31,7 @@ def _stub_executor(tmp_path):
     executor.run_id = 0
     executor.progress_filename = str(tmp_path / "progress.sbsv")
     executor.start_time = __import__("time").time()
-    executor.probe_result = SimpleNamespace()
+    executor.probe_result = SimpleNamespace(memcheck_policy=None)
     executor.filter_result = [1, 2]
     executor.brpatched_total_patches = 2
     executor.filter_total_patches = 2
@@ -255,6 +255,7 @@ def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
     executor = _stub_executor(tmp_path)
     executor.disable_binradar = False
     executor.probe_result = SimpleNamespace(
+        memcheck_policy=None,
         tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
             0xDEAD, "guest-signal"))
     executor.save_progress = lambda row: None
@@ -298,6 +299,7 @@ def test_final_ignores_interrupted_iteration_without_baseline(tmp_path):
     executor = _stub_executor(tmp_path)
     executor.disable_binradar = False
     executor.probe_result = SimpleNamespace(
+        memcheck_policy=None,
         tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
             0xDEAD, "guest-signal"))
     executor.save_progress = lambda row: None

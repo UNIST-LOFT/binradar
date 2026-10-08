@@ -25,6 +25,7 @@ class FinalResultRequest:
     run_id: int
     candidates: Sequence[int]
     tracer_fault_reference: binradar_verifier.TracerFaultReference | None
+    probe_memcheck_policy: str | None
     disable_binradar: bool
     binradar_failed: bool
     wall_time_reached: bool
@@ -39,8 +40,9 @@ def _fault_identity_key(result: dict) -> tuple:
     if (image is None) != (offset is None):
         raise ValueError("missing result fault image/offset pair")
     if image is not None:
-        return binradar_verifier.TracerFaultReference(
-            result.get("fault_addr", 0), "provenance-access", image, offset).identity_key
+        image, offset = binradar_verifier.decode_fault_image_fields(
+            {"image": image, "image-offset": offset})
+        return ("image", image, offset)
     return ("main", result.get("fault_addr"))
 
 
@@ -56,6 +58,11 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
         "[binradar] [crash] [iter: int] [patch: int] "
         "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
         "[host_fault_addr: hex] [image: str] [image-offset: hex]")
+    source_parser = sbsv.parser()
+    source_parser.add_schema(
+        "[binradar] [crash] [iter: int] [patch: int] "
+        "[guest_pc: hex] [guest_cs_base: hex] [fault_addr: hex] "
+        "[host_fault_addr: hex] [source: str] [image: str] [image-offset: hex]")
     parser.add_schema("[binradar] [normal] [iter: int] [patch: int]")
     parser.add_schema(
         "[binradar] [commit] [iter: int] [patch: int] [br: str]")
@@ -66,7 +73,9 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
             has_site_fields = "[image " in line or "[image-offset " in line
             if has_site_fields and line.strip().startswith("[binradar] [normal]"):
                 raise ValueError("normal BINRADAR outcome carries fault site")
-            result = (site_parser if has_site_fields else parser).parse_line_detached(line)
+            row_parser = (source_parser if "[source " in line else
+                          site_parser if has_site_fields else parser)
+            result = row_parser.parse_line_detached(line)
             if result is None:
                 continue
             iteration = result["iter"]
@@ -84,6 +93,10 @@ def iter_legacy_binradar_results(trace_file: str) -> Iterator[IterationResults]:
             if result.schema_name == "binradar$crash":
                 patch_result["result"] = "crash"
                 patch_result["fault_addr"] = result["fault_addr"]
+                source = binradar_verifier._row_field(result, "source")
+                if source is not None and source not in (*binradar_verifier.TRACER_FAULT_VALID_SOURCES, "unknown"):
+                    raise ValueError("invalid diagnostic fault source")
+                patch_result["source"] = None if source == "unknown" else source
                 image, offset = binradar_verifier.decode_fault_image_fields(
                     result, required=False)
                 patch_result["image_id"] = image
@@ -228,10 +241,23 @@ def write_final_result(request: FinalResultRequest) -> None:
             "verifier evidence only.")
         binradar_iterations = iter(())
     elif os.path.exists(binradar_evidence_file):
+        version = binradar_evidence.evidence_version(
+            binradar_evidence_file, binradar_evidence.EvidenceKind.BINRADAR)
+        if (request.probe_memcheck_policy == binradar_verifier.MEMCHECK_POLICY
+                and version != 4):
+            raise ValueError("coverage-v5 FINAL requires canonical BINRADAR v4 evidence")
+        if (request.tracer_fault_reference is not None
+                and request.tracer_fault_reference.source == "syscall-request"
+                and (version != 4 or request.probe_memcheck_policy != binradar_verifier.MEMCHECK_POLICY)):
+            raise ValueError("syscall-request FINAL requires coverage-v5 and canonical BINRADAR v4 evidence")
         compact_binradar = True
         binradar_iterations = binradar_evidence.read_binradar(
             binradar_evidence_file)
     elif os.path.exists(trace_msg_log_file):
+        if (request.probe_memcheck_policy == binradar_verifier.MEMCHECK_POLICY
+                or (request.tracer_fault_reference is not None
+                    and request.tracer_fault_reference.source == "syscall-request")):
+            raise ValueError("current FINAL requires canonical BINRADAR v4 evidence")
         binradar_iterations = iter_legacy_binradar_results(
             trace_msg_log_file)
     else:
