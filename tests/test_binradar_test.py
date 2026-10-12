@@ -45,7 +45,7 @@ def test_standalone_live_probe_requires_current_policy(monkeypatch, tmp_path):
     (tmp_path / "guest.orig").write_bytes(b"toy")
     (tmp_path / "out").mkdir()
     (tmp_path / "out/plt_info.txt").write_text("malloc free")
-    for policy in ("coverage-v4", MEMCHECK_POLICY):
+    for policy in ("coverage-v4", "coverage-v5", MEMCHECK_POLICY):
         log = (f"[memcheck] [policy {policy}]\n"
                "[snapshot] [fault-reference] [version 3] [valid true] "
                "[source syscall-request] [address 0] [image none] [image-offset 0]\n"

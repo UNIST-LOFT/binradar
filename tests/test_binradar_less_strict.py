@@ -285,7 +285,7 @@ def test_failed_binradar_trace_is_ignored_and_final_reports_failed_phase(
     executor.phase_failures = {"binradar": "RuntimeError: tracer failed"}
     executor.filter_result = [1]
     executor.probe_result = SimpleNamespace(
-        memcheck_policy="coverage-v5",
+        memcheck_policy=binradar.binradar_verifier.MEMCHECK_POLICY,
         tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
             0xDEAD, "guest-signal"))
     progress = []

@@ -229,6 +229,10 @@ def write_final_result(request: FinalResultRequest) -> None:
     skip_binradar_analysis = (
         request.disable_binradar or request.binradar_failed)
     compact_binradar = False
+    # coverage-v5 introduced source-bearing canonical evidence. Its historical
+    # format contract survives the live-policy cutover to coverage-v6.
+    source_bearing_policy = request.probe_memcheck_policy in (
+        "coverage-v5", binradar_verifier.MEMCHECK_POLICY)
     stop = _run_stop(request.run_dir, request.run_prefix, request.run_id)
     if request.disable_binradar:
         logger.info(
@@ -243,21 +247,23 @@ def write_final_result(request: FinalResultRequest) -> None:
     elif os.path.exists(binradar_evidence_file):
         version = binradar_evidence.evidence_version(
             binradar_evidence_file, binradar_evidence.EvidenceKind.BINRADAR)
-        if (request.probe_memcheck_policy == binradar_verifier.MEMCHECK_POLICY
-                and version != 4):
-            raise ValueError("coverage-v5 FINAL requires canonical BINRADAR v4 evidence")
+        if source_bearing_policy and version != 4:
+            raise ValueError(
+                f"{request.probe_memcheck_policy} FINAL requires canonical BINRADAR v4 evidence")
         if (request.tracer_fault_reference is not None
                 and request.tracer_fault_reference.source == "syscall-request"
-                and (version != 4 or request.probe_memcheck_policy != binradar_verifier.MEMCHECK_POLICY)):
-            raise ValueError("syscall-request FINAL requires coverage-v5 and canonical BINRADAR v4 evidence")
+                and (version != 4 or not source_bearing_policy)):
+            raise ValueError(
+                "syscall-request FINAL requires coverage-v5 or coverage-v6 "
+                "and canonical BINRADAR v4 evidence")
         compact_binradar = True
         binradar_iterations = binradar_evidence.read_binradar(
             binradar_evidence_file)
     elif os.path.exists(trace_msg_log_file):
-        if (request.probe_memcheck_policy == binradar_verifier.MEMCHECK_POLICY
+        if (source_bearing_policy
                 or (request.tracer_fault_reference is not None
                     and request.tracer_fault_reference.source == "syscall-request")):
-            raise ValueError("current FINAL requires canonical BINRADAR v4 evidence")
+            raise ValueError("source-bearing FINAL requires canonical BINRADAR v4 evidence")
         binradar_iterations = iter_legacy_binradar_results(
             trace_msg_log_file)
     else:
