@@ -234,6 +234,8 @@ class RunResult:
     # P3's reduction counters are independent of confidence-ranked patch lists;
     # -1/None means the archived run did not record that field.
     binradar_coverage: str = ""
+    binradar_collection_complete: str = "unknown"
+    binradar_collection_reason: str = "unknown"
     binradar_raw_committed: int = -1
     binradar_processed: int = -1
     binradar_patch0_no_observation: int = -1
@@ -1351,6 +1353,10 @@ def collect_experiment_result(exp_dir: str, workdir_name: str,
         final_path = os.path.join(run_dir, "final.sbsv")
         coverage = parse_final_coverage(final_path)
         run_res.binradar_coverage = coverage.get("binradar-coverage", "")
+        run_res.binradar_collection_complete = coverage.get(
+            "collection-complete", "unknown")
+        run_res.binradar_collection_reason = coverage.get(
+            "collection-reason", "unknown")
         if not run_res.binradar_coverage:
             run_res.binradar_coverage = parse_progress_coverage_marker(
                 progress_path, prefix, run_id)
@@ -1903,7 +1909,9 @@ def format_result_log(result: ExperimentResult) -> str:
                 f"    [coverage] {run_res.binradar_coverage}: "
                 f"{coverage_counts}; subject-kind "
                 f"{run_res.binradar_subject_kind or 'N/A'}; "
-                f"fault-reference-valid {fault_reference}")
+                f"fault-reference-valid {fault_reference}; "
+                f"collection-complete {run_res.binradar_collection_complete}; "
+                f"collection-reason {run_res.binradar_collection_reason}")
         if (run_res.binradar_attempted >= 0 or
                 run_res.binradar_stop_reason or
                 run_res.binradar_tracer_attempts >= 0):
@@ -2055,7 +2063,8 @@ def format_result_log(result: ExperimentResult) -> str:
                         detail += ")"
                         lines.append(f"      patch {pid}: rejected{detail}")
                     else:
-                        lines.append(f"      patch {pid}: verified")
+                        lines.append(
+                            f"      patch {pid}: {d.get('res') or 'unavailable'}")
 
         if run_res.filter_done:
             lines.append(
@@ -2115,6 +2124,8 @@ CSV_COLUMNS = [
     "binradar_rejected_count",
     "binradar_remaining_patches_count",
     "binradar_coverage",
+    "binradar_collection_complete",
+    "binradar_collection_reason",
     "binradar_raw_committed",
     "binradar_processed",
     "binradar_patch0_no_observation",
@@ -2251,6 +2262,8 @@ def format_results_csv(all_results: List[ExperimentResult],
                 "error_preview": error_preview,
             }
             row["binradar_coverage"] = run_res.binradar_coverage
+            row["binradar_collection_complete"] = run_res.binradar_collection_complete
+            row["binradar_collection_reason"] = run_res.binradar_collection_reason
             for counter in COVERAGE_COUNTER_FIELDS:
                 column = "binradar_" + counter.replace("-", "_")
                 value = getattr(run_res, column)

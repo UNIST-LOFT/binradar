@@ -199,7 +199,7 @@ _PLAN_ATTEMPT_SOURCE_KINDS = frozenset((
 _PLAN_ATTEMPT_SEED_SEMANTICS = frozenset((
     "snapshot-state", "observed-read", "unknown"))
 _PLAN_ATTEMPT_RESULTS = frozenset((
-    "completed", "no-observation", "unusable-exit", "timeout", "unknown"))
+    "completed", "no-observation", "unusable-exit", "timeout", "capacity", "unknown"))
 _PLAN_ATTEMPT_EXITS = frozenset(("normal", "crash", "unusable", "unknown"))
 _PLAN_ATTEMPT_WITNESSES = frozenset((
     "matched-value", "different-value", "unknown", "not-applicable"))
@@ -338,6 +338,8 @@ def _normalize_plan_attempt(fields: Dict[str, str]) -> Optional[Dict[str, str]]:
 def _classify_plan_attempt_outcome(
         row: Dict[str, str], reference) -> str:
     """Classify a patch-0 crash only against the typed persisted PROBE ref."""
+    if row.get("attempt-result") == "capacity":
+        return "unknown"
     patch0_exit = row.get("patch0-exit", "unknown")
     if patch0_exit == "normal":
         return "normal"
@@ -1250,6 +1252,7 @@ class BinRadarExecutor:
             f"[{exec_mode}] [start] [prefix {self.run_prefix}] "
             f"[id {self.run_id}]")
         timed_out = False
+        collection = binradar_runtime.CollectionStatus()
         phase_env = self._phase_environment(exec_mode, self.run_dir)
         session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
 
@@ -1269,12 +1272,14 @@ class BinRadarExecutor:
                         rundir=self.run_dir, binary=self.artifacts.original,
                         test_cmd=self.test_cmd, testcase=testcase)
                     summary = tracer.run()
+                    collection = summary.collection
                     tracer_time, tracer_success = (
                         summary.elapsed_ms, summary.success)
                     self.save_progress(
                         f"[{exec_mode}] [tracer] [prefix {self.run_prefix}] "
                         f"[id {self.run_id}] [tracer-time {tracer_time}] "
-                        f"[tracer-success {tracer_success}]")
+                        f"[tracer-success {tracer_success}] "
+                        f"{collection.serialize()}")
                     if not tracer_success:
                         if (tracer.run_result is not None
                                 and tracer.run_result.timed_out):
@@ -1320,7 +1325,7 @@ class BinRadarExecutor:
                 f"[prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(
             f"[{exec_mode}] [done] [prefix {self.run_prefix}] "
-            f"[id {self.run_id}]")
+            f"[id {self.run_id}] {collection.serialize()}")
 
     def run_fuzzolic(self):
         self._run_concolic_phase("fuzzolic")
@@ -1524,6 +1529,7 @@ class BinRadarExecutor:
         # accounting below charges the actual v4 reply count.
         representative_reservation = 1 + len(self.filter_result)
         summary = None
+        collection = None
         committed = 0
         discarded = 0
         representative_runs = 0
@@ -1637,6 +1643,11 @@ class BinRadarExecutor:
                             tracer.iter + 1 if tracer.forkserver_mode else 0)
                         attempted += 1
                         summary = tracer.run()
+                        collection = binradar_runtime.aggregate_collection_status(
+                            collection, summary.collection)
+                        if summary.representative_runs == 0:
+                            # Pre-banner cutoff is not a real child attempt.
+                            attempted -= 1
                         ingest_tracer_diagnostics()
                         active_attempt = None
                         if (summary.representative_runs >
@@ -1678,10 +1689,11 @@ class BinRadarExecutor:
                                 binradar_runtime.AttemptResult.COMPLETED:
                             committed += 1
                             logger.debug(message)
-                        else:
+                        elif summary.representative_runs > 0:
                             discarded += 1
                             message += " [discarded true]"
                             logger.warning(message)
+                        message += " " + summary.collection.serialize()
                         self.save_progress(message)
                         if tracer.forkserver_mode and summary.attempt > 1:
                             persist_plan_attempt(
@@ -1695,6 +1707,9 @@ class BinRadarExecutor:
         except TimeoutError as exc:
             if session.deadline.expired():
                 timed_out = True
+                if active_attempt is not None:
+                    collection = binradar_runtime.aggregate_collection_status(
+                        collection, binradar_runtime.CollectionStatus())
                 if active_attempt is not None and active_attempt > 1:
                     mutation_attempted += 1
                     mutation_pending += 1
@@ -1785,6 +1800,7 @@ class BinRadarExecutor:
                 f"[binradar] [stop] "
                 f"[prefix {self.run_prefix}] [id {self.run_id}] "
                 f"[reason {stop_reason}] "
+                f"{(collection if collection is not None else binradar_runtime.CollectionStatus()).serialize()} "
                 f"[attempt {stop_attempt}] "
                 f"[remaining {stop_remaining}] "
                 f"[committed {committed}] "
@@ -1864,7 +1880,8 @@ class BinRadarExecutor:
             raise RuntimeError(error)
         self.save_progress(
             f"[binradar] [done] [prefix {self.run_prefix}] "
-            f"[id {self.run_id}]")
+            f"[id {self.run_id}] "
+            f"{(collection if collection is not None else binradar_runtime.CollectionStatus()).serialize()}")
     
     def run_feedback(self):
         if self.probe_result is None:

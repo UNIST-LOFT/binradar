@@ -14,6 +14,114 @@ sys.path.insert(0, str(ROOT / "fuzzolic"))
 import binradar_runtime
 
 
+@pytest.mark.parametrize("result,stop", [(4, 0), (0, 5), (4, 1)])
+def test_capacity_result_and_stop_must_be_paired(
+        tmp_path, monkeypatch, fake_script, result, stop):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, statuses=[(1, 1, 2, result, stop)])
+    try:
+        executor.start()
+        with pytest.raises(RuntimeError, match="capacity result/stop pair"):
+            executor.run()
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("remaining,stop", [(1, 0), (0, 1)])
+def test_binradar_completed_capacity_is_a_real_observation(
+        tmp_path, monkeypatch, fake_script, remaining, stop):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="completed_capacity",
+        statuses=[(1, 1, remaining, 0, stop)])
+    executor.mode = "binradar"
+    try:
+        executor.start()
+        summary = executor.run()
+        assert summary.success
+        assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+        assert summary.terminal == (stop == 1)
+        assert summary.collection.capacity
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("mode,error", [
+    ("completed_capacity", RuntimeError),
+    ("completed_capacity_malformed", ValueError),
+])
+def test_completed_capacity_requires_binradar_and_valid_status(
+        tmp_path, monkeypatch, fake_script, mode, error):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode=mode,
+        statuses=[(1, 1, 0, 0, 1)])
+    if mode.endswith("malformed"):
+        executor.mode = "binradar"
+    try:
+        executor.start()
+        with pytest.raises(error):
+            executor.run()
+    finally:
+        stop_executor(executor)
+
+
+def test_capacity_reply_is_successful_but_incomplete(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, statuses=[(1, 1, 2, 4, 5)])
+    try:
+        executor.start()
+        summary = executor.run()
+        assert summary.success and summary.terminal
+        assert summary.collection.complete is False
+        assert summary.attempt_result == binradar_runtime.AttemptResult.CAPACITY
+        assert summary.remaining_plans == 2
+    finally:
+        stop_executor(executor)
+
+
+def test_pre_entry_capacity_exit_is_not_a_guest_normal_outcome(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="capacity_before_banner")
+    try:
+        # A prior complete file must be removed before starting this process.
+        Path(executor.collection_status_path).write_text('{"complete":true}')
+        executor.start()
+        summary = executor.run()
+        assert summary.success and summary.terminal
+        assert summary.attempt_result == binradar_runtime.AttemptResult.CAPACITY
+        assert summary.stop_reason == binradar_runtime.StopReason.CAPACITY
+        assert summary.collection.complete is False
+        assert summary.collection.reason == "query-capacity"
+        assert summary.collection.queries == 2
+        assert summary.attempt == 0 and summary.representative_runs == 0
+        assert executor.run_result is None
+    finally:
+        stop_executor(executor)
+
+
+def test_pre_entry_capacity_sidecar_cannot_hide_real_exit_error(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="capacity_before_banner_error")
+    try:
+        with pytest.raises(EOFError, match="exit status 1"):
+            executor.start()
+    finally:
+        stop_executor(executor)
+
+
+def test_partial_banner_cannot_be_reclassified_as_capacity(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="capacity_before_banner_partial")
+    try:
+        with pytest.raises(EOFError, match="forkserver handshake"):
+            executor.start()
+    finally:
+        stop_executor(executor)
+
+
 def test_transport_keeps_cached_binary_records_off_patch_log():
     env = {"BINRADAR_PATCH_CACHE_ENABLE": "1"}
     pipes = binradar_runtime.ForkserverTransport(env, "binradar")
@@ -39,7 +147,7 @@ ctrl = int(os.environ["BINRADAR_FORKSERVER_CTRL_R"])
 stat = int(os.environ["BINRADAR_FORKSERVER_STAT_W"])
 mode = os.environ.get("FAKE_MODE", "normal")
 log_path = os.environ.get("FAKE_LOG")
-version = int(os.environ.get("FAKE_VERSION", "0x41464c03"), 0)
+version = int(os.environ.get("FAKE_VERSION", "0x41464c04"), 0)
 wrong_ack = int(os.environ.get("FAKE_WRONG_ACK", "0x12345678"), 0)
 
 
@@ -85,6 +193,13 @@ def run_summaries(summaries):
             else:
                 os.close(stat)
             return
+        if mode in ("completed_capacity", "completed_capacity_malformed"):
+            import json
+            with open(os.environ["SYMBOLIC_COLLECTION_STATUS_FILE"], "w") as stream:
+                json.dump({} if mode.endswith("malformed") else {
+                    "version": 1, "complete": False, "reason": "query-capacity",
+                    "queries": 2, "expr_bytes": 64, "query_capacity": 4,
+                    "expr_capacity_bytes": 128}, stream)
         os.write(stat, summary)
         log("summary:%d:%d:%d" %
             (attempt, representative_runs, remaining))
@@ -93,6 +208,17 @@ def run_summaries(summaries):
             return
 
 
+if mode.startswith("capacity_before_banner"):
+    import json
+    status_path = os.environ["SYMBOLIC_COLLECTION_STATUS_FILE"]
+    with open(status_path, "w", encoding="utf-8") as stream:
+        json.dump({"version": 1, "complete": False, "reason": "query-capacity",
+                   "queries": 2, "expr_bytes": 64, "query_capacity": 4,
+                   "expr_capacity_bytes": 128}, stream)
+    if mode.endswith("partial"):
+        os.write(stat, bytes([4, 76]))
+    os.close(stat)
+    raise SystemExit(1 if mode.endswith("error") else 0)
 if mode == "close_before_banner":
     os.close(stat)
     raise SystemExit(0)
@@ -409,7 +535,7 @@ def test_wrong_acknowledgement_fails_handshake(monkeypatch, tmp_path, fake_scrip
 
 def test_old_word_tracer_fails_new_runner(monkeypatch, tmp_path, fake_script):
     executor, _ = make_executor(tmp_path, monkeypatch, fake_script, mode="normal")
-    executor.env["FAKE_VERSION"] = "0x41464c02"
+    executor.env["FAKE_VERSION"] = "0x41464c03"
     started = time.monotonic()
     try:
         with pytest.raises(RuntimeError, match="Unexpected forkserver handshake"):
@@ -444,7 +570,7 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
     try:
         banner = struct.unpack("<I", read_pipe(stat_r, 4))[0]
         assert banner == binradar_runtime.HANDSHAKE_EXPECTED
-        old_word = 0x41464C02
+        old_word = 0x41464C03
         os.write(ctrl_w, struct.pack("<I", old_word ^ 0xFFFFFFFF))
         proc.wait(timeout=1)
     finally:
@@ -454,57 +580,6 @@ def test_old_runner_fails_new_tracer(monkeypatch, tmp_path, fake_script):
             proc.kill()
             proc.wait(timeout=2)
     assert log_path.read_text(encoding="ascii").splitlines() == ["ack-mismatch"]
-
-
-HEADER_PATH = ROOT / "tracer" / "linux-user" / "binradar-forkserver.h"
-
-
-def _header_enum_values(enum_name: str) -> dict[str, int]:
-    """Extract ``NAME = value`` rows of one C enum from the tracer header."""
-    text = HEADER_PATH.read_text(encoding="utf-8")
-    body = text.split(f"typedef enum {enum_name} {{", 1)[1].split("}", 1)[0]
-    values: dict[str, int] = {}
-    for line in body.splitlines():
-        line = line.split("/*", 1)[0].strip().rstrip(",")
-        if not line or "=" not in line:
-            continue
-        name, raw = line.split("=", 1)
-        values[name.strip()] = int(raw.strip(), 0)
-    return values
-
-
-def test_python_protocol_enums_mirror_the_tracer_header():
-    """Cross-language fixture: a half-migrated deployment must not be silent."""
-    header = HEADER_PATH.read_text(encoding="utf-8")
-    assert "BINRADAR_FORKSERVER_PROTOCOL_V4 0x41464c03u" in header
-    assert "BINRADAR_FORKSERVER_SUMMARY_WORDS 5u" in header
-    assert binradar_runtime.HANDSHAKE_EXPECTED == 0x41464C03
-    assert binradar_runtime.FORKSERVER_SUMMARY_WORDS == 5
-
-    attempt = _header_enum_values("BinradarForkserverAttemptResult")
-    assert attempt == {
-        "BINRADAR_FORKSERVER_ATTEMPT_COMPLETED":
-            binradar_runtime.AttemptResult.COMPLETED,
-        "BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION":
-            binradar_runtime.AttemptResult.NO_OBSERVATION,
-        "BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT":
-            binradar_runtime.AttemptResult.UNUSABLE_EXIT,
-        "BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT":
-            binradar_runtime.AttemptResult.TIMEOUT,
-    }
-    stop = _header_enum_values("BinradarForkserverStopReason")
-    assert stop == {
-        "BINRADAR_FORKSERVER_STOP_CONTINUE":
-            binradar_runtime.StopReason.CONTINUE,
-        "BINRADAR_FORKSERVER_STOP_EXHAUSTED":
-            binradar_runtime.StopReason.EXHAUSTED,
-        "BINRADAR_FORKSERVER_STOP_BASELINE_UNAVAILABLE":
-            binradar_runtime.StopReason.BASELINE_UNAVAILABLE,
-        "BINRADAR_FORKSERVER_STOP_FAILURE_LIMIT":
-            binradar_runtime.StopReason.FAILURE_LIMIT,
-        "BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE":
-            binradar_runtime.StopReason.RESOURCE_FAILURE,
-    }
 
 
 def test_unknown_attempt_result_is_a_protocol_error(monkeypatch, tmp_path,

@@ -615,8 +615,12 @@ def _binradar_loop_executor(tmp_path):
     return executor
 
 
+@pytest.mark.parametrize("complete,expected_collection", [
+    (True, "unknown"),
+    (False, "false"),
+])
 def test_binradar_inflight_deadline_does_not_reuse_stale_queue_count(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, complete, expected_collection):
     class _Deadline:
         reached = False
 
@@ -632,9 +636,14 @@ def test_binradar_inflight_deadline_does_not_reuse_stale_queue_count(
         def run(self):
             if self.iter == 0:
                 self.iter = 1
-                return _summary(
-                    1, 2, binradar_runtime.AttemptResult.COMPLETED,
-                    binradar_runtime.StopReason.CONTINUE, runs=3)
+                return binradar_runtime.RunSummary(
+                    elapsed_ms=1, success=True, attempt=1,
+                    representative_runs=3, remaining_plans=2,
+                    attempt_result=binradar_runtime.AttemptResult.COMPLETED,
+                    stop_reason=binradar_runtime.StopReason.CONTINUE,
+                    collection=binradar_runtime.CollectionStatus(
+                        complete, "none" if complete else "expr-capacity",
+                        2, 128, 8, 128))
             self.deadline.reached = True
             raise TimeoutError("phase deadline")
 
@@ -676,6 +685,9 @@ def test_binradar_inflight_deadline_does_not_reuse_stale_queue_count(
     assert "[planned 2] [attempted 2]" in stop
     assert "[mutation-attempted 1]" in stop
     assert "[mutation-pending 1] [queued unknown]" in stop
+    assert f"[collection-complete {expected_collection}]" in stop
+    if not complete:
+        assert "[collection-reason expr-capacity]" in stop
 
 
 def test_binradar_loop_continues_after_a_discarded_attempt(
@@ -802,6 +814,79 @@ def test_binradar_loop_reports_baseline_unavailable(tmp_path, monkeypatch):
     assert "[reason baseline-unavailable]" in stop_rows[0]
     assert "[remaining 0]" in stop_rows[0]
     assert "[discarded 1]" in stop_rows[0]
+
+
+def test_binradar_capacity_discards_current_attempt_and_retains_prior_count(
+        tmp_path, monkeypatch):
+    cutoff = binradar_runtime.RunSummary(
+        elapsed_ms=1, success=True, attempt=2, representative_runs=1,
+        remaining_plans=2, attempt_result=binradar_runtime.AttemptResult.CAPACITY,
+        stop_reason=binradar_runtime.StopReason.CAPACITY,
+        collection=binradar_runtime.CollectionStatus(
+            False, "query-capacity", 2, 64, 4, 128))
+    tracer = _RecordingTracer([
+        _summary(1, 3, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE), cutoff,
+        _summary(3, 1, binradar_runtime.AttemptResult.COMPLETED,
+                 binradar_runtime.StopReason.CONTINUE),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    rows = []
+    executor.save_progress = rows.append
+    executor.run_binradar()
+    assert len(tracer.summaries) == 1
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[reason capacity]" in stop
+    assert "[committed 1] [discarded 1]" in stop
+    assert "[collection-complete false]" in stop
+    assert "[collection-reason query-capacity]" in stop
+    done = next(row for row in rows if "[binradar] [done]" in row)
+    assert "[collection-complete false]" in done
+
+
+def test_completed_capacity_then_complete_preserves_first_cutoff(tmp_path, monkeypatch):
+    cutoff = binradar_runtime.CollectionStatus(False, "expr-capacity", 2, 64, 4, 128)
+    complete = binradar_runtime.CollectionStatus(True, "none", 1, 32, 4, 128)
+    tracer = _RecordingTracer([
+        binradar_runtime.RunSummary(1, True, 1, 1, 1,
+            binradar_runtime.AttemptResult.COMPLETED,
+            binradar_runtime.StopReason.CONTINUE, cutoff),
+        binradar_runtime.RunSummary(1, True, 2, 1, 0,
+            binradar_runtime.AttemptResult.COMPLETED,
+            binradar_runtime.StopReason.EXHAUSTED, complete),
+    ])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    rows = []
+    executor.save_progress = rows.append
+    executor.run_binradar()
+    assert not tracer.summaries
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[reason exhausted]" in stop
+    assert "[committed 2] [discarded 0]" in stop
+    for action in ("stop", "done"):
+        row = next(row for row in rows if f"[binradar] [{action}]" in row)
+        assert "[collection-complete false]" in row
+        assert "[collection-reason expr-capacity]" in row
+        assert "[collection-expr-bytes 64]" in row
+
+
+def test_pre_banner_capacity_has_no_attempted_or_discarded_child(tmp_path, monkeypatch):
+    tracer = _RecordingTracer([binradar_runtime.RunSummary(
+        0, True, 0, 0, 0, binradar_runtime.AttemptResult.CAPACITY,
+        binradar_runtime.StopReason.CAPACITY,
+        binradar_runtime.CollectionStatus(False, "query-capacity", 2, 64, 4, 128))])
+    _install_binradar_loop_fakes(monkeypatch, tracer)
+    executor = _binradar_loop_executor(tmp_path)
+    rows = []
+    executor.save_progress = rows.append
+    executor.run_binradar()
+    stop = next(row for row in rows if "[binradar] [stop]" in row)
+    assert "[committed 0] [discarded 0]" in stop
+    assert "[attempted 0]" in stop
+    assert "[representative-runs 0]" in stop
+    assert not any("[discarded true]" in row for row in rows)
 
 
 def test_binradar_loop_records_resource_failure_before_raising(

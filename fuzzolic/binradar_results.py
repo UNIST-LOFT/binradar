@@ -151,6 +151,7 @@ def _has_complete_coverage_contract(
         raw_committed > 0
         and patch0_no_observation == 0
         and stop.get("reason") == "exhausted"
+        and stop.get("collection-complete") == "true"
         and stop.get("representative-runs-partial") == "false"
         and counters["attempt"] == raw_committed
         and counters["remaining"] == 0
@@ -221,7 +222,10 @@ def write_final_result(request: FinalResultRequest) -> None:
         for patch in candidates
     }
 
+    binradar_observed: set[int] = set()
+
     def record_evidence(patch: int, accepted: bool) -> None:
+        binradar_observed.add(patch)
         total_evidences[patch] = total_evidences.get(patch, 0) + 1
         if accepted:
             accept_evidences[patch] = accept_evidences.get(patch, 0) + 1
@@ -338,7 +342,8 @@ def write_final_result(request: FinalResultRequest) -> None:
         else:
             original_unclassified_crash += 1
         for members, patch_result in groups:
-            if "result" not in patch_result or "br" not in patch_result:
+            if ("result" not in patch_result or "br" not in patch_result
+                    or patch_result["br"] in (None, "null")):
                 continue
             same_crash = (original["result"] == "crash"
                           and patch_result["result"] == "crash"
@@ -385,7 +390,7 @@ def write_final_result(request: FinalResultRequest) -> None:
     # the phase produced no BinRadar evidence at all: that is the same
     # no-evidence class as a disabled/failed/baseline-unavailable phase, not a
     # partial sweep of real attempts.
-    if (skip_binradar_analysis
+    if (skip_binradar_analysis or processed_iterations == 0
             or stop.get("reason") in ("baseline-unavailable",
                                       "representative-budget-unavailable")):
         coverage = "unavailable"
@@ -410,7 +415,9 @@ def write_final_result(request: FinalResultRequest) -> None:
         f"[incremental-rejected {len(incremental)}] "
         f"[final-survivors {len(binradar_remaining_patches)}] "
         f"[subject-kind {'singleton' if len(candidates) == 1 else 'multi' if candidates else 'empty'}] "
-        f"[fault-reference-valid {str(fault_reference_valid).lower()}]")
+        f"[fault-reference-valid {str(fault_reference_valid).lower()}] "
+        f"[collection-complete {stop.get('collection-complete', 'unknown')}] "
+        f"[collection-reason {stop.get('collection-reason', 'unknown')}]")
     request.save_progress(coverage_row)
 
     def bounded_ids(ids: set[int]) -> tuple[str, bool]:
@@ -543,7 +550,11 @@ def write_final_result(request: FinalResultRequest) -> None:
 
         if not skip_binradar_analysis:
             for patch_id in sorted(remaining_patches):
-                if patch_id in binradar_remaining_patches:
+                if patch_id not in binradar_observed:
+                    result_file.write(
+                        f"[final] [binradar] [patch {patch_id}] "
+                        f"[res unavailable] [reason no-observation] [iter -1]\n")
+                elif patch_id in binradar_remaining_patches:
                     result_file.write(
                         f"[final] [binradar] [patch {patch_id}] "
                         f"[res verified] [reason none] [iter -1]\n")

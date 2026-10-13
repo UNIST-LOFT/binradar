@@ -3,6 +3,7 @@
 import ctypes
 import enum
 import hashlib
+import json
 import os
 import random
 import select
@@ -30,11 +31,11 @@ SOLVER_TIMEOUT = 10.0
 SHM_KEYS = ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY")
 SHM_KEY_SEED_ENV = "BINRADAR_SHM_KEY_SEED"
 SHM_KEY_DRAW_LIMIT = 1024
-# Protocol v4 handshake word.  Mirrors BINRADAR_FORKSERVER_PROTOCOL_V4 in
+# Protocol v5 handshake word.  Mirrors BINRADAR_FORKSERVER_PROTOCOL_V5 in
 # tracer/linux-user/binradar-forkserver.h; tests/test_binradar_forkserver_protocol.py
 # pins both sides so a half-migrated deployment fails the handshake rather
 # than misreading packet bytes.
-HANDSHAKE_EXPECTED = 0x41464C03
+HANDSHAKE_EXPECTED = 0x41464C04
 FORKSERVER_SUMMARY_WORDS = 5
 
 
@@ -50,6 +51,7 @@ class AttemptResult(enum.IntEnum):
     NO_OBSERVATION = 1
     UNUSABLE_EXIT = 2
     TIMEOUT = 3
+    CAPACITY = 4
 
 
 class StopReason(enum.IntEnum):
@@ -64,6 +66,90 @@ class StopReason(enum.IntEnum):
     BASELINE_UNAVAILABLE = 2
     FAILURE_LIMIT = 3
     RESOURCE_FAILURE = 4
+    CAPACITY = 5
+
+
+@dataclass(frozen=True)
+class CollectionStatus:
+    """Collection completeness is independent of subprocess success."""
+
+    complete: Optional[bool] = None
+    reason: str = "unknown"
+    queries: Optional[int] = None
+    expr_bytes: Optional[int] = None
+    query_capacity: Optional[int] = None
+    expr_capacity_bytes: Optional[int] = None
+
+    @property
+    def capacity(self) -> bool:
+        return self.complete is False and self.reason in (
+            "query-capacity", "expr-capacity")
+
+    def serialize(self) -> str:
+        complete = "unknown" if self.complete is None else str(self.complete).lower()
+        fields = [("collection-complete", complete),
+                  ("collection-reason", self.reason)]
+        fields.extend((name, "unknown" if value is None else str(value))
+                      for name, value in (
+                          ("collection-queries", self.queries),
+                          ("collection-expr-bytes", self.expr_bytes),
+                          ("collection-query-capacity", self.query_capacity),
+                          ("collection-expr-capacity-bytes", self.expr_capacity_bytes)))
+        return " ".join(f"[{name} {value}]" for name, value in fields)
+
+
+def aggregate_collection_status(
+        previous: Optional[CollectionStatus], current: CollectionStatus
+) -> CollectionStatus:
+    """Retain the first cutoff; unknown attempts cannot prove completeness."""
+    if previous is None:
+        return current
+    if previous.complete is False:
+        return previous
+    if current.complete is False:
+        return current
+    if previous.complete is None:
+        return previous
+    return current
+
+
+def read_collection_status(path: str) -> CollectionStatus:
+    """Missing state is unknown; malformed or contradictory state is an error."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate collection status field: {key}")
+            result[key] = value
+        return result
+
+    try:
+        with open(path, encoding="utf-8") as stream:
+            row = json.load(stream, object_pairs_hook=unique_object)
+    except FileNotFoundError:
+        return CollectionStatus()
+    fields = {"version", "complete", "reason", "queries", "expr_bytes",
+              "query_capacity", "expr_capacity_bytes"}
+    if not isinstance(row, dict) or set(row) != fields:
+        raise ValueError("Invalid collection status fields")
+    if type(row["version"]) is not int or row["version"] != 1:
+        raise ValueError("Unsupported collection status version")
+    if type(row["complete"]) is not bool or row["reason"] not in (
+            "none", "query-capacity", "expr-capacity"):
+        raise ValueError("Invalid collection completeness/reason")
+    if row["complete"] != (row["reason"] == "none"):
+        raise ValueError("Contradictory collection completeness/reason")
+    counters = fields - {"version", "complete", "reason"}
+    if any(type(row[key]) is not int or row[key] < 0 for key in counters):
+        raise ValueError("Invalid collection status counters")
+    if (row["query_capacity"] < 2 or row["expr_capacity_bytes"] == 0
+            or row["queries"] > row["query_capacity"] - 2
+            or row["expr_bytes"] > row["expr_capacity_bytes"]):
+        raise ValueError("Collection status counters exceed capacity")
+    if (row["reason"] == "query-capacity" and
+            row["queries"] != row["query_capacity"] - 2):
+        raise ValueError("Query capacity status does not fill the ordinary queue")
+    return CollectionStatus(**{key: row[key] for key in fields - {"version"}})
 
 
 def protocol_enum_name(value: enum.IntEnum) -> str:
@@ -319,7 +405,7 @@ class ForkserverTransport:
         return struct.unpack("<I", self.read(4, timeout))[0]
 
     def read_summary(self, timeout: Optional[float]) -> Tuple[int, int, int, int, int]:
-        """Read the fixed five-word protocol-v4 attempt summary."""
+        """Read the fixed five-word protocol-v5 attempt summary."""
         return struct.unpack(
             "<IIIII", self.read(4 * FORKSERVER_SUMMARY_WORDS, timeout))
 
@@ -348,15 +434,17 @@ class ForkserverTransport:
             except InterruptedError:
                 continue
             if not chunk:
-                raise EOFError(
+                error = EOFError(
                     f"[TRACER] [{self.mode}] EOF while reading from forkserver")
+                error.bytes_read = len(data)
+                raise error
             data.extend(chunk)
         return bytes(data)
 
 
 @dataclass(frozen=True)
 class RunSummary:
-    """One protocol-v4 attempt reply plus the wall time it took.
+    """One protocol-v5 attempt reply plus the wall time it took.
 
     ``remaining_plans`` is the tracer's real not-yet-executed plan count, never
     a fabricated stop flag.  ``attempt_result`` and ``stop_reason`` are the
@@ -372,6 +460,7 @@ class RunSummary:
     remaining_plans: int
     attempt_result: AttemptResult
     stop_reason: StopReason
+    collection: CollectionStatus = CollectionStatus()
 
     @property
     def terminal(self) -> bool:
@@ -409,6 +498,15 @@ class TracerExecutor:
         self.stop_reason = StopReason.EXHAUSTED
         self.run_result: Optional[binradar_utils.ExecutionResult] = None
         self.transport: Optional[ForkserverTransport] = None
+        self.collection_status_path = str(
+            Path(rundir).resolve() / f"{mode}-collection-status.json")
+        self.env["SYMBOLIC_COLLECTION_STATUS_FILE"] = self.collection_status_path
+        self.collection = CollectionStatus()
+        self._early_capacity = False
+
+    def _clear_collection_status(self) -> None:
+        Path(self.collection_status_path).unlink(missing_ok=True)
+        self.collection = CollectionStatus()
 
     def remaining_phase_time(self, cap: Optional[float] = None) -> Optional[float]:
         return self.deadline.remaining(cap)
@@ -461,6 +559,8 @@ class TracerExecutor:
         raise EOFError(message) from error
 
     def start(self) -> None:
+        self._clear_collection_status()
+        self._early_capacity = False
         self._process_cleanup_started = False
         self._process_cleanup_done = False
         if not self.forkserver_mode:
@@ -490,6 +590,17 @@ class TracerExecutor:
         try:
             banner = self.transport.read_u32(startup_wait)
         except (EOFError, TimeoutError) as exc:
+            if isinstance(exc, EOFError) and getattr(exc, "bytes_read", None) == 0:
+                # EOF can precede reaping by a scheduling tick. Only a bounded,
+                # successful exit with a strictly valid capacity sidecar qualifies.
+                try:
+                    exit_code = self.process.wait(timeout=self.process_reap_timeout)
+                except subprocess.TimeoutExpired:
+                    exit_code = None
+                self.collection = read_collection_status(self.collection_status_path)
+                if exit_code == 0 and self.collection.capacity:
+                    self._early_capacity = True
+                    return
             effective_timeout = startup_wait \
                 if startup_wait is not None else startup_timeout
             self._raise_forkserver_startup_failure(exc, effective_timeout)
@@ -510,24 +621,43 @@ class TracerExecutor:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Tracer process not started")
         started = time.monotonic()
+        if self._early_capacity:
+            self.attempt_result = AttemptResult.CAPACITY
+            self.stop_reason = StopReason.CAPACITY
+            return RunSummary(
+                elapsed_ms=0, success=True, attempt=0,
+                representative_runs=0, remaining_plans=0,
+                attempt_result=self.attempt_result, stop_reason=self.stop_reason,
+                collection=self.collection)
         if not self.forkserver_mode:
             self.run_result = binradar_utils.execute_await(
                 self.process, timeout=self.deadline.remaining())
             logger.info(
                 f"[TRACER] [{self.mode}] Target process finished with exit code "
                 f"{self.run_result.decode_status()}, success {self.run_result.success}")
+            self.collection = read_collection_status(self.collection_status_path)
             self.representative_runs = 1
+            self.attempt_result = (AttemptResult.CAPACITY if self.collection.capacity
+                                   else AttemptResult.COMPLETED)
+            self.stop_reason = (StopReason.CAPACITY if self.collection.capacity
+                                else StopReason.EXHAUSTED)
             return RunSummary(
                 elapsed_ms=int((time.monotonic() - started) * 1000),
-                success=self.run_result.success,
+                # A real guest crash is still a useful ordinary trace. Only a
+                # claimed capacity cutoff must prove its intentional exit 0.
+                success=(self.run_result.success and
+                         (not self.collection.capacity or
+                          self.run_result.exit_code == 0)),
                 attempt=0,
                 representative_runs=1,
                 remaining_plans=0,
-                attempt_result=AttemptResult.COMPLETED,
-                stop_reason=StopReason.EXHAUSTED,
+                attempt_result=self.attempt_result,
+                stop_reason=self.stop_reason,
+                collection=self.collection,
             )
         try:
             assert self.transport is not None
+            self._clear_collection_status()
             self.transport.write_u32(0)
             attempt, representative_runs, remaining_plans, attempt_result, \
                 stop_reason = self.transport.read_summary(
@@ -540,6 +670,19 @@ class TracerExecutor:
                     f"[TRACER] [{self.mode}] Forkserver returned unknown "
                     f"attempt result {attempt_result} / stop reason "
                     f"{stop_reason}") from exc
+
+            if ((parsed_result == AttemptResult.CAPACITY) !=
+                    (parsed_stop == StopReason.CAPACITY)):
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Invalid capacity result/stop pair")
+            self.collection = read_collection_status(self.collection_status_path)
+            if parsed_stop == StopReason.CAPACITY:
+                if self.collection.complete is True:
+                    raise RuntimeError("Capacity reply claims complete collection")
+                if self.collection.complete is None:
+                    self.collection = CollectionStatus(False, "capacity")
+            elif self.collection.capacity and self.mode != "binradar":
+                raise RuntimeError("Capacity sidecar without capacity reply")
 
             expected_attempt = self.iter + 1
             if attempt != expected_attempt:
@@ -609,6 +752,7 @@ class TracerExecutor:
             remaining_plans=remaining_plans,
             attempt_result=self.attempt_result,
             stop_reason=self.stop_reason,
+            collection=self.collection,
         )
 
     def _cleanup_process_group(

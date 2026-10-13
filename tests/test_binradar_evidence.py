@@ -298,8 +298,9 @@ def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
 
 
 @pytest.mark.parametrize("other_phase_cutoff", [False, True])
+@pytest.mark.parametrize("collection_complete", ["true", "false", "unknown"])
 def test_exhausted_queue_with_full_evidence_is_complete(
-        tmp_path, other_phase_cutoff):
+        tmp_path, other_phase_cutoff, collection_complete):
     run_dir = tmp_path / "trial-00000"
     run_dir.mkdir()
     _write_binradar(run_dir / "binradar.br")
@@ -333,12 +334,16 @@ def test_exhausted_queue_with_full_evidence_is_complete(
         "[representative-runs 4] [representative-runs-partial false] "
         "[planned 1] [attempted 2] [mutation-attempted 1] "
         "[mutation-discarded 0] [mutation-committed 1] "
-        "[mutation-pending 0] [queued 0]\n")
+        "[mutation-pending 0] [queued 0] "
+        f"[collection-complete {collection_complete}] "
+        f"[collection-reason {'query-capacity' if collection_complete == 'false' else 'none' if collection_complete == 'true' else 'unknown'}]\n")
     binradar_results.write_final_result(request)
     report = (run_dir / "final.sbsv").read_text()
-    assert "[final] [coverage] [binradar-coverage complete]" in report
+    expected = "complete" if collection_complete == "true" else "partial"
+    assert f"[final] [coverage] [binradar-coverage {expected}]" in report
     assert (f"[wall-time-reached {str(other_phase_cutoff).lower()}] "
-            "[binradar-coverage complete]") in report
+            f"[binradar-coverage {expected}]") in report
+    assert f"[collection-complete {collection_complete}]" in report
 
 
 def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):
@@ -553,6 +558,40 @@ def test_final_publishes_exact_rejection_id_sets(tmp_path):
             "[truncated-sets ]") in report
     assert ("[standalone-rejected 2] [overlap-rejected 1] "
             "[incremental-rejected 1]") in report
+
+
+@pytest.mark.parametrize("prior", ["none", "baseline", "rejection"])
+def test_capacity_coverage_never_fabricates_candidate_verification(tmp_path, prior):
+    run_dir = tmp_path / "trial-00000"
+    run_dir.mkdir()
+    frames = []
+    if prior != "none":
+        frames.append(struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]))
+    if prior == "rejection":
+        frames.append(struct.pack("<II", 2, 2)
+            + _group(0, 2, 0x1234, [0], [0])
+            + _group(1, 2, 0x1234, [1], [1]))
+    _write_binradar_frames(run_dir / "binradar.br", frames=frames)
+    binradar_evidence.write_verifier(run_dir / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=1,
+            total_evidences=1, observations={})])
+    (tmp_path / "progress.sbsv").write_text(
+        "[binradar] [stop] [prefix trial] [id 0] [reason capacity] "
+        "[collection-complete false] [collection-reason query-capacity]\n")
+    binradar_results.write_final_result(_final_request(
+        run_dir, [1], binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    report = (run_dir / "final.sbsv").read_text()
+    assert "[verifier] [patch 1] [res verified]" in report
+    assert "[binradar] [patch 1] [res verified]" not in report
+    assert "[collection-complete false] [collection-reason query-capacity]" in report
+    if prior == "rejection":
+        assert "[binradar] [patch 1] [res rejected] [reason same-crash] [iter 2]" in report
+        assert "[score 0.500000] [accept-evidences 1] [total-evidences 2]" in report
+    else:
+        assert "[binradar] [patch 1] [res unavailable] [reason no-observation]" in report
+        assert "[score 1.000000] [accept-evidences 1] [total-evidences 1]" in report
+    assert f"[binradar-coverage {'unavailable' if prior == 'none' else 'partial'}]" in report
 
 
 def test_rejection_set_serialization_is_bounded(tmp_path, monkeypatch):

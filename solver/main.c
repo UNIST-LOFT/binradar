@@ -62,6 +62,99 @@ Expr*      pool;
 static int    query_shm_id = -1;
 static Query* next_query;
 static Query* query_queue;
+static Query* collection_end;
+static size_t collection_query_count;
+static size_t collection_expr_bytes;
+static int collection_complete;
+static const char* collection_reason;
+
+/* Query indices exclude the handshake and terminal slots. This check must
+ * precede every indexed AST access, including assignments in release builds. */
+static inline size_t checked_query_ast_index(size_t index)
+{
+    if (index >= EXPR_QUERY_CAPACITY - 2 || index >= collection_query_count) {
+        ABORT("Invalid query AST index %lu (committed %lu).", index,
+              collection_query_count);
+    }
+    return index;
+}
+
+/* Scan only the physical transport, before lowering any retained records.
+ * A null crash boundary remains incomplete/unknown; a full unterminated
+ * transport or an inconsistent terminal is corruption, not capacity success. */
+static void prepare_collection(void)
+{
+    collection_complete = 0;
+    collection_reason = "unknown";
+    collection_expr_bytes = 0;
+    collection_end = NULL;
+    for (size_t slot = 1; slot < EXPR_QUERY_CAPACITY; slot++) {
+        Query* q = query_queue + slot;
+        if (!q->query) {
+            collection_end = q;
+            break;
+        }
+        if (!symbolic_query_is_terminal(q)) {
+            continue;
+        }
+        uint64_t reason = q->args64;
+        if ((q->query == FINAL_QUERY && reason != SYMBOLIC_COLLECTION_COMPLETE) ||
+            (q->query == FINAL_QUERY_CAPACITY &&
+             reason != SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+             reason != SYMBOLIC_COLLECTION_EXPR_CAPACITY) ||
+            (reason == SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+             slot != EXPR_QUERY_CAPACITY - 1) ||
+            q->address > sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY) {
+            ABORT("Invalid symbolic collection terminal at slot %lu.", slot);
+        }
+        collection_end = q;
+        collection_expr_bytes = q->address;
+        collection_complete = reason == SYMBOLIC_COLLECTION_COMPLETE;
+        collection_reason = symbolic_collection_reason_name(
+            (SymbolicCollectionStopReason)reason);
+        break;
+    }
+    if (!collection_end) {
+        ABORT("Symbolic query transport has no bounded terminal.");
+    }
+    collection_query_count = (size_t)(collection_end - query_queue) - 1;
+    printf("[solver] [collection] [version 1] [complete %d] [reason %s]"
+           " [queries %lu] [expr-bytes %lu] [expr-bytes-known %d]"
+           " [query-capacity %lu] [expr-capacity-bytes %lu]\n",
+           collection_complete, collection_reason, collection_query_count,
+           collection_expr_bytes, symbolic_query_is_terminal(collection_end),
+           (size_t)EXPR_QUERY_CAPACITY,
+           sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
+}
+
+static inline void check_collection_expr_span(const void* address, size_t bytes)
+{
+    uintptr_t base = (uintptr_t)pool;
+    uintptr_t start = (uintptr_t)address;
+    size_t limit = symbolic_query_is_terminal(collection_end)
+                       ? collection_expr_bytes
+                       : sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY;
+    if (start < base || start - base > limit ||
+        bytes > limit - (start - base)) {
+        ABORT("Expression span exceeds committed transport (%p, %lu bytes).",
+              address, bytes);
+    }
+}
+
+static inline void check_collection_expr(const Expr* expr)
+{
+    check_collection_expr_span(expr, sizeof(*expr));
+    if (((uintptr_t)expr - (uintptr_t)pool) % _Alignof(Expr)) {
+        ABORT("Unaligned expression in symbolic transport (%p).", expr);
+    }
+}
+
+static void report_collection_processed(void)
+{
+    printf("[solver] [processed-prefix] [queries %lu] [incomplete %d]"
+           " [reason %s]\n", collection_query_count, !collection_complete,
+           collection_reason);
+}
 
 uint8_t printed[MAX_PRINT_CHECK];
 static ssize_t query_start_idx = -1;
@@ -571,7 +664,7 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
                                                  size_t      query_idx,
                                                  Z3_solver solver, Z3_ast* deps)
 {
-    if (query_idx >= EXPR_QUERY_CAPACITY || !z3_ast_exprs[query_idx]) {
+    if (query_idx >= EXPR_QUERY_CAPACITY || !z3_ast_exprs[checked_query_ast_index(query_idx)]) {
         ABORT("Cannot register query %lu without a Z3 constraint.", query_idx);
     }
 
@@ -632,15 +725,15 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
             if (query_dep_idx >= EXPR_QUERY_CAPACITY) {
                 continue;
             }
-            assert(z3_ast_exprs[query_dep_idx]);
+            assert(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
             Z3_solver_assert(
                 smt_solver.ctx, solver,
-                // Z3_simplify(smt_solver.ctx, z3_ast_exprs[query_dep_idx]));
-                z3_ast_exprs[query_dep_idx]);
+                // Z3_simplify(smt_solver.ctx, z3_ast_exprs[checked_query_ast_index(query_dep_idx)]));
+                z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
             // printf("Adding expr %lu for %lu\n", query_dep_idx, query_idx);
             // printf("[%lu]: ", query_dep_idx);
-            // print_z3_ast(z3_ast_exprs[query_dep_idx]);
-            // print_z3_original(z3_ast_exprs[query_dep_idx]);
+            // print_z3_ast(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
+            // print_z3_original(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
         }
     }
 
@@ -652,8 +745,8 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
             g_hash_table_iter_init(&iter, current->exprs);
             while (g_hash_table_iter_next(&iter, &key, &value)) {
                 size_t query_dep_idx = (size_t)key;
-                assert(z3_ast_exprs[query_dep_idx]);
-                and_args[k++] = z3_ast_exprs[query_dep_idx];
+                assert(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
+                and_args[k++] = z3_ast_exprs[checked_query_ast_index(query_dep_idx)];
                 // printf("Adding expr %lu for %lu\n", query_dep_idx,
                 // query_idx);
             }
@@ -730,9 +823,9 @@ static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver, int 
                 if (skip_expr == query_dep_idx) {
                     continue;
                 }
-                assert(z3_ast_exprs[query_dep_idx]);
+                assert(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
                 Z3_solver_assert(smt_solver.ctx, solver,
-                                 z3_ast_exprs[query_dep_idx]);
+                                 z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
             }
         }
     }
@@ -768,9 +861,9 @@ static inline void add_deps_to_solver_upto(GHashTable* inputs, Z3_solver solver,
                 if (max_query_idx >= 0 && (ssize_t)query_dep_idx > max_query_idx) {
                     continue;
                 }
-                assert(z3_ast_exprs[query_dep_idx]);
+                assert(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
                 Z3_solver_assert(smt_solver.ctx, solver,
-                                 z3_ast_exprs[query_dep_idx]);
+                                 z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
             }
         }
     }
@@ -816,12 +909,12 @@ static inline Z3_ast get_deps(GHashTable* inputs)
                 if (query_dep_idx >= EXPR_QUERY_CAPACITY) {
                     continue;
                 }
-                assert(z3_ast_exprs[query_dep_idx]);
+                assert(z3_ast_exprs[checked_query_ast_index(query_dep_idx)]);
 #if 0
                 for (size_t i = 0; i < testcase.size; i++) {
                     eval_data[i] = testcase.data[i];
                 }
-                uintptr_t solution = conc_query_eval_value(smt_solver.ctx, z3_ast_exprs[query_dep_idx], eval_data,
+                uintptr_t solution = conc_query_eval_value(smt_solver.ctx, z3_ast_exprs[checked_query_ast_index(query_dep_idx)], eval_data,
                                                     symbols_sizes, symbols_count, NULL);
                 if (solution == 0) {
                     printf("Expr id=%lu is UNSAT\n", query_dep_idx);
@@ -829,9 +922,9 @@ static inline Z3_ast get_deps(GHashTable* inputs)
                 }
 #endif
                 if (!r) {
-                    r = z3_ast_exprs[query_dep_idx];
+                    r = z3_ast_exprs[checked_query_ast_index(query_dep_idx)];
                 } else {
-                    Z3_ast args[2] = {r, z3_ast_exprs[query_dep_idx]};
+                    Z3_ast args[2] = {r, z3_ast_exprs[checked_query_ast_index(query_dep_idx)]};
                     r              = Z3_mk_and(smt_solver.ctx, 2, args);
                 }
             }
@@ -874,11 +967,11 @@ static inline Z3_ast get_deps_upto(GHashTable* inputs, ssize_t max_query_idx,
                 continue;
             }
             if (idx < 0 || idx >= EXPR_QUERY_CAPACITY ||
-                !z3_ast_exprs[idx]) {
+                !z3_ast_exprs[checked_query_ast_index(idx)]) {
                 continue;
             }
             g_hash_table_add(added, key);
-            Z3_ast args[2] = {result, z3_ast_exprs[idx]};
+            Z3_ast args[2] = {result, z3_ast_exprs[checked_query_ast_index(idx)]};
             result = Z3_mk_and(smt_solver.ctx, 2, args);
         }
     }
@@ -4160,6 +4253,9 @@ static inline size_t reverse_scale_sload_index(size_t index)
 Z3_ast smt_query_to_z3_wrapper(Expr* query, uintptr_t is_const_value,
                                size_t width, GHashTable** inputs)
 {
+    if (query && !is_const_value) {
+        check_collection_expr(query);
+    }
     if (debug_translation) {
         print_expr(query);
     }
@@ -4254,6 +4350,9 @@ Z3_ast smt_query_to_z3(Expr* query, uintptr_t is_const_value, size_t width,
                        GHashTable** inputs)
 {
     assert(inputs && *inputs == NULL);
+    if (query && !is_const_value) {
+        check_collection_expr(query);
+    }
     CachedExpr* ce = g_hash_table_lookup(z3_expr_cache, (gpointer)query);
     if (ce) {
         *inputs = ce->inputs;
@@ -5674,7 +5773,7 @@ static void smt_branch_query(Query* q)
     // SAYF("Translating query %lu to Z3...\n", GET_QUERY_IDX(q));
     GHashTable* inputs   = NULL;
     Z3_ast      z3_query = smt_query_to_z3_wrapper(q->query, 0, 0, &inputs);
-    z3_ast_exprs[GET_QUERY_IDX(q)] = z3_query;
+    z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = z3_query;
     // SAYF("DONE: Translating query to Z3\n");
 #if 0
     if (OP(z3_query) == Z3_OP_FALSE) {
@@ -6474,6 +6573,7 @@ static void smt_slice_query(Query* q)
 
     // symbolic input expression
     Expr* s_load = (q->query + 1);
+    check_collection_expr(s_load);
     assert(s_load->opkind == IS_SYMBOLIC);
     assert(CONST(s_load->op1) == s_load_id);
     uintptr_t s_load_size = CONST(s_load->op2);
@@ -6537,8 +6637,17 @@ static void smt_slice_query(Query* q)
 
     if (config.memory_slice_reasoning) {
         if (q->query->opkind == MEMORY_SLICE_ACCESS) {
-            while (slice->opkind == MEMORY_SLICE) {
+            while (1) {
+                check_collection_expr(slice);
+                if (slice->opkind != MEMORY_SLICE) {
+                    break;
+                }
+                if (slices_count >= MAX_NUM_SLICES) {
+                    ABORT("Too many transported memory slices.");
+                }
                 assert(CONST(slice->op2) == s_load_id);
+                check_collection_expr(slice->op1);
+                check_collection_expr_span(&slice->op1->op2, SLICE_SIZE);
                 slices_addrs[slices_count] = slice->op1;
                 slices_count += 1;
                 // printf("Slice at %p.\n", slice->op1);
@@ -6563,6 +6672,7 @@ static void smt_slice_query(Query* q)
     }
     if (q->query->opkind == MEMORY_INPUT_SLICE_ACCESS) {
         Expr* input_slice = (q->query + 2);
+        check_collection_expr(input_slice);
         assert(input_slice->opkind == INPUT_SLICE);
         slice_start = CONST(input_slice->op1);
         slice_end = CONST(input_slice->op2);
@@ -6674,7 +6784,7 @@ static void smt_slice_query(Query* q)
                 Z3_mk_eq(smt_solver.ctx, z3_addr,
                          smt_new_const(addr_conc, sizeof(uintptr_t) * 8));
 
-            z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+            z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = c;
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
 
             smt_notify_fuzzy_constraint(c);
@@ -6800,7 +6910,7 @@ static void smt_slice_query(Query* q)
 
     g_hash_table_add(inputs, (gpointer)scale_sload_index(s_load_id));
     g_hash_table_add(inputs, (gpointer)scale_sload_index(s_load_id) + 1);
-    z3_ast_exprs[GET_QUERY_IDX(q)] = e;
+    z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = e;
     update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
 
     f_hash_table_destroy(conc_addrs);
@@ -6867,7 +6977,7 @@ static void smt_expr_query(Query* q, OPKIND opkind)
             Z3_ast c = Z3_mk_eq(smt_solver.ctx, z3_query,
                                 smt_new_const(solution,
                                               sizeof(uintptr_t) * 8));
-            z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+            z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = c;
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
         }
         return;
@@ -6968,7 +7078,7 @@ static void smt_expr_query(Query* q, OPKIND opkind)
 #if 0
         get_inputs_expr(c);
 #endif
-        z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = c;
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
         smt_notify_fuzzy_constraint(c);
     }
@@ -6997,7 +7107,7 @@ static void smt_mem_concr_query(Query* q, OPKIND opkind)
     Z3_ast    c        = Z3_mk_eq(smt_solver.ctx, memory_expr,
                         smt_new_const(conc_val, SIZE(memory_expr)));
 
-    z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+    z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = c;
     update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
     smt_notify_fuzzy_constraint(c);
 
@@ -7055,7 +7165,7 @@ static void smt_binradar_concr_query(Query* q)
                         smt_new_const(concrete_val, expr_n_bits));
 
     if (reverse_directed_lowering) {
-        z3_ast_exprs[GET_QUERY_IDX(q)] = c;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = c;
         update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
         smt_notify_fuzzy_constraint(c);
         return;
@@ -7089,7 +7199,7 @@ static void smt_binradar_heap_bound_check(Query* q)
     smt_bv_resize(&offset_expr, &size_expr, 0);
     Z3_ast check = Z3_mk_bvult(smt_solver.ctx, offset_expr, size_expr);
     inputs = merge_inputs(inputs, size_inputs);
-    z3_ast_exprs[GET_QUERY_IDX(q)] = check;
+    z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = check;
     if (reverse_directed_lowering) {
         if (inputs) {
             update_and_add_deps_to_solver(inputs, GET_QUERY_IDX(q), NULL, NULL);
@@ -7259,7 +7369,7 @@ static void strcmp_s1_symbolic(Query* q,
     // print_z3_ast(branch);
 
     if (skip_update_deps <= 0) {
-        z3_ast_exprs[GET_QUERY_IDX(q)] = branch;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = branch;
     }
 
     GHashTable* inputs = merge_inputs(s1_inputs, s2_inputs);
@@ -7357,7 +7467,7 @@ static void smt_model_numeric_mutations(Query* q, int is_signed)
     }
 
     size_t query_idx = GET_QUERY_IDX(q);
-    z3_ast_exprs[query_idx] = Z3_mk_true(smt_solver.ctx);
+    z3_ast_exprs[checked_query_ast_index(query_idx)] = Z3_mk_true(smt_solver.ctx);
     update_and_add_deps_to_solver(inputs, query_idx, NULL, NULL);
 
     int64_t min_index = get_min_input_index(inputs);
@@ -7472,7 +7582,7 @@ static void smt_model_expr(Query* q)
                 branch_neg = c;
             }
 
-            z3_ast_exprs[GET_QUERY_IDX(q)] = branch;
+            z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = branch;
 
             GHashTable* inputs = merge_inputs(s1_inputs, s2_inputs);
 
@@ -7538,7 +7648,7 @@ static void smt_model_expr(Query* q)
             }
         }
 
-        z3_ast_exprs[GET_QUERY_IDX(q)] = cc;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = cc;
         update_and_add_deps_to_solver(s1_inputs, GET_QUERY_IDX(q), NULL, NULL);
 
 #if BRANCH_COVERAGE == QSYM
@@ -7659,7 +7769,7 @@ static void smt_model_expr(Query* q)
         }
         sub_idx_offset = 0;
 
-        z3_ast_exprs[GET_QUERY_IDX(q)] = cc;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = cc;
         update_and_add_deps_to_solver(p_inputs, GET_QUERY_IDX(q), NULL, NULL);
 
     } else if (q->model == MODEL_MEMCMP) {
@@ -7702,7 +7812,7 @@ static void smt_model_expr(Query* q)
 
         // print_z3_ast(branch_neg);
 
-        z3_ast_exprs[GET_QUERY_IDX(q)] = branch;
+        z3_ast_exprs[checked_query_ast_index(GET_QUERY_IDX(q))] = branch;
         GHashTable* inputs = merge_inputs(s1_inputs, s2_inputs);
 
         if (is_interesting) {
@@ -7801,6 +7911,8 @@ static void smt_model_expr(Query* q)
 
 static void smt_query(Query* q)
 {
+    checked_query_ast_index(GET_QUERY_IDX(q));
+    check_collection_expr(q->query);
     fprintf(stderr, "[query] [index %lu] [addr %lx] [op %s] [model %d]\n",  
         GET_QUERY_IDX(q), q->address,
         opkind_to_str(q->query->opkind), q->model);
@@ -7922,11 +8034,11 @@ static void reverse_directed_prefix_init(ssize_t first_idx)
 
     uint64_t asserted = 0;
     for (ssize_t idx = 0; idx < first_idx; idx++) {
-        if (!z3_ast_exprs[idx]) {
+        if (!z3_ast_exprs[checked_query_ast_index(idx)]) {
             continue;
         }
         Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
-                         z3_ast_exprs[idx]);
+                         z3_ast_exprs[checked_query_ast_index(idx)]);
         asserted++;
     }
     printf("[reverse-directed] [prefix-init] [first %ld] [asserted %llu]\n",
@@ -7979,9 +8091,9 @@ static void reverse_directed_solve(void)
     for (unsigned int j = 1; j < S; j++) {
         Z3_solver_push(smt_solver.ctx, reverse_prefix_solver);
         for (ssize_t i = indices[j - 1]; i < indices[j]; i++) {
-            if (z3_ast_exprs[i]) {
+            if (z3_ast_exprs[checked_query_ast_index(i)]) {
                 Z3_solver_assert(smt_solver.ctx, reverse_prefix_solver,
-                                 z3_ast_exprs[i]);
+                                 z3_ast_exprs[checked_query_ast_index(i)]);
             }
         }
     }
@@ -8062,10 +8174,7 @@ static void handle_query_reverse_directed(void)
     get_time(&reverse_budget_start);
     reverse_candidates = g_array_new(FALSE, FALSE, sizeof(ReverseCandidate));
     reverse_directed_lowering = 1;
-    for (Query* q = query_queue + 1; q->query != FINAL_QUERY; q++) {
-        if (!q->query) {
-            break;
-        }
+    for (Query* q = query_queue + 1; q < collection_end; q++) {
         if (reverse_budget_exceeded()) {
             printf("[reverse-directed] [budget] [phase lowering]"
                    " [elapsed %llu]\n",
@@ -8090,6 +8199,7 @@ static void handle_query_reverse_directed(void)
     reverse_directed_lowering = 0;
     reverse_directed_solving = 0;
     reverse_directed_solve();
+    report_collection_processed();
     g_array_free(reverse_candidates, TRUE);
     reverse_candidates = NULL;
 }
@@ -8341,102 +8451,47 @@ static inline void reset_solver_session(void)
     sub_idx_offset = 0;
 }
 
-int handle_query_original() {
-    current_query_mode = QUERY_MODE_ORIGINAL;
+static int handle_query_forward(enum query_mode mode)
+{
+    current_query_mode = mode;
     struct timespec start, current;
     get_time(&start);
-    while (1) {
-        if (next_query[0].query == NULL) {
-            // tracer may have crashed
-            break;
-        } else {
-            if (next_query[0].query == FINAL_QUERY) {
-                SAYF("\n\nReached final query. Exiting...\n");
-
-                printf("Translation time: %lu usecs\n",
-                       smt_solver.translation_time);
-                printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                save_bitmaps();
-                return 0;
+    int status = 0;
+    while (next_query < collection_end) {
+        if (config.timeout > 0) {
+            get_time(&current);
+            uint64_t total_solving_time =
+                get_diff_time_microsec(&start, &current) / 1000;
+            if (total_solving_time > config.timeout) {
+                SAYF("\n\nSolving time exceded budget time. Exiting...\n");
+                status = 1;
+                break;
             }
-
-            if (config.timeout > 0) {
-                get_time(&current);
-                uint64_t total_solving_time = get_diff_time_microsec(&start, &current);
-                total_solving_time /= 1000;
-                //printf("solving time: %lu timeout: %lu \n",
-                // total_solving_time, config.timeout);
-                if (total_solving_time > config.timeout) {
-                    SAYF("\n\nSolving time exceded budget time. Exiting...\n");
-
-                    printf("Translation time: %lu usecs\n",
-                           smt_solver.translation_time);
-                    printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                    save_bitmaps();
-                    return 1;
-                }
-            }
-            if (query_start_idx < 0) {
-                load_query_window_config();
-            }
-            smt_query(&next_query[0]);
-            next_query++;
         }
+        if (query_start_idx < 0) {
+            load_query_window_config();
+        }
+        smt_query(next_query);
+        next_query++;
     }
-    return 0;
+    if (!status) {
+        report_collection_processed();
+        SAYF("\n\nReached committed collection boundary. Exiting...\n");
+    }
+    printf("Translation time: %lu usecs\n", smt_solver.translation_time);
+    printf("Slice reasoning time: %lu usecs\n", smt_solver.slice_reasoning_time);
+    save_bitmaps();
+    return status;
 }
 
-int handle_query_binradar() {
-    current_query_mode = QUERY_MODE_BINRADAR;
-    struct timespec start, current;
-    get_time(&start);
-    while (1) {
-        if (next_query[0].query == NULL) {
-            // tracer may have crashed
-            break;
-        } else {
-            if (next_query[0].query == FINAL_QUERY) {
-                SAYF("\n\nReached final query. Exiting...\n");
+int handle_query_original()
+{
+    return handle_query_forward(QUERY_MODE_ORIGINAL);
+}
 
-                printf("Translation time: %lu usecs\n",
-                       smt_solver.translation_time);
-                printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                save_bitmaps();
-                return 0;
-            }
-
-            if (config.timeout > 0) {
-                get_time(&current);
-                uint64_t total_solving_time = get_diff_time_microsec(&start, &current);
-                total_solving_time /= 1000;
-                //printf("solving time: %lu timeout: %lu \n",
-                // total_solving_time, config.timeout);
-                if (total_solving_time > config.timeout) {
-                    SAYF("\n\nSolving time exceded budget time. Exiting...\n");
-
-                    printf("Translation time: %lu usecs\n",
-                           smt_solver.translation_time);
-                    printf("Slice reasoning time: %lu usecs\n",
-                       smt_solver.slice_reasoning_time);
-
-                    save_bitmaps();
-                    return 1;
-                }
-            }
-            if (query_start_idx < 0) {
-                load_query_window_config();
-            }
-            smt_query(&next_query[0]);
-            next_query++;
-        }
-    }
-    return 0;
+int handle_query_binradar()
+{
+    return handle_query_forward(QUERY_MODE_BINRADAR);
 }
 
 
@@ -8545,24 +8600,23 @@ int main(int argc, char* argv[])
 
         next_query = query_queue + 1;
         MEM_BARRIER();
+        prepare_collection();
 
         load_query_window_config();
 
-        // 1. generate inputs using original method
-        Query *original_next_query = next_query;
-        // 2. generate inputs using binradar method
         if (forkserver_mode) {
             if (reverse_directed_mode) {
                 handle_query_reverse_directed();
             } else {
                 // reset_solver_session();
-                handle_query_binradar();
+                int status = handle_query_binradar();
+                if (status) {
+                    return status;
+                }
             }
         } else {
-            handle_query_original();
-            break;
+            return handle_query_original();
         }
-        next_query = original_next_query;
         next_query = query_queue;
         memset(next_query, 0, sizeof(Query) * EXPR_QUERY_CAPACITY);
         next_query[0].query = (void*)SHM_READY;

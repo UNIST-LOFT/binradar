@@ -469,6 +469,38 @@ def test_collect_cutoff_top_patches_by_confidence(tmp_path):
     assert "(+2 more)" in csv_row["remaining_patches"]
 
 
+def test_collect_preserves_unavailable_binradar_and_collection_cutoff(tmp_path):
+    run_dir = tmp_path / "workdir" / "out" / "run-00000"
+    run_dir.mkdir(parents=True)
+    (run_dir.parent / "progress.sbsv").write_text(
+        "[final] [done] [prefix run] [id 0] "
+        "[remaining_patches [1]] [binradar_remaining_patches [1]] "
+        "[binradar-coverage unavailable]\n")
+    (run_dir / "final.sbsv").write_text(
+        "[final] [coverage] [binradar-coverage unavailable] "
+        "[raw-committed 0] [processed 0] [collection-complete false] "
+        "[collection-reason query-capacity]\n"
+        "[final] [verifier] [patch 1] [res verified]\n"
+        "[final] [binradar] [patch 1] [res unavailable] "
+        "[reason no-observation] [iter -1]\n"
+        "[final] [confidence] [patch 1] [score 1.0] "
+        "[accept-evidences 1] [total-evidences 1]\n")
+    collector.binradar_evidence.write_verifier(run_dir / "verifier.br", [
+        collector.binradar_evidence.VerifierPatchResult(
+            patch=1, verified=True, accept_evidences=1,
+            total_evidences=1, observations={})])
+    result = collector.collect_experiment_result(str(tmp_path), "workdir", "run")
+    run = result.runs[0]
+    assert run.binradar_data[1]["res"] == "unavailable"
+    assert run.binradar_coverage == "unavailable"
+    log = collector.format_result_log(result)
+    assert "patch 1: unavailable" in log
+    assert "collection-complete false; collection-reason query-capacity" in log
+    csv = collector.format_results_csv([result])[0]
+    assert csv["binradar_collection_complete"] == "false"
+    assert csv["binradar_collection_reason"] == "query-capacity"
+
+
 def test_collect_reports_untruncated_binradar_counts(tmp_path):
     workdir = tmp_path / "workdir"
     out_dir = workdir / "out"
