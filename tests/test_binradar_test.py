@@ -97,6 +97,156 @@ def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path)
     assert tracer_execution_cancelled(result.exit_code)
 
 
+def test_overhead_input_defaults_to_configured_poc_and_allows_override(tmp_path):
+    configured = tmp_path / "configured input"
+    configured.write_bytes(b"configured")
+    override = tmp_path / "explicit input"
+    override.write_bytes(b"explicit")
+    env = {"POC_INPUT": configured.name}
+    assert binradar_test._select_overhead_input(str(tmp_path), env, None) == str(configured)
+    assert binradar_test._select_overhead_input(
+        str(tmp_path), env, override.name) == str(override)
+    assert binradar_test._select_overhead_input(
+        str(tmp_path), {"POC_INPUT": str(configured)}, None) == str(configured)
+    assert binradar_test._select_overhead_input(
+        str(tmp_path / "unused"), env, str(override)) == str(override)
+
+
+def test_overhead_directory_selects_one_file_by_name_not_creation_order(tmp_path):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "z-last").write_bytes(b"created first")
+    first = inputs / "b-first file"
+    first.write_bytes(b"created second")
+    (inputs / "a-directory").mkdir()
+    (inputs / "a-directory" / "nested").write_bytes(b"not an immediate file")
+    assert binradar_test._select_overhead_input(str(tmp_path), {}, "inputs") == str(first)
+
+
+def test_overhead_missing_explicit_input_never_falls_back_to_poc(tmp_path):
+    import pytest
+
+    configured = tmp_path / "configured"
+    configured.write_bytes(b"not a fallback for an explicit path")
+    with pytest.raises(FileNotFoundError):
+        binradar_test._select_overhead_input(
+            str(tmp_path), {"POC_INPUT": str(configured)}, "missing")
+    with pytest.raises(FileNotFoundError):
+        binradar_test._select_overhead_input(str(tmp_path), {}, None)
+
+
+def test_overhead_empty_directory_skips_subject_without_poc_fallback(tmp_path):
+    from types import SimpleNamespace
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "empty").mkdir()
+    (workdir / "configured").write_bytes(b"not used")
+    (workdir / "config.env").write_text('BINARY="not-needed"\nPOC_INPUT="configured"\n')
+    assert binradar_test._select_overhead_input(
+        str(workdir), {"POC_INPUT": "configured"}, "empty") is None
+    rows = binradar_test._run_overhead_subject(
+        str(tmp_path), "subject", SimpleNamespace(
+            workdir="workdir", input="empty", repeats=5, warmup=1, timeout=1))
+    assert {row["tool"] for row in rows} == {"orig", "qasan", "tracer", "valgrind"}
+    assert all(row["status"] == "skipped" and row["samples"] == []
+               and row["slowdown"] == "" for row in rows)
+    assert all(row["input"] == str(workdir / "empty") for row in rows)
+
+
+def test_overhead_medians_exclude_warmup_and_use_native_baseline():
+    from types import SimpleNamespace
+
+    rows = binradar_test._overhead_rows(
+        "subject", "benign", SimpleNamespace(repeats=3, warmup=1))
+    for row, factor in zip(rows, (1, 2, 3, 4)):
+        row["samples"] = [
+            {"phase": phase, "iteration": index, "seconds": seconds * factor,
+             "status": "ok", "exit_code": 0}
+            for index, (phase, seconds) in enumerate(
+                [("warmup", 1000), ("measure", 1), ("measure", 9), ("measure", 2)], 1)]
+    binradar_test._overhead_summarize(rows)
+    assert [row["median_seconds"] for row in rows] == [2, 4, 6, 8]
+    assert [row["slowdown"] for row in rows] == [1, 2, 3, 4]
+    assert [row["overhead_percent"] for row in rows] == [0, 100, 200, 300]
+    assert rows[1]["min_seconds"] == 2
+    assert rows[1]["max_seconds"] == 18
+    assert all(row["completed"] == 3 for row in rows)
+
+
+def test_overhead_never_reports_ratio_for_failed_or_incomplete_runs():
+    from types import SimpleNamespace
+
+    for bad_tool in range(4):
+        for bad_phase in ("warmup", "measure"):
+            rows = binradar_test._overhead_rows(
+                "subject", "benign", SimpleNamespace(repeats=1, warmup=1))
+            for index, row in enumerate(rows):
+                row["samples"] = [
+                    {"phase": phase, "iteration": 1, "seconds": 2,
+                     "status": "timeout" if index == bad_tool and phase == bad_phase else "ok",
+                     "exit_code": -15 if index == bad_tool and phase == bad_phase else 0}
+                    for phase in ("warmup", "measure")]
+            binradar_test._overhead_summarize(rows)
+            assert rows[bad_tool]["status"] == "timeout"
+            assert rows[bad_tool]["median_seconds"] == ""
+            assert rows[bad_tool]["slowdown"] == ""
+            if bad_tool == 0:
+                assert all(row["slowdown"] == "" for row in rows)
+                assert rows[1]["status"] == "baseline-unavailable"
+            else:
+                assert rows[0]["slowdown"] == 1
+    rows = binradar_test._overhead_rows(
+        "subject", "benign", SimpleNamespace(repeats=2, warmup=0))
+    binradar_test._overhead_summarize(rows)
+    assert all(row["status"] == "error" and row["slowdown"] == "" for row in rows)
+
+
+def test_overhead_checker_rows_cannot_mask_timeout_or_nonzero_exit():
+    from binradar_utils import ExecutionResult
+    from binradar_verifier import MEMCHECK_POLICY
+
+    logs = {
+        "orig": "",
+        "valgrind": "",
+        "qasan": "[exit] [result ok]\n",
+        "tracer": f"[memcheck] [policy {MEMCHECK_POLICY}]\n"
+                  "[snapshot] [exit] [normal] [entrypoint-hit 0]\n",
+    }
+    for tool, log in logs.items():
+        assert binradar_test._overhead_outcome(
+            tool, ExecutionResult(True, 0, "", log)) == "ok"
+        assert binradar_test._overhead_outcome(
+            tool, ExecutionResult(True, 0, "", log, timed_out=True)) == "timeout"
+        assert binradar_test._overhead_outcome(
+            tool, ExecutionResult(True, -15, "", log)) == "cancelled"
+        assert binradar_test._overhead_outcome(
+            tool, ExecutionResult(True, 99, "", log)) == "nonzero-exit"
+    assert binradar_test._overhead_outcome(
+        "qasan", ExecutionResult(True, 0, "", "[exit] [result crash]\n")) == "detected"
+    assert binradar_test._overhead_outcome(
+        "tracer", ExecutionResult(True, 0, "", logs["tracer"].replace(MEMCHECK_POLICY, "coverage-v1"))) == "invalid-output"
+
+
+def test_overhead_stdin_is_reopened_and_timeouts_are_not_samples(tmp_path):
+    import sys
+
+    testcase = tmp_path / "benign input"
+    testcase.write_bytes(b"clean input\n")
+    command = [sys.executable, "-c",
+               "import sys; sys.exit(0 if sys.stdin.buffer.read() == b'clean input\\n' else 3)"]
+    for _ in range(2):
+        sample = binradar_test._overhead_sample(
+            "orig", command, binradar_test._overhead_environment(),
+            str(tmp_path), str(testcase), 5)
+        assert sample["status"] == "ok" and sample["exit_code"] == 0
+    sample = binradar_test._overhead_sample(
+        "orig", [sys.executable, "-c", "import time; time.sleep(5)"],
+        binradar_test._overhead_environment(), str(tmp_path), None, 0.02)
+    assert sample["status"] == "timeout"
+    assert sample["exit_code"] != 0
+
+
 def test_valgrind_interceptor_uses_target_return_address():
     log = """
 ==1== Invalid write of size 1

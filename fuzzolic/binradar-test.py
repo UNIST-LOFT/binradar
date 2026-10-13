@@ -2,12 +2,16 @@
 import argparse
 import csv
 import enum
+import json
+import math
 import os
 import random
 import re
 import sbsv
 import shlex
+import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -41,6 +45,14 @@ Usage:
     uv run ../../fuzzolic/binradar-test.py qasan [options]
 
 Subcommands:
+    overhead
+        Measure serial native/QASAN/provenance-memcheck tracer/Valgrind runs
+        of .orig using POC_INPUT by default, or an explicit --input file.
+        An input directory selects only its first regular file by name.
+        Report median wall time, slowdown versus native, and percent overhead.
+        Defaults: one warmup, five measurements; startup included, model
+        metadata preparation excluded. Invalid runs never produce ratios.
+
     qasan
         Run the probe-style QASAN execution (afl-qemu-trace --asan host)
         against <binary>.orig and <binary>.brpatched (PATCH_ID=0, i.e.
@@ -2200,6 +2212,289 @@ def cmd_compare_fault_addr(args):
 
 
 # ---------------------------------------------------------------------------
+# Standalone execution overhead (not fault-location comparison)
+# ---------------------------------------------------------------------------
+
+_OVERHEAD_TOOLS = ("orig", "qasan", "tracer", "valgrind")
+_OVERHEAD_COLUMNS = (
+    "experiment", "input", "tool", "status", "detail", "repeats", "warmups",
+    "completed", "median_seconds", "min_seconds", "max_seconds", "slowdown",
+    "overhead_percent", "memcheck_policy", "command", "samples",
+)
+
+
+def _overhead_environment():
+    # Keep target library/search paths, but never inherit a surrounding pipeline's
+    # forkserver, logging, patch selection, preload or instrumentation settings.
+    prefixes = ("AFL_", "QASAN_", "QEMU_", "BINRADAR_", "SYMBOLIC_", "E9_",
+                "PATCH_", "BRCACHE_", "TAOSC_", "ASAN_", "LSAN_", "UBSAN_")
+    keys = {"PLT_INFO_FILE", "NO_EXTERNAL_SOLVER", "EXPR_POOL_SHM_KEY",
+            "QUERY_SHM_KEY", "BITMAP_SHM_KEY", "LD_PRELOAD", "VALGRIND_OPTS"}
+    return {key: value for key, value in os.environ.items()
+            if key not in keys and not key.startswith(prefixes)}
+
+
+def _overhead_outcome(tool, result):
+    # Timeout/cancellation wins over rows salvaged during shutdown.
+    if result.timed_out:
+        return "timeout"
+    if not result.success:
+        return "error"
+    if binradar_verifier.tracer_execution_cancelled(result.exit_code):
+        return "cancelled"
+    log = result.stderr or ""
+    if tool == "tracer":
+        if not binradar_verifier.tracer_memcheck_policy_acknowledged(log):
+            return "invalid-output"
+        if extract_tracer_exit(log) == "crash" or extract_tracer_prov_finding(log):
+            return "detected"
+        if extract_tracer_exit(log) != "ok":
+            return "invalid-output"
+    elif tool == "qasan":
+        outcome = extract_exit_info(log)
+        if outcome == "crash":
+            return "detected"
+        if outcome != "ok":
+            return "invalid-output"
+    if result.exit_code != 0:
+        return "nonzero-exit"
+    return "ok"
+
+
+def _overhead_sample(tool, command, environment, workdir, stdin_path, timeout):
+    # Files are opened before the clock. stdout is discarded for every arm;
+    # stderr is drained by communicate(), avoiding pipe backpressure deadlock.
+    with open(stdin_path or os.devnull, "rb") as input_stream:
+        start = time.perf_counter_ns()
+        process = subprocess.Popen(
+            command, cwd=workdir, env=environment, stdin=input_stream,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            start_new_session=True)
+        try:
+            result = binradar_utils.execute_await(process, timeout=timeout)
+        finally:
+            # Also reap on Ctrl-C; never leave a benchmark child behind.
+            if process.poll() is None:
+                binradar_utils.kill_process_group(process.pid, grace=0)
+                process.wait()
+        elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
+    status = _overhead_outcome(tool, result)
+    return {"seconds": elapsed, "status": status, "exit_code": result.exit_code,
+            "diagnostic": result.stderr[-2000:] if status != "ok" else ""}
+
+
+def _overhead_summarize(rows):
+    for row in rows:
+        measured = [sample for sample in row["samples"]
+                    if sample["phase"] == "measure"]
+        row["completed"] = sum(sample["status"] == "ok" for sample in measured)
+        if row["status"] != "pending":
+            continue
+        failure = next((sample for sample in row["samples"]
+                        if sample["status"] != "ok"), None)
+        if failure:
+            row["status"] = failure["status"]
+            row["detail"] = (f'{failure["phase"]} {failure["iteration"]}: '
+                             f'{failure["status"]}, exit={failure["exit_code"]}')
+        elif len(measured) != row["repeats"]:
+            row["status"] = "error"
+            row["detail"] = "incomplete measurements"
+        else:
+            times = [sample["seconds"] for sample in measured]
+            row.update(status="ok", median_seconds=statistics.median(times),
+                       min_seconds=min(times), max_seconds=max(times))
+    baseline = rows[0]
+    for row in rows:
+        if row["status"] != "ok":
+            continue
+        if baseline["status"] != "ok" or not baseline["median_seconds"]:
+            row["status"] = "baseline-unavailable"
+            row["detail"] = "native baseline did not complete every run cleanly"
+            continue
+        ratio = row["median_seconds"] / baseline["median_seconds"]
+        row.update(slowdown=ratio, overhead_percent=(ratio - 1) * 100)
+    return rows
+
+
+def _overhead_rows(experiment, testcase, args):
+    return [dict.fromkeys(_OVERHEAD_COLUMNS, "") | {
+        "experiment": experiment, "input": testcase, "tool": tool,
+        "status": "pending", "repeats": args.repeats, "warmups": args.warmup,
+        "completed": 0, "samples": [],
+        "memcheck_policy": binradar_verifier.MEMCHECK_POLICY if tool == "tracer" else "",
+    } for tool in _OVERHEAD_TOOLS]
+
+
+def _select_overhead_input(workdir, env, requested):
+    source = requested if requested is not None else env.get("POC_INPUT", "")
+    if not source:
+        raise FileNotFoundError("no input specified and POC_INPUT is not configured")
+    source = os.path.abspath(os.path.join(workdir, source))
+    if os.path.isdir(source):
+        with os.scandir(source) as entries:
+            selected = min((entry.path for entry in entries if entry.is_file()), default=None)
+        return selected
+    if not os.path.isfile(source):
+        raise FileNotFoundError(f"input file not found: {source}")
+    return source
+
+
+def _run_overhead_subject(exp_dir, display, args):
+    workdir = os.path.abspath(os.path.join(exp_dir, args.workdir))
+    env_paths = [os.path.join(workdir, "binradar.env"),
+                 os.path.join(workdir, "config.env"), os.path.join(exp_dir, "config.env")]
+    env_path = next((path for path in env_paths if os.path.isfile(path)), None)
+    env = binradar_utils.load_env(env_path) if env_path else {}
+    try:
+        if env_path is None:
+            raise FileNotFoundError("binradar.env / config.env not found")
+        source = _select_overhead_input(workdir, env, args.input)
+    except FileNotFoundError as error:
+        rows = _overhead_rows(display, args.input or env.get("POC_INPUT", ""), args)
+        for row in rows:
+            row.update(status="unavailable", detail=str(error))
+        return rows
+    if source is None:
+        directory = args.input if args.input is not None else env.get("POC_INPUT", "")
+        rows = _overhead_rows(display, os.path.join(workdir, directory), args)
+        for row in rows:
+            row.update(status="skipped", detail="input directory has no regular files")
+        return rows
+    testcases = [source]
+    binary = os.path.join(workdir, env.get("BINARY", "") + ".orig")
+    if not env.get("BINARY") or not os.path.isfile(binary):
+        rows = _overhead_rows(display, source, args)
+        for row in rows:
+            row.update(status="unavailable", detail=f"original binary not found: {binary}")
+        return rows
+    tokens = shlex.split(env.get("TEST_CMD", ""))
+    file_argument = any("@@" in token for token in tokens)
+    base_env = _overhead_environment()
+    results = []
+    # Generate model metadata once, outside all timed regions; never overwrite
+    # the production workdir's cached PLT file or trust a potentially stale one.
+    with tempfile.TemporaryDirectory(prefix="binradar-overhead-") as temporary:
+        plt_info = os.path.join(temporary, "plt_info.txt")
+        tracer_error = ""
+        if shutil.which(TRACER_BIN) is not None:
+            try:
+                prepared = binradar_utils.execute(
+                    [sys.executable, os.path.join(SCRIPT_DIR, "find_models_addrs.py"),
+                     "-o", plt_info, binary], env=base_env, cwd=workdir,
+                    timeout=30, verbose=False)
+                if (not prepared.success or prepared.exit_code != 0
+                        or not os.path.isfile(plt_info) or os.path.getsize(plt_info) == 0):
+                    tracer_error = "model metadata preparation failed: " + prepared.stderr[-1000:]
+            except OSError as error:
+                tracer_error = f"model metadata preparation failed: {error}"
+        for testcase in testcases:
+            target = [binary] + [token.replace("@@", testcase) for token in tokens]
+            commands = {
+                "orig": target,
+                "qasan": [QEMU_STACKTRACE_RELEASE, "--asan", "host", binary, "--"] + target[1:],
+                "tracer": [TRACER_BIN] + target,
+                "valgrind": ["valgrind", "--tool=memcheck", "--error-exitcode=99",
+                             "--leak-check=no"] + target,
+            }
+            environments = {tool: dict(base_env) for tool in _OVERHEAD_TOOLS}
+            environments["qasan"]["AFL_USE_QASAN"] = "1"
+            environments["tracer"].update({
+                "BINRADAR_MEMCHECK_ENABLE": "1",
+                "BINRADAR_MEMCHECK_POLICY": binradar_verifier.MEMCHECK_POLICY,
+                "BINRADAR_FORKSERVER_ENABLE": "0", "BINRADAR_OSPREY_ENABLE": "0",
+                "BINRADAR_TRACE_FILE": "none", "PLT_INFO_FILE": plt_info,
+            })
+            rows = _overhead_rows(display, testcase, args)
+            for row in rows:
+                tool = row["tool"]
+                row["command"] = shlex.join(commands[tool])
+                if shutil.which(commands[tool][0]) is None:
+                    row.update(status="unavailable", detail=f"executable not found: {commands[tool][0]}")
+                elif tool == "tracer" and tracer_error:
+                    row.update(status="error", detail=tracer_error)
+            for phase, count in (("warmup", args.warmup), ("measure", args.repeats)):
+                for iteration in range(count):
+                    # Rotate the first arm to reduce fixed-order/cache bias.
+                    offset = iteration % len(rows)
+                    for row in rows[offset:] + rows[:offset]:
+                        if row["status"] != "pending":
+                            continue
+                        tool = row["tool"]
+                        try:
+                            sample = _overhead_sample(
+                                tool, commands[tool], environments[tool], workdir,
+                                None if file_argument else testcase, args.timeout)
+                        except OSError as error:
+                            row.update(status="error", detail=str(error))
+                            continue
+                        sample.update(phase=phase, iteration=iteration + 1)
+                        row["samples"].append(sample)
+            results.extend(_overhead_summarize(rows))
+    return results
+
+
+def _format_overhead_row(row):
+    timing = ""
+    if row["median_seconds"] != "":
+        timing = f' median={row["median_seconds"]:.6f}s'
+    if row["slowdown"] != "":
+        timing += f' slowdown={row["slowdown"]:.3f}x overhead={row["overhead_percent"]:+.2f}%'
+    return (f'[{row["status"]}] {row["experiment"]} {row["input"]} '
+            f'{row["tool"]}{timing}' + (f' ({row["detail"]})' if row["detail"] else ""))
+
+
+def cmd_overhead(args):
+    if args.repeats < 1 or args.warmup < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise SystemExit("ERROR: --repeats must be positive, --warmup nonnegative, --timeout finite and positive")
+    exp_file_dir = os.path.dirname(os.path.abspath(args.exp))
+    try:
+        with open(args.exp) as stream:
+            subjects = [line.strip() for line in stream
+                        if line.strip() and not line.lstrip().startswith("#")]
+    except OSError as error:
+        raise SystemExit(f"ERROR: {error}") from error
+    if not subjects:
+        raise SystemExit("ERROR: empty experiment list")
+    rows = []
+    for subject in subjects:
+        display = display_path(exp_file_dir, subject)
+        try:
+            subject_rows = _run_overhead_subject(
+                os.path.join(exp_file_dir, subject), display, args)
+        except (OSError, ValueError) as error:
+            subject_rows = _overhead_rows(display, args.input, args)
+            for row in subject_rows:
+                row.update(status="error", detail=str(error))
+        rows.extend(subject_rows)
+        for row in subject_rows:
+            print(_format_overhead_row(row), flush=True)
+    output_path = args.output
+    if not output_path:
+        logs_dir = os.path.join(LOFTIX_DIR if os.path.isdir(LOFTIX_DIR) else os.getcwd(), "logs")
+        output_path = os.path.join(logs_dir, f"overhead-{datetime.now():%Y-%m-%d_%H-%M-%S}.{args.format}")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", newline="") as stream:
+        if args.format in ("csv", "tsv"):
+            writer = csv.DictWriter(stream, fieldnames=_OVERHEAD_COLUMNS,
+                                    delimiter="\t" if args.format == "tsv" else ",")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row | {"samples": json.dumps(row["samples"])})
+        else:
+            stream.write("Standalone wall-clock overhead; startup included, metadata generation excluded.\n"
+                         "Ratios require every warmup and measurement to exit cleanly.\n"
+                         "slowdown = median(tool) / median(orig); overhead = (slowdown - 1) * 100%.\n")
+            for row in rows:
+                stream.write(_format_overhead_row(row) + "\n")
+                stream.write(f'  command: {row["command"]}\n')
+                stream.write(f'  memcheck-policy: {row["memcheck_policy"]}\n')
+                stream.write(f'  samples: {json.dumps(row["samples"])}\n')
+    print(f"Results written to: {output_path}")
+    if any(row["status"] not in ("ok", "skipped") for row in rows):
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2207,6 +2502,24 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run tests on binradar benchmark subjects")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    overhead = sub.add_parser(
+        "overhead", help="measure standalone orig/QASAN/tracer/Valgrind execution overhead")
+    overhead.add_argument("--exp", default="exp.list",
+                          help="experiment list; subject paths are relative to this file")
+    overhead.add_argument("--workdir", default="workdir", help="subject work directory name")
+    overhead.add_argument("--input",
+                          help="file or directory, relative to each workdir (or absolute); default: POC_INPUT; directories select the first regular file by name")
+    overhead.add_argument("--repeats", type=int, default=5,
+                          help="measured runs per tool/input (default: 5)")
+    overhead.add_argument("--warmup", type=int, default=1,
+                          help="unmeasured warmup runs per tool/input (default: 1)")
+    overhead.add_argument("--timeout", type=float, default=180,
+                          help="per-process timeout in seconds (default: 180)")
+    overhead.add_argument("--format", choices=("log", "csv", "tsv"), default="log")
+    overhead.add_argument("--output", default="",
+                          help="output path (default: logs/overhead-<timestamp>.<ext>)")
+    overhead.set_defaults(func=cmd_overhead)
 
     qasan = sub.add_parser(
         "qasan", help="test qasan crash detection on .brpatched vs .orig")
