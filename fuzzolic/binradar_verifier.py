@@ -1,6 +1,8 @@
 import subprocess
 import hashlib
+import heapq
 import json
+import re
 import struct
 import os
 import signal
@@ -20,6 +22,7 @@ import logger
 
 import binradar_evidence
 import binradar_utils
+from binradar_input_schedule import InputScore, split_score
 from binradar_taosc_predicates import (
     CachedSnapshot,
     GenericEnvironments,
@@ -119,6 +122,31 @@ def concrete_fault_addr_from_row(row: Any) -> Optional[int]:
     return address
 
 
+def concrete_testcase_eligible(exit_info: str, fault_addr: Optional[int],
+                               poc_fault_addr: Optional[int]) -> bool:
+    """Use the same baseline fault gate for admission and verification."""
+    return (exit_info != "crash"
+            or (fault_addr is not None and poc_fault_addr is not None
+                and fault_addr == poc_fault_addr))
+
+
+def concrete_candidate_digest(patches: Sequence[int]) -> str:
+    """Stable identity of the fixed configured candidate universe."""
+    ids = sorted(patches)
+    if any(type(patch) is not int or patch <= 0 for patch in ids) \
+            or len(ids) != len(set(ids)):
+        raise ValueError("invalid concrete scheduling candidate IDs")
+    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode()).hexdigest()
+
+
+def concrete_schedule_header(patches: Sequence[int], context: Dict[str, Any]) -> str:
+    """Hex JSON avoids SBSV bracket ambiguities in environment provenance."""
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":")).encode().hex()
+    return ("[minimizer] [schedule] [version 1] [policy append-novelty-v1] "
+            f"[candidates {concrete_candidate_digest(patches)}] "
+            f"[candidate-count {len(patches)}] [context {encoded}]")
+
+
 def concrete_result_parsers() -> Tuple[sbsv.parser, ...]:
     parsers = []
     for schema in (PROBE_RESULT_SCHEMA_V4,
@@ -139,7 +167,8 @@ def concrete_result_parsers() -> Tuple[sbsv.parser, ...]:
 
 
 def parse_concrete_result_row(line: str, parsers: Sequence[sbsv.parser]) -> Any:
-    """Try historical schemas without treating malformed evidence as absent."""
+    """Decode optional scheduling separately from the concrete oracle schema."""
+    line, score = split_score(line)
     parse_error = None
     for parser in parsers:
         try:
@@ -148,8 +177,10 @@ def parse_concrete_result_row(line: str, parsers: Sequence[sbsv.parser]) -> Any:
             parse_error = exc
             continue
         if row is not None and row.schema_name == "testcase$result":
+            if score is not None:
+                row.data.update(score.as_dict())
             return row
-    if parse_error is not None:
+    if score is not None or parse_error is not None:
         raise ValueError("Malformed concrete testcase result") from parse_error
     return None
 
@@ -1182,6 +1213,7 @@ class BinRadarQemuRunner:
         self, binary: str, patch_id: str, testcase: str,
         verbose: bool = False, extra_env: Optional[Dict[str, str]] = None,
         capture_cached: bool = False,
+        base_env: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[bytes],
                Optional[bytes]]:
         """Run one probe and drain the patch text and cached binary channels.
@@ -1193,36 +1225,68 @@ class BinRadarQemuRunner:
         if binary.endswith((".brpatched", ".brcached")):
             self.load_instruction_map(binary)
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
-        patch_rfd, patch_wfd = os.pipe()
-        cache_rfd = cache_wfd = None
-        env = self.get_env_for_exec(patch_id=patch_id, patch_fd=patch_wfd,
-                                    binary=binary)
-        pass_fds = [patch_wfd]
-        if capture_cached:
-            cache_rfd, cache_wfd = os.pipe()
-            env["PATCH_CACHED_FD"] = str(cache_wfd)
-            pass_fds.append(cache_wfd)
-        if extra_env is not None:
-            env.update(extra_env)
-        proc = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=self.dir, start_new_session=True, pass_fds=tuple(pass_fds),
-            env=env)
-        os.close(patch_wfd)
-        if cache_wfd is not None:
-            os.close(cache_wfd)
-        patch_thread, patch_chunks = binradar_utils.create_pipe_reader_thread(
-            patch_rfd, verbose=verbose)
-        cache_thread = None
+        # Keep ownership explicit even when pipe creation, spawning, or a
+        # host cancellation raises before execute_await can clean up.
+        from binradar_runtime import PROCESS_REGISTRY
+        self.run_results = None
+        owned_fds: Set[int] = set()
+        readers: List[threading.Thread] = []
+        proc = None
         cache_chunks: List[bytes] = []
-        if cache_rfd is not None:
-            cache_thread, cache_chunks = \
-                binradar_utils.create_pipe_reader_thread(cache_rfd)
-        result = binradar_utils.execute_await(
-            proc, timeout=60.0, verbose=verbose)
-        patch_thread.join()
-        if cache_thread is not None:
-            cache_thread.join()
+        try:
+            patch_rfd, patch_wfd = os.pipe()
+            owned_fds.update((patch_rfd, patch_wfd))
+            env = (self.get_env_for_exec(patch_id=patch_id, binary=binary)
+                   if base_env is None else dict(base_env))
+            env["PATCH_ID"] = patch_id
+            env["PATCH_FD"] = str(patch_wfd)
+            env.pop("PATCH_CACHED_FD", None)
+            pass_fds = [patch_wfd]
+            cache_rfd = None
+            if capture_cached:
+                cache_rfd, cache_wfd = os.pipe()
+                owned_fds.update((cache_rfd, cache_wfd))
+                env["PATCH_CACHED_FD"] = str(cache_wfd)
+                pass_fds.append(cache_wfd)
+            if extra_env is not None:
+                env.update(extra_env)
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=self.dir, start_new_session=True, pass_fds=tuple(pass_fds),
+                env=env)
+            PROCESS_REGISTRY.register(proc)
+            for fd in pass_fds:
+                os.close(fd)
+                owned_fds.remove(fd)
+            patch_thread, patch_chunks = binradar_utils.create_pipe_reader_thread(
+                patch_rfd, verbose=verbose)
+            readers.append(patch_thread)
+            owned_fds.remove(patch_rfd)
+            if cache_rfd is not None:
+                cache_thread, cache_chunks = \
+                    binradar_utils.create_pipe_reader_thread(cache_rfd)
+                readers.append(cache_thread)
+                owned_fds.remove(cache_rfd)
+            result = binradar_utils.execute_await(
+                proc, timeout=60.0, verbose=verbose)
+            self.run_results = result
+        finally:
+            try:
+                if proc is not None:
+                    if proc.poll() is None:
+                        binradar_utils.kill_process_group(proc.pid, grace=0.0,
+                                                          first_signal=signal.SIGKILL)
+                        proc.communicate()
+                    # Surviving descendants must stop before pipes/map are read.
+                    binradar_utils.kill_process_group(proc.pid, grace=0.0,
+                                                      first_signal=signal.SIGKILL)
+            finally:
+                if proc is not None:
+                    PROCESS_REGISTRY.unregister(proc)
+                for fd in owned_fds:
+                    os.close(fd)
+                for reader in readers:
+                    reader.join()
         if not result.success:
             reason = (f"timed out after 60s" if result.timed_out
                       else f"exit status {result.decode_status()}")
@@ -1291,12 +1355,14 @@ class Testcase:
     exit: str
     fault_addr: int
     br: List[int]
-    def __init__(self, id: int, filename: str, exit: str, fault_addr: int, br: List[int]):
+    def __init__(self, id: int, filename: str, exit: str, fault_addr: int,
+                 br: List[int], score: Optional[InputScore] = None):
         self.id = id
         self.filename = filename
         self.exit = exit
         self.fault_addr = fault_addr
         self.br = br
+        self.score = score
 
 
 class BinRadarConcreteVerifierResult:
@@ -1489,7 +1555,10 @@ class BinRadarConcreteVerifier:
     security_rejected: Set[int]
     feedback_hard_rejected: Set[int]
     wall_time_reached_logged: bool
-    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False, patched_binary_patches: Optional[List[int]] = None):
+    def __init__(self, dir: str, run_dir: str, runner: BinRadarQemuRunner, probe_result: BinRadarProbeResult, patched_binary: str, patches: List[int], feedback_mode: bool = False, patched_binary_patches: Optional[List[int]] = None, input_schedule: str = "fifo"):
+        if input_schedule not in ("fifo", "novelty"):
+            raise ValueError(f"invalid concrete input schedule: {input_schedule!r}")
+        self.input_schedule = input_schedule
         self.dir = dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -1558,9 +1627,9 @@ class BinRadarConcreteVerifier:
         filename = row["file"]
         exit = row["exit"]
         fault_addr = row["fault-addr"]
-        if exit == "crash" and (concrete_fault_addr_from_row(row) is None
-                                or self.probe_result.concrete_fault_addr is None
-                                or fault_addr != self.probe_result.concrete_fault_addr):
+        if not concrete_testcase_eligible(
+                exit, concrete_fault_addr_from_row(row),
+                self.probe_result.concrete_fault_addr):
             self.logger.debug(f"[testcase] [skip-fault-diff] [id {id}] [file {filename}] [fault-addr {fault_addr:x}] [original-fault-addr {self.probe_result.fault_addr:x}]")
             return None
         return Testcase(
@@ -1568,7 +1637,8 @@ class BinRadarConcreteVerifier:
             filename=filename,
             exit=exit,
             fault_addr=fault_addr,
-            br=row["br"]
+            br=row["br"],
+            score=(InputScore.from_row(row) if "schedule-version" in row else None),
         )
 
     def _record_observation(self, patch: int, name: str) -> None:
@@ -1958,147 +2028,248 @@ class BinRadarConcreteVerifier:
             patch_id, predicate,
             os.path.join(self.minimized_dir, testcase.filename))
 
+    def _validate_schedule_header(self, line: str) -> None:
+        """Authenticate the fixed candidate/artifact namespace before replay."""
+        pattern = (r"\[minimizer\] \[schedule\] \[version ([0-9]+)\] "
+                   r"\[policy append-novelty-v1\] \[candidates ([0-9a-f]{64})\] "
+                   r"\[candidate-count ([0-9]+)\] \[context ([0-9a-f]+)\]"
+                   r"(?: \[time [0-9]+\])?\s*")
+        start = line.index("[minimizer] [schedule]")
+        match = re.fullmatch(pattern, line[start:])
+        if match is None or match[1] != "1":
+            raise ValueError("malformed or unsupported concrete schedule header")
+        if (match[2] != concrete_candidate_digest(self.patches)
+                or int(match[3]) != len(self.patches)):
+            raise ValueError("concrete schedule candidate scope mismatch")
+
+        def unique_object(pairs):
+            result = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ValueError("duplicate concrete schedule context field")
+                result[name] = value
+            return result
+
+        try:
+            context = json.loads(bytes.fromhex(match[4]), object_pairs_hook=unique_object)
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("malformed concrete schedule context") from exc
+        if not isinstance(context, dict):
+            raise ValueError("malformed concrete schedule context")
+        for name in ("artifact_sha256", "qemu_sha256", "descriptor_digest"):
+            value = context.get(name)
+            if name == "descriptor_digest" and value == "none":
+                continue
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"invalid concrete schedule {name}")
+        settings = context.get("coverage_settings")
+        if isinstance(settings, str):
+            try:
+                settings = json.loads(settings, object_pairs_hook=unique_object)
+            except ValueError as exc:
+                raise ValueError("invalid concrete schedule coverage settings") from exc
+        if (type(context.get("map_bytes")) is not int
+                or context["map_bytes"] != 65536
+                or not isinstance(settings, dict)
+                or any(not isinstance(key, str) or (value is not None and not isinstance(value, str))
+                       for key, value in settings.items())
+                or not isinstance(context.get("patch_reason"), str)
+                or not isinstance(context.get("backend"), str)):
+            raise ValueError("invalid concrete schedule capture context")
+        cached = context["descriptor_digest"] != "none"
+        if cached:
+            # Local import keeps the capture owner out of verifier's import cycle.
+            from binradar_input_features import descriptor_digest
+            coverage = load_cached_predicate_set(
+                Path(self.dir) / "brpatches.json", Path(self.runner.cached_binary()),
+                self.runner.patch_kind, self.runner.brcache_stack_size, self.patches)
+            if coverage.predicates is None or descriptor_digest({
+                    patch: coverage.predicates[patch] for patch in self.patches
+            }) != context["descriptor_digest"]:
+                raise ValueError("concrete schedule predicate descriptor mismatch")
+        artifact = self.runner.cached_binary() if cached else self.runner.patched_binary()
+        for path, key in ((artifact, "artifact_sha256"),
+                          (QEMU_STACKTRACE_RELEASE, "qemu_sha256")):
+            digest = hashlib.sha256()
+            with open(path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != context[key]:
+                raise ValueError(f"concrete schedule {key} mismatch")
+
     def run_verification_streaming(self, minimizer_result_file: str,
                                    poll_interval: float = 0.2,
                                    minimizer_thread: Optional[threading.Thread] = None,
                                    minimizer_exc_queue: Optional[Any] = None,
                                    timeout: Optional[float] = None) -> bool:
-        """Stream minimizer evidence and serialize one verdict per patch.
+        """Ingest a committed backlog, then dispatch one immutable priority.
 
-        A standalone replay requires either the complete ``done`` marker or a
-        timeout ``stopped`` marker. A live stream may stop consuming rows once
-        every patch is rejected while the minimizer continues to completion.
-        ``timeout`` is the total wall-clock budget for this verifier run;
-        non-positive values disable the deadline. Reaching the deadline is a
-        graceful cutoff: already-observed hard failures remain rejected and
-        every other patch is verified with confidence computed from the
-        evidence consumed so far. The return value reports that cutoff.
+        Legacy files retain FIFO order. Scheduled standalone replay adopts the
+        stored policy; live novelty runs require its header and complete scores.
+        Normal producer completion drains pending work. The shared live cutoff
+        stops dispatch, whereas a historical stopped file can still be replayed
+        within the standalone verifier's own budget.
         """
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         parser = sbsv.parser()
         result_parsers = concrete_result_parsers()
         parser.add_schema("[minimizer] [done] [time: int]")
-        parser.add_schema(
-            "[minimizer] [stopped] [reason: str] [time: int]")
+        parser.add_schema("[minimizer] [stopped] [reason: str] [time: int]")
         pending_patches = list(self.patches)
+        pending: List[Tuple[Tuple[int, int, int, int], Testcase]] = []
         done_seen = False
         stop_reason: Optional[str] = None
-        dead_without_marker = False
+        scheduled = False
+        last_sequence = -1
+        rows_seen = admitted = dispatched = completed = 0
+        inflight = False
         timed_out = False
+        terminal_reason = "exhausted"
+        dead_without_marker = False
+
+        def raise_worker_failure() -> None:
+            if minimizer_exc_queue is not None and not minimizer_exc_queue.empty():
+                raise minimizer_exc_queue.get_nowait()
 
         def record_rejection(patch: int, testcase: Testcase) -> None:
-            if patch not in pending_patches:
-                return
-            self._log_result(patch, "rejected", testcase.filename)
-            pending_patches.remove(patch)
+            if patch in pending_patches:
+                self._log_result(patch, "rejected", testcase.filename)
+                pending_patches.remove(patch)
 
         try:
-            if not os.path.exists(minimizer_result_file):
+            waited = 0.0
+            while not os.path.exists(minimizer_result_file):
+                self._raise_if_timed_out(deadline)
+                raise_worker_failure()
                 if minimizer_thread is None:
-                    raise RuntimeError(
-                        f"Minimizer results not found: {minimizer_result_file}")
-                waited = 0.0
-                while not os.path.exists(minimizer_result_file):
-                    self._raise_if_timed_out(deadline)
-                    if not minimizer_thread.is_alive():
-                        if (minimizer_exc_queue is not None
-                                and not minimizer_exc_queue.empty()):
-                            raise minimizer_exc_queue.get_nowait()
-                        raise RuntimeError(
-                            "Minimizer ended without writing a terminal "
-                            "marker. Its results are incomplete.")
-                    time.sleep(poll_interval)
-                    waited += poll_interval
-                    if waited >= 60:
-                        raise RuntimeError(
-                            f"Minimizer results not found: "
-                            f"{minimizer_result_file}")
-            with open(minimizer_result_file, "r", encoding="utf-8") as f:
-                offset = f.tell()
+                    raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+                if not minimizer_thread.is_alive():
+                    raise RuntimeError("Minimizer ended without writing a terminal marker")
+                if waited >= 60:
+                    raise RuntimeError(f"Minimizer results not found: {minimizer_result_file}")
+                time.sleep(poll_interval)
+                waited += poll_interval
+            with open(minimizer_result_file, "rb") as source:
+                offset = 0
                 while True:
                     self._raise_if_timed_out(deadline)
-                    f.seek(offset)
-                    fcntl.flock(f, fcntl.LOCK_EX)
-                    data = f.read()
-                    offset = f.tell()
-                    fcntl.flock(f, fcntl.LOCK_UN)
-                    for line in data.split("\n"):
+                    raise_worker_failure()
+                    source.seek(offset)
+                    fcntl.flock(source, fcntl.LOCK_EX)
+                    try:
+                        # Freeze the boundary: an active producer cannot keep
+                        # the reader ingesting forever instead of dispatching.
+                        end = os.fstat(source.fileno()).st_size
+                        if end < offset:
+                            raise RuntimeError("minimizer stream was truncated")
+                        data = source.read(end - offset)
+                    finally:
+                        fcntl.flock(source, fcntl.LOCK_UN)
+                    complete = data.rfind(b"\n") + 1
+                    offset += complete
+                    torn = complete != len(data)
+                    for line in data[:complete].decode("utf-8").splitlines():
+                        self._raise_if_timed_out(deadline)
+                        if "[minimizer] [schedule]" in line:
+                            if scheduled or rows_seen or done_seen or stop_reason is not None:
+                                raise ValueError("duplicate or late concrete schedule header")
+                            self._validate_schedule_header(line)
+                            scheduled = True
+                            continue
                         row = parse_concrete_result_row(line, result_parsers)
                         if row is None:
                             row = parser.parse_line_detached(line)
                         if row is None:
                             continue
                         if row.schema_name == "testcase$result":
+                            if done_seen or stop_reason is not None:
+                                raise ValueError("testcase published after minimizer terminal marker")
+                            score = (InputScore.from_row(row.data)
+                                     if "schedule-version" in row.data else None)
+                            if scheduled != (score is not None):
+                                raise ValueError("missing score or schedule header in concrete stream")
+                            if (not scheduled and minimizer_thread is not None
+                                    and self.input_schedule == "novelty"):
+                                raise ValueError("live novelty stream has no schedule header")
+                            if score is not None:
+                                if score.seq <= last_sequence:
+                                    raise ValueError("duplicate or decreasing scheduling sequence")
+                                last_sequence = score.seq
+                            rows_seen += 1
                             testcase = self._testcase_from_result_row(row.data)
-                            if testcase is None:
-                                continue
-                            self.testcases.append(testcase)
-                            rejected = self._test_testcase_batch(
-                                list(pending_patches), testcase, deadline,
-                                on_rejected=lambda patch, testcase=testcase:
-                                    record_rejection(patch, testcase))
-                            # Keep compatibility with batch implementations
-                            # that return rejections without using the callback.
-                            for patch in rejected:
-                                record_rejection(patch, testcase)
-                            if (not pending_patches
-                                    and minimizer_thread is not None):
-                                self._write_results()
-                                return False
+                            if testcase is not None:
+                                key = score.heap_key if score is not None else (0, 0, 0, rows_seen)
+                                heapq.heappush(pending, (key, testcase))
+                                admitted += 1
                         elif row.schema_name == "minimizer$done":
                             done_seen = True
                         elif row.schema_name == "minimizer$stopped":
                             stop_reason = row["reason"]
-                    if stop_reason is not None:
-                        if stop_reason != binradar_utils.WALL_TIME_REACHED:
-                            raise RuntimeError(
-                                f"Minimizer stopped for unsupported reason: "
-                                f"{stop_reason}")
+                            if stop_reason != binradar_utils.WALL_TIME_REACHED:
+                                raise RuntimeError(f"Minimizer stopped for unsupported reason: {stop_reason}")
+                    raise_worker_failure()
+                    writer_alive = minimizer_thread is not None and minimizer_thread.is_alive()
+                    terminal = done_seen or stop_reason is not None
+                    timed_out = stop_reason is not None
+                    if torn and (terminal or not writer_alive):
+                        raise RuntimeError("minimizer.sbsv contains an unterminated line")
+                    if (done_seen and minimizer_thread is not None
+                            and self.input_schedule == "novelty" and not scheduled):
+                        raise ValueError("live novelty stream has no schedule header")
+                    if minimizer_thread is None and not terminal:
+                        raise RuntimeError("minimizer.sbsv does not contain a terminal minimizer marker")
+                    if not writer_alive and not terminal:
+                        # The writer may have published its marker after the
+                        # captured boundary. Re-read once after observing exit.
+                        if dead_without_marker:
+                            raise RuntimeError("Minimizer ended without writing a terminal marker")
+                        dead_without_marker = True
+                        continue
+                    if stop_reason is not None and minimizer_thread is not None:
                         timed_out = True
                         break
-                    if minimizer_thread is None:
-                        if done_seen:
+                    if not pending_patches:
+                        terminal_reason = "all-rejected"
+                        break
+                    if pending:
+                        key, testcase = heapq.heappop(pending)
+                        self.testcases.append(testcase)
+                        dispatched += 1
+                        inflight = True
+                        self.logger.info(
+                            f"[scheduler] [dispatch] [seq {key[3]}] [id {testcase.id}] "
+                            f"[score-patch-outcomes {-key[0]}] "
+                            f"[score-patch-signatures {-key[1]}] [score-edges {-key[2]}] "
+                            f"[pending {len(pending)}]")
+                        rejected = self._test_testcase_batch(
+                            list(pending_patches), testcase, deadline,
+                            on_rejected=lambda patch, testcase=testcase:
+                                record_rejection(patch, testcase))
+                        for patch in rejected:
+                            record_rejection(patch, testcase)
+                        completed += 1
+                        inflight = False
+                        if not pending_patches:
+                            terminal_reason = "all-rejected"
                             break
-                        raise RuntimeError(
-                            "minimizer.sbsv does not contain a terminal "
-                            "minimizer marker ([minimizer] [done] or "
-                            "[minimizer] [stopped] missing). Run the "
-                            "minimizer phase first, or --run-single-phase "
-                            "minimizer-verifier to run the minimizer and the "
-                            "verifier concurrently.")
-                    if not minimizer_thread.is_alive():
-                        if done_seen:
-                            break
-                        if (minimizer_exc_queue is not None
-                                and not minimizer_exc_queue.empty()):
-                            raise minimizer_exc_queue.get_nowait()
-                        # The terminal marker may have been written between
-                        # the last read and thread exit. One more read round is
-                        # conclusive once the writer is dead.
-                        if dead_without_marker:
-                            raise RuntimeError(
-                                "Minimizer ended without writing a terminal "
-                                "marker. Its results are incomplete.")
-                        dead_without_marker = True
+                        continue
+                    if terminal:
+                        timed_out = stop_reason is not None
+                        break
                     time.sleep(poll_interval)
-                # The writer holds the lock across write+flush. A
-                # non-newline-terminated tail indicates a torn row from an
-                # external writer.
-                f.seek(offset)
-                fcntl.flock(f, fcntl.LOCK_EX)
-                tail = f.read()
-                fcntl.flock(f, fcntl.LOCK_UN)
-                if tail and not tail.endswith("\n"):
-                    raise RuntimeError(
-                        "minimizer.sbsv contains an unterminated line")
             if not timed_out:
                 self._raise_if_timed_out(deadline)
         except _VerifierTimeout:
             timed_out = True
 
         if timed_out:
+            terminal_reason = binradar_utils.WALL_TIME_REACHED
             self.mark_wall_time_reached()
+        self.logger.info(
+            f"[scheduler] [stop] [reason {terminal_reason}] [admitted {admitted}] "
+            f"[dispatched {dispatched}] [completed {completed}] "
+            f"[pending {len(pending)}] [inflight {int(inflight)}]")
         for patch in pending_patches:
             self._log_result(patch, "verified", "")
         self._write_results()

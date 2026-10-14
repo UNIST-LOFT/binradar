@@ -10,6 +10,7 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import binradar_config
 import binradar_evidence
 import binradar_minimizer
 import binradar_utils
@@ -226,6 +227,10 @@ def main():
         help="use an existing filter.br or legacy filter.sbsv file "
              "(default: reuse from workdir/out if present, otherwise run "
              "the filter)")
+    parser.add_argument(
+        "--concrete-input-schedule", choices=binradar_config.CONCRETE_INPUT_SCHEDULES,
+        default=None,
+        help="concrete testcase ordering (CLI > BINRADAR_CONCRETE_INPUT_SCHEDULE > fifo)")
     args = parser.parse_args()
 
     workdir = os.path.abspath(args.workdir)
@@ -233,6 +238,9 @@ def main():
     if not os.path.isfile(env_path):
         sys.exit(f"ERROR: binradar.env not found: {env_path}")
     env = binradar_utils.load_env(env_path)
+    env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = \
+        binradar_config.resolve_concrete_input_schedule(
+            args.concrete_input_schedule, env)
 
     for key in ("BINARY", "TEST_CMD", "PATCH_LOC", "TOTAL_PATCHES"):
         if key not in env:
@@ -334,7 +342,8 @@ def main():
         testcase_dirs = [queue_dir, crashes_dir]
         logger.info(f"[MINIMIZER] Testcase dirs: {', '.join(testcase_dirs)}")
         minimizer = binradar_minimizer.BinRadarMinimizer(
-            workdir, minimizer_dir, probe_result, testcase_dirs, env)
+            workdir, minimizer_dir, probe_result, testcase_dirs, env,
+            patches=survived)
         minimizer.load_testcases()
         logger.info(f"[MINIMIZER] Loaded {len(minimizer.testcases)} unique testcases")
 
@@ -346,7 +355,10 @@ def main():
             else os.path.join(workdir, f"{binary}.brpatched")
         verifier = binradar_verifier.BinRadarConcreteVerifier(
             workdir, minimizer_dir, runner, probe_result,
-            verifier_binary, survived)
+            verifier_binary, survived,
+            patched_binary_patches=list(range(
+                1, int(env.get("BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])) + 1)),
+            input_schedule=env["BINRADAR_CONCRETE_INPUT_SCHEDULE"])
         minimizer_result_file = os.path.join(minimizer_dir, "minimizer.sbsv")
         binradar_minimizer.run_minimizer_and_verifier(
             minimizer, verifier, minimizer_result_file)

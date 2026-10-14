@@ -109,12 +109,16 @@ class RunSettings:
     symbolic_max_bytes: Optional[int] = None
     symbolic_deadline_ms: Optional[int] = None
     memcheck_policy: Optional[str] = None
+    # Optional additive field: absent historical policy remains unknown.
+    concrete_input_schedule: Optional[str] = None
 
 
 # Settings row schema version.  Version 1 rows carry no advisor budgets;
 # version 2 carries P4a/B fields; version 3 adds the C1 portfolio and
 # representative budget. Version 4 records the selected memcheck policy;
 # actual tracer acknowledgement is persisted separately in the v3 probe.
+# Concrete-input scheduling is an additive optional field; generic settings
+# readers preserve it without a version gate, so it does not change this version.
 RUN_SETTINGS_VERSION = 4
 
 
@@ -206,6 +210,10 @@ class RunRecordStore:
                 ("symbolic-max-bytes", settings.symbolic_max_bytes),
                 ("symbolic-deadline-ms", settings.symbolic_deadline_ms)):
             fields.append(field(name, "unknown" if value is None else value))
+        fields.append(field(
+            "concrete-input-schedule",
+            "unknown" if settings.concrete_input_schedule is None
+            else settings.concrete_input_schedule))
         output = os.path.join(run_dir, "binradar-setting.sbsv")
         previous = ""
         if os.path.exists(output):

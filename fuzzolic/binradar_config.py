@@ -10,6 +10,9 @@ import binradar_verifier
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 SYMBOLIC_MUTATION_MODE_DEFAULT = "off"
 SYMBOLIC_MUTATION_MODES = ("off", "shadow", "boundary")
+# Concrete testcase ordering is independent of symbolic mutation scheduling.
+CONCRETE_INPUT_SCHEDULE_DEFAULT = "fifo"
+CONCRETE_INPUT_SCHEDULES = ("fifo", "novelty")
 # Queue scheduling policy for mutation plans.  `existing` is the historical
 # order and the default; `retained-first` is the one P4b B2 experiment.
 SYMBOLIC_SCHEDULE_DEFAULT = "existing"
@@ -63,6 +66,24 @@ def validate_symbolic_mutation_mode(value: str) -> str:
             f"invalid symbolic mutation mode {value!r}; expected one of "
             f"{', '.join(SYMBOLIC_MUTATION_MODES)}")
     return normalized
+
+
+def validate_concrete_input_schedule(value: str) -> str:
+    """Normalize and validate the concrete testcase ordering policy."""
+    normalized = str(value).strip().lower()
+    if normalized not in CONCRETE_INPUT_SCHEDULES:
+        raise ValueError(
+            f"invalid concrete input schedule {value!r}; expected one of "
+            f"{', '.join(CONCRETE_INPUT_SCHEDULES)}")
+    return normalized
+
+
+def resolve_concrete_input_schedule(
+        cli_value: str | None, env: Mapping[str, str]) -> str:
+    """Resolve CLI > loaded environment > FIFO without startup side effects."""
+    return validate_concrete_input_schedule(
+        cli_value if cli_value is not None else env.get(
+            "BINRADAR_CONCRETE_INPUT_SCHEDULE", CONCRETE_INPUT_SCHEDULE_DEFAULT))
 
 
 def validate_symbolic_schedule(value: str) -> str:
@@ -184,6 +205,7 @@ class RunConfig:
     invocation: str
     e9_metadata_prefix: str
     retained_environment: tuple[tuple[str, str], ...]
+    concrete_input_schedule: str = CONCRETE_INPUT_SCHEDULE_DEFAULT
 
     @classmethod
     def from_environment(
@@ -274,6 +296,7 @@ class RunConfig:
             invocation=env.get("BINRADAR_INVOCATION", ""),
             e9_metadata_prefix=prefix,
             retained_environment=tuple(retained.items()),
+            concrete_input_schedule=resolve_concrete_input_schedule(None, env),
         )
 
     def resolved_poc_input(self) -> str:
@@ -289,6 +312,7 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "BINRADAR_SYMBOLIC_MUTATION_MODE": config.symbolic_mutation_mode,
         "BINRADAR_SYMBOLIC_SCHEDULE": config.symbolic_schedule,
+        "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
         "BINRADAR_MUTATION_PORTFOLIO": config.mutation_portfolio,
         "SYMBOLIC_TESTCASE_NAME": config.resolved_poc_input(),
         "PLT_INFO_FILE": plt_info_file,
@@ -315,6 +339,7 @@ def build_worker_environment(
         "PATCH_LOC": config.patch_loc,
         "E9_METADATA_PREFIX": config.e9_metadata_prefix,
         "TOTAL_PATCHES": str(config.total_patches),
+        "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
     })
     return environment
 

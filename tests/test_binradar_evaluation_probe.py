@@ -13,6 +13,8 @@ import io
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "fuzzolic"))
 
@@ -104,7 +106,7 @@ def _workdir_with_probe(tmp_path: Path, version: int) -> Path:
     return work
 
 
-def _run_evaluation(monkeypatch, work: Path):
+def _run_evaluation(monkeypatch, work: Path, extra_args=()):
     runner = _StubRunner()
     monkeypatch.setattr(
         binradar_verifier.BinRadarQemuRunner, "from_env",
@@ -112,7 +114,7 @@ def _run_evaluation(monkeypatch, work: Path):
     monkeypatch.setattr(
         sys, "argv",
         ["binradar-evaluation.py", "--workdir", str(work),
-         "--fuzzer", "repro", "--fuzz-out", str(work / "fuzz")])
+         "--fuzzer", "repro", "--fuzz-out", str(work / "fuzz")] + list(extra_args))
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         evaluation.main()
@@ -126,6 +128,27 @@ def test_current_probe_reuses_and_verifies(monkeypatch, tmp_path):
     assert ("probe",) not in runner.calls
     record = binradar_evidence.read_verifier(
         work / "repro" / "verified.br").patches[1]
+    assert not record.verified
+
+
+def test_evaluation_invalid_schedule_has_no_output_side_effects(monkeypatch, tmp_path):
+    work = _workdir_with_probe(tmp_path, 4)
+    with (work / "binradar.env").open("a") as env_file:
+        env_file.write('BINRADAR_CONCRETE_INPUT_SCHEDULE="random"\n')
+    with pytest.raises(ValueError, match="concrete input schedule"):
+        _run_evaluation(monkeypatch, work)
+    assert not (work / "repro").exists()
+
+
+def test_evaluation_cli_overrides_invalid_environment_and_verifies(
+        monkeypatch, tmp_path):
+    work = _workdir_with_probe(tmp_path, 4)
+    with (work / "binradar.env").open("a") as env_file:
+        env_file.write('BINRADAR_CONCRETE_INPUT_SCHEDULE="random"\n')
+    _run_evaluation(monkeypatch, work, ["--concrete-input-schedule", "fifo"])
+    record = binradar_evidence.read_verifier(
+        work / "repro" / "verified.br").patches[1]
+    assert record.total_evidences >= 1
     assert not record.verified
 
 

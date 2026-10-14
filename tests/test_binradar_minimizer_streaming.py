@@ -114,9 +114,134 @@ def _verifier_result(run_dir: Path):
     return binradar_evidence.read_verifier(run_dir / "verifier.br")
 
 
-def test_default_min_file_age_is_10s(tmp_path):
-    minimizer = _make_minimizer(tmp_path, [])
-    assert minimizer.min_file_age == 10.0
+
+
+
+def _scheduled_stream(tmp_path, monkeypatch, scores):
+    import hashlib
+    from binradar_input_schedule import InputScore
+
+    run_dir = tmp_path / "run"
+    (run_dir / "minimized").mkdir(parents=True)
+    artifact = tmp_path / "nm.brpatched"
+    artifact.write_bytes(b"test artifact")
+    qemu = tmp_path / "qemu"
+    qemu.write_bytes(b"test qemu")
+    monkeypatch.setattr(binradar_verifier, "QEMU_STACKTRACE_RELEASE", str(qemu))
+    context = {
+        "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "qemu_sha256": hashlib.sha256(qemu.read_bytes()).hexdigest(),
+        "descriptor_digest": "none", "map_bytes": 65536,
+        "coverage_settings": "{}", "patch_reason": "unsupported",
+        "backend": "coverage-only",
+    }
+    header = binradar_verifier.concrete_schedule_header([1], context) + "\n"
+
+    def row(seq, edges):
+        name = f"{seq}_input"
+        (run_dir / "minimized" / name).write_bytes(str(seq).encode())
+        score = InputScore(seq, 0, 0, edges, "unsupported")
+        return (f"[testcase] [result] [id {seq}] [file {name}] "
+                f"{_probe().serialize()} {_patch_result().serialize()} "
+                f"{score.serialize()} [time 1]\n")
+
+    path = run_dir / "minimizer.sbsv"
+    path.write_text(header + "".join(row(i, edges) for i, edges in enumerate(scores)))
+    verifier = _make_verifier(tmp_path)
+    return verifier, path, row
+
+
+def test_scheduled_backlog_uses_score_then_publication_order(tmp_path, monkeypatch):
+    verifier, path, _ = _scheduled_stream(tmp_path, monkeypatch, [1, 9, 9, 0])
+    with path.open("a") as stream:
+        stream.write("[minimizer] [done] [time 1]\n")
+    observed = []
+
+    def execute(patch_id, testcase, verbose=False):
+        observed.append(Path(testcase).name)
+        return _probe(), _patch_result()
+
+    verifier.runner.test_with_patched = execute
+    assert not verifier.run_verification_streaming(str(path), poll_interval=0.001)
+    assert observed == ["1_input", "2_input", "0_input", "3_input"]
+
+
+def test_live_newcomer_overtakes_pending_without_batch_wait(tmp_path, monkeypatch):
+    verifier, path, row = _scheduled_stream(tmp_path, monkeypatch, [5, 0])
+    verifier.input_schedule = "novelty"
+    started = threading.Event()
+    published = threading.Event()
+    observed = []
+    failures = queue.Queue()
+
+    def produce():
+        try:
+            assert started.wait(5), "verifier waited for the producer instead of dispatching"
+            with path.open("a") as stream:
+                stream.write(row(2, 8) + "[minimizer] [done] [time 1]\n")
+        except BaseException as exc:
+            failures.put(exc)
+        finally:
+            published.set()
+
+    def execute(patch_id, testcase, verbose=False):
+        observed.append(Path(testcase).name)
+        if len(observed) == 1:
+            started.set()
+            assert published.wait(5)
+        return _probe(), _patch_result()
+
+    verifier.runner.test_with_patched = execute
+    producer = threading.Thread(target=produce)
+    producer.start()
+    try:
+        assert not verifier.run_verification_streaming(
+            str(path), minimizer_thread=producer, minimizer_exc_queue=failures,
+            poll_interval=0.001)
+    finally:
+        started.set()
+        producer.join(5)
+    assert observed == ["0_input", "2_input", "1_input"]
+
+
+@pytest.mark.parametrize("damage", ["missing-score", "duplicate-sequence", "no-header",
+                                     "candidate-mismatch", "artifact-mismatch", "torn-tail"])
+def test_scheduled_stream_rejects_inconsistent_protocol(tmp_path, monkeypatch, damage):
+    verifier, path, _ = _scheduled_stream(tmp_path, monkeypatch, [1, 2])
+    text = path.read_text() + "[minimizer] [done] [time 1]\n"
+    if damage == "missing-score":
+        from binradar_input_schedule import split_score
+        text = "\n".join(split_score(line)[0] if "[id 0]" in line else line
+                         for line in text.split("\n"))
+    elif damage == "duplicate-sequence":
+        text = text.replace("[schedule-seq 1]", "[schedule-seq 0]")
+    elif damage == "no-header":
+        text = text.split("\n", 1)[1]
+    elif damage == "candidate-mismatch":
+        text = text.replace(binradar_verifier.concrete_candidate_digest([1]), "0" * 64)
+    elif damage == "artifact-mismatch":
+        (tmp_path / "nm.brpatched").write_bytes(b"changed artifact")
+    else:
+        text += "[testcase] [result] [id"
+    path.write_text(text)
+    with pytest.raises((ValueError, RuntimeError)):
+        verifier.run_verification_streaming(str(path), poll_interval=0.001)
+    assert not (tmp_path / "run" / "verifier.br").exists()
+
+
+def test_historical_scheduled_cutoff_replays_backlog_and_retains_cutoff(tmp_path, monkeypatch):
+    verifier, path, _ = _scheduled_stream(tmp_path, monkeypatch, [1, 3])
+    with path.open("a") as stream:
+        stream.write("[minimizer] [stopped] [reason wall-time-reached] [time 1]\n")
+    observed = []
+
+    def execute(patch_id, testcase, verbose=False):
+        observed.append(Path(testcase).name)
+        return _probe(), _patch_result()
+
+    verifier.runner.test_with_patched = execute
+    assert verifier.run_verification_streaming(str(path), poll_interval=0.001)
+    assert observed == ["1_input", "0_input"]
 
 
 def test_scan_defers_recent_files_while_producers_alive(tmp_path):
@@ -709,7 +834,7 @@ def _stub_executor(tmp_path):
     executor.progress_filename = str(tmp_path / "out" / "progress.sbsv")
     executor.previous_progress = None
     executor.start_time = time.time()
-    executor.probe_result = SimpleNamespace(fault_addr=0x1234)
+    executor.probe_result = _probe()
     executor.filter_result = [1]
     executor.run_id = -1
     executor.run_prefix = ""

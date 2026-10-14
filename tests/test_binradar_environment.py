@@ -348,6 +348,26 @@ def test_symbolic_budget_rejects_unrepresentable_deadline():
         binradar_config.SYMBOLIC_DEADLINE_MS_MAX
 
 
+@pytest.mark.parametrize("policy,expected", [(None, "fifo"), (" Novelty ", "novelty")])
+def test_concrete_schedule_config_is_pure_and_worker_policy_is_frozen(
+        tmp_path, policy, expected):
+    env = {
+        "BINRADAR_OUTDIR": str(tmp_path / "out"),
+        "BINRADAR_TIMEOUT": "60", "BINARY": "bin", "POC_INPUT": "poc",
+        "TEST_CMD": "@@", "PATCH_LOC": "0x1000", "TOTAL_PATCHES": "2",
+    }
+    if policy is not None:
+        env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = policy
+    config = binradar_config.RunConfig.from_environment(str(tmp_path), env)
+    env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = "random"
+    worker_env = binradar_config.build_worker_environment(config, env)
+    assert config.concrete_input_schedule == expected
+    assert worker_env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] == expected
+    with pytest.raises(ValueError, match="concrete input schedule"):
+        binradar_config.RunConfig.from_environment(str(tmp_path), env)
+    assert not (tmp_path / "out").exists()
+
+
 def test_base_environment_emits_resolved_advisor_budgets(tmp_path):
     """A per-run override must reach the phase environment, not a constant."""
     run_config = binradar_config.RunConfig.from_environment(

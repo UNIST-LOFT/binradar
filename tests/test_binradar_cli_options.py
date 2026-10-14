@@ -144,6 +144,43 @@ def test_symbolic_schedule_defaults_to_existing(tmp_path, monkeypatch):
     assert captured["BINRADAR_SYMBOLIC_SCHEDULE"] == "existing"
 
 
+@pytest.mark.parametrize("args,env_value,expected", [
+    ([], None, "fifo"),
+    ([], "novelty", "novelty"),
+    (["--concrete-input-schedule", "fifo"], "novelty", "fifo"),
+    (["--concrete-input-schedule", "novelty"], "invalid", "novelty"),
+])
+def test_concrete_input_schedule_precedence_and_roundtrip(
+        tmp_path, monkeypatch, args, env_value, expected):
+    from dataclasses import FrozenInstanceError
+
+    extra_env = ("" if env_value is None else
+                 f'BINRADAR_CONCRETE_INPUT_SCHEDULE="{env_value}"\n')
+    captured = _run_main(monkeypatch, tmp_path, args, extra_env)
+    config = binradar_config.RunConfig.from_environment(
+        str(tmp_path / "workdir"), captured)
+    assert config.concrete_input_schedule == expected
+    with pytest.raises(FrozenInstanceError):
+        config.concrete_input_schedule = "fifo"
+    base = binradar_config.build_base_environment(config, "unused-plt")
+    workers = binradar_config.build_worker_environment(config, {
+        "BINRADAR_CONCRETE_INPUT_SCHEDULE": "invalid"})
+    assert base["BINRADAR_CONCRETE_INPUT_SCHEDULE"] == expected
+    assert workers["BINRADAR_CONCRETE_INPUT_SCHEDULE"] == expected
+    assert config.symbolic_schedule == "existing"
+
+
+@pytest.mark.parametrize("args,extra_env,error", [
+    (["--concrete-input-schedule", "random"], "", SystemExit),
+    ([], 'BINRADAR_CONCRETE_INPUT_SCHEDULE="random"\n', ValueError),
+])
+def test_invalid_concrete_policy_does_not_prepare_run(
+        tmp_path, monkeypatch, args, extra_env, error):
+    with pytest.raises(error):
+        _run_main(monkeypatch, tmp_path, args, extra_env)
+    assert not (tmp_path / "workdir" / "out").exists()
+
+
 def test_mixed_portfolio_and_budget_reach_resolved_configuration(
         tmp_path, monkeypatch):
     captured = _run_main(
@@ -218,6 +255,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     executor.feedback_mode = False
     executor.symbolic_mutation_mode = "off"
     executor.symbolic_schedule = "retained-first"
+    executor.concrete_input_schedule = "novelty"
     executor.mutation_portfolio = "replacement"
     executor.representative_budget = 1234
     executor.symbolic_budgets = binradar_config.SymbolicBudgets(
@@ -243,7 +281,8 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
         "[fuzzy: bool] "
         "[reverse-directed: bool] [less-strict: bool] "
         "[forkserver-child-timeout: int] [symbolic-max-work: str] "
-        "[symbolic-max-bytes: str] [symbolic-deadline-ms: str]")
+        "[symbolic-max-bytes: str] [symbolic-deadline-ms: str] "
+        "[concrete-input-schedule: str]")
     with (run_dir / "binradar-setting.sbsv").open() as settings_file:
         row = parser.load(settings_file)["binradar-setting"][0]
 
@@ -264,6 +303,7 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     # A recorded policy is written verbatim; only an unrecorded field is
     # `unknown`, never the built-in default.
     assert row["symbolic-schedule"] == "retained-first"
+    assert row["concrete-input-schedule"] == "novelty"
 
     executor.invocation = "binradar.py --run-single-phase final --run-id 0"
     executor.write_run_settings("single-phase-final")
@@ -274,3 +314,4 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert rows[0]["target-patches-status"] == "all-expanded"
     assert rows[1]["invocation"] == executor.invocation
     assert rows[1]["execution-mode"] == "single-phase-final"
+    assert [row["concrete-input-schedule"] for row in rows] == ["novelty", "novelty"]

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Optional
 
+import binradar_config
 import binradar_fuzzer
 import binradar_minimizer
 import binradar_runtime
@@ -174,12 +175,20 @@ class ConcreteWorkerFactory:
     verifier_binary: Optional[str]
     patched_binary_patches: tuple[int, ...]
 
+    def __post_init__(self) -> None:
+        resolved = binradar_config.resolve_concrete_input_schedule(None, self.config)
+        config = dict(self.config)
+        config["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = resolved
+        object.__setattr__(self, "config", config)
+
     @classmethod
     def create(
             cls, workdir: str, run_dir: str, probe_result: Any,
             config: dict[str, str], fuzzer_outdir: str,
             patches: Sequence[int], verifier_binary: Optional[str],
             patched_binary_patches: Sequence[int]) -> "ConcreteWorkerFactory":
+        policy = binradar_config.resolve_concrete_input_schedule(None, config)
+        config = dict(config, BINRADAR_CONCRETE_INPUT_SCHEDULE=policy)
         testcase_dirs = [
             os.path.join(run_dir, "fuzzolic-tests"),
             os.path.join(run_dir, "directed-tests"),
@@ -210,7 +219,7 @@ class ConcreteWorkerFactory:
         logger.info("TESTCASE_DIRS: " + ", ".join(self.testcase_dirs))
         return binradar_minimizer.BinRadarMinimizer(
             self.workdir, self.run_dir, self.probe_result,
-            list(self.testcase_dirs), self.config)
+            list(self.testcase_dirs), self.config, patches=list(self.patches))
 
     def build_verifier(
             self) -> binradar_verifier.BinRadarConcreteVerifier:
@@ -222,4 +231,5 @@ class ConcreteWorkerFactory:
         return binradar_verifier.BinRadarConcreteVerifier(
             self.workdir, self.run_dir, runner, self.probe_result,
             self.verifier_binary, list(self.patches),
-            patched_binary_patches=list(self.patched_binary_patches))
+            patched_binary_patches=list(self.patched_binary_patches),
+            input_schedule=self.config["BINRADAR_CONCRETE_INPUT_SCHEDULE"])

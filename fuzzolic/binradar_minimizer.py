@@ -7,15 +7,20 @@ import subprocess
 import tempfile
 import shutil
 import hashlib
+import heapq
 import time
+from contextlib import ExitStack
 import threading
 import queue
 import fcntl
 
-from typing import List, Dict, Set, Tuple, Any, Optional
+from typing import List, Dict, Set, Tuple, Any, Optional, Sequence
 
 import binradar_utils
 import binradar_verifier
+import binradar_config
+from binradar_input_features import BaselineFeatureCollector
+from binradar_input_schedule import InputScore, NoveltyScorer
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
@@ -32,6 +37,7 @@ class TestcaseInfo:
     def __init__(self, data: bytes, filename: str):
         self.data = data
         self.filename = filename
+        self.discovery_sequence = 0
         self.hash = self.compute_hash(data)
         self.is_crash = False
         self.patch_hit_cnt = 0
@@ -48,7 +54,7 @@ class TestcaseInfo:
         return self.hash == other.hash
 
     def __lt__(self, other):
-        return self.filename < other.filename
+        return (self.filename, self.discovery_sequence) < (other.filename, other.discovery_sequence)
     
     def compute_hash(self, data: bytes) -> str:
         hasher = hashlib.sha256()
@@ -92,7 +98,14 @@ class BinRadarMinimizer:
     log_file: str
     start_time: float
     def __init__(self, work_dir: str, run_dir: str, probe_result: binradar_verifier.BinRadarProbeResult, testcases_dirs: List[str], config: Dict[str, str],
-                 min_file_age: float = 10.0):
+                 min_file_age: float = 10.0, *,
+                 patches: Optional[Sequence[int]] = None):
+        self.input_schedule = binradar_config.resolve_concrete_input_schedule(None, config)
+        self.patches = list(patches) if patches is not None else list(
+            range(1, int(config.get("TOTAL_PATCHES", "0")) + 1))
+        self._candidate_digest = binradar_verifier.concrete_candidate_digest(self.patches)
+        self._collector: Optional[BaselineFeatureCollector] = None
+        self._scorer: Optional[NoveltyScorer] = None
         self.work_dir = work_dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -167,8 +180,9 @@ class BinRadarMinimizer:
                 testcase_info = TestcaseInfo(data, testcase_file)
                 if testcase_info in self.testcases:
                     continue
+                testcase_info.discovery_sequence = len(self.testcases)
                 self.testcases.add(testcase_info)
-                self.pending.append(testcase_info)
+                heapq.heappush(self.pending, testcase_info)
 
     @staticmethod
     def _file_version(stat: os.stat_result) -> Tuple[int, int, int, int]:
@@ -213,9 +227,24 @@ class BinRadarMinimizer:
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         id = 0
-        last_scan = 0.0
+        last_scan = float("-inf")
+        final_scan = False
         try:
-            with tempfile.TemporaryDirectory(dir=self.run_dir) as tmpdir:
+            with ExitStack() as resources:
+                self._raise_if_cancelled(cancel_event)
+                self._raise_if_timed_out(deadline)
+                if self.input_schedule == "novelty":
+                    self._collector = resources.enter_context(
+                        BaselineFeatureCollector(runner, self.patches))
+                    namespace = self._candidate_digest + ":" + self._collector.descriptor_digest
+                    self._scorer = resources.enter_context(
+                        NoveltyScorer(self._collector.predicates, namespace))
+                    context = dict(self._collector.metadata,
+                                   descriptor_digest=self._collector.descriptor_digest,
+                                   backend=self._scorer.backend)
+                    self._raise_if_timed_out(deadline)
+                    self.log(binradar_verifier.concrete_schedule_header(self.patches, context))
+                tmpdir = resources.enter_context(tempfile.TemporaryDirectory(dir=self.run_dir))
                 current_testcase = os.path.join(tmpdir, ".cur_input")
                 while True:
                     self._raise_if_cancelled(cancel_event)
@@ -223,21 +252,33 @@ class BinRadarMinimizer:
                     self._raise_producer_failure(producer_exc_queue)
                     producers_alive = (producer_threads is not None
                                        and any(t.is_alive() for t in producer_threads))
-                    now = time.time()
-                    if (now - last_scan) >= scan_interval or not producers_alive:
+                    now = time.monotonic()
+                    if not final_scan and (not producers_alive or now - last_scan >= scan_interval):
                         self.scan_testcases(producers_alive=producers_alive)
                         last_scan = now
-                    id = self._process_pending(
-                        runner, id, current_testcase, producer_exc_queue,
-                        cancel_event, deadline)
-                    if not producers_alive:
+                        final_scan = not producers_alive
+                    if self.pending:
+                        id = self._process_pending(
+                            runner, id, current_testcase, producer_exc_queue,
+                            cancel_event, deadline)
+                        continue
+                    if final_scan:
                         self._raise_producer_failure(producer_exc_queue)
                         break
                     time.sleep(poll_interval)
+                if self._scorer is not None:
+                    counts = self._scorer.counts
+                    self.log(f"[minimizer] [schedule-history] "
+                             f"[patch-outcomes {counts['patch_outcomes']}] "
+                             f"[patch-signatures {counts['patch_signatures']}] "
+                             f"[edges {counts['edges']}]")
         except _MinimizerTimeout:
             self.log(f"[minimizer] [stopped] "
                      f"[reason {binradar_utils.WALL_TIME_REACHED}]")
             return True
+        finally:
+            self._collector = None
+            self._scorer = None
         self.log("[minimizer] [done]")
         return False
 
@@ -268,36 +309,54 @@ class BinRadarMinimizer:
             producer_exc_queue: Optional["queue.Queue[BaseException]"] = None,
             cancel_event: Optional[threading.Event] = None,
             deadline: Optional[float] = None) -> int:
-        """Run queued immutable testcase snapshots and return the next id."""
-        for testcase in sorted(self.pending):
+        """Process one snapshot, then return to discovery and deadline checks."""
+        def check() -> None:
             self._raise_if_cancelled(cancel_event)
             self._raise_if_timed_out(deadline)
             self._raise_producer_failure(producer_exc_queue)
-            self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
-            with open(current_testcase, "wb") as f:
-                f.write(testcase.data)
-            # TODO: better minimization
+
+        check()
+        testcase = heapq.heappop(self.pending)
+        self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
+        with open(current_testcase, "wb") as stream:
+            stream.write(testcase.data)
+        features = None
+        if self._collector is not None:
+            features = self._collector.run(current_testcase)
+            run_res, patch_res = features.probe, features.patch
+        else:
             run_res, patch_res = runner.test_with_patched("0", current_testcase, verbose=False)
-            # run_result = runner.test_with_original(current_testcase, verbose=False)
-            self._raise_if_timed_out(deadline)
-            if run_res is None:
-                self.log(f"Failed {testcase.filename} with error.")
-                continue
-            if not run_res.patch_hit():
-                self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_res.serialize()}")
-                continue
-            if patch_res is None:
-                self.log(f"Failed to run patched binary for {testcase.filename}.")
-                continue
-            self._raise_if_cancelled(cancel_event)
-            self._raise_producer_failure(producer_exc_queue)
-            save_file = f"{id}_{os.path.basename(testcase.filename)}"
-            with open(os.path.join(self.minimized_dir, save_file), "wb") as f:
-                f.write(testcase.data)
-            self.log(f"[testcase] [result] [id {id}] [file {save_file}] {run_res.serialize()} {patch_res.serialize()}")
-            id += 1
-        self.pending.clear()
-        return id
+        check()
+        if run_res is None:
+            self.log(f"Failed {testcase.filename} with error.")
+            return id
+        if not run_res.patch_hit():
+            self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_res.serialize()}")
+            return id
+        if patch_res is None:
+            self.log(f"Failed to run patched binary for {testcase.filename}.")
+            return id
+        score_suffix = ""
+        if features is not None:
+            if binradar_verifier.concrete_testcase_eligible(
+                    run_res.exit_info, run_res.concrete_fault_addr,
+                    self.probe_result.concrete_fault_addr):
+                score = self._scorer.score(
+                    id, features.snapshots, features.coverage,
+                    patch_reason=features.patch_reason,
+                    coverage_reason=features.coverage_reason, check=check)
+            else:
+                # Preserve the baseline row for existing consumers, but don't
+                # let a verifier-excluded crash reserve novelty for others.
+                score = InputScore(id, 0, 0, 0, "ineligible", "ineligible")
+            score_suffix = " " + score.serialize()
+        check()
+        save_file = f"{id}_{os.path.basename(testcase.filename)}"
+        with open(os.path.join(self.minimized_dir, save_file), "wb") as stream:
+            stream.write(testcase.data)
+        self.log(f"[testcase] [result] [id {id}] [file {save_file}] "
+                 f"{run_res.serialize()} {patch_res.serialize()}{score_suffix}")
+        return id + 1
 
 
 def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,

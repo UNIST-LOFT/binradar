@@ -694,6 +694,7 @@ class BinRadarExecutor:
     # "existing" | "retained-first".  Explicit for the same reason as the
     # mode: an inherited environment must not select an experiment.
     symbolic_schedule: str
+    concrete_input_schedule: str = binradar_config.CONCRETE_INPUT_SCHEDULE_DEFAULT
     # P4c C1 family portfolio and Python-owned complete-attempt budget.
     mutation_portfolio: str
     representative_budget: int
@@ -736,6 +737,7 @@ class BinRadarExecutor:
         self.feedback_mode = config.feedback_mode
         self.symbolic_mutation_mode = config.symbolic_mutation_mode
         self.symbolic_schedule = config.symbolic_schedule
+        self.concrete_input_schedule = config.concrete_input_schedule
         self.mutation_portfolio = config.mutation_portfolio
         self.representative_budget = config.representative_budget
         self.symbolic_budgets = config.symbolic_budgets
@@ -938,6 +940,7 @@ class BinRadarExecutor:
                 feedback=self.feedback_mode,
                 symbolic_mutation_mode=self.symbolic_mutation_mode,
                 symbolic_schedule=self.symbolic_schedule,
+                concrete_input_schedule=self.concrete_input_schedule,
                 mutation_portfolio=self.mutation_portfolio,
                 representative_budget=self.representative_budget,
                 symbolic_max_work=self.symbolic_budgets.max_work,
@@ -2130,6 +2133,12 @@ def main():
               "'boundary' proposes comparison-guided values.  Every other "
               "phase always runs with the advisor off"))
     parser.add_argument(
+        "--concrete-input-schedule", choices=binradar_config.CONCRETE_INPUT_SCHEDULES,
+        default=None,
+        help=("concrete testcase ordering (default: fifo, or "
+              "BINRADAR_CONCRETE_INPUT_SCHEDULE from binradar.env; "
+              "novelty prioritizes fixed admission scores)"))
+    parser.add_argument(
         "--symbolic-schedule", dest="symbolic_schedule",
         choices=binradar_config.SYMBOLIC_SCHEDULES,
         default=None,
@@ -2202,6 +2211,9 @@ def main():
         sys.exit(f"ERROR: workdir {workdir} does not exist.")
 
     env = binradar_utils.load_env(os.path.join(workdir, "binradar.env"))
+    env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = \
+        binradar_config.resolve_concrete_input_schedule(
+            args.concrete_input_schedule, env)
     if args.timeout >= 0:
         env["BINRADAR_TIMEOUT"] = str(args.timeout)
     else:

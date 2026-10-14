@@ -124,7 +124,8 @@ def test_feedback_rejects_legacy_mutation_classification_without_overwrite(tmp_p
     assert (existing / "keep").read_bytes() == b"historical"
 
 
-def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(tmp_path):
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(tmp_path, scheduled):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     executor.probe_result.tracer_fault_reference = None
     cases = [
@@ -136,7 +137,11 @@ def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(
     for index, (name, outcome, fault, hit, version) in enumerate(cases):
         filename = f"{index}_{name}"
         (run_dir / "minimized" / filename).write_bytes(b"benign" if name == "duplicate" else name.encode())
-        rows.append(_full_row(index, filename, outcome, fault, hit, version))
+        row = _full_row(index, filename, outcome, fault, hit, version)
+        if scheduled:
+            from binradar_input_schedule import InputScore
+            row = row.replace("[time 1]", InputScore(index, 0, 0, 1, "unsupported").serialize() + " [time 1]")
+        rows.append(row)
     rows.insert(0, _full_row(99, "1_malicious", "crash", 0x1234).replace(
         "[fault-addr 1234]", "[fault-addr nothex]"))
     (run_dir / "minimizer.sbsv").write_text("".join(rows))
