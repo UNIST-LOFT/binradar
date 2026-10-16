@@ -941,6 +941,8 @@ class BinRadarExecutor:
                 symbolic_mutation_mode=self.symbolic_mutation_mode,
                 symbolic_schedule=self.symbolic_schedule,
                 concrete_input_schedule=self.concrete_input_schedule,
+                concrete_execution_policy=binradar_verifier.CONCRETE_EXECUTION_POLICY,
+                concrete_input_quantum_seconds=binradar_verifier.CONCRETE_INPUT_QUANTUM_SECONDS,
                 mutation_portfolio=self.mutation_portfolio,
                 representative_budget=self.representative_budget,
                 symbolic_max_work=self.symbolic_budgets.max_work,

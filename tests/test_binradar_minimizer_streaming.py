@@ -100,14 +100,15 @@ def _make_minimizer(tmp_path, testcase_dirs, **kwargs):
         str(tmp_path), str(run_dir), _probe(), testcase_dirs, {}, **kwargs)
 
 
-def _make_verifier(tmp_path):
+def _make_verifier(tmp_path, patches=(1,)):
+    (tmp_path / "run").mkdir(exist_ok=True)
     runner = binradar_verifier.BinRadarQemuRunner(
         dir=str(tmp_path), binary="nm", test_cmd="-l @@", patch_loc="0x1000")
     runner.test_with_patched = \
         lambda patch_id, testcase, verbose=False: (_probe(), _patch_result())
     return binradar_verifier.BinRadarConcreteVerifier(
         str(tmp_path), str(tmp_path / "run"), runner, _probe(),
-        "nm.brpatched", [1])
+        "nm.brpatched", list(patches))
 
 
 def _verifier_result(run_dir: Path):
@@ -117,7 +118,7 @@ def _verifier_result(run_dir: Path):
 
 
 
-def _scheduled_stream(tmp_path, monkeypatch, scores):
+def _scheduled_stream(tmp_path, monkeypatch, scores, patches=(1,)):
     import hashlib
     from binradar_input_schedule import InputScore
 
@@ -135,7 +136,7 @@ def _scheduled_stream(tmp_path, monkeypatch, scores):
         "coverage_settings": "{}", "patch_reason": "unsupported",
         "backend": "coverage-only",
     }
-    header = binradar_verifier.concrete_schedule_header([1], context) + "\n"
+    header = binradar_verifier.concrete_schedule_header(patches, context) + "\n"
 
     def row(seq, edges):
         name = f"{seq}_input"
@@ -147,7 +148,7 @@ def _scheduled_stream(tmp_path, monkeypatch, scores):
 
     path = run_dir / "minimizer.sbsv"
     path.write_text(header + "".join(row(i, edges) for i, edges in enumerate(scores)))
-    verifier = _make_verifier(tmp_path)
+    verifier = _make_verifier(tmp_path, patches)
     return verifier, path, row
 
 
@@ -202,6 +203,207 @@ def test_live_newcomer_overtakes_pending_without_batch_wait(tmp_path, monkeypatc
         started.set()
         producer.join(5)
     assert observed == ["0_input", "2_input", "1_input"]
+
+
+@pytest.mark.parametrize("policy", ["fifo", "novelty"])
+def test_slow_input_yields_and_ingests_new_input_between_turns(
+        tmp_path, monkeypatch, policy):
+    from binradar_input_schedule import split_score
+
+    verifier, path, row = _scheduled_stream(
+        tmp_path, monkeypatch, [9, 0], patches=(1, 2, 3))
+    verifier.input_schedule = policy
+    if policy == "fifo":
+        path.write_text("".join(split_score(line)[0] + "\n"
+                                for line in path.read_text().splitlines()[1:]))
+    clock = [0.0]
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: clock[0])
+    calls = []
+    logs = []
+    monkeypatch.setattr(verifier.logger, "info", logs.append)
+
+    def execute(patch_id, testcase, verbose=False):
+        case = Path(testcase).name
+        calls.append((case, int(patch_id)))
+        if len(calls) == 1:
+            # A committed newcomer must join round zero before this high-score
+            # input gets a second turn. This also proves a lone long child
+            # returns normally rather than being killed at the quantum.
+            clock[0] += 1.1
+            appended = row(2, 5)
+            if policy == "fifo":
+                appended = split_score(appended.rstrip("\n"))[0] + "\n"
+            with path.open("a") as stream:
+                stream.write(appended + "[minimizer] [done] [time 1]\n")
+        return _probe(), _patch_result()
+
+    verifier.runner.test_with_patched = execute
+    # Standalone requires a terminal marker at its first read; the appended
+    # rows are instead supplied by an active, deterministic writer facade.
+    writer = SimpleNamespace(is_alive=lambda: True)
+    assert not verifier.run_verification_streaming(
+        str(path), minimizer_thread=writer, poll_interval=0.001)
+    middle = ["2_input", "1_input"] if policy == "novelty" else ["1_input", "2_input"]
+    assert calls == ([("0_input", 1)]
+                     + [(case, patch) for case in middle for patch in (1, 2, 3)]
+                     + [("0_input", 2), ("0_input", 3)])
+    assert verifier.total_evidences == {1: 3, 2: 3, 3: 3}
+    assert len(verifier.testcases) == 3
+    assert any("[yield]" in line for line in logs)
+    assert any("[resume]" in line for line in logs)
+    assert any("[admitted 3] [dispatched 3] [completed 3] [pending 0] "
+               "[resumable 0] [inflight 0]" in line for line in logs)
+
+
+def test_resumed_input_omits_globally_rejected_candidate(tmp_path, monkeypatch):
+    verifier, path, _ = _scheduled_stream(
+        tmp_path, monkeypatch, [9, 0], patches=(1, 2, 3))
+    with path.open("a") as stream:
+        stream.write("[minimizer] [done] [time 1]\n")
+    clock = [0.0]
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def execute(patch_id, testcase, verbose=False):
+        calls.append((Path(testcase).name, int(patch_id)))
+        if len(calls) == 1:
+            clock[0] += 1.1
+        patch_result = binradar_verifier.BinRadarPatchResult(
+            int(patch_id), [2] if calls[-1] == ("1_input", 2) else [0])
+        return _probe(), patch_result
+
+    verifier.runner.test_with_patched = execute
+    assert not verifier.run_verification_streaming(str(path))
+    assert ("0_input", 2) not in calls
+    assert calls[-1] == ("0_input", 3)
+    assert verifier.total_evidences == {1: 2, 2: 1, 3: 2}
+    assert not _verifier_result(tmp_path / "run").patches[2].verified
+
+
+@pytest.mark.parametrize("stop", ["shared-cutoff", "writer-failure"])
+def test_yield_checks_writer_and_shared_cutoff_before_resume(tmp_path, monkeypatch, stop):
+    verifier, path, _ = _scheduled_stream(
+        tmp_path, monkeypatch, [9, 0], patches=(1, 2))
+    clock = [0.0]
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: clock[0])
+    failures = queue.Queue()
+    calls = []
+
+    def execute(patch_id, testcase, verbose=False):
+        calls.append((Path(testcase).name, int(patch_id)))
+        clock[0] += 1.1
+        if stop == "shared-cutoff":
+            with path.open("a") as stream:
+                stream.write("[minimizer] [stopped] [reason wall-time-reached] [time 1]\n")
+        else:
+            failures.put(RuntimeError("writer failed between turns"))
+        return _probe(), binradar_verifier.BinRadarPatchResult(1, [2])
+
+    verifier.runner.test_with_patched = execute
+    kwargs = dict(minimizer_thread=SimpleNamespace(is_alive=lambda: True),
+                  minimizer_exc_queue=failures)
+    if stop == "writer-failure":
+        with pytest.raises(RuntimeError, match="writer failed between turns"):
+            verifier.run_verification_streaming(str(path), **kwargs)
+        assert verifier.verdicts == {1: ("rejected", "0_input")}
+        assert not (tmp_path / "run" / "verifier.br").exists()
+    else:
+        assert verifier.run_verification_streaming(str(path), **kwargs)
+        evidence = _verifier_result(tmp_path / "run")
+        assert evidence.stop_reason == binradar_utils.WALL_TIME_REACHED
+        assert not evidence.patches[1].verified
+        assert evidence.patches[2].verified
+        assert "[admitted 2] [dispatched 1] [completed 0] [pending 1] " \
+               "[resumable 1] [inflight 0]" in (tmp_path / "run" / "verifier.log").read_text()
+    assert calls == [("0_input", 1)]
+    assert verifier.total_evidences == {1: 1, 2: 0}
+
+
+def test_failure_mid_turn_keeps_prior_conclusive_rejection(tmp_path, monkeypatch):
+    verifier, path, _ = _scheduled_stream(
+        tmp_path, monkeypatch, [1], patches=(1, 2, 3))
+    with path.open("a") as stream:
+        stream.write("[minimizer] [done] [time 1]\n")
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: 0.0)
+
+    def execute(patch_id, testcase, verbose=False):
+        if int(patch_id) == 2:
+            raise RuntimeError("child transport failed")
+        return _probe(), binradar_verifier.BinRadarPatchResult(1, [2])
+
+    verifier.runner.test_with_patched = execute
+    with pytest.raises(RuntimeError, match="child transport failed"):
+        verifier.run_verification_streaming(str(path))
+    assert verifier.verdicts == {1: ("rejected", "0_input")}
+    assert verifier.total_evidences == {1: 1, 2: 0, 3: 0}
+    assert "[verifier] [patch-crashed] [patch 1]" in (tmp_path / "run" / "verifier.log").read_text()
+    assert not (tmp_path / "run" / "verifier.br").exists()
+
+
+@pytest.mark.parametrize("candidate_count", [4, 17])
+def test_cached_quantum_records_each_candidate_once_and_releases_capture(
+        tmp_path, monkeypatch, candidate_count):
+    import weakref
+
+    patches = tuple(range(1, candidate_count + 1))
+    active = set(patches)
+    verifier = _make_verifier(tmp_path, patches)
+    verifier.cache_family = binradar_verifier.PredicateFamily.GENERIC_ERM
+    verifier.cached_predicates = {
+        patch: "=p1p0" if patch % 2 else "=p0p0" for patch in patches}
+    testcase = binradar_verifier.Testcase(0, "input", "ok", 0, [0])
+    sweep = binradar_verifier.ConcreteInputSweep(candidate_count)
+    clock = [0.0]
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: clock[0])
+    calls = []
+    snapshots = []
+
+    def execute(patch, case):
+        calls.append(patch)
+        snapshot = binradar_verifier.CachedSnapshot(
+            patch, int(patch % 2 == 0), (0,) * 16)
+        snapshots.append(weakref.ref(snapshot))
+        clock[0] += 1.1
+        return _probe(), binradar_verifier.BinRadarCachedRun(patch, [snapshot])
+
+    monkeypatch.setattr(verifier, "run_testcase_cached", execute)
+    verifier._test_testcase_quantum(patches, testcase, sweep, active)
+    assert calls == [1]
+    assert verifier.total_evidences == {patch: patch % 2 for patch in patches}
+    assert all(ref() is None for ref in snapshots)
+    verifier._test_testcase_quantum(patches, testcase, sweep, active)
+    assert sweep.remaining == 0
+    assert calls == [1, 2]
+    assert verifier.total_evidences == dict.fromkeys(patches, 1)
+    assert all(ref() is None for ref in snapshots)
+
+
+def test_failed_cached_capture_falls_back_once_across_resume(tmp_path, monkeypatch):
+    verifier = _make_verifier(tmp_path, (1, 2))
+    verifier.cache_family = binradar_verifier.PredicateFamily.GENERIC_ERM
+    testcase = binradar_verifier.Testcase(0, "input", "ok", 0, [0])
+    sweep = binradar_verifier.ConcreteInputSweep(2)
+    clock = [0.0]
+    monkeypatch.setattr(binradar_verifier.time, "monotonic", lambda: clock[0])
+    cached_calls = []
+    patched_calls = []
+
+    def cached(patch, case):
+        cached_calls.append(patch)
+        clock[0] += 1.1
+        return None, None
+
+    def patched(patch, case):
+        patched_calls.append(patch)
+        return _probe(), _patch_result()
+
+    monkeypatch.setattr(verifier, "run_testcase_cached", cached)
+    monkeypatch.setattr(verifier, "run_testcase_patched", patched)
+    for expected_calls in ([1], [1, 2]):
+        verifier._test_testcase_quantum((1, 2), testcase, sweep, {1, 2})
+        assert cached_calls == patched_calls == expected_calls
+    assert sweep.remaining == 0
+    assert verifier.total_evidences == {1: 1, 2: 1}
 
 
 @pytest.mark.parametrize("damage", ["missing-score", "duplicate-sequence", "no-header",

@@ -11,7 +11,7 @@ import logging
 import time
 import threading
 import fcntl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
                     Set, TextIO, Tuple)
@@ -78,6 +78,52 @@ PROBE_RESULT_SCHEMA_V2 = (
     "[fault-addr: hex] [tracer-fault-valid: bool] "
     "[tracer-fault-source: str] [tracer-fault-addr: hex] "
     "[patch-func-candidates: list[str]] [stacktrace: list[str]]")
+
+
+CONCRETE_INPUT_QUANTUM_SECONDS = 1.0
+CONCRETE_EXECUTION_POLICY = "round-robin-v1"
+
+
+@dataclass(slots=True)
+class ConcreteInputSweep:
+    """Unfinished candidate indices; never owns a capture or environment."""
+
+    remaining: int
+    bits: bytearray = field(init=False, repr=False)
+    cursor: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        self.bits = bytearray(b"\xff") * ((self.remaining + 7) // 8)
+        if self.remaining % 8:
+            self.bits[-1] = (1 << (self.remaining % 8)) - 1
+
+    def discard(self, index: int) -> None:
+        byte, offset = divmod(index, 8)
+        mask = 1 << offset
+        if self.bits[byte] & mask:
+            self.bits[byte] &= ~mask
+            self.remaining -= 1
+
+    def pending_indices(self):
+        """Iterate pending indices without copying the candidate population."""
+        for byte in range(self.cursor // 8, len(self.bits)):
+            value = self.bits[byte]
+            while value:
+                bit = value & -value
+                value ^= bit
+                yield byte * 8 + bit.bit_length() - 1
+
+    def pop(self) -> int:
+        # Every earlier index has already been consumed or grouped. Advance
+        # monotonically so a noncached sweep visits each bit at most once.
+        while not self.bits[self.cursor // 8]:
+            self.cursor = (self.cursor // 8 + 1) * 8
+        byte = self.cursor // 8
+        value = self.bits[byte]
+        index = byte * 8 + (value & -value).bit_length() - 1
+        self.discard(index)
+        self.cursor = index + 1
+        return index
 
 
 MEMCHECK_POLICY = "coverage-v6"
@@ -1889,35 +1935,40 @@ class BinRadarConcreteVerifier:
                 f"[reason {e}]")
             return None
 
-    def _test_testcase_batch(
-        self, patches: List[int], testcase: Testcase,
+    def _test_testcase_quantum(
+        self, patches: Sequence[int], testcase: Testcase,
+        sweep: ConcreteInputSweep, active: Set[int],
         deadline: Optional[float] = None,
         on_rejected: Optional[Callable[[int], None]] = None,
-    ) -> Set[int]:
-        """Run one representative per distinct complete branch vector.
+    ) -> None:
+        """Advance one sweep, yielding only between atomic representative groups.
 
-        ``on_rejected`` serializes conclusive failures immediately. This is
-        important at a graceful deadline: a later timeout in the same batch
-        must not discard a rejection that has already been observed.
+        Candidate indices refer to the verifier's shared immutable universe.
+        Complete-vector equivalence and first-hit acceleration are local to
+        this turn: no captured snapshots or prepared environments survive it.
+        The quantum never interrupts a child or an equivalence group. Immediate
+        rejection callbacks retain conclusive evidence if a later child fails.
         """
-        rejected: Set[int] = set()
+        quantum_end = time.monotonic() + CONCRETE_INPUT_QUANTUM_SECONDS
 
         def record_rejection(patch: int) -> None:
-            rejected.add(patch)
             if on_rejected is not None:
                 on_rejected(patch)
 
-        if self.cache_family is None:
-            for patch in patches:
-                if self._test_testcase(patch, testcase, deadline):
-                    record_rejection(patch)
-            return rejected
-
-        remaining = list(patches)
         first_branches: Optional[Dict[int, int]] = {}
-        while remaining:
+        worked = False
+        while sweep.remaining:
             self._raise_if_timed_out(deadline)
-            representative = remaining.pop(0)
+            if worked and time.monotonic() >= quantum_end:
+                break
+            representative = patches[sweep.pop()]
+            if representative not in active:
+                continue
+            worked = True
+            if self.cache_family is None:
+                if self._test_testcase(representative, testcase, deadline):
+                    record_rejection(representative)
+                continue
             self.logger.info(
                 f"[verifier-cache] [miss] [patch {representative}] "
                 f"[id {testcase.id}] [file {testcase.filename}]")
@@ -1962,9 +2013,12 @@ class BinRadarConcreteVerifier:
                     representative_result):
                 record_rejection(representative)
 
-            equivalent: List[Tuple[int, List[int]]] = []
-            unmatched = []
-            for patch in remaining:
+            equivalent = 0
+            for index in sweep.pending_indices():
+                patch = patches[index]
+                if patch not in active:
+                    sweep.discard(index)
+                    continue
                 start_index = 0
                 if observed and first_branches is not None:
                     first_branch = first_branches.get(patch)
@@ -1977,30 +2031,25 @@ class BinRadarConcreteVerifier:
                             first_branches[patch] = first_branch
                     if first_branch is not None:
                         if first_branch != observed[0]:
-                            unmatched.append(patch)
                             continue
                         start_index = 1
                 matches = self._cached_matches(
                     patch, cached.snapshots, observed, environments,
                     start_index)
                 if matches:
-                    equivalent.append((patch, observed))
-                else:
-                    unmatched.append(patch)
-            remaining = unmatched
+                    sweep.discard(index)
+                    equivalent += 1
+                    if self._test_result(
+                            patch, testcase, result,
+                            BinRadarPatchResult(patch, observed),
+                            log_detail=False):
+                        record_rejection(patch)
             if equivalent:
                 self.logger.info(
                     f"[verifier-cache] [group] "
                     f"[representative {representative}] "
-                    f"[members {len(equivalent) + 1}] "
+                    f"[members {equivalent + 1}] "
                     f"[id {testcase.id}]")
-            for patch, branches in equivalent:
-                if self._test_result(
-                        patch, testcase, result,
-                        BinRadarPatchResult(patch, branches),
-                        log_detail=False):
-                    record_rejection(patch)
-        return rejected
 
     def run_testcase_patched(self, patch_id: int, testcase: Testcase) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarPatchResult]]:
         if not self._patched_executable(patch_id):
@@ -2102,13 +2151,17 @@ class BinRadarConcreteVerifier:
                                    minimizer_thread: Optional[threading.Thread] = None,
                                    minimizer_exc_queue: Optional[Any] = None,
                                    timeout: Optional[float] = None) -> bool:
-        """Ingest a committed backlog, then dispatch one immutable priority.
+        """Ingest committed rows before each round-robin input work quantum.
 
-        Legacy files retain FIFO order. Scheduled standalone replay adopts the
-        stored policy; live novelty runs require its header and complete scores.
-        Normal producer completion drains pending work. The shared live cutoff
-        stops dispatch, whereas a historical stopped file can still be replayed
-        within the standalone verifier's own budget.
+        The heap orders service round before the immutable novelty/FIFO key;
+        fresh inputs start at round zero and unfinished sweeps advance a round.
+        A fast complete sweep retains the original score/publication ordering.
+        A quantum may overrun by its atomic representative and equivalence
+        group, including both cached and fallback children at unchanged limits.
+        Scheduled standalone replay adopts the stored policy; live novelty runs
+        require its header and complete scores. Normal producer completion
+        drains both new and resumed work. The shared live cutoff stops dispatch,
+        whereas historical stopped files replay within the standalone budget.
         """
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
@@ -2116,8 +2169,14 @@ class BinRadarConcreteVerifier:
         result_parsers = concrete_result_parsers()
         parser.add_schema("[minimizer] [done] [time: int]")
         parser.add_schema("[minimizer] [stopped] [reason: str] [time: int]")
-        pending_patches = list(self.patches)
-        pending: List[Tuple[Tuple[int, int, int, int], Testcase]] = []
+        patches = tuple(self.patches)
+        pending_patches = set(patches)
+        pending: List[Tuple[int, Tuple[int, int, int, int], Testcase,
+                            Optional[ConcreteInputSweep]]] = []
+        never_started = resumable = 0
+        self.logger.info(
+            f"[scheduler] [execution-policy {CONCRETE_EXECUTION_POLICY}] "
+            f"[input-quantum-seconds {CONCRETE_INPUT_QUANTUM_SECONDS}]")
         done_seen = False
         stop_reason: Optional[str] = None
         scheduled = False
@@ -2200,8 +2259,9 @@ class BinRadarConcreteVerifier:
                             testcase = self._testcase_from_result_row(row.data)
                             if testcase is not None:
                                 key = score.heap_key if score is not None else (0, 0, 0, rows_seen)
-                                heapq.heappush(pending, (key, testcase))
+                                heapq.heappush(pending, (0, key, testcase, None))
                                 admitted += 1
+                                never_started += 1
                         elif row.schema_name == "minimizer$done":
                             done_seen = True
                         elif row.schema_name == "minimizer$stopped":
@@ -2233,26 +2293,44 @@ class BinRadarConcreteVerifier:
                         terminal_reason = "all-rejected"
                         break
                     if pending:
-                        key, testcase = heapq.heappop(pending)
-                        self.testcases.append(testcase)
-                        dispatched += 1
+                        self._raise_if_timed_out(deadline)
+                        raise_worker_failure()
+                        service_round, key, testcase, sweep = heapq.heappop(pending)
+                        if sweep is None:
+                            sweep = ConcreteInputSweep(len(patches))
+                            self.testcases.append(testcase)
+                            dispatched += 1
+                            never_started -= 1
+                            action = "dispatch"
+                        else:
+                            resumable -= 1
+                            action = "resume"
                         inflight = True
                         self.logger.info(
-                            f"[scheduler] [dispatch] [seq {key[3]}] [id {testcase.id}] "
+                            f"[scheduler] [{action}] [seq {key[3]}] [id {testcase.id}] "
+                            f"[service-round {service_round}] "
                             f"[score-patch-outcomes {-key[0]}] "
                             f"[score-patch-signatures {-key[1]}] [score-edges {-key[2]}] "
-                            f"[pending {len(pending)}]")
-                        rejected = self._test_testcase_batch(
-                            list(pending_patches), testcase, deadline,
+                            f"[pending {never_started}] [resumable {resumable}]")
+                        self._test_testcase_quantum(
+                            patches, testcase, sweep, pending_patches, deadline,
                             on_rejected=lambda patch, testcase=testcase:
                                 record_rejection(patch, testcase))
-                        for patch in rejected:
-                            record_rejection(patch, testcase)
-                        completed += 1
-                        inflight = False
                         if not pending_patches:
-                            terminal_reason = "all-rejected"
-                            break
+                            sweep.remaining = 0
+                        if sweep.remaining:
+                            resumable += 1
+                            heapq.heappush(pending, (service_round + 1, key, testcase, sweep))
+                            self.logger.info(
+                                f"[scheduler] [yield] [seq {key[3]}] [id {testcase.id}] "
+                                f"[service-round {service_round}] "
+                                f"[remaining {sweep.remaining}] "
+                                f"[pending {never_started}] [resumable {resumable}]")
+                        else:
+                            completed += 1
+                        inflight = False
+                        # Re-ingest committed rows and check producer/cutoff
+                        # state before every next turn, including a resume.
                         continue
                     if terminal:
                         timed_out = stop_reason is not None
@@ -2269,8 +2347,10 @@ class BinRadarConcreteVerifier:
         self.logger.info(
             f"[scheduler] [stop] [reason {terminal_reason}] [admitted {admitted}] "
             f"[dispatched {dispatched}] [completed {completed}] "
-            f"[pending {len(pending)}] [inflight {int(inflight)}]")
-        for patch in pending_patches:
-            self._log_result(patch, "verified", "")
+            f"[pending {never_started}] [resumable {resumable}] "
+            f"[inflight {int(inflight)}]")
+        for patch in patches:
+            if patch in pending_patches:
+                self._log_result(patch, "verified", "")
         self._write_results()
         return timed_out

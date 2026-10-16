@@ -14,8 +14,8 @@ from typing import Callable, Mapping, Optional
 import binradar_runtime
 import binradar_utils
 from binradar_taosc_predicates import (
-    CachedSnapshot, ParsedPredicate, evaluate_cached_branch,
-    precompile_generic_predicates, wrap64,
+    CachedSnapshot, ParsedPredicate, PredicateTrap, _compile_patch_str,
+    evaluate_cached_branch, wrap64,
 )
 
 SCHEDULE_VERSION = 1
@@ -140,23 +140,58 @@ def split_score(line: str):
     return line[:start].rstrip() + trailing_time + newline, score
 
 
-def _reduce(predicates, namespace, snapshots):
-    """Reduce all hits without retaining a candidate-by-hit outcome matrix."""
-    outcomes, signatures = set(), set()
-    ordered = sorted(predicates.items())
-    prefix = hashlib.sha256(namespace.encode("utf-8")).digest()
-    for snapshot in snapshots:
-        environment = (tuple(wrap64(value) for value in snapshot.registers)
-                       if not snapshot.is_CWE805 else None)
-        packed = bytearray((len(ordered) + 3) // 4)
-        for index, (patch_id, predicate) in enumerate(ordered):
-            outcome = evaluate_cached_branch(predicate, snapshot, environment)
-            if outcome not in (0, 1, 2):
-                raise ValueError("Invalid predicate outcome")
-            outcomes.add((patch_id, outcome))
-            packed[index // 4] |= outcome << (2 * (index % 4))
-        signatures.add(hashlib.sha256(prefix + bytes(packed)).digest())
-    return outcomes, signatures
+class _Reducer:
+    """Prepared descriptor work; only compact aggregate features cross IPC.
+
+    Outcome byte i contains bits 0/1/2 for the ascending candidate at i.
+    Signatures retain the original namespace-prefixed two-bit vector digest.
+    No state survives a request; equivalent adjacent states need not repeat
+    deterministic expression evaluation or insert the same feature twice.
+    """
+    def __init__(self, predicates, namespace):
+        self.count = len(predicates)
+        self.prefix = hashlib.sha256(namespace.encode("utf-8")).digest()
+        groups = {}
+        for index, (_, predicate) in enumerate(sorted(predicates.items())):
+            groups.setdefault(predicate, []).append(index)
+        self.generic = all(isinstance(predicate, str) for predicate in groups)
+        self.groups = [
+            (_compile_patch_str(predicate) if self.generic else predicate,
+             tuple((index, index // 4, 2 * (index % 4)) for index in indices))
+            for predicate, indices in groups.items()
+        ]
+
+    def reduce(self, snapshots):
+        outcomes = bytearray(self.count)
+        signatures = set()
+        previous = None
+        for snapshot in snapshots:
+            if self.generic:
+                if snapshot.is_CWE805:
+                    raise ValueError("generic predicate with a CWE-805 snapshot")
+                state = tuple(wrap64(value) for value in snapshot.registers)
+            else:
+                state = (snapshot.registers, snapshot.clamps, snapshot.stack)
+            if state == previous:
+                continue
+            previous = state
+            packed = bytearray((self.count + 3) // 4)
+            for evaluator, positions in self.groups:
+                if self.generic:
+                    try:
+                        outcome = int(evaluator(state) != 0)
+                    except PredicateTrap:
+                        outcome = 2
+                else:
+                    outcome = evaluate_cached_branch(evaluator, snapshot)
+                if outcome not in (0, 1, 2):
+                    raise ValueError("Invalid predicate outcome")
+                token = 1 << outcome
+                for index, byte_index, shift in positions:
+                    outcomes[index] |= token
+                    packed[byte_index] |= outcome << shift
+            signatures.add(hashlib.sha256(self.prefix + packed).digest())
+        return bytes(outcomes), b"".join(signatures)
 
 
 class NoveltyScorer:
@@ -169,7 +204,8 @@ class NoveltyScorer:
         self.predicates = dict(sorted(predicates.items()))
         self.namespace = namespace
         self.backend = "process" if predicates else "coverage-only"
-        self._outcomes = set()
+        self._outcomes = bytearray(len(self.predicates))
+        self._outcome_count = 0
         self._signatures = set()
         self._edges = set()
         self._process = None
@@ -180,7 +216,7 @@ class NoveltyScorer:
 
     @property
     def counts(self):
-        return {"patch_outcomes": len(self._outcomes),
+        return {"patch_outcomes": self._outcome_count,
                 "patch_signatures": len(self._signatures), "edges": len(self._edges)}
 
     def __enter__(self):
@@ -281,14 +317,20 @@ class NoveltyScorer:
         self._busy = True
         try:
             check()
-            outcomes, signatures = (self._reduce_managed(snapshots, check)
-                                    if snapshots is not None else (set(), set()))
+            outcomes, digest_bytes = (self._reduce_managed(snapshots, check)
+                                      if snapshots is not None else (b"", b""))
+            signatures = {digest_bytes[offset:offset + 32]
+                          for offset in range(0, len(digest_bytes), 32)}
+            new_outcomes = sum((mask & ~seen).bit_count()
+                               for mask, seen in zip(outcomes, self._outcomes))
             edges = {index for index, count in enumerate(coverage) if count} if coverage is not None else set()
-            score = InputScore(seq, len(outcomes - self._outcomes),
+            score = InputScore(seq, new_outcomes,
                                len(signatures - self._signatures), len(edges - self._edges),
                                patch_reason, coverage_reason)
             check()
-            self._outcomes.update(outcomes)
+            for index, mask in enumerate(outcomes):
+                self._outcomes[index] |= mask
+            self._outcome_count += new_outcomes
             self._signatures.update(signatures)
             self._edges.update(edges)
             self.highwater.update(self.counts)
@@ -319,11 +361,12 @@ def _worker(fd):
     with socket.socket(fileno=fd) as channel:
         try:
             predicates, namespace = _worker_receive(channel)
-            precompile_generic_predicates(predicates)
+            reducer = _Reducer(predicates, namespace)
+            del predicates, namespace
             while True:
                 snapshots = _worker_receive(channel)
                 try:
-                    response = (True, _reduce(predicates, namespace, snapshots))
+                    response = (True, reducer.reduce(snapshots))
                 except Exception as exc:
                     response = (False, f"{type(exc).__name__}: {exc}")
                 # Drop raw states before returning the compact token sets.

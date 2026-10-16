@@ -1,7 +1,7 @@
 """Immutable wire scores, first-observer reduction, and worker ownership."""
 import dataclasses
+import hashlib
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -138,14 +138,107 @@ def test_cwe805_register_and_stack_predicates_use_every_hit():
         assert score(scorer, 1, [outside]).new_patch_outcomes == 0
 
 
+def reduced_features(predicates, namespace, snapshots):
+    masks, digests = schedule._Reducer(predicates, namespace).reduce(snapshots)
+    outcomes = {(patch_id, outcome)
+                for patch_id, mask in zip(sorted(predicates), masks)
+                for outcome in (0, 1, 2) if mask & (1 << outcome)}
+    return outcomes, {digests[offset:offset + 32]
+                      for offset in range(0, len(digests), 32)}
+
+
 def test_joint_signatures_have_stable_order_and_namespace():
     snapshots = [snapshot(0), snapshot(1), snapshot(2), snapshot(2)]
-    left = schedule._reduce({9: ">v0p1", 3: ">v0p0"}, "a", snapshots)
-    right = schedule._reduce({3: ">v0p0", 9: ">v0p1"}, "a", snapshots)
-    other = schedule._reduce({3: ">v0p0", 9: ">v0p1"}, "b", snapshots)
+    left = reduced_features({9: ">v0p1", 3: ">v0p0"}, "a", snapshots)
+    right = reduced_features({3: ">v0p0", 9: ">v0p1"}, "a", snapshots)
+    other = reduced_features({3: ">v0p0", 9: ">v0p1"}, "b", snapshots)
     assert left == right
     assert left[0] == other[0]
     assert left[1].isdisjoint(other[1])
+
+
+def signature(namespace, packed):
+    return hashlib.sha256(hashlib.sha256(namespace.encode()).digest() + bytes(packed)).digest()
+
+
+def test_generic_traps_wrapping_duplicate_descriptors_and_digest_bytes():
+    predicates = {11: "/v0v1", 7: "=+v0p1n9223372036854775808",
+                  5: "/v0v1", 2: "p0"}
+    states = [CachedSnapshot(0, 0, (2**63 - 1, 0) + (0,) * 14),
+              CachedSnapshot(0, 0, (2**63, 2**64 - 1) + (0,) * 14),
+              CachedSnapshot(0, 0, (8, 2) + (0,) * 14)]
+    expected_outcomes = {(2, 0), (5, 1), (5, 2), (7, 0), (7, 1), (11, 1), (11, 2)}
+    expected_signatures = {signature("traps", [value]) for value in (152, 136, 68)}
+    assert reduced_features(predicates, "traps", states + states[-1:]) == (
+        expected_outcomes, expected_signatures)
+    with schedule.NoveltyScorer(predicates, "traps") as scorer:
+        first = score(scorer, 0, states + states[-1:])
+        assert (first.new_patch_outcomes, first.new_patch_signatures) == (7, 3)
+        assert score(scorer, 1, states[::-1]).heap_key == (0, 0, 0, 1)
+
+
+def test_cwe805_unsigned_clamp_wrap_overflow_and_strict_capacity():
+    descriptors = ["c1p0", "c2p1q8", "c1s64i0", "c2s16i4q2", "c1p0"]
+    predicates = {index: parse_predicate_descriptor(value)
+                  for index, value in enumerate(descriptors, 1)}
+    # Inverted clamps do not match pointers, but their capacity wraps u64.
+    clamps = ((100, 200), (300, 250)) + ((0, 0),) * 254
+    stack = (200).to_bytes(8, "little") + (50).to_bytes(2, "little")
+    inside = CachedSnapshot(0, 0, (100, 2**61) + (0,) * 14, clamps, stack)
+    outside = CachedSnapshot(0, 0, (200, 25) + (0,) * 14, clamps, stack)
+    # [0,2,1,0,0] and [1,0,1,0,1], in ascending candidate order.
+    outcomes, digests = reduced_features(predicates, "clamps", [inside, inside, outside])
+    assert outcomes == {(1, 0), (1, 1), (2, 2), (2, 0), (3, 1), (4, 0), (5, 0), (5, 1)}
+    assert digests == {signature("clamps", [24, 0]), signature("clamps", [17, 1])}
+    exact = CachedSnapshot(0, 0, (200, 25) + (0,) * 14,
+                           ((100, 300),) + ((0, 0),) * 255, stack)
+    # 8*25 equals the sole capacity: strict '<' must take the patch.
+    assert reduced_features({2: predicates[2]}, "strict", [exact])[0] == {(2, 1)}
+
+
+@pytest.mark.parametrize("width", [8, 16, 32])
+def test_cwe805_stack_cell_offset_unsigned_load_and_zero_clamps(width):
+    size = width // 8
+    maximum = (1 << width) - 1
+    predicate = parse_predicate_descriptor(f"c2s{width}i1q2")
+    stack = bytes(size) + maximum.to_bytes(size, "little")
+    state = CachedSnapshot(0, 0, (0,) * 16,
+                           ((0, maximum * 2),) + ((0, 0),) * 255, stack)
+    # The selected unsigned cell times two equals capacity, not less than it.
+    assert reduced_features({8: predicate}, "width", [state])[0] == {(8, 1)}
+    zeros = CachedSnapshot(0, 0, (0,) * 16, ((0, 0),) * 256, bytes(size * 2))
+    assert reduced_features({8: predicate}, "zero", [zeros])[0] == {(8, 1)}
+
+
+def test_empty_capture_has_no_patch_features_but_preserves_availability():
+    with schedule.NoveltyScorer({1: "p1"}, "empty") as scorer:
+        empty = score(scorer, 0, [])
+        assert empty.patch_reason == "none"
+        assert empty.new_patch_outcomes == empty.new_patch_signatures == 0
+        assert score(scorer, 1, [snapshot(0)]).new_patch_outcomes == 1
+
+
+def test_final_check_failure_does_not_commit_patch_history(monkeypatch):
+    scorer = schedule.NoveltyScorer({1: ">v0p0"}, "final-check")
+    first = score(scorer, 0, [snapshot(0)])
+    assert first.new_patch_outcomes == 1
+    worker = scorer._process
+    before = scorer.counts
+    new_features = schedule._Reducer(scorer.predicates, scorer.namespace).reduce([snapshot(1)])
+    monkeypatch.setattr(scorer, "_reduce_managed", lambda snapshots, check: new_features)
+    calls = 0
+
+    def check():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise TimeoutError("final check")
+
+    with pytest.raises(TimeoutError, match="final check"):
+        score(scorer, 1, [snapshot(1)], bitmap(5), check=check)
+    assert scorer.counts == before
+    assert worker.poll() is not None
+    assert not binradar_runtime.PROCESS_REGISTRY.contains(worker)
 
 
 def test_coverage_only_never_spawns_and_counter_values_do_not_matter():
@@ -169,24 +262,30 @@ def test_unavailable_features_never_reserve_tokens():
         assert score(scorer, 1, [snapshot(1)], bitmap(3)).heap_key == (-1, -1, -1, 1)
 
 
-def test_cancellation_reaps_inflight_worker_without_history_commit():
-    scorer = schedule.NoveltyScorer({i: ">v0p0" for i in range(1, 2001)}, "cancel")
-    started = time.monotonic()
+def test_cancellation_reaps_inflight_worker_without_history_commit(monkeypatch):
+    scorer = schedule.NoveltyScorer({1: ">v0p0"}, "cancel")
+    receive = scorer._receive_bytes
+    awaiting_response = False
     worker = None
 
     class Cancelled(Exception):
         pass
 
+    def receive_after_request(size, check):
+        nonlocal awaiting_response, worker
+        # Both real request frames have been sent. Cancel at the normal
+        # response-wait check, independent of evaluator speed or host load.
+        awaiting_response = True
+        worker = scorer._process
+        return receive(size, check)
+
     def check():
-        nonlocal worker
-        if scorer._process is not None:
-            worker = scorer._process
-        if time.monotonic() - started > 0.15:
+        if awaiting_response:
             raise Cancelled
 
+    monkeypatch.setattr(scorer, "_receive_bytes", receive_after_request)
     with pytest.raises(Cancelled):
-        score(scorer, 0, [snapshot(1)] * 10000, bitmap(2), check=check)
-    assert time.monotonic() - started < 2
+        score(scorer, 0, [snapshot(1)], bitmap(2), check=check)
     assert worker is not None and worker.poll() is not None
     assert not binradar_runtime.PROCESS_REGISTRY.contains(worker)
     assert scorer.counts == {"patch_outcomes": 0, "patch_signatures": 0, "edges": 0}

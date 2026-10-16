@@ -868,8 +868,8 @@ def eval_patch_str(s: str, env: Sequence[int]) -> int:
 
 
 def CWE805_branch_taken(predicate: CWE805Predicate,
-                        registers: List[int], stack: bytes,
-                        clamps: List[Tuple[int, int]]) -> int:
+                        registers: Sequence[int], stack: bytes,
+                        clamps: Sequence[Tuple[int, int]]) -> int:
     """Mirror brpatch.c::CWE805_branch_taken (plan §7.3).
 
     Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
@@ -1017,9 +1017,9 @@ def _evaluate_CWE805_snapshot(
         raise ValueError("CWE-805 predicate with a generic snapshot")
     return CWE805_branch_taken(
         predicate,
-        list(snapshot.registers),
+        snapshot.registers,
         snapshot.stack,
-        list(snapshot.clamps),
+        snapshot.clamps,
     )
 
 

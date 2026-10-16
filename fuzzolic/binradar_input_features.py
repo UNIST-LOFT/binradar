@@ -129,6 +129,9 @@ class BaselineFeatureCollector:
         self.family = selected.family
         self.predicates = ({patch: selected.predicates[patch] for patch in ids}
                            if selected.predicates is not None else {})
+        self._required_stack_bytes = max(
+            (predicate_stack_bytes(p) for p in self.predicates.values()),
+            default=0) if self.family == PredicateFamily.CWE805_ERM else 0
         self.patch_reason = "none" if self.predicates else _reason(selected.reason)
         self.binary = runner.cached_binary() if self.predicates else runner.patched_binary()
         # Never fallback from corrupt required E9 metadata to another artifact.
@@ -168,14 +171,13 @@ class BaselineFeatureCollector:
         if patch is None or patch.br_selection != [snapshot.branch for snapshot in snapshots]:
             return None, "brch-text-mismatch"
         expected_cwe = self.family == PredicateFamily.CWE805_ERM
-        required = max((predicate_stack_bytes(p) for p in self.predicates.values()), default=0)
         for snapshot in snapshots:
             if snapshot.patch_id != 0 or snapshot.branch != 0:
                 return None, "nonneutral-brch"
             if snapshot.is_CWE805 != expected_cwe:
                 return None, "brch-family-mismatch"
             if expected_cwe and (len(snapshot.stack) != self.runner.brcache_stack_size
-                                 or len(snapshot.stack) < required):
+                                 or len(snapshot.stack) < self._required_stack_bytes):
                 return None, "brch-stack-mismatch"
         return tuple(snapshots), "none"
 

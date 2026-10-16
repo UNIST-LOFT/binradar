@@ -710,8 +710,11 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
         0, "input", "ok", 0, [0])
     verifier.testcases.append(testcase)
 
-    rejected = verifier._test_testcase_batch([1, 2, 3], testcase)
-    assert rejected == set()
+    sweep = binradar.binradar_verifier.ConcreteInputSweep(3)
+    while sweep.remaining:
+        verifier._test_testcase_quantum(
+            (1, 2, 3), testcase, sweep, {1, 2, 3})
+    assert verifier.security_rejected == set()
     assert verifier.accept_evidences == {1: 1, 2: 0, 3: 0}
     assert verifier.total_evidences == {1: 1, 2: 1, 3: 1}
     # One representative run per distinct branch vector. Both representatives
