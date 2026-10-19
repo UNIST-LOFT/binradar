@@ -12,6 +12,7 @@ if SCRIPT_DIR not in sys.path:
 
 import binradar_config
 import binradar_evidence
+from binradar_feedback import FeedbackExportRequest, export_feedback
 import binradar_minimizer
 import binradar_utils
 import binradar_verifier
@@ -228,6 +229,10 @@ def main():
              "(default: reuse from workdir/out if present, otherwise run "
              "the filter)")
     parser.add_argument(
+        "--feedback-mode", "--feedback", dest="feedback_mode",
+        action="store_true", default=None,
+        help="Capture concrete predicate feedback (otherwise use BINRADAR_FEEDBACK_MODE)")
+    parser.add_argument(
         "--concrete-input-schedule", choices=binradar_config.CONCRETE_INPUT_SCHEDULES,
         default=None,
         help="concrete testcase ordering (CLI > BINRADAR_CONCRETE_INPUT_SCHEDULE > fifo)")
@@ -238,6 +243,8 @@ def main():
     if not os.path.isfile(env_path):
         sys.exit(f"ERROR: binradar.env not found: {env_path}")
     env = binradar_utils.load_env(env_path)
+    if args.feedback_mode is not None:
+        env["BINRADAR_FEEDBACK_MODE"] = "1" if args.feedback_mode else "0"
     env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = \
         binradar_config.resolve_concrete_input_schedule(
             args.concrete_input_schedule, env)
@@ -356,6 +363,7 @@ def main():
         verifier = binradar_verifier.BinRadarConcreteVerifier(
             workdir, minimizer_dir, runner, probe_result,
             verifier_binary, survived,
+            feedback_mode=env.get("BINRADAR_FEEDBACK_MODE", "0") == "1",
             patched_binary_patches=list(range(
                 1, int(env.get("BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])) + 1)),
             input_schedule=env["BINRADAR_CONCRETE_INPUT_SCHEDULE"])
@@ -373,6 +381,16 @@ def main():
         verified_file = os.path.join(eval_dir, "verified.br")
         shutil.copyfile(os.path.join(minimizer_dir, "verifier.br"), verified_file)
         logger.info(f"[VERIFIER] Saved verified result: {verified_file}")
+        if env.get("BINRADAR_FEEDBACK_MODE", "0") == "1":
+            export_feedback(FeedbackExportRequest(
+                workdir=workdir, run_dir=minimizer_dir,
+                original_binary=runner.original_binary(),
+                poc_source=os.path.join(workdir, env["POC_INPUT"]),
+                run_prefix=args.fuzzer, run_id=0, save_progress=logger.info,
+                candidate_ids=tuple(survived),
+                poc_fault_reference=probe_result.tracer_fault_reference,
+                poc_concrete_fault_addr=probe_result.concrete_fault_addr,
+                poc_memcheck_policy=probe_result.memcheck_policy))
 
         # 4. Final analysis
         final_file = os.path.join(eval_dir, "final.sbsv")

@@ -118,8 +118,11 @@ class BaselineFeatureCollector:
     identity metadata and requested SHM allocation are operational failures.
     The caller still owns concrete fault eligibility and publication.
     """
-    def __init__(self, runner: verifier.BinRadarQemuRunner, patches: Sequence[int]):
+    def __init__(self, runner: verifier.BinRadarQemuRunner, patches: Sequence[int], *,
+                 coverage_enabled: bool = True):
         self.runner = runner
+        self.coverage_enabled = coverage_enabled
+        self._entered = False
         if any(type(patch) is not int or patch <= 0 for patch in patches):
             raise ValueError("baseline candidates must be positive integer ids")
         ids = sorted(set(patches))
@@ -138,24 +141,34 @@ class BaselineFeatureCollector:
         runner.load_instruction_map(self.binary)
         self.descriptor_digest = descriptor_digest(self.predicates)
         self._environment = runner.get_env_for_exec("0", binary=self.binary)
+        # Feedback-only execution must not attach to an inherited fuzzer map.
+        self._environment.pop("__AFL_SHM_ID", None)
         # Presence-only AFL switches distinguish absent from an empty value.
         settings = {key: self._environment.get(key) for key in _COVERAGE_KEYS}
         self.metadata = {
             "artifact_sha256": _sha256(self.binary),
+            "original_sha256": _sha256(runner.original_binary()),
             "qemu_sha256": _sha256(verifier.QEMU_STACKTRACE_RELEASE),
-            "map_bytes": MAP_BYTES,
+            "baseline_artifact": str(Path(self.binary).resolve()),
+            "baseline_policy": "neutral-cached" if self.predicates else "original-patched",
+            "state_reason": self.patch_reason,
+            "coverage_enabled": self.coverage_enabled,
+            "map_bytes": MAP_BYTES if self.coverage_enabled else None,
             "coverage_settings": json.dumps(settings, sort_keys=True, separators=(",", ":")),
             "patch_reason": self.patch_reason,
         }
         self._map: Optional[_CoverageMap] = None
 
     def __enter__(self):
-        if self._map is not None:
+        if self._entered:
             raise RuntimeError("baseline collector already entered")
-        self._map = _CoverageMap()
+        if self.coverage_enabled:
+            self._map = _CoverageMap()
+        self._entered = True
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        self._entered = False
         region, self._map = self._map, None
         if region is not None:
             region.close()
@@ -182,10 +195,12 @@ class BaselineFeatureCollector:
         return tuple(snapshots), "none"
 
     def run(self, testcase: str) -> BaselineFeatures:
-        if self._map is None:
+        if not self._entered:
             raise RuntimeError("baseline collector must be used as a context manager")
-        self._map.clear()
-        extra_env = {"__AFL_SHM_ID": str(self._map.ident)}
+        extra_env = {}
+        if self._map is not None:
+            self._map.clear()
+            extra_env["__AFL_SHM_ID"] = str(self._map.ident)
         if self.predicates:
             extra_env["TAOSC_PRED"] = "p0"  # original path for both ERM families
             extra_env["BRCACHE_STACK_SIZE"] = str(self.runner.brcache_stack_size)
@@ -217,8 +232,9 @@ class BaselineFeatureCollector:
                 or any(branch != 0 for branch in patch.br_selection)):
             return BaselineFeatures(None, None, None, None,
                                     "invalid-baseline-branches", "unusable-baseline")
-        coverage = self._map.read()
-        coverage_reason = "none" if any(coverage) else "empty-map"
+        coverage = self._map.read() if self._map is not None else None
+        coverage_reason = ("disabled" if coverage is None else
+                           "none" if any(coverage) else "empty-map")
         if coverage_reason != "none":
             coverage = None
         snapshots, patch_reason = (self._patch_snapshots(binary, probe, patch)

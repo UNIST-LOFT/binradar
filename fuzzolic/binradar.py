@@ -19,6 +19,7 @@ import binradar_artifacts
 import binradar_baseline
 import binradar_config
 import binradar_feedback
+from binradar_feedback_capture import write_mutation_context
 import binradar_fuzzer
 import binradar_minimizer
 import binradar_pipeline
@@ -1485,8 +1486,12 @@ class BinRadarExecutor:
         binradar_env = self._phase_environment(
             exec_mode, self.run_dir, artifact)
         feedback_staging = os.path.join(self.run_dir, "binradar-feedback")
-        if self.feedback_mode and os.path.exists(feedback_staging):
-            shutil.rmtree(feedback_staging)
+        if self.feedback_mode:
+            if os.path.exists(feedback_staging):
+                shutil.rmtree(feedback_staging)
+            write_mutation_context(
+                self.run_dir, workdir=self.workdir, artifact=tracer_binary,
+                candidates=self.filter_result, input_file=testcase)
         if artifact.cache_enabled:
             binradar_env["BINRADAR_PATCH_CACHE_ENABLE"] = "1"
             binradar_env["BINRADAR_PATCH_MANIFEST"] = str(
@@ -1898,6 +1903,7 @@ class BinRadarExecutor:
                 run_dir=self.run_dir,
                 original_binary=self.artifacts.original,
                 poc_source=self.resolved_poc_input(),
+                candidate_ids=tuple(self.filter_result),
                 poc_fault_reference=self.probe_result.tracer_fault_reference,
                 poc_concrete_fault_addr=self.probe_result.concrete_fault_addr,
                 poc_memcheck_policy=self.probe_result.memcheck_policy,

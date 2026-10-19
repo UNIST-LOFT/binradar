@@ -265,3 +265,22 @@ def test_verifier_never_runs_an_uncompiled_id_on_brpatched(tmp_path):
     assert result is None and patch_result is None
     assert verifier.accept_evidences == {31: 0}
     assert verifier.total_evidences == {31: 0}
+
+
+def test_feedback_singleton_selects_usable_cache(tmp_path, monkeypatch):
+    import binradar_feedback_capture
+
+    monkeypatch.setattr(binradar_feedback_capture.CaptureJournal, "__init__",
+                        lambda self, *args, **kwargs: None)
+    (tmp_path / "run").mkdir()
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, ["=p0p0"])
+    runner = binradar_verifier.BinRadarQemuRunner(
+        str(tmp_path), "bin", "@@", "0x1000", patch_kind="generic-erm")
+    original = binradar_verifier.BinRadarProbeResult(
+        0x1000, 0x1000, [], "ok", 1, 1, 0, [])
+    verifier = binradar_verifier.BinRadarConcreteVerifier(
+        str(tmp_path), str(tmp_path / "run"), runner, original,
+        str(tmp_path / "bin.brpatched"), [1], feedback_mode=True)
+    assert verifier.cache_family == binradar_verifier.PredicateFamily.GENERIC_ERM
+    assert verifier.cached_predicates == {1: "=p0p0"}

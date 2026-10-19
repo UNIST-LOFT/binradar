@@ -1,6 +1,5 @@
 """Taosc feedback artifact export."""
 
-import hashlib
 import os
 import re
 import shutil
@@ -10,6 +9,7 @@ from dataclasses import dataclass
 
 import binradar_evidence
 import binradar_verifier
+from binradar_feedback_export import write_classification
 from binradar_taosc_predicates import parse_cached_snapshots
 import logger
 import sbsv
@@ -24,21 +24,10 @@ class FeedbackExportRequest:
     run_prefix: str
     run_id: int
     save_progress: Callable[[str], None]
+    candidate_ids: tuple[int, ...]
     poc_fault_reference: binradar_verifier.TracerFaultReference | None = None
     poc_concrete_fault_addr: int | None = None
     poc_memcheck_policy: str | None = None
-
-
-def _result_parsers():
-    return binradar_verifier.concrete_result_parsers()
-
-
-def _parse_result_row(line, parsers):
-    try:
-        return binradar_verifier.parse_concrete_result_row(line, parsers)
-    except ValueError:
-        # Export may omit malformed observations; verification must fail instead.
-        return None
 
 
 def _validate_feedback_identity(line: str) -> None:
@@ -252,7 +241,6 @@ def export_feedback(request: FeedbackExportRequest) -> None:
 
 def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
                            mutation_pairs: list[tuple[str, str]]) -> None:
-    minimizer_result_file = os.path.join(request.run_dir, "minimizer.sbsv")
     os.makedirs(feedback_dir)
     shutil.copyfile(
         os.path.join(request.workdir, "binradar.env"),
@@ -293,67 +281,4 @@ def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
             f"[poc-fault-valid {'true' if reference is not None else 'false'}] "
             f"[poc-fault-addr {reference if reference is not None else 0:x}]\n")
 
-    parsers = _result_parsers()
-    copied_hashes = set()
-    copied_counts = {"benign": 0, "malicious": 0}
-    minimized_dir = os.path.join(request.run_dir, "minimized")
-    with open(minimizer_result_file, "r", encoding="utf-8") as result_file:
-        for line_number, line in enumerate(result_file, start=1):
-            row = _parse_result_row(line, parsers)
-            if row is None:
-                continue
-
-            patch_hit = row.data.get("patch-hit")
-            if patch_hit is None or patch_hit <= 0:
-                continue
-
-            exit_info = row["exit"]
-            if (row.data.get("version") != 4
-                    or row.data.get("concrete-oracle") != binradar_verifier.CONCRETE_ORACLE):
-                continue
-            if exit_info == "ok":
-                category = "benign"
-            elif exit_info == "crash":
-                # Concrete inputs were run by QASAN, not the symbolic tracer.
-                # Require the independently recorded oracle/validity on both
-                # observations; never promote a historical bare fault-addr or
-                # use a tracer finding to attest a concrete crash.
-                if (request.poc_concrete_fault_addr is None
-                        or binradar_verifier.concrete_fault_addr_from_row(row) is None
-                        or row["fault-addr"] != request.poc_concrete_fault_addr):
-                    continue
-                category = "malicious"
-            else:
-                continue
-
-            filename = os.path.basename(row["file"])
-            source = os.path.join(minimized_dir, filename)
-            try:
-                with open(source, "rb") as source_file:
-                    data = source_file.read()
-            except OSError as exc:
-                logger.warning(
-                    f"[FEEDBACK] Skipping missing testcase {source} "
-                    f"from minimizer line {line_number}: {exc}")
-                continue
-
-            digest = hashlib.sha256(data).hexdigest()
-            if digest in copied_hashes:
-                continue
-
-            destination_dir = (
-                benign_dir if category == "benign" else malicious_dir)
-            destination = os.path.join(destination_dir, filename)
-            if os.path.exists(destination):
-                destination = os.path.join(
-                    destination_dir, f"{row['id']}_{filename}")
-            shutil.copyfile(source, destination)
-            with open(os.path.join(concrete_dir, "results.sbsv"), "a", encoding="utf-8") as diagnostics:
-                diagnostics.write(line if line.endswith("\n") else line + "\n")
-            copied_hashes.add(digest)
-            copied_counts[category] += 1
-
-    logger.info(
-        f"[FEEDBACK] Copied concrete inputs: "
-        f"benign {copied_counts['benign']}, "
-        f"malicious {copied_counts['malicious']}")
+    write_classification(request, feedback_dir, mutation_pairs)

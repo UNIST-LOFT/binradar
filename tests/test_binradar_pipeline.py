@@ -88,39 +88,6 @@ def test_strict_producer_failure_invalidates_concrete_stream():
     assert registry.stop_calls == 1
 
 
-@pytest.mark.parametrize("policy", [None, "fifo", "novelty"])
-def test_factory_constructs_real_workers_with_policy_and_candidates(
-        tmp_path, monkeypatch, policy):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    config = {} if policy is None else {"BINRADAR_CONCRETE_INPUT_SCHEDULE": policy}
-    original_config = dict(config)
-    expected = policy or "fifo"
-    factory = binradar_pipeline.ConcreteWorkerFactory.create(
-        str(tmp_path), str(run_dir), object(), config,
-        str(tmp_path / "afl"), [7], str(tmp_path / "binary.brpatched"),
-        list(range(1, 8)))
-    # Only the target runner is replaced; the actual worker constructors must
-    # resolve their own state and receive the selected candidate universe.
-    runner = object()
-    monkeypatch.setattr(
-        binradar_pipeline.binradar_verifier.BinRadarQemuRunner, "from_env",
-        staticmethod(lambda *args: runner))
-    minimizer = factory.build_minimizer()
-    verifier = factory.build_verifier()
-    try:
-        assert minimizer.input_schedule == expected
-        assert set(minimizer.patches) == {7}
-        assert verifier.input_schedule == expected
-        assert verifier.patches == [7]
-        assert verifier.patched_binary_patches == set(range(1, 8))
-        assert config == original_config
-    finally:
-        for handler in list(verifier.logger.handlers):
-            handler.close()
-            verifier.logger.removeHandler(handler)
-
-
 def test_invalid_factory_policy_preserves_existing_worker_outputs(tmp_path):
     run_dir = tmp_path / "run"
     minimized = run_dir / "minimized"

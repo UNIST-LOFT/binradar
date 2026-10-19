@@ -28,12 +28,15 @@ def _feedback_executor(tmp_path):
     (workdir / "poc").mkdir()
     (workdir / "poc" / "input").write_bytes(b"poc")
     (workdir / "binradar.env").write_text("BINARY=target\n")
-    (workdir / "brpatches.json").write_text(json.dumps({"version": 1}))
+    (workdir / "brpatches.json").write_text(json.dumps({"version": 1, "kind": "generic-erm",
+        "predicates": [{"id": 1, "source_line": 2, "descriptor": "p0"},
+                       {"id": 2, "source_line": 4, "descriptor": "p1"}]}))
     (workdir / "target.orig").write_bytes(b"original")
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.workdir = str(workdir)
     executor.run_dir = str(run_dir)
     executor.binary = "target"
+    executor.filter_result = [1, 2]
     executor.artifacts = SimpleNamespace(original=str(workdir / "target.orig"))
     executor.poc_input = "poc/input"
     executor.probe_result = SimpleNamespace(
@@ -45,6 +48,9 @@ def _feedback_executor(tmp_path):
     executor.run_id = 0
     progress = []
     executor.save_progress = progress.append
+    from binradar_feedback_capture import CaptureJournal
+    for channel in ("baseline", "verifier"):
+        CaptureJournal(str(run_dir), channel, workdir=str(workdir), candidates=[1, 2])
     return executor, run_dir, progress
 
 
@@ -98,6 +104,11 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
 
 
 def _commits(run_dir, frames, *, truncated_tail=False):
+    from binradar_feedback_capture import write_mutation_context
+    workdir = run_dir.parents[1]
+    write_mutation_context(str(run_dir), workdir=str(workdir),
+                           artifact=str(workdir / "target.orig"), candidates=[1, 2],
+                           input_file=str(workdir / "poc/input"))
     baseline = struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])
     data = struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0) + _frame(4, baseline)
     for iteration, groups in frames:
@@ -142,8 +153,6 @@ def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(
             from binradar_input_schedule import InputScore
             row = row.replace("[time 1]", InputScore(index, 0, 0, 1, "unsupported").serialize() + " [time 1]")
         rows.append(row)
-    rows.insert(0, _full_row(99, "1_malicious", "crash", 0x1234).replace(
-        "[fault-addr 1234]", "[fault-addr nothex]"))
     (run_dir / "minimizer.sbsv").write_text("".join(rows))
     executor.run_feedback()
     concrete = run_dir / "feedback" / "concrete"

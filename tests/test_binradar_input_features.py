@@ -74,14 +74,15 @@ assert os.environ.get('AFL_INST_LIBS') == {os.environ.get('AFL_INST_LIBS')!r}
 libc = ctypes.CDLL(None)
 libc.shmat.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
 libc.shmat.restype = ctypes.c_void_p
-address = libc.shmat(int(os.environ["__AFL_SHM_ID"]), None, 0)
-assert address != ctypes.c_void_p(-1).value
-if {slot!r} is not None:
-    ctypes.c_ubyte.from_address(address + {slot or 0}).value = 7
+if '__AFL_SHM_ID' in os.environ:
+    address = libc.shmat(int(os.environ["__AFL_SHM_ID"]), None, 0)
+    assert address != ctypes.c_void_p(-1).value
+    if {slot!r} is not None:
+        ctypes.c_ubyte.from_address(address + {slot or 0}).value = 7
 with open({str(Path(runner.dir) / 'executions')!r}, 'a') as stream:
     stream.write('one\\n')
-if {hits!r}:
-    os.write(int(os.environ['PATCH_FD']), b'[patch] [id 0] [br 0] [v 1]\\n')
+for _ in range({hits!r}):
+    os.write(int(os.environ['PATCH_FD']), ('[patch] [id %s] [br 0] [v 1]\\n' % os.environ['PATCH_ID']).encode())
 if 'PATCH_CACHED_FD' in os.environ:
     assert os.environ['TAOSC_PRED'] == 'p0'
     os.write(int(os.environ['PATCH_CACHED_FD']), {capture!r})
@@ -282,6 +283,184 @@ def test_instrumentation_environment_cannot_drift_mid_collection(runner, monkeyp
         result = collector.run("input")
         assert result.coverage_reason == "none"
         assert json.loads(collector.metadata["coverage_settings"])["AFL_INST_LIBS"] is None
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_capture_only_never_allocates_map_and_preserves_repeated_states(
+        runner, monkeypatch, supported):
+    if not supported:
+        runner.patch_kind = "CWE805-direct"
+    monkeypatch.setenv("__AFL_SHM_ID", "inherited-invalid-map")
+    monkeypatch.setattr(features, "_CoverageMap", lambda: pytest.fail("capture allocated AFL map"))
+    _child(runner, monkeypatch, hits=3, capture=_record() * 3)
+    with features.BaselineFeatureCollector(
+            runner, [1], coverage_enabled=False) as collector:
+        result = collector.run("input")
+        assert collector._map is None
+        assert collector.metadata["coverage_enabled"] is False
+        assert collector.metadata["map_bytes"] is None
+    assert result.probe.is_normal_exit()
+    assert result.patch.br_selection == [0, 0, 0]
+    assert result.coverage is None and result.coverage_reason == "disabled"
+    if supported:
+        assert len(result.snapshots) == 3
+        assert result.snapshots[0] == result.snapshots[1] == result.snapshots[2]
+        assert result.patch_reason == "none"
+    else:
+        assert result.snapshots is None
+        assert result.patch_reason != "none"
+    assert (Path(runner.dir) / "executions").read_text() == "one\n"
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_fifo_feedback_publishes_durable_states_before_baseline_row(
+        runner, monkeypatch, tmp_path, supported):
+    import binradar_minimizer
+    from binradar_feedback_capture import CaptureJournal
+
+    if not supported:
+        runner.patch_kind = "CWE805-direct"
+    _child(runner, monkeypatch, hits=3, capture=_record() * 3)
+    monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env", lambda *args: runner)
+    monkeypatch.setattr(features, "_CoverageMap", lambda: pytest.fail("FIFO allocated AFL map"))
+    monkeypatch.setattr(binradar_minimizer, "NoveltyScorer",
+                        lambda *args: pytest.fail("FIFO instantiated scorer"))
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "case").write_bytes(b"immutable input")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    baseline = verifier.BinRadarProbeResult(
+        patch_loc=0x1000, patch_func_entry=0x1000, stacktrace=[],
+        exit_info="ok", patch_hit_cnt=1, patch_func_hit_cnt=1,
+        fault_addr=0, patch_func_candidates=[], tracer_fault_reference=None)
+    minimizer = binradar_minimizer.BinRadarMinimizer(
+        str(tmp_path), str(run_dir), baseline, [str(inputs)],
+        {"BINRADAR_FEEDBACK_MODE": "1"}, patches=[1])
+    actual_record = CaptureJournal.record
+    observed = []
+
+    def record(journal, case, filename, **kwargs):
+        assert (run_dir / "minimized" / filename).read_bytes() == b"immutable input"
+        assert "[testcase] [result]" not in Path(minimizer.log_file).read_text()
+        observed.append(kwargs)
+        return actual_record(journal, case, filename, **kwargs)
+
+    monkeypatch.setattr(CaptureJournal, "record", record)
+    assert minimizer.run_testcases() is False
+    assert len(observed) == 1
+    observation = observed[0]
+    assert observation["branches"] == [0, 0, 0]
+    assert observation["members"] == []
+    if supported:
+        assert len(observation["snapshots"]) == 3
+        assert any(path.read_bytes() == _record() * 3
+                   for path in (run_dir / "feedback-capture").rglob("*.brch"))
+    else:
+        assert observation["snapshots"] is None
+        assert observation["state_reason"] != "none"
+    row = Path(minimizer.log_file).read_text()
+    assert "[testcase] [result]" in row and "[minimizer] [done]" in row
+    assert "[schedule-seq" not in row
+    assert (tmp_path / "executions").read_text() == "one\n"
+    assert not minimizer.pending
+
+
+@pytest.mark.parametrize("enabled,stale_mode", [(True, None), (True, "0"), (False, "1")])
+def test_main_feedback_setting_controls_executed_concrete_evidence(
+        runner, monkeypatch, tmp_path, enabled, stale_mode):
+    import binradar_artifacts
+    import binradar_config
+    import binradar_evidence
+    from binradar_feedback_bundle import load_bundle
+    from test_binradar_feedback import binradar
+
+    _child(runner, monkeypatch, hits=3, capture=_record() * 3)
+    monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env", lambda *args: runner)
+    monkeypatch.setattr(features, "_CoverageMap", lambda: pytest.fail("FIFO allocated AFL map"))
+    inputs = tmp_path / "input" / "benign"
+    inputs.mkdir(parents=True)
+    (inputs / "case").write_bytes(b"immutable input")
+    env = {
+        "BINRADAR_OUTDIR": str(tmp_path / "out"), "BINRADAR_TIMEOUT": "60",
+        "BINARY": "target", "POC_INPUT": "input/benign/case", "TEST_CMD": "@@",
+        "PATCH_LOC": "0x1000", "TOTAL_PATCHES": "2",
+        "BINRADAR_FEEDBACK_MODE": "1" if enabled else "0",
+    }
+    (tmp_path / "binradar.env").write_text("\n".join(f"{key}={value}" for key, value in env.items()))
+    executor = object.__new__(binradar.BinRadarExecutor)
+    executor.run_config = binradar_config.RunConfig.from_environment(str(tmp_path), env)
+    executor.config = binradar_config.build_base_environment(executor.run_config, "unused-plt")
+    if stale_mode is not None:
+        executor.config["BINRADAR_FEEDBACK_MODE"] = stale_mode
+    executor.workdir = str(tmp_path)
+    executor.run_dir = str(tmp_path / "out" / "run-00000")
+    Path(executor.run_dir).mkdir(parents=True)
+    executor.binary = "target"
+    executor.poc_input = env["POC_INPUT"]
+    executor.filter_result = [1]
+    executor.brpatched_total_patches = 2
+    executor.artifacts = binradar_artifacts.ArtifactSet(str(tmp_path), "target", "generic-erm", 0, 2)
+    executor.probe_result = verifier.BinRadarProbeResult(
+        patch_loc=0x1000, patch_func_entry=0x1000, stacktrace=[],
+        exit_info="ok", patch_hit_cnt=1, patch_func_hit_cnt=1,
+        fault_addr=0, patch_func_candidates=[], tracer_fault_reference=None)
+    executor.run_prefix, executor.run_id = "run", 0
+    progress = []
+    executor.save_progress = progress.append
+    factory = executor._concrete_worker_factory(require_verifier=True)
+    minimizer = factory.build_minimizer()
+    minimizer.min_file_age = 0
+    concrete = factory.build_verifier()
+    assert minimizer.run_testcases() is False
+    assert concrete.run_verification_streaming(factory.minimizer_result_file, timeout=10) is False
+    result = binradar_evidence.read_verifier(Path(executor.run_dir) / "verifier.br")
+    assert result.patches[1].observations["no-crash-pass-same-br"] == 1
+    assert (tmp_path / "executions").read_text() == "one\none\n"
+    if enabled:
+        executor.run_feedback()
+        bundle = load_bundle(Path(executor.run_dir) / "feedback")
+        assert bundle.predicates[1]["concrete-counts"] == "0,0,1,0,0,0"
+        assert bundle.coverage["c0"]["status"] == "complete"
+        assert {trace["representative"] for trace in bundle.traces.values()} == {0, 1}
+        for trace in bundle.traces.values():
+            assert [state.branch for state in bundle.states(trace["key"])] == [0, 0, 0]
+    else:
+        assert not (Path(executor.run_dir) / "feedback-capture").exists()
+
+
+@pytest.mark.parametrize("termination", ["failed", "wall-time-reached"])
+def test_feedback_interruption_never_claims_complete_capture(
+        runner, monkeypatch, tmp_path, termination):
+    import queue
+    import binradar_minimizer
+
+    monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env", lambda *args: runner)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    minimizer = binradar_minimizer.BinRadarMinimizer(
+        str(tmp_path), str(run_dir), None, [],
+        {"BINRADAR_FEEDBACK_MODE": "1"}, patches=[1])
+    if termination == "failed":
+        failures = queue.Queue()
+        failures.put(RuntimeError("producer failed"))
+        with pytest.raises(RuntimeError, match="producer failed"):
+            minimizer.run_testcases(producer_exc_queue=failures)
+    else:
+        checks = []
+
+        def cutoff(deadline):
+            checks.append(deadline)
+            if len(checks) == 2:
+                raise binradar_minimizer._MinimizerTimeout()
+
+        monkeypatch.setattr(minimizer, "_raise_if_timed_out", cutoff)
+        assert minimizer.run_testcases() is True
+    assert "[minimizer] [done]" not in Path(minimizer.log_file).read_text()
+    assert not list((run_dir / "minimized").iterdir())
+    terminal = run_dir / "feedback-capture" / "baseline" / "terminal.json"
+    assert json.loads(terminal.read_text())["reason"] == termination
+    assert not (tmp_path / "executions").exists()
 
 
 def test_descriptor_digest_is_order_independent_and_candidate_bound():

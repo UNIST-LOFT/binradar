@@ -232,4 +232,5 @@ class ConcreteWorkerFactory:
             self.workdir, self.run_dir, runner, self.probe_result,
             self.verifier_binary, list(self.patches),
             patched_binary_patches=list(self.patched_binary_patches),
+            feedback_mode=self.config.get("BINRADAR_FEEDBACK_MODE", "0") == "1",
             input_schedule=self.config["BINRADAR_CONCRETE_INPUT_SCHEDULE"])

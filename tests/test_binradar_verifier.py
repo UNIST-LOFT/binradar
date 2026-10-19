@@ -243,6 +243,32 @@ def test_historical_probe_cannot_claim_current_concrete_oracle(version):
         restored.serialize()
 
 
+@pytest.mark.parametrize("defect", ["raw-id", "family", "partial", "hit-count", "text-id"])
+def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, monkeypatch, defect):
+    import binradar_taosc_predicates as predicates
+
+    runner = binradar_verifier.BinRadarQemuRunner(
+        str(tmp_path), "target", "@@", "0x1000", patch_kind="generic-erm")
+    flags = predicates.CACHED_SNAPSHOT_FLAG_CWE805 if defect == "family" else 0
+    raw = predicates.CACHED_SNAPSHOT_HEADER.pack(
+        predicates.CACHED_SNAPSHOT_MAGIC, predicates.CACHED_SNAPSHOT_VERSION,
+        9 if defect == "raw-id" else 0, 0, 0, flags)
+    if flags:
+        raw += predicates.CACHED_SNAPSHOT_CLAMPS.pack(*([0] * 512))
+    raw += predicates.CACHED_SNAPSHOT_REGS.pack(*([0] * 16))
+    if defect == "partial":
+        raw = raw[:-1]
+    observed = _concrete_probe(None, "ok")
+    if defect == "hit-count":
+        observed.patch_hit_cnt = 2
+    text_id = 1 if defect == "text-id" else 0
+    monkeypatch.setattr(runner, "_test_with_capture", lambda *args, **kwargs: (
+        observed, f"[patch] [id {text_id}] [br 0]\n".encode(), raw))
+    actual, cached = runner.test_with_cached(5, "=p0p0", "input")
+    assert actual is observed
+    assert cached is None
+
+
 def test_concrete_only_probe_does_not_claim_tracer_policy():
     probe = binradar_verifier.BinRadarProbeResult.from_log(
         "[patch-info] [set true] [location 1000]\n[exit] [result crash]\n")

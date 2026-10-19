@@ -22,6 +22,7 @@ import logger
 
 import binradar_evidence
 import binradar_utils
+from binradar_feedback_capture import CaptureJournal
 from binradar_input_schedule import InputScore, split_score
 from binradar_taosc_predicates import (
     CachedSnapshot,
@@ -1371,10 +1372,15 @@ class BinRadarQemuRunner:
             },
             capture_cached=True)
         if probe is None or patch_data is None or cached_data is None:
-            return None, None
+            return probe, None
         snapshots, error = parse_cached_snapshots(cached_data)
         if error is not None:
             logger.warning(f"Cached capture rejected: {error}")
+            return probe, None
+        if any(snapshot.patch_id != 0
+               or snapshot.is_CWE805 != (not isinstance(predicate, str))
+               for snapshot in snapshots):
+            logger.warning("Cached capture runtime id or predicate family mismatch")
             return probe, None
         if probe.patch_hit_cnt != len(snapshots):
             logger.warning(
@@ -1451,6 +1457,8 @@ class BinRadarConcreteVerifierResult:
             patch_id = feedback["patch"]
             self.feedback_counts[patch_id] = self.feedback_counts.get(patch_id, 0) + 1
             self.feedback[patch_id] = dict(feedback.data)
+            if feedback["security-res"] == "rejected":
+                self.patch_verified[patch_id] = False
         
         # Legacy verifier files have verdict rows but no confidence rows.
         # Represent their unknown evidence as the documented 0/0 score.
@@ -1536,7 +1544,8 @@ class BinRadarConcreteVerifierResult:
         instance.feedback_counts = {}
         instance.stop_reason = evidence.stop_reason
         for patch, record in evidence.patches.items():
-            instance.patch_verified[patch] = record.verified
+            instance.patch_verified[patch] = (
+                record.verified and not record.security_rejected)
             instance.patch_verdict_counts[patch] = 1
             instance.accept_evidences[patch] = record.accept_evidences
             instance.total_evidences[patch] = record.total_evidences
@@ -1646,10 +1655,9 @@ class BinRadarConcreteVerifier:
         self.patched_binary_patches = (
             None if patched_binary_patches is None
             else set(patched_binary_patches))
-        # Run the cached path for a single surviving candidate too when it is
-        # not compiled into .brpatched; otherwise there is no artifact that
-        # can execute it at all.
-        cache_needed = len(patches) > 1 or any(
+        # Feedback captures states even for a compiled singleton. Cached-only
+        # survivors also need this path: .brpatched cannot execute their ids.
+        cache_needed = feedback_mode or len(patches) > 1 or any(
             not self._patched_executable(patch) for patch in patches)
         if cache_needed:
             coverage = load_cached_predicate_set(
@@ -1662,6 +1670,9 @@ class BinRadarConcreteVerifier:
             else:
                 self.cache_family = coverage.family
                 self.cached_predicates = coverage.predicates
+        self.capture_journal = (CaptureJournal(
+            run_dir, "verifier", workdir=dir, candidates=patches)
+            if feedback_mode else None)
 
     def _patched_executable(self, patch: int) -> bool:
         """True when ``patch`` may run on the .brpatched artifact."""
@@ -1688,6 +1699,7 @@ class BinRadarConcreteVerifier:
         )
 
     def _record_observation(self, patch: int, name: str) -> None:
+        self._last_observation = name
         counts = self.observation_counts.setdefault(patch, {})
         counts[name] = counts.get(name, 0) + 1
 
@@ -1748,7 +1760,8 @@ class BinRadarConcreteVerifier:
             verdict, testcase = self.verdicts[patch]
             records.append(binradar_evidence.VerifierPatchResult(
                 patch=patch,
-                verified=(verdict == "verified"),
+                verified=(verdict == "verified"
+                          and patch not in self.security_rejected),
                 accept_evidences=self.accept_evidences.get(patch, 0),
                 total_evidences=self.total_evidences.get(patch, 0),
                 observations=dict(self.observation_counts.get(patch, {})),
@@ -1778,6 +1791,8 @@ class BinRadarConcreteVerifier:
         one diagnostic line each; the representative line plus the compact
         terminal summaries preserve the observable evidence.
         """
+        self._last_observation = "unobserved"
+
         def detail(message: str) -> None:
             if log_detail:
                 self.logger.info(message)
@@ -1880,12 +1895,31 @@ class BinRadarConcreteVerifier:
         """Run one candidate normally and return whether it is rejected."""
         self._raise_if_timed_out(deadline)
         self.logger.info(f"[testcase] [try] [patch {patch}] [id {testcase.id}] / {len(self.testcases)}: [file {testcase.filename}]")
+        if not self._patched_executable(patch):
+            if self.capture_journal is not None:
+                self.capture_journal.skip(
+                    testcase.id, testcase.filename, [patch],
+                    "not-run-no-executable-artifact")
+            return False
         result, patch_result = self.run_testcase_patched(patch, testcase)
-        self._raise_if_timed_out(deadline)
+        if not self.feedback_mode:
+            self._raise_if_timed_out(deadline)
+        rejected = False
+        observation = "attempted-unusable"
         if result is None:
             self.logger.error(f"Failed to run the test case {testcase.filename} with patched binary.")
-            return False
-        return self._test_result(patch, testcase, result, patch_result)
+        else:
+            rejected = self._test_result(patch, testcase, result, patch_result)
+            observation = self._last_observation
+        if self.capture_journal is not None:
+            self.capture_journal.record(
+                testcase.id, testcase.filename, representative=patch,
+                members=[patch], probe=result,
+                branches=(patch_result.br_selection if patch_result else None),
+                artifact=self.runner.patched_binary(),
+                state_reason="noncached-execution",
+                observation=observation)
+        return rejected
 
     def _cached_branches(
         self, patch: int, snapshots: List[CachedSnapshot],
@@ -1950,6 +1984,9 @@ class BinRadarConcreteVerifier:
         rejection callbacks retain conclusive evidence if a later child fails.
         """
         quantum_end = time.monotonic() + CONCRETE_INPUT_QUANTUM_SECONDS
+        journal = self.capture_journal
+        if journal is not None:
+            journal.start(testcase.id, testcase.filename)
 
         def record_rejection(patch: int) -> None:
             if on_rejected is not None:
@@ -1963,6 +2000,9 @@ class BinRadarConcreteVerifier:
                 break
             representative = patches[sweep.pop()]
             if representative not in active:
+                if journal is not None:
+                    journal.skip(testcase.id, testcase.filename,
+                                 [representative], "not-run-global-reject")
                 continue
             worked = True
             if self.cache_family is None:
@@ -1974,8 +2014,16 @@ class BinRadarConcreteVerifier:
                 f"[id {testcase.id}] [file {testcase.filename}]")
             result, cached = self.run_testcase_cached(
                 representative, testcase)
-            self._raise_if_timed_out(deadline)
+            if not self.feedback_mode:
+                self._raise_if_timed_out(deadline)
             if result is None or cached is None:
+                if journal is not None:
+                    journal.record(
+                        testcase.id, testcase.filename,
+                        representative=representative, members=[], probe=result,
+                        branches=None, artifact=self.runner.cached_binary(),
+                        state_reason="invalid-cached-capture",
+                        observation="attempted-unusable")
                 self.logger.warning(
                     f"[verifier-cache] [fallback] [patch {representative}] "
                     f"[id {testcase.id}]")
@@ -1988,6 +2036,13 @@ class BinRadarConcreteVerifier:
             evaluated = self._cached_branches(
                 representative, cached.snapshots, environments)
             if evaluated is None or evaluated != observed:
+                if journal is not None:
+                    journal.record(
+                        testcase.id, testcase.filename,
+                        representative=representative, members=[], probe=result,
+                        branches=observed, artifact=self.runner.cached_binary(),
+                        state_reason="runtime-mismatch",
+                        observation="attempted-unusable")
                 self.logger.warning(
                     f"[verifier-cache] [runtime-mismatch] "
                     f"[patch {representative}] [id {testcase.id}]")
@@ -2012,12 +2067,19 @@ class BinRadarConcreteVerifier:
                     representative, testcase, result,
                     representative_result):
                 record_rejection(representative)
+            observation = self._last_observation
+            members = [representative] if journal is not None else None
 
             equivalent = 0
             for index in sweep.pending_indices():
+                if not self.feedback_mode:
+                    self._raise_if_timed_out(deadline)
                 patch = patches[index]
                 if patch not in active:
                     sweep.discard(index)
+                    if journal is not None:
+                        journal.skip(testcase.id, testcase.filename,
+                                     [patch], "not-run-global-reject")
                     continue
                 start_index = 0
                 if observed and first_branches is not None:
@@ -2039,11 +2101,19 @@ class BinRadarConcreteVerifier:
                 if matches:
                     sweep.discard(index)
                     equivalent += 1
+                    if members is not None:
+                        members.append(patch)
                     if self._test_result(
                             patch, testcase, result,
                             BinRadarPatchResult(patch, observed),
                             log_detail=False):
                         record_rejection(patch)
+            if journal is not None:
+                journal.record(
+                    testcase.id, testcase.filename,
+                    representative=representative, members=members,
+                    probe=result, branches=observed, artifact=self.runner.cached_binary(),
+                    snapshots=cached.snapshots, observation=observation)
             if equivalent:
                 self.logger.info(
                     f"[verifier-cache] [group] "
@@ -2317,6 +2387,13 @@ class BinRadarConcreteVerifier:
                             on_rejected=lambda patch, testcase=testcase:
                                 record_rejection(patch, testcase))
                         if not pending_patches:
+                            if self.capture_journal is not None:
+                                skipped = [patches[index]
+                                           for index in sweep.pending_indices()]
+                                if skipped:
+                                    self.capture_journal.skip(
+                                        testcase.id, testcase.filename, skipped,
+                                        "not-run-global-reject")
                             sweep.remaining = 0
                         if sweep.remaining:
                             resumable += 1
@@ -2340,6 +2417,10 @@ class BinRadarConcreteVerifier:
                 self._raise_if_timed_out(deadline)
         except _VerifierTimeout:
             timed_out = True
+        except BaseException:
+            if self.capture_journal is not None:
+                self.capture_journal.finish("error")
+            raise
 
         if timed_out:
             terminal_reason = binradar_utils.WALL_TIME_REACHED
@@ -2351,6 +2432,19 @@ class BinRadarConcreteVerifier:
             f"[inflight {int(inflight)}]")
         for patch in patches:
             if patch in pending_patches:
-                self._log_result(patch, "verified", "")
+                self._log_result(
+                    patch, "rejected" if patch in self.security_rejected
+                    else "verified", "")
         self._write_results()
+        if self.capture_journal is not None:
+            if terminal_reason == "all-rejected":
+                for _, _, testcase, sweep in pending:
+                    if sweep is not None:
+                        skipped = [patches[index]
+                                   for index in sweep.pending_indices()]
+                        if skipped:
+                            self.capture_journal.skip(
+                                testcase.id, testcase.filename, skipped,
+                                "not-run-global-reject")
+            self.capture_journal.finish(terminal_reason)
         return timed_out

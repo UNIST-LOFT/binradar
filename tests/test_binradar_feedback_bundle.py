@@ -1,0 +1,361 @@
+"""Semantic regressions for the producer's normalized Taosc handoff."""
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from test_binradar_feedback import _commits, _feedback_executor, _full_row
+from test_binradar_evidence import _group
+import binradar_feedback_bundle as bundle_reader
+from binradar_feedback_capture import CaptureJournal, decode_ids, unpack_branches
+from binradar_taosc_predicates import CachedSnapshot
+import binradar_verifier as verifier
+
+
+def _probe(outcome="normal", fault=0):
+    return SimpleNamespace(
+        exit_info={"normal": "ok", "crash": "crash", "timeout": "timeout"}[outcome],
+        concrete_oracle=verifier.CONCRETE_ORACLE,
+        concrete_fault_addr=fault if outcome == "crash" else None,
+        concrete_fault_source="native" if outcome == "crash" else "unavailable",
+        raw_fault_addr=fault if outcome == "crash" else 0)
+
+
+def _states(patch, values, branches):
+    return [CachedSnapshot(patch_id=patch, branch=branch,
+                           registers=(value & ((1 << 64) - 1),) + (0,) * 15)
+            for value, branch in zip(values, branches)]
+
+
+class _CaptureRun:
+    def __init__(self, tmp_path, candidates=(1, 2)):
+        self.executor, self.run_dir, self.progress = _feedback_executor(tmp_path)
+        self.candidates = tuple(candidates)
+        self.executor.filter_result = list(candidates)
+        self.workdir = tmp_path / "workdir"
+        # A real generic expression: signed rax > 5. Physical source lines are
+        # deliberately distinct from runtime ids.
+        (self.workdir / "brpatches.json").write_text(json.dumps({
+            "version": 1, "kind": "generic-erm", "predicates": [
+                {"id": patch, "source_line": 2 * patch,
+                 "descriptor": ">v0p5"} for patch in candidates]}))
+        self.baseline = CaptureJournal(str(self.run_dir), "baseline",
+                                      workdir=str(self.workdir), candidates=candidates)
+        self.verifier = CaptureJournal(str(self.run_dir), "verifier",
+                                      workdir=str(self.workdir), candidates=candidates)
+        self.rows = []
+
+    def case(self, case, *, outcome="normal", branches=(0,), values=None):
+        filename = f"case-{case}"
+        (self.run_dir / "minimized" / filename).write_bytes(f"input-{case}".encode())
+        fault = 0x1234 if outcome == "crash" else 0
+        row = _full_row(case, filename, "crash" if outcome == "crash" else "ok",
+                        fault, patch_hit=len(branches))
+        row = row.replace("[br [0]]", "[br [" + "] [".join(map(str, branches)) + "]]")
+        self.rows.append(row)
+        if values is None:
+            values = [8] * len(branches)
+        self.baseline.record(case, filename, representative=0, members=[],
+                             probe=_probe(outcome, fault), branches=branches,
+                             artifact=str(self.workdir / "target.orig"),
+                             snapshots=_states(0, values, branches))
+        self.verifier.start(case, filename)
+        return filename
+
+    def trace(self, case, patch, *, branches=(0,), values=None,
+              outcome="normal", fault=0, observation="no-crash-pass-same-br",
+              captured=True):
+        if values is None:
+            values = [8] * len(branches or ())
+        return self.verifier.record(
+            case, f"case-{case}", representative=patch, members=[patch],
+            probe=_probe(outcome, fault), branches=branches,
+            artifact=str(self.workdir / "target.orig"),
+            snapshots=_states(patch, values, branches) if captured else None,
+            observation=observation)
+
+    def export(self):
+        self.baseline.finish("completed")
+        self.verifier.finish("completed")
+        (self.run_dir / "minimizer.sbsv").write_text("".join(self.rows))
+        self.executor.run_feedback()
+        return bundle_reader.load_bundle(self.run_dir / "feedback")
+
+
+def test_normalized_round_trip_preserves_order_repetition_and_executed_trace_lengths(tmp_path):
+    run = _CaptureRun(tmp_path)
+    run.case(0, branches=(0, 0, 0, 0), values=[8, 4, 8, -1])
+    first = run.trace(0, 1, branches=(1, 0, 1, 0), values=[8, 4, 8, -1],
+                      observation="no-crash-confidence-diff-br")
+    second = run.trace(0, 2, branches=(0, 1), values=[4, 8],
+                       observation="no-crash-confidence-diff-br")
+    bundle = run.export()
+
+    assert bundle.selected == {1, 2}
+    assert set(bundle.traces) == {"c0-b1", first, second}
+    assert [state.registers[0] for state in bundle.states(first)] == [8, 4, 8, (1 << 64) - 1]
+    assert bundle.evaluate(1, first) == [1, 0, 1, 0]
+    assert bundle.evaluate(2, first) == [1, 0, 1, 0]
+    assert bundle.evaluate(1, second) == [0, 1]
+    assert bundle.traces[first]["hits"] == 4
+    assert bundle.traces[second]["hits"] == 2
+    assert unpack_branches(bundle.traces[first]["hits"], bundle.traces[first]["branches"]) == [1, 0, 1, 0]
+    assert bundle.traces[first]["state"] != bundle.traces[second]["state"]
+    assert [(row["trace"], row["members"], row["bin"]) for row in bundle.observations] == [
+        (first, "1", "no-crash-confidence-diff-br"),
+        (second, "2", "no-crash-confidence-diff-br")]
+    assert bundle.inputs["c0"]["baseline"] == "c0-b1"
+    assert (bundle.root / bundle.inputs["c0"]["file"]).read_bytes() == b"input-0"
+    assert bundle.predicates[2]["tid"] == 4
+    assert bundle.metadata["state"]["alignment"] == "trace-local-order-only"
+    assert bundle.metadata["state"]["offline_evaluation"] == "guard-values-only-not-execution-outcomes"
+
+
+def test_observed_four_classes_insufficient_and_both_hard_reject_bins(tmp_path):
+    run = _CaptureRun(tmp_path, range(1, 8))
+    run.case(0, outcome="crash")
+    for patch in range(1, 8):
+        run.trace(0, patch, observation="crash-pass")
+    run.case(1, outcome="crash")
+    for patch in (2, 4):
+        run.trace(1, patch, outcome="crash", fault=0x1234, observation="crash-fail")
+    run.case(2)
+    for patch in (1, 2):
+        run.trace(2, patch)
+    for patch in (3, 4):
+        run.trace(2, patch, branches=(1,), observation="no-crash-confidence-diff-br")
+    run.trace(2, 6, outcome="crash", fault=0x1234, observation="no-crash-fail")
+    run.trace(2, 7, branches=(2,), observation="patch-crashed")
+    bundle = run.export()
+
+    assert {patch: row["concrete"] for patch, row in bundle.predicates.items()} == {
+        1: "ground-truth-equivalent", 2: "subset", 3: "superset", 4: "mixed",
+        5: "insufficient-evidence"}
+    assert {patch: row["concrete-counts"] for patch, row in bundle.predicates.items()} == {
+        1: "0,1,1,0,0,0", 2: "1,1,1,0,0,0", 3: "0,1,0,1,0,0",
+        4: "1,1,0,1,0,0", 5: "0,1,0,0,0,0"}
+    assert set(bundle.excluded) == {6, 7}
+    assert bundle.excluded[6]["reason"] == bundle.excluded[7]["reason"] == "hard-reject"
+    assert bundle.excluded[6]["concrete-counts"] == "0,1,0,0,1,0"
+    assert bundle.excluded[7]["concrete-counts"] == "0,1,0,0,0,1"
+    # Exclusion is a global decision, not invented executions for missing cases.
+    assert all(not (row["input"] == "c1" and set(decode_ids(row["members"])) & {6, 7})
+               for row in bundle.observations)
+    assert decode_ids(bundle.coverage["c1"]["not-run"]) == [1, 3, 5, 6, 7]
+
+
+def test_missing_skipped_and_unusable_are_case_scoped_not_synthetic_observations(tmp_path):
+    run = _CaptureRun(tmp_path, range(1, 5))
+    run.case(0)
+    run.trace(0, 1)
+    run.verifier.skip(0, "case-0", [2], "security-rejected")
+    timeout = run.trace(0, 3, outcome="timeout", branches=None,
+                        observation="no-crash-timeout", captured=False)
+    run.case(1)
+    run.trace(1, 2)
+    run.trace(1, 4)
+    run.case(2)
+    bundle = run.export()
+
+    assert bundle.coverage["c0"] == {
+        "input": "c0", "status": "partial", "not-run": "4", "unusable": "3", "skipped": "2"}
+    assert bundle.coverage["c1"] == {
+        "input": "c1", "status": "partial", "not-run": "1,3", "unusable": "none", "skipped": "none"}
+    assert bundle.coverage["c2"] == {
+        "input": "c2", "status": "unavailable", "not-run": "1-4", "unusable": "none", "skipped": "none"}
+    assert len(bundle.observations) == 4
+    assert [(row["trace"], row["bin"]) for row in bundle.observations if row["members"] == "3"] == [(timeout, "unusable")]
+    assert not any(row["input"] == "c2" for row in bundle.observations)
+    with pytest.raises(ValueError, match="no complete state"):
+        bundle.states(timeout)
+
+
+@pytest.mark.parametrize("stale", ["input", "state"])
+def test_stale_capture_is_rejected_before_replacing_published_bundle(tmp_path, stale):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    published = run.run_dir / "feedback"
+    published.mkdir()
+    sentinel = published / "keep"
+    sentinel.write_bytes(b"previous publication")
+    if stale == "input":
+        (run.run_dir / "minimized/case-0").write_bytes(b"changed after capture")
+    else:
+        payload = next((run.run_dir / "feedback-capture/states").glob("*.brch"))
+        payload.write_bytes(payload.read_bytes() + b"corruption")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        run.export()
+    assert sentinel.read_bytes() == b"previous publication"
+    assert not (published / "feedback.sbsv").exists()
+
+
+def test_concrete_and_mutation_evidence_never_pool_into_sufficient_classification(tmp_path):
+    run = _CaptureRun(tmp_path)
+    run.case(0, outcome="crash")
+    run.trace(0, 1, observation="crash-pass")
+    # The mutation domain supplies only a normal-baseline observation; together
+    # these would be sufficient if a consumer accidentally pooled the domains.
+    _commits(run.run_dir, [(2, [
+        _group(0, 1, 0, [0], [0]),
+        _group(1, 1, 0, [0], [1])])])
+    bundle = run.export()
+    candidate = bundle.predicates[1]
+    assert candidate["concrete-counts"] == "0,1,0,0,0,0"
+    assert candidate["mutation-counts"] == "0,0,1,0,0,0"
+    assert candidate["concrete"] == candidate["mutation"] == "insufficient-evidence"
+    assert bundle.inputs["c0"]["domain"] == "concrete"
+    assert bundle.inputs["m2"]["domain"] == "mutation"
+    assert {(row["input"], row["bin"]) for row in bundle.observations} == {
+        ("c0", "crash-pass"), ("m2", "no-crash-pass-same-br")}
+
+
+@pytest.mark.parametrize("channels", [("baseline",), ("verifier",), ("baseline", "verifier")])
+@pytest.mark.parametrize("timestamped", [False, True])
+def test_missing_capture_headers_do_not_replace_valid_feedback(tmp_path, channels, timestamped):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    if timestamped:
+        run.rows = ["2026-10-19 00:00:00,000 - " + row for row in run.rows]
+    run.trace(0, 1)
+    bundle = run.export()
+    published = (bundle.root / "feedback.sbsv").read_bytes()
+    completed = list(run.progress)
+    for channel in channels:
+        (run.run_dir / "feedback-capture" / channel / "header.json").unlink()
+    with pytest.raises(ValueError, match="Concrete feedback capture missing"):
+        run.executor.run_feedback()
+    assert (bundle.root / "feedback.sbsv").read_bytes() == published
+    assert sum("[done]" in row for row in run.progress) == sum("[done]" in row for row in completed)
+
+
+def test_nonfeedback_verifier_cannot_publish_feedback_even_with_capture_headers(tmp_path):
+    import binradar_evidence as evidence
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    bundle = run.export()
+    published = (bundle.root / "feedback.sbsv").read_bytes()
+    records = [evidence.VerifierPatchResult(
+        patch=patch, verified=True, accept_evidences=0, total_evidences=0,
+        observations={}, testcase="", has_feedback=False,
+        feedback_accepted=False, security_rejected=False) for patch in (1, 2)]
+    evidence.write_verifier(run.run_dir / "verifier.br", records, "exhausted")
+    with pytest.raises(ValueError, match="did not run in feedback mode"):
+        run.executor.run_feedback()
+    assert (bundle.root / "feedback.sbsv").read_bytes() == published
+
+
+def test_mutation_only_export_does_not_require_absent_concrete_workers(tmp_path):
+    run = _CaptureRun(tmp_path)
+    for channel in ("baseline", "verifier"):
+        (run.run_dir / "feedback-capture" / channel / "header.json").unlink()
+    _commits(run.run_dir, [(2, [
+        _group(0, 1, 0, [0], [0]), _group(1, 1, 0, [0], [1])])])
+    bundle = run.export()
+    assert {row["domain"] for row in bundle.inputs.values()} == {"mutation"}
+    assert bundle.predicates[1]["mutation-counts"] == "0,0,1,0,0,0"
+    assert bundle.metadata["capture"] == {"baseline": None, "verifier": None}
+
+
+@pytest.mark.parametrize("missing", ["identity", "reference"])
+def test_unidentified_candidate_crash_remains_unusable_not_export_failure(tmp_path, missing):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    result = _probe("crash", 0x9000)
+    if missing == "identity":
+        result.concrete_fault_addr = None
+        result.concrete_fault_source = "unavailable"
+    else:
+        run.executor.probe_result.concrete_fault_addr = None
+    run.verifier.record(0, "case-0", representative=1, members=[1], probe=result,
+                        branches=[0], artifact=str(run.workdir / "target.orig"),
+                        observation="no-crash-skip-diff-addr")
+    bundle = run.export()
+    assert bundle.observations[0]["bin"] == "unusable"
+    assert bundle.coverage["c0"]["unusable"] == "1"
+    assert bundle.predicates[1]["concrete-counts"] == "0,0,0,0,0,0"
+
+
+def test_terminal_hard_reject_is_excluded_when_its_witness_was_not_published(tmp_path):
+    import binradar_evidence as evidence
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    records = [evidence.VerifierPatchResult(
+        patch=patch, verified=patch == 2, accept_evidences=0, total_evidences=0,
+        observations={}, testcase="", has_feedback=True,
+        feedback_accepted=patch == 2, security_rejected=patch == 1) for patch in (1, 2)]
+    evidence.write_verifier(run.run_dir / "verifier.br", records, "failed")
+    bundle = run.export()
+    assert bundle.excluded[1]["reason"] == "hard-reject-witness-unavailable"
+    assert 1 not in bundle.predicates
+    assert bundle.observations == []
+    assert bundle.coverage["c0"]["not-run"] == "1-2"
+
+
+@pytest.mark.parametrize("conflicting_writes", [False, True])
+def test_mutation_label_comes_from_baseline_and_write_sets_must_agree(tmp_path, conflicting_writes):
+    from test_binradar_feedback import _pair
+    run = _CaptureRun(tmp_path)
+    _pair(run.run_dir, patch=0, branches=(0,), outcome="crash", fault=0x1234,
+          source="guest-signal")
+    _, candidate = _pair(run.run_dir, patch=1, branches=(1,), outcome="normal")
+    _commits(run.run_dir, [(2, [
+        _group(0, 2, 0x1234, [0], [0], source="guest-signal"),
+        _group(1, 1, 0, [1], [1])])])
+    if conflicting_writes:
+        candidate.write_text(candidate.read_text().replace("00100000", "00200000"))
+        with pytest.raises(ValueError, match="disagree on write set"):
+            run.export()
+        return
+    bundle = run.export()
+    assert bundle.inputs["m2"]["label"] == "target-crash"
+    assert bundle.observations[0]["bin"] == "crash-pass"
+    assert bundle.predicates[1]["mutation-counts"] == "0,1,0,0,0,0"
+    trace = bundle.traces[bundle.observations[0]["trace"]]
+    assert trace["state"].startswith("binradar/")
+    assert bundle.states(trace["key"])[0].branch == 1
+
+
+@pytest.mark.parametrize("damage", ["coverage", "summary", "input-bytes"])
+def test_reader_rejects_inconsistent_evidence_not_just_syntax(tmp_path, damage):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    bundle = run.export()
+    path = bundle.root / "feedback.sbsv"
+    if damage == "input-bytes":
+        (bundle.root / bundle.inputs["c0"]["file"]).write_bytes(b"changed")
+    else:
+        text = path.read_text()
+        if damage == "coverage":
+            text = text.replace("[not-run 2]", "[not-run none]")
+        else:
+            text = text.replace("[concrete-counts 0,0,1,0,0,0]", "[concrete-counts 0,0,2,0,0,0]")
+        path.write_text(text)
+    with pytest.raises(ValueError, match="disagrees|checksum mismatch"):
+        bundle_reader.load_bundle(path)
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong-count", "truncated", "trailing", "duplicate-field"])
+def test_reader_rejects_malformed_complete_marker(tmp_path, damage):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    bundle = run.export()
+    path = bundle.root / "feedback.sbsv"
+    lines = path.read_text().splitlines(keepends=True)
+    assert lines[-1].startswith("[done]")
+    if damage == "absent":
+        lines.pop()
+    elif damage == "wrong-count":
+        lines[-1] = lines[-1].replace("[inputs 1]", "[inputs 2]")
+    elif damage == "truncated":
+        lines[-1] = lines[-1].rstrip("\n")
+    elif damage == "trailing":
+        lines.append(lines[-1])
+    else:
+        lines[-1] = lines[-1].rstrip("\n") + " [inputs 1]\n"
+    path.write_text("".join(lines))
+    with pytest.raises(ValueError):
+        bundle_reader.load_bundle(path)

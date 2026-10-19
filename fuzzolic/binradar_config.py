@@ -339,6 +339,7 @@ def build_worker_environment(
         "PATCH_LOC": config.patch_loc,
         "E9_METADATA_PREFIX": config.e9_metadata_prefix,
         "TOTAL_PATCHES": str(config.total_patches),
+        "BINRADAR_FEEDBACK_MODE": "1" if config.feedback_mode else "0",
         "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
     })
     return environment

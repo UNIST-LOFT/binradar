@@ -19,6 +19,7 @@ from typing import List, Dict, Set, Tuple, Any, Optional, Sequence
 import binradar_utils
 import binradar_verifier
 import binradar_config
+from binradar_feedback_capture import CaptureJournal
 from binradar_input_features import BaselineFeatureCollector
 from binradar_input_schedule import InputScore, NoveltyScorer
 
@@ -106,6 +107,8 @@ class BinRadarMinimizer:
         self._candidate_digest = binradar_verifier.concrete_candidate_digest(self.patches)
         self._collector: Optional[BaselineFeatureCollector] = None
         self._scorer: Optional[NoveltyScorer] = None
+        self.feedback_mode = config.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
+        self._capture_journal: Optional[CaptureJournal] = None
         self.work_dir = work_dir
         self.run_dir = run_dir
         self.minimized_dir = os.path.join(run_dir, "minimized")
@@ -233,9 +236,19 @@ class BinRadarMinimizer:
             with ExitStack() as resources:
                 self._raise_if_cancelled(cancel_event)
                 self._raise_if_timed_out(deadline)
-                if self.input_schedule == "novelty":
+                if self.input_schedule == "novelty" or self.feedback_mode:
                     self._collector = resources.enter_context(
-                        BaselineFeatureCollector(runner, self.patches))
+                        BaselineFeatureCollector(
+                            runner, self.patches,
+                            coverage_enabled=self.input_schedule == "novelty"))
+                    if self.feedback_mode:
+                        self._capture_journal = CaptureJournal(
+                            self.run_dir, "baseline", workdir=self.work_dir,
+                            candidates=self.patches,
+                            context=dict(self._collector.metadata,
+                                         descriptor_digest=self._collector.descriptor_digest,
+                                         input_schedule=self.input_schedule))
+                if self.input_schedule == "novelty":
                     namespace = self._candidate_digest + ":" + self._collector.descriptor_digest
                     self._scorer = resources.enter_context(
                         NoveltyScorer(self._collector.predicates, namespace))
@@ -273,12 +286,24 @@ class BinRadarMinimizer:
                              f"[patch-signatures {counts['patch_signatures']}] "
                              f"[edges {counts['edges']}]")
         except _MinimizerTimeout:
+            if self._capture_journal is not None:
+                self._capture_journal.finish(binradar_utils.WALL_TIME_REACHED)
             self.log(f"[minimizer] [stopped] "
                      f"[reason {binradar_utils.WALL_TIME_REACHED}]")
             return True
+        except _MinimizerCancelled:
+            if self._capture_journal is not None:
+                self._capture_journal.finish("cancelled")
+            raise
+        except BaseException:
+            if self._capture_journal is not None:
+                self._capture_journal.finish("failed")
+            raise
         finally:
             self._collector = None
             self._scorer = None
+        if self._capture_journal is not None:
+            self._capture_journal.finish("done")
         self.log("[minimizer] [done]")
         return False
 
@@ -337,7 +362,8 @@ class BinRadarMinimizer:
             self.log(f"Failed to run patched binary for {testcase.filename}.")
             return id
         score_suffix = ""
-        if features is not None:
+        if self._scorer is not None:
+            assert features is not None
             if binradar_verifier.concrete_testcase_eligible(
                     run_res.exit_info, run_res.concrete_fault_addr,
                     self.probe_result.concrete_fault_addr):
@@ -354,6 +380,14 @@ class BinRadarMinimizer:
         save_file = f"{id}_{os.path.basename(testcase.filename)}"
         with open(os.path.join(self.minimized_dir, save_file), "wb") as stream:
             stream.write(testcase.data)
+        if self._capture_journal is not None:
+            assert features is not None and self._collector is not None
+            self._capture_journal.record(
+                id, save_file, representative=0, members=[],
+                probe=run_res, branches=patch_res.br_selection,
+                artifact=self._collector.binary,
+                snapshots=features.snapshots, state_reason=features.patch_reason,
+                observation="baseline")
         self.log(f"[testcase] [result] [id {id}] [file {save_file}] "
                  f"{run_res.serialize()} {patch_res.serialize()}{score_suffix}")
         return id + 1
@@ -439,6 +473,8 @@ def run_minimizer_and_verifier(minimizer: BinRadarMinimizer,
         # deadline handler could serialize the terminal cutoff marker.
         minimizer.log(f"[minimizer] [stopped] "
                       f"[reason {binradar_utils.WALL_TIME_REACHED}]")
+    if timed_out and getattr(minimizer, "_capture_journal", None) is not None:
+        minimizer._capture_journal.finish(binradar_utils.WALL_TIME_REACHED)
     if timed_out and hasattr(verifier, "mark_wall_time_reached"):
         # The verifier can finish early after rejecting every patch while the
         # minimizer continues. If the shared pair then reaches its deadline,
