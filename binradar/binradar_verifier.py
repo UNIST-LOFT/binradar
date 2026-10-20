@@ -19,6 +19,7 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
 import sbsv
 
 from . import logger
+from . import paths
 
 from . import binradar_evidence
 from . import binradar_utils
@@ -414,11 +415,6 @@ def _probe_version(row: Any) -> Optional[int]:
         return int(row["version"])
     except (KeyError, TypeError):
         return None
-
-
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
-QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "utils", "binradar-aflplusplus", "afl-qemu-trace")
 
 
 def addr_in_e9_ranges(addr: int, exclude_ranges: str) -> bool:
@@ -1205,7 +1201,7 @@ class BinRadarQemuRunner:
     def get_qemu_stacktrace_command_for_binary(
         self, binary: str, input_file: str, patch_func_entry: int = 0,
     ) -> List[str]:
-        cmd = [QEMU_STACKTRACE_RELEASE, "--input", input_file,
+        cmd = [paths.QASAN_QEMU_BIN, "--input", input_file,
                "--patch-loc", self.patch_loc, "--asan", "host"]
         if patch_func_entry != 0:
             cmd += ["--patch-func-entry", f"0x{patch_func_entry:x}"]
@@ -2208,7 +2204,7 @@ class BinRadarConcreteVerifier:
                 raise ValueError("concrete schedule predicate descriptor mismatch")
         artifact = self.runner.cached_binary() if cached else self.runner.patched_binary()
         for path, key in ((artifact, "artifact_sha256"),
-                          (QEMU_STACKTRACE_RELEASE, "qemu_sha256")):
+                          (paths.QASAN_QEMU_BIN, "qemu_sha256")):
             digest = hashlib.sha256()
             with open(path, "rb") as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):

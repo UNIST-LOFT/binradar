@@ -15,10 +15,7 @@ import sbsv
 from . import binradar_utils
 from . import binradar_verifier
 from . import logger
-
-TRACER_BIN = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)),
-    "..", "tracer", "build", "x86_64-linux-user", "qemu-x86_64")
+from . import paths
 
 _EXIT_SCHEMA = (
     "[snapshot] [exit] [normal] [entrypoint-hit: int]")
@@ -136,7 +133,7 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
                 test_cmd: str, testcase: str, timeout: float):
     """Run the real tracer once on `binary` and return its execution result.
     """
-    command = [TRACER_BIN, "-symbolic", "-d", "page", binary] + shlex.split(
+    command = [paths.TRACER_BIN, "-symbolic", "-d", "page", binary] + shlex.split(
         test_cmd.replace("@@", testcase))
     patch_rfd = patch_wfd = None
     env = dict(environment)

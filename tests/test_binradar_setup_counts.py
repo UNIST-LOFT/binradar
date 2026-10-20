@@ -5,17 +5,23 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-
+import pytest
 
 from binradar import binradar_setup
 
 from binradar import binradar_taosc_predicates
 
 
+@pytest.fixture(autouse=True)
+def _e9_executables(monkeypatch):
+    monkeypatch.setenv("E9TOOL", "/bin/true")
+    monkeypatch.setenv("E9COMPILE", "/bin/false")
+
+
 def _fake_run(calls):
     def fake_run(cmd, cwd=None, **kwargs):
         calls.append(list(cmd))
-        if "e9tool" in cmd:
+        if cmd[0] == "/bin/true":
             Path(cmd[cmd.index("-o") + 1]).write_bytes(
                 b"\x7fELF" + b"\0" * 100)
         return subprocess.CompletedProcess(cmd, 0)

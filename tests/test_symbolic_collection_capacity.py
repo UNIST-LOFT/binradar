@@ -9,11 +9,12 @@ import pytest
 
 
 from binradar import binradar_runtime
+from binradar import paths
 
 
 @pytest.fixture(scope="module")
 def capacity_guest(tmp_path_factory):
-    if not Path(binradar_runtime.TRACER_BIN).is_file():
+    if not Path(paths.TRACER_BIN).is_file():
         pytest.skip("built tracer required for capacity integration")
     work = tmp_path_factory.mktemp("collection-guest")
     source = work / "capacity.c"
@@ -134,7 +135,7 @@ def test_real_collection_capacity(tmp_path, capacity_guest, mode, count, reason)
     env = collection_environment(tmp_path)
     marker = tmp_path / "completed"
     result = subprocess.run([
-        binradar_runtime.TRACER_BIN, "-symbolic", "-d", "page", str(guest),
+        paths.TRACER_BIN, "-symbolic", "-d", "page", str(guest),
         env["SYMBOLIC_TESTCASE_NAME"], mode, str(count), str(marker),
     ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         timeout=180, check=False)

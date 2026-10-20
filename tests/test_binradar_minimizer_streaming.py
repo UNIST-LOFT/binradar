@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from binradar import binradar_config
+from binradar import paths
 
 
 
@@ -121,7 +122,7 @@ def _scheduled_stream(tmp_path, monkeypatch, scores, patches=(1,)):
     artifact.write_bytes(b"test artifact")
     qemu = tmp_path / "qemu"
     qemu.write_bytes(b"test qemu")
-    monkeypatch.setattr(binradar_verifier, "QEMU_STACKTRACE_RELEASE", str(qemu))
+    monkeypatch.setattr(paths, "QASAN_QEMU_BIN", str(qemu))
     context = {
         "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
         "qemu_sha256": hashlib.sha256(qemu.read_bytes()).hexdigest(),

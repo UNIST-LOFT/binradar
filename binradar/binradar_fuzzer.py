@@ -8,11 +8,8 @@ from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
 from . import binradar_utils
 from . import logger
+from . import paths
 import sbsv
-
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QEMU_TARGETED_SIMPLE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_targeted_simple", "target", "release", "qemu_targeted_simple")
-AFL_PATH = os.path.join(ROOT_DIR, "utils", "AFLplusplus")
 
 class BinRadarFuzzer:
     def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
@@ -72,7 +69,7 @@ class BinRadarFuzzer:
 class TargetedSimpleFuzzer(BinRadarFuzzer):
     def get_qemu_targeted_simple_command(self, binary: str, input_path: str) -> List[str]:
         cmd = [
-            QEMU_TARGETED_SIMPLE_RELEASE,
+            paths.TARGETED_FUZZER_BIN,
             "-t", self.patch_loc,
             "-i", input_path,
             "-o", self.outdir,
@@ -97,7 +94,7 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
 class AFLppFuzzer(BinRadarFuzzer):
     def get_aflpp_command(self, binary: str, input_path: str) -> List[str]:
         cmd = [
-            os.path.join(AFL_PATH, "afl-fuzz"),
+            paths.AFL_FUZZ_BIN,
             "-Q",
             "-t", self.afl_exec_timeout,
             "-i", input_path,
@@ -109,7 +106,7 @@ class AFLppFuzzer(BinRadarFuzzer):
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
         # env["LC_ALL"] = "C"
-        env["AFL_PATH"] = AFL_PATH
+        env["AFL_PATH"] = paths.AFL_SUPPORT_DIR
         env["AFL_NO_UI"] = "1"
         env["AFL_USE_QASAN"] = "1"
         # Currently, all benchmarks are using poc/testcases

@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 
+from binradar import paths
 from binradar import binradar_input_features as features
 from binradar import binradar_utils
 from binradar import binradar_verifier as verifier
@@ -50,7 +51,7 @@ def runner(tmp_path, monkeypatch):
     }))
     qemu = tmp_path / "qemu"
     qemu.write_bytes(b"qemu-build-identity")
-    monkeypatch.setattr(verifier, "QEMU_STACKTRACE_RELEASE", str(qemu))
+    monkeypatch.setattr(paths, "QASAN_QEMU_BIN", str(qemu))
     return verifier.BinRadarQemuRunner(
         str(tmp_path), "target", "@@", "1000",
         {suffix: ("0x9000-0xa000", []) for suffix in ("brpatched", "brcached")},

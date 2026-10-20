@@ -4,10 +4,10 @@ Collect binradar results from multiple experiments into a single log or CSV file
 
 Usage:
     cd benchmarks/loftix
-    python ../scripts/binradar-collect-results.py binradar --exp exp.list --workdir workdir --run-prefix run
-    python ../scripts/binradar-collect-results.py binradar --exp exp.list --format csv
-    python ../scripts/binradar-collect-results.py sdfuzz --exp exp.list --workdir workdir
-    python ../scripts/binradar-collect-results.py taosc --exp exp.list --workdir workdir-013
+    python ../../binradar-collect-results.py binradar --exp exp.list --workdir workdir --run-prefix run
+    python ../../binradar-collect-results.py binradar --exp exp.list --format csv
+    python ../../binradar-collect-results.py sdfuzz --exp exp.list --workdir workdir
+    python ../../binradar-collect-results.py taosc --exp exp.list --workdir workdir-013
 
 Subcommands:
     binradar (default)
@@ -87,11 +87,7 @@ from itertools import repeat
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
-sys.path.insert(0, str(SCRIPT_DIR.parent.parent))
-
-from binradar import binradar_evidence, binradar_utils
+from . import binradar_evidence, binradar_utils, paths
 
 
 def _result_artifact(run_dir: str, stem: str) -> str:
@@ -2802,9 +2798,9 @@ def cmd_binradar(args):
 
     _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
 
-    # Create logs directory
-    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir = Path(paths.LOFTIX_DIR) / "logs"
+    if not args.output:
+        os.makedirs(logs_dir, exist_ok=True)
 
     # Collect all results (in parallel; see --jobs)
     collect = partial(collect_experiment_result, workdir_name=workdir_name,
@@ -2869,9 +2865,9 @@ def cmd_binradar_stats(args):
 
     _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
 
-    # Create logs directory
-    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir = Path(paths.LOFTIX_DIR) / "logs"
+    if not args.output:
+        os.makedirs(logs_dir, exist_ok=True)
 
     # Collect all results (in parallel; see --jobs)
     collect = partial(collect_stats_experiment, workdir_name=workdir_name,
@@ -2937,9 +2933,9 @@ def cmd_sdfuzz(args):
 
     _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
 
-    # Create logs directory
-    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir = Path(paths.LOFTIX_DIR) / "logs"
+    if not args.output:
+        os.makedirs(logs_dir, exist_ok=True)
 
     # Collect all results (in parallel; see --jobs)
     collect = partial(collect_sdfuzz_experiment, workdir_name=workdir_name,
@@ -3002,9 +2998,9 @@ def cmd_taosc(args):
 
     _, resolved_dirs, display_dirs = load_experiment_list(exp_file)
 
-    # Create logs directory
-    logs_dir = SCRIPT_DIR.parent / "loftix" / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir = Path(paths.LOFTIX_DIR) / "logs"
+    if not args.output:
+        os.makedirs(logs_dir, exist_ok=True)
 
     collect = partial(collect_taosc_experiment, workdir_name=workdir_name)
     all_results: List[TaoscResult] = collect_all(collect, resolved_dirs,
@@ -3114,4 +3110,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

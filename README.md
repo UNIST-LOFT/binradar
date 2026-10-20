@@ -46,10 +46,12 @@ from binradar.binradar_feedback_bundle import load_bundle
 
 Do not execute `binradar/cli.py` directly or put `binradar/` on
 `PYTHONPATH`. From another directory, use the installed commands or
-`uv run --project /path/to/checkout binradar ...`. Native tools still require
-the built checkout; the Python wheel does not bundle tracer/solver/AFL/E9.
-See the [package and CLI contract](agent-docs/BINRADAR.md#python-package-and-cli-entrypoints)
-for all entrypoints. Rebuild existing Docker images for the new root wrappers.
+`uv run --project /path/to/checkout binradar ...`. The Python wheel does not
+bundle native tools or benchmark templates. Their checkout-relative defaults
+are centralized in `binradar/paths.py` for Guix store-path substitution; E9 uses
+`E9TOOL`/`E9COMPILE` overrides or lazy Guix lookup. See the
+[native deployment contract](agent-docs/BINRADAR.md#native-tool-and-resource-paths)
+and [CLI entrypoints](agent-docs/BINRADAR.md#python-package-and-cli-entrypoints). Rebuild existing Docker images for the new root wrappers.
 
 ## Usage
 ```shell
@@ -74,7 +76,7 @@ just list exp.list # You can edit exp.list to select benchmarks to run.
 just run taosc exp.list 1       # taosc consumes multiple CPU cores
 just run setup exp.list 20      # setup includes the POC behavioral filter
 just run binradar-fo exp.list 20    # docker runner; use `just run br-fo exp.list 20` to run without docker
-uv run ../scripts/binradar-collect-results.py binradar --run-prefix br-fo --format tsv
+uv run ../../binradar-collect-results.py binradar --run-prefix br-fo --format tsv
 # Check the collected results in the `benchmarks/loftix/logs` directory.
 ```
 
@@ -146,7 +148,7 @@ Output will be saved in the `out` directory in the working directory. You can ch
 Multi-candidate generic/CWE-805 ERM filtering uses `.brcached` representatives and complete captured branch vectors; singleton/direct/specialized candidates use `.brpatched`. `filter.sbsv` records source ids, pass/fail decisions, and compact survivor ids and is regenerated on every setup invocation. `.brpatched` contains at most the top 30 survivors; multi-candidate ERM sets also retain every survivor in `.brcached` and `brpatches.json` for `--target-patches all`. `binradar.py` starts at PROBE and has no separate FILTER phase.
 
 ### binradar-collect-results.py
-`benchmarks/scripts/binradar-collect-results.py` collects results for the subjects in `exp.list` (one subject dir per line). It uses subcommands:
+The root `binradar-collect-results.py` wrapper collects results for the subjects in `exp.list` (one subject dir per line). Its implementation is `binradar/binradar_collect_results.py`, importable as `from binradar import binradar_collect_results`. After `uv sync --locked`, use the installed `binradar-collect-results` command or `python -m binradar.binradar_collect_results`. The old `benchmarks/scripts/` entrypoint is removed. It uses subcommands:
 - `binradar` (default; omitting the subcommand also works): collects binradar results from `<workdir>/out` (progress.sbsv + verifier.sbsv), plus the patch filter context from `<workdir>/filter.sbsv` (predicates evaluated/survived; a missing `[filter] [done]` marker is reported). Options: `--exp` (default `exp.list`), `--workdir` (default `workdir`), `--run-prefix` (default `run`), `--format log|csv|tsv` (default `log`), `--output <file>`.
 - `sdfuzz`: collects external-fuzzer evaluation results from `<workdir>/<fuzzer>` (output of `binradar-evaluation.py`): `final.sbsv` remaining patches and per-patch verdicts, `evaluation.log` testcase counts/errors, and the `<workdir>/filter.sbsv` context. Options: same shared options plus `--fuzzer` (default `sdfuzz`).
 

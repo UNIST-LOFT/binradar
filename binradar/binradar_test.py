@@ -21,19 +21,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-
+from . import paths
 from . import binradar_utils
 from . import binradar_verifier
 from .binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
-    QEMU_STACKTRACE_RELEASE,
 )
-
-LOFTIX_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "benchmarks", "loftix"))
-TRACER_BIN = os.path.join(SCRIPT_DIR, "..", "tracer", "build", "x86_64-linux-user", "qemu-x86_64")
-SOLVER_BIN = os.path.join(SCRIPT_DIR, "..", "solver", "build", "solver-smt")
 
 """
 Run tests on binradar benchmark subjects listed in exp.list.
@@ -614,7 +608,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     binary = env.get("BINARY", "")
     orig_bin = os.path.join(workdir, f"{binary}.orig")
     test_cmd = env.get("TEST_CMD", "")
-    command = [TRACER_BIN, orig_bin] + shlex.split(
+    command = [paths.TRACER_BIN, orig_bin] + shlex.split(
         test_cmd.replace("@@", testcase))
     proc_env = dict(os.environ)
     proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -641,11 +635,10 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
         except Exception:
             pass
     if need_regen:
-        find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
         try:
             os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
-                [sys.executable, find_models, "-o", plt_info, orig_bin],
+                [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, orig_bin],
                 cwd=workdir, timeout=30, verbose=False)
         except Exception:
             pass
@@ -703,7 +696,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     binary = env.get("BINARY", "")
     orig_bin = os.path.join(workdir, f"{binary}.orig")
     test_cmd = env.get("TEST_CMD", "")
-    command = [TRACER_BIN, "-symbolic", "-d", "page", orig_bin] + shlex.split(
+    command = [paths.TRACER_BIN, "-symbolic", "-d", "page", orig_bin] + shlex.split(
         test_cmd.replace("@@", testcase))
     proc_env = dict(os.environ)
     proc_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
@@ -732,11 +725,10 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
         except Exception:
             pass
     if need_regen:
-        find_models = os.path.join(SCRIPT_DIR, "find_models_addrs.py")
         try:
             os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
-                [sys.executable, find_models, "-o", plt_info, orig_bin],
+                [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, orig_bin],
                 cwd=workdir, timeout=30, verbose=False)
         except Exception:
             pass
@@ -761,7 +753,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
         for bitmap in ("global", "context", "memory"):
             with open(os.path.join(run_dir, f"{bitmap}-bitmap"), "w") as f:
                 pass
-        solver_cmd = ["stdbuf", "-o0", SOLVER_BIN,
+        solver_cmd = ["stdbuf", "-o0", paths.SOLVER_SMT_BIN,
                       "-i", testcase,
                       "-o", out_dir,
                       "-b", os.path.join(run_dir, "global-bitmap"),
@@ -997,7 +989,7 @@ def run_valgrind_subject(exp_dir: str, workdir_name: str,
         valgrind_res = binradar_utils.execute(
             valgrind_cmd, cwd=workdir, timeout=timeout, verbose=False)
 
-        qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
+        qasan_cmd = [paths.QASAN_QEMU_BIN, "--input", testcase,
                      "--asan", "host"]
         if env.get("PATCH_LOC"):
             qasan_cmd += ["--patch-loc", env["PATCH_LOC"]]
@@ -1083,8 +1075,8 @@ def run_tracer_subject(exp_dir: str, workdir_name: str,
     if missing:
         result.detail = "missing: " + ", ".join(missing)
         return result
-    if not os.path.isfile(TRACER_BIN):
-        result.detail = f"tracer binary not found: {TRACER_BIN}"
+    if not os.path.isfile(paths.TRACER_BIN):
+        result.detail = f"tracer binary not found: {paths.TRACER_BIN}"
         return result
 
     # Build the afl-qemu-trace probe command by hand (like run_valgrind_subject)
@@ -1092,7 +1084,7 @@ def run_tracer_subject(exp_dir: str, workdir_name: str,
     # requires PATCH_LOC in the env; subjects with only a config.env
     # fallback lack that key. None of them are needed for an .orig probe.
     try:
-        qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
+        qasan_cmd = [paths.QASAN_QEMU_BIN, "--input", testcase,
                      "--asan", "host"]
         if env.get("PATCH_LOC"):
             qasan_cmd += ["--patch-loc", env["PATCH_LOC"]]
@@ -1193,8 +1185,8 @@ def run_memcheck_reach_subject(exp_dir: str, workdir_name: str,
     if missing:
         result.detail = "missing: " + ", ".join(missing)
         return result
-    if not os.path.isfile(TRACER_BIN):
-        result.detail = f"tracer binary not found: {TRACER_BIN}"
+    if not os.path.isfile(paths.TRACER_BIN):
+        result.detail = f"tracer binary not found: {paths.TRACER_BIN}"
         return result
 
     # Determine the patch function entry point from the latest probe
@@ -1320,8 +1312,8 @@ def run_compare_fault_addr_subject(exp_dir: str, workdir_name: str,
     if missing:
         result.detail = "missing: " + ", ".join(missing)
         return result
-    if not os.path.isfile(TRACER_BIN):
-        result.detail = f"tracer binary not found: {TRACER_BIN}"
+    if not os.path.isfile(paths.TRACER_BIN):
+        result.detail = f"tracer binary not found: {paths.TRACER_BIN}"
         return result
 
     try:
@@ -1339,7 +1331,7 @@ def run_compare_fault_addr_subject(exp_dir: str, workdir_name: str,
         result.valgrind_cmd = format_repro_command(workdir, valgrind_cmd, {})
 
         # QASAN probe on .orig (afl-qemu-trace, patch id 0).
-        qasan_cmd = [QEMU_STACKTRACE_RELEASE, "--input", testcase,
+        qasan_cmd = [paths.QASAN_QEMU_BIN, "--input", testcase,
                      "--asan", "host"]
         if env.get("PATCH_LOC"):
             qasan_cmd += ["--patch-loc", env["PATCH_LOC"]]
@@ -1922,8 +1914,8 @@ def cmd_qasan(args):
     if args.output:
         output_path = args.output
     else:
-        logs_dir = os.path.join(LOFTIX_DIR, "logs")
-        if not os.path.isdir(LOFTIX_DIR):
+        logs_dir = os.path.join(paths.LOFTIX_DIR, "logs")
+        if not os.path.isdir(paths.LOFTIX_DIR):
             logs_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         ext = args.format if args.format in ("csv", "tsv") else "log"
@@ -1988,8 +1980,8 @@ def cmd_valgrind(args):
     if args.output:
         output_path = args.output
     else:
-        logs_dir = os.path.join(LOFTIX_DIR, "logs")
-        if not os.path.isdir(LOFTIX_DIR):
+        logs_dir = os.path.join(paths.LOFTIX_DIR, "logs")
+        if not os.path.isdir(paths.LOFTIX_DIR):
             logs_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         ext = args.format if args.format in ("csv", "tsv") else "log"
@@ -2054,8 +2046,8 @@ def cmd_tracer(args):
     if args.output:
         output_path = args.output
     else:
-        logs_dir = os.path.join(LOFTIX_DIR, "logs")
-        if not os.path.isdir(LOFTIX_DIR):
+        logs_dir = os.path.join(paths.LOFTIX_DIR, "logs")
+        if not os.path.isdir(paths.LOFTIX_DIR):
             logs_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         ext = args.format if args.format in ("csv", "tsv") else "log"
@@ -2120,8 +2112,8 @@ def cmd_memcheck_reach(args):
     if args.output:
         output_path = args.output
     else:
-        logs_dir = os.path.join(LOFTIX_DIR, "logs")
-        if not os.path.isdir(LOFTIX_DIR):
+        logs_dir = os.path.join(paths.LOFTIX_DIR, "logs")
+        if not os.path.isdir(paths.LOFTIX_DIR):
             logs_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         ext = args.format if args.format in ("csv", "tsv") else "log"
@@ -2187,8 +2179,8 @@ def cmd_compare_fault_addr(args):
     if args.output:
         output_path = args.output
     else:
-        logs_dir = os.path.join(LOFTIX_DIR, "logs")
-        if not os.path.isdir(LOFTIX_DIR):
+        logs_dir = os.path.join(paths.LOFTIX_DIR, "logs")
+        if not os.path.isdir(paths.LOFTIX_DIR):
             logs_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         ext = args.format if args.format in ("csv", "tsv") else "log"
@@ -2374,10 +2366,10 @@ def _run_overhead_subject(exp_dir, display, args):
     with tempfile.TemporaryDirectory(prefix="binradar-overhead-") as temporary:
         plt_info = os.path.join(temporary, "plt_info.txt")
         tracer_error = ""
-        if shutil.which(TRACER_BIN) is not None:
+        if shutil.which(paths.TRACER_BIN) is not None:
             try:
                 prepared = binradar_utils.execute(
-                    [sys.executable, os.path.join(SCRIPT_DIR, "find_models_addrs.py"),
+                    [sys.executable, paths.FIND_MODELS_SCRIPT,
                      "-o", plt_info, binary], env=base_env, cwd=workdir,
                     timeout=30, verbose=False)
                 if (not prepared.success or prepared.exit_code != 0
@@ -2389,8 +2381,8 @@ def _run_overhead_subject(exp_dir, display, args):
             target = [binary] + [token.replace("@@", testcase) for token in tokens]
             commands = {
                 "orig": target,
-                "qasan": [QEMU_STACKTRACE_RELEASE, "--asan", "host", binary, "--"] + target[1:],
-                "tracer": [TRACER_BIN] + target,
+                "qasan": [paths.QASAN_QEMU_BIN, "--asan", "host", binary, "--"] + target[1:],
+                "tracer": [paths.TRACER_BIN] + target,
                 "valgrind": ["valgrind", "--tool=memcheck", "--error-exitcode=99",
                              "--leak-check=no"] + target,
             }
@@ -2468,7 +2460,7 @@ def cmd_overhead(args):
             print(_format_overhead_row(row), flush=True)
     output_path = args.output
     if not output_path:
-        logs_dir = os.path.join(LOFTIX_DIR if os.path.isdir(LOFTIX_DIR) else os.getcwd(), "logs")
+        logs_dir = os.path.join(paths.LOFTIX_DIR if os.path.isdir(paths.LOFTIX_DIR) else os.getcwd(), "logs")
         output_path = os.path.join(logs_dir, f"overhead-{datetime.now():%Y-%m-%d_%H-%M-%S}.{args.format}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", newline="") as stream:

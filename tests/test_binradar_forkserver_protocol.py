@@ -10,6 +10,7 @@ import pytest
 
 
 from binradar import binradar_runtime
+from binradar import paths
 
 
 @pytest.mark.parametrize("result,stop", [(4, 0), (0, 5), (4, 1)])
@@ -278,7 +279,7 @@ while True:
 @pytest.fixture
 def reentered_guest(tmp_path):
     """A guest whose entrypoint executes three times in one process."""
-    if not Path(binradar_runtime.TRACER_BIN).is_file():
+    if not Path(paths.TRACER_BIN).is_file():
         pytest.skip("built tracer required for entrypoint integration")
     source = tmp_path / "reentered.c"
     source.write_text(r'''
@@ -365,7 +366,7 @@ def make_executor(tmp_path, monkeypatch, fake_script, mode="check_unread", statu
     )
     if statuses is not None:
         env["FAKE_STATUSES"] = ";".join(",".join(str(x) for x in row) for row in statuses)
-    monkeypatch.setattr(binradar_runtime, "TRACER_BIN", str(fake_script))
+    monkeypatch.setattr(paths, "TRACER_BIN", str(fake_script))
     executor = binradar_runtime.TracerExecutor(
         "protocol",
         env,

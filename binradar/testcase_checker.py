@@ -7,8 +7,7 @@ import subprocess
 import tempfile
 import shutil
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-TRACER_BIN = SCRIPT_DIR + '/../tracer/build/x86_64-linux-user/qemu-x86_64'
+from . import paths
 
 
 def progressBar(value, endvalue, bar_length=20):
@@ -77,7 +76,7 @@ if not os.path.exists(testcase_dir):
     usage()
 testcase_dir = os.path.abspath(testcase_dir)
 
-args = [TRACER_BIN] + ['-symbolic'] + sys.argv[4:]
+args = [paths.TRACER_BIN] + ['-symbolic'] + sys.argv[4:]
 
 use_stdin = True
 arg_input_idx = -1

@@ -13,12 +13,7 @@ import argparse
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-if 'AFL_PATH' not in os.environ:
-    AFL_PATH = SCRIPT_DIR + '/../../AFLplusplus/'
-else:
-    AFL_PATH = os.environ['AFL_PATH']
-
-AFL_BIN = AFL_PATH + '/afl-fuzz'
+from . import paths
 FUZZOLIC_BIN = SCRIPT_DIR + '/fuzzolic.py'
 DEVNULL = open(os.devnull, 'w')
 WAITING_TIME_AFTER_AFL_INSTANCE_START = 30
@@ -126,7 +121,7 @@ def main():
             red_queen_mode_a = "-c"
             red_queen_mode_b = "0"
 
-        afl_master_args = [ AFL_BIN, red_queen_mode_a, red_queen_mode_b, '-M', 'afl-master', '-o', run_dir, '-i', input_dir] + afl_args + ['--'] + [ prog ] + program_args[1:]
+        afl_master_args = [ os.path.join(os.environ.get('AFL_PATH', paths.LEGACY_AFL_SUPPORT_DIR), 'afl-fuzz'), red_queen_mode_a, red_queen_mode_b, '-M', 'afl-master', '-o', run_dir, '-i', input_dir] + afl_args + ['--'] + [ prog ] + program_args[1:]
         afl_master = subprocess.Popen(afl_master_args, stdout=DEVNULL, stderr=DEVNULL)
         p_children.append(afl_master)
         print("Running: %s" % ' '.join(afl_master_args))
@@ -134,7 +129,7 @@ def main():
         print("Waiting %s seconds before starting slave." % WAITING_TIME_AFTER_AFL_INSTANCE_START)
         time.sleep(WAITING_TIME_AFTER_AFL_INSTANCE_START)
 
-        afl_slave_args = [ AFL_BIN, '-S', 'afl-slave', '-o', run_dir, '-i', input_dir] + afl_args + [ prog ] + program_args[1:]
+        afl_slave_args = [ os.path.join(os.environ.get('AFL_PATH', paths.LEGACY_AFL_SUPPORT_DIR), 'afl-fuzz'), '-S', 'afl-slave', '-o', run_dir, '-i', input_dir] + afl_args + [ prog ] + program_args[1:]
         afl_slave = subprocess.Popen(afl_slave_args, stdout=DEVNULL, stderr=DEVNULL)
         p_children.append(afl_slave)
 

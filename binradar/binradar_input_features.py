@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from . import paths
 from . import binradar_verifier as verifier
 from .binradar_taosc_predicates import (
     CachedSnapshot, ParsedPredicate, PredicateFamily, parse_cached_snapshots,
@@ -148,7 +149,7 @@ class BaselineFeatureCollector:
         self.metadata = {
             "artifact_sha256": _sha256(self.binary),
             "original_sha256": _sha256(runner.original_binary()),
-            "qemu_sha256": _sha256(verifier.QEMU_STACKTRACE_RELEASE),
+            "qemu_sha256": _sha256(paths.QASAN_QEMU_BIN),
             "baseline_artifact": str(Path(self.binary).resolve()),
             "baseline_policy": "neutral-cached" if self.predicates else "original-patched",
             "state_reason": self.patch_reason,

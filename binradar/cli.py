@@ -29,11 +29,8 @@ from . import binradar_runtime
 from . import binradar_utils
 from . import binradar_verifier
 from . import logger
+from . import paths
 import sbsv
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-TRACER_BIN = SCRIPT_DIR + "/../tracer/build/x86_64-linux-user/qemu-x86_64"
-FIND_MODELS_BIN = SCRIPT_DIR + "/find_models_addrs.py"
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
 # Floor for the PROBE normalized-fault-reference tracer run.  The reference
@@ -901,7 +898,7 @@ class BinRadarExecutor:
             logger.info(f"PLT info file already exists: {plt_info}")
             return plt_info
         plt_result = binradar_utils.execute(
-            [FIND_MODELS_BIN, "-o", plt_info, self.artifacts.original])
+            [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, self.artifacts.original])
         if not plt_result.success:
             logger.warning("Failed to find PLT info. PLT-based optimizations will be disabled.")
             sys.exit(plt_result.exit_code)
@@ -1131,7 +1128,7 @@ class BinRadarExecutor:
         # Run the tracer on .orig to obtain a normalized fault reference.
         # It is used for BINRADAR analysis in FINAL; QASAN's concrete address
         # remains a separate observation.
-        tracer_cmd = [TRACER_BIN, self.artifacts.original] + shlex.split(
+        tracer_cmd = [paths.TRACER_BIN, self.artifacts.original] + shlex.split(
             self.test_cmd.replace("@@", self.resolved_poc_input()))
         tracer_env = os.environ.copy()
         tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"

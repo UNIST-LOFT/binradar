@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """Tests for SBSV parsing in binradar-collect-results.py."""
 
-import importlib.util
-from pathlib import Path
+import csv
 
-ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location(
-    "binradar_collect_results",
-    ROOT / "benchmarks" / "scripts" / "binradar-collect-results.py",
-)
-collector = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(collector)
+from binradar import binradar_collect_results as collector
+
+
+def test_explicit_output_does_not_write_to_installation(tmp_path, monkeypatch):
+    installation = tmp_path / "installation"
+    installation.write_text("not a writable benchmark directory")
+    monkeypatch.setattr(collector.paths, "LOFTIX_DIR", str(installation))
+    workdir = tmp_path / "subject" / "workdir"
+    workdir.mkdir(parents=True)
+    (workdir / "predicates").write_text("max1 - rax == ~max1\nmax1 / rax < +max1\n")
+    experiments = tmp_path / "exp.list"
+    experiments.write_text("subject\n")
+    output = tmp_path / "results.csv"
+    monkeypatch.setattr(collector.sys, "argv", [
+        "binradar-collect-results", "taosc", "--exp", str(experiments),
+        "--format", "csv", "--output", str(output), "--jobs", "1",
+    ])
+
+    collector.main()
+
+    with output.open() as source:
+        row = next(csv.DictReader(source))
+    assert row["experiment"] == "subject"
+    assert row["original_predicates"] == "2"
 
 
 def test_parse_compact_filter_and_verifier_artifacts(tmp_path):

@@ -23,9 +23,6 @@ from .binradar_feedback_capture import CaptureJournal
 from .binradar_input_features import BaselineFeatureCollector
 from .binradar_input_schedule import InputScore, NoveltyScorer
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")
-
 class TestcaseInfo:
     hash: str
     data: bytes

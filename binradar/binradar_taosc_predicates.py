@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
 
+from . import paths
+
 INT64_MIN = -(1 << 63)
 _MASK64 = (1 << 64) - 1
 
@@ -479,7 +481,7 @@ def e9tool_command(spec: InstrumentationSpec, out_path: Path,
     The JSON-metadata and final-binary commands differ only in
     ``--format=json`` and the output path.
     """
-    cmd = ["guix", "shell", "e9patch@1.0.1", "--", "e9tool"]
+    cmd = [paths.e9tool()]
     if fmt is not None:
         cmd.append(f"--format={fmt}")
     cmd.append("-100")

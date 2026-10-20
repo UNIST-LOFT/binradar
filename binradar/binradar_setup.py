@@ -16,8 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-
+from . import paths
 from . import binradar_taosc_predicates
 from . import binradar_utils
 from . import binradar_verifier
@@ -48,12 +47,6 @@ from .binradar_taosc_predicates import (
     write_filter,
     write_runtime_predicates,
 )
-
-ROOT_DIR = SCRIPT_DIR.parent
-BENCHMARK_SCRIPTS = ROOT_DIR / "benchmarks" / "scripts"
-BRPATCH_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch.c"
-BRPATCH_CACHED_SOURCE = ROOT_DIR / "benchmarks" / "loftix" / "brpatch-cached.c"
-
 
 """Build BinRadar artifacts and filter candidates against the POC.
 
@@ -110,7 +103,7 @@ def ensure_original_binary(workdir: Path, configdir: Path, config: dict) -> Path
     original_binary = workdir / f"{binary}.orig"
     if original_binary.exists():
         return original_binary
-    cmd = [sys.executable, str(BENCHMARK_SCRIPTS / "binradar_get_binary.py"),
+    cmd = [sys.executable, str(paths.BENCHMARK_SCRIPTS / "binradar_get_binary.py"),
            "-c", str(configdir)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -163,7 +156,7 @@ def build_cached_binary(
         raise RuntimeError("brpatch.c and brpatches.inc must be prepared "
                            "before building .brcached")
 
-    shutil.copy(BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
+    shutil.copy(paths.BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
     destinations_file = workdir / "patch-destination"
     if not destinations_file.exists():
         destinations_file_original = workdir / "destinations"
@@ -189,8 +182,7 @@ def build_cached_binary(
             raise RuntimeError("CWE-805 cache requires an allocator trace")
         compile_defines += ["-DBRPATCH_CWE805",
                             f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
-    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
-           "e9compile", "brpatch-cached.c"] + compile_defines
+    cmd = [paths.e9compile(), "brpatch-cached.c"] + compile_defines
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:
@@ -1316,13 +1308,12 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
             print(f"Error: no destination found in {destinations_file}")
             exit(1)
         brpatch_source = workdir / "brpatch.c"
-        shutil.copy(BRPATCH_SOURCE, brpatch_source)
+        shutil.copy(paths.BRPATCH_SOURCE, brpatch_source)
         brpatches_inc = workdir / "brpatches.inc"
         _emit_brpatches_inc(brpatches_inc, [])
         compile_defines = [f"-DTAOSC_DEST={dest}", "-DBRPATCH_CWE805",
                            f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"]
-        cmd = ["guix", "shell", "e9patch@1.0.1", "--",
-                "e9compile", "brpatch.c"] + compile_defines
+        cmd = [paths.e9compile(), "brpatch.c"] + compile_defines
         print(" ".join(cmd))
         result = subprocess.run(cmd, cwd=workdir)
         if result.returncode != 0:
@@ -1500,7 +1491,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
     patch_cnt = len(selected_patch_records)
     binradar_env["TOTAL_PATCHES"] = str(patch_cnt)
     brpatch_source = workdir / "brpatch.c"
-    shutil.copy(BRPATCH_SOURCE, brpatch_source)
+    shutil.copy(paths.BRPATCH_SOURCE, brpatch_source)
     brpatches_inc = workdir / "brpatches.inc"
     _emit_brpatches_inc(brpatches_inc, selected_patch_records)
     compile_defines = [f"-DTAOSC_DEST={dest}"]
@@ -1508,8 +1499,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         assert allocator is not None
         compile_defines.append("-DBRPATCH_CWE805")
         compile_defines.append(f"-DBRPATCH_ALLOC_{allocator.kind.upper()}")
-    cmd = ["guix", "shell", "e9patch@1.0.1", "--",
-            "e9compile", "brpatch.c"] + compile_defines
+    cmd = [paths.e9compile(), "brpatch.c"] + compile_defines
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=workdir)
     if result.returncode != 0:

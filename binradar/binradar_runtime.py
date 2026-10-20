@@ -20,11 +20,7 @@ from typing import BinaryIO, Callable, Dict, List, NoReturn, Optional, Tuple
 
 from . import binradar_utils
 from . import logger
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-SOLVER_SMT_BIN = str(SCRIPT_DIR / "../solver/build/solver-smt")
-SOLVER_FUZZY_BIN = str(SCRIPT_DIR / "../solver/build/solver-fuzzy")
-TRACER_BIN = str(SCRIPT_DIR / "../tracer/build/x86_64-linux-user/qemu-x86_64")
+from . import paths
 
 SOLVER_WAIT_TIME_AT_STARTUP = 1.0
 SOLVER_TIMEOUT = 10.0
@@ -479,7 +475,7 @@ class TracerExecutor:
             self, mode: str, env: Dict[str, str], workdir: str, rundir: str,
             binary: str, test_cmd: str, testcase: str, deadline: Deadline,
             registry: ProcessRegistry = PROCESS_REGISTRY):
-        self.command = [TRACER_BIN, "-symbolic", "-d", "page", binary] + \
+        self.command = [paths.TRACER_BIN, "-symbolic", "-d", "page", binary] + \
             shlex.split(test_cmd.replace("@@", testcase))
         self.mode = mode
         self.env = env
@@ -848,8 +844,8 @@ class SolverExecutor:
         for bitmap in (global_bitmap, context_bitmap, memory_bitmap):
             with open(bitmap, "w", encoding="utf-8"):
                 pass
-        solver_bin = (SOLVER_SMT_BIN if self.reverse_directed else
-                      (SOLVER_FUZZY_BIN if self.fuzzy else SOLVER_SMT_BIN))
+        solver_bin = (paths.SOLVER_SMT_BIN if self.reverse_directed else
+                      (paths.SOLVER_FUZZY_BIN if self.fuzzy else paths.SOLVER_SMT_BIN))
         self.command = [
             "stdbuf", "-o0", solver_bin, "-i", self.testcase,
             "-o", self.out_dir, "-b", global_bitmap, "-c", context_bitmap,

@@ -28,9 +28,17 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _e9_executables(monkeypatch):
+    monkeypatch.setenv("E9TOOL", "/bin/true")
+    monkeypatch.setenv("E9COMPILE", "/bin/false")
+
+
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "taosc-61f9f3a"
-TAOSC_REV = "61f9f3a6ad09bb0a7a6712a71c32d9da922333ed"
 
 from binradar import binradar_setup
 
@@ -54,12 +62,6 @@ SIZE_REGEX = re.compile(
 
 def _load_lines(name: str) -> list:
     return (FIXTURES / name / "predicates").read_text().splitlines()
-
-
-def test_fixture_revision_recorded():
-    """The Taosc revision and grammar source are recorded in the tests."""
-    assert TAOSC_REV == "61f9f3a6ad09bb0a7a6712a71c32d9da922333ed"
-    assert (ROOT / "utils" / "taosc" / "cwe805" / "filter.zig").exists()
 
 
 def test_generic_fixture_is_generic():
@@ -900,9 +902,10 @@ def test_e9tool_command_identical_spec():
     # Identical ordered -M/-P pairs; only --format and -o differ.
     json_pairs = [(json_cmd[i], json_cmd[i + 1])
                   for i in range(len(json_cmd))
-                  if json_cmd[i] == "-M"]
+                  if json_cmd[i] in ("-M", "-P")]
     bin_pairs = [(bin_cmd[i], bin_cmd[i + 1])
-                 for i in range(len(bin_cmd)) if bin_cmd[i] == "-M"]
+                 for i in range(len(bin_cmd))
+                 if bin_cmd[i] in ("-M", "-P")]
     assert json_pairs == bin_pairs
     assert "--format=json" in json_cmd
     assert "--format=json" not in bin_cmd

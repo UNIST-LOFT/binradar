@@ -36,6 +36,12 @@ from binradar import binradar_utils
 from binradar import cli as binradar
 from binradar import binradar_artifacts
 
+@pytest.fixture(autouse=True)
+def _e9_executables(monkeypatch):
+    monkeypatch.setenv("E9TOOL", "/bin/true")
+    monkeypatch.setenv("E9COMPILE", "/bin/false")
+
+
 PAGE = binradar_setup.PAGE_SIZE
 TRAMPOLINE = binradar_setup.E9MapType.TRAMPOLINE
 RESERVE = binradar_setup.E9MapType.RESERVE
@@ -454,7 +460,7 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
     def fake_run(cmd, cwd=None, **kwargs):
         calls.append((list(cmd), cwd))
         # e9compile and e9tool both succeed; e9tool writes the outputs.
-        if cmd[0] == "guix" and "e9tool" in cmd:
+        if cmd[0] == "/bin/true":
             out = cmd[cmd.index("-o") + 1]
             Path(out).write_bytes(b"\x7fELF" + b"\0" * 100)
         return subprocess.CompletedProcess(cmd, 0)
@@ -477,12 +483,12 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
 
     # e9compile ran with the destination define.
     compile_cmds = [c for c, _ in calls
-                    if "e9compile" in c and "brpatch-cached.c" in c]
+                    if c[0] == "/bin/false" and "brpatch-cached.c" in c]
     assert compile_cmds, "e9compile brpatch-cached.c not invoked"
     assert "-DTAOSC_DEST=0x4106d8" in compile_cmds[0]
     assert "-DBRPATCH_CWE805" not in compile_cmds[0]
     # e9tool ran the JSON and binary commands from one spec.
-    tool_cmds = [c for c, _ in calls if "e9tool" in c]
+    tool_cmds = [c for c, _ in calls if c[0] == "/bin/true"]
     assert len(tool_cmds) == 2
     json_cmd = tool_cmds[0]
     bin_cmd = tool_cmds[1]
@@ -515,7 +521,7 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
 
     def fake_run(cmd, cwd=None, **kwargs):
         calls.append(list(cmd))
-        if "e9tool" in cmd:
+        if cmd[0] == "/bin/true":
             Path(cmd[cmd.index("-o") + 1]).write_bytes(
                 b"\x7fELF" + b"\0" * 100)
         return subprocess.CompletedProcess(cmd, 0)
@@ -529,10 +535,10 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
         workdir, tmp_path, env,
         binradar_setup.PredicateFamily.CWE805_ERM, allocator)
 
-    compile_cmd = next(cmd for cmd in calls if "e9compile" in cmd)
+    compile_cmd = next(cmd for cmd in calls if cmd[0] == "/bin/false")
     assert "-DBRPATCH_CWE805" in compile_cmd
     assert "-DBRPATCH_ALLOC_MALLOC" in compile_cmd
-    tool_cmds = [cmd for cmd in calls if "e9tool" in cmd]
+    tool_cmds = [cmd for cmd in calls if cmd[0] == "/bin/true"]
     assert len(tool_cmds) == 2
     for cmd in tool_cmds:
         assert "-O0" in cmd
@@ -781,7 +787,7 @@ def test_prepare_patch_empty_predicates_builds_zero_candidates(
     binradar_env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
 
     def fake_run(cmd, cwd=None, **kwargs):
-        if cmd[0] == "guix" and "e9tool" in cmd:
+        if cmd[0] == "/bin/true":
             out = cmd[cmd.index("-o") + 1]
             Path(out).write_bytes(b"\x7fELF" + b"\0" * 100)
         return subprocess.CompletedProcess(cmd, 0)
