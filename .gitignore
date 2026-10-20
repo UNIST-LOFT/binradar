@@ -1,6 +1,7 @@
 asm_in_out.log
 .vscode
 *.pyc
+__pycache__/
 *.egg-info/
 dist/
 workdir*

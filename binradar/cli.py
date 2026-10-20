@@ -2135,16 +2135,16 @@ def main():
     parser.add_argument(
         "--symbolic-mutation-mode", dest="symbolic_mutation_mode",
         choices=binradar_config.SYMBOLIC_MUTATION_MODES,
-        default=None,
+        default="boundary",
         help=("symbolic boundary advisor mode for the BinRadar tracer phase "
-              "(default: off, or BINRADAR_SYMBOLIC_MUTATION_MODE from "
+              "(default: boundary, or BINRADAR_SYMBOLIC_MUTATION_MODE from "
               "binradar.env); 'shadow' ranks and reports without proposing, "
               "'boundary' proposes comparison-guided values.  Every other "
               "phase always runs with the advisor off"))
     parser.add_argument(
         "--concrete-input-schedule", choices=binradar_config.CONCRETE_INPUT_SCHEDULES,
-        default=None,
-        help=("concrete testcase ordering (default: fifo, or "
+        default="novelty",
+        help=("concrete testcase ordering (default: novelty, or "
               "BINRADAR_CONCRETE_INPUT_SCHEDULE from binradar.env; "
               "novelty prioritizes fixed admission scores)"))
     parser.add_argument(
