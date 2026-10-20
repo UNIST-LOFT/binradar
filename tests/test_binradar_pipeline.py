@@ -1,13 +1,10 @@
-import sys
 import threading
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_pipeline
+
+from fuzzolic import binradar_pipeline
 
 
 class RecordingRegistry:

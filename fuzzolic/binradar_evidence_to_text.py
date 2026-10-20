@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, TextIO
 
-import binradar_evidence
+from . import binradar_evidence
 
 
 def _write_filter(path: Path, output: TextIO,

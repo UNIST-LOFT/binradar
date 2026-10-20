@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-import binradar_verifier as verifier
-from binradar_taosc_predicates import (
+from . import binradar_verifier as verifier
+from .binradar_taosc_predicates import (
     CachedSnapshot, ParsedPredicate, PredicateFamily, parse_cached_snapshots,
     predicate_descriptor, predicate_stack_bytes,
 )

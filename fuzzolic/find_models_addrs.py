@@ -111,37 +111,42 @@ def process_plt(binary, outfile=None):
             else:
                 outfile.write("%s,%s,0x%x\n" % (os.path.basename(binary), name, addr))
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-o', '--output', metavar='<output>',
-                        type=str, help='output path')
-parser.add_argument('binary', metavar='<binary>',
-                        type=str, help='path to the binary to run')
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o', '--output', metavar='<output>',
+                            type=str, help='output path')
+    parser.add_argument('binary', metavar='<binary>',
+                            type=str, help='path to the binary to run')
 
-args = parser.parse_args()
+    args = parser.parse_args()
 
-if not os.path.exists(args.binary):
-    print("Invalid binary: %s" % args.binary)
-    sys.exit(1)
+    if not os.path.exists(args.binary):
+        print("Invalid binary: %s" % args.binary)
+        sys.exit(1)
 
-ldd_out = run(["ldd", args.binary])
-ldd_out = ldd_out.strip("\t").split("\n")
-libs = []
-for lib in ldd_out:
-    matches = re.findall(".* => (.+) \(.+\)", lib)
-    for m in matches:
-        if "libdl.so" not in m:
-            libs.append(m)
+    ldd_out = run(["ldd", args.binary])
+    ldd_out = ldd_out.strip("\t").split("\n")
+    libs = []
+    for lib in ldd_out:
+        matches = re.findall(".* => (.+) \(.+\)", lib)
+        for m in matches:
+            if "libdl.so" not in m:
+                libs.append(m)
 
-outfile = None
-if args.output:
-    outfile = open(args.output, "w")
+    outfile = None
+    if args.output:
+        outfile = open(args.output, "w")
 
-binaries = [ args.binary ] + libs
-for b in binaries:
-    if "libc.so" in b:
-        process_plt_libc(b, outfile)
-    else:
-        process_plt(b, outfile)
+    binaries = [ args.binary ] + libs
+    for b in binaries:
+        if "libc.so" in b:
+            process_plt_libc(b, outfile)
+        else:
+            process_plt(b, outfile)
 
-if outfile:
-    outfile.close()
+    if outfile:
+        outfile.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

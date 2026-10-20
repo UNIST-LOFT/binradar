@@ -57,10 +57,11 @@ RUN cargo install just
 WORKDIR /workspace/fuzzolic
 COPY --chown=binradar:binradar pyproject.toml uv.lock ./
 
-RUN uv venv && uv sync
+RUN uv venv && uv sync --no-install-project
 
 # fuzzolic
 COPY --chown=binradar:binradar . .
+RUN uv sync
 
 # Build QEMU tracer
 RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && bear -- make -j 32

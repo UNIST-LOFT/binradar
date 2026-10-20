@@ -1,17 +1,14 @@
 """Immutable wire scores, first-observer reduction, and worker ownership."""
 import dataclasses
 import hashlib
-import sys
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_input_schedule as schedule
-import binradar_runtime
-from binradar_taosc_predicates import CachedSnapshot, parse_predicate_descriptor
+
+from fuzzolic import binradar_input_schedule as schedule
+from fuzzolic import binradar_runtime
+from fuzzolic.binradar_taosc_predicates import CachedSnapshot, parse_predicate_descriptor
 
 
 def snapshot(value):

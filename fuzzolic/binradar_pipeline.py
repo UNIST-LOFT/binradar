@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Optional
 
-import binradar_config
-import binradar_fuzzer
-import binradar_minimizer
-import binradar_runtime
-import binradar_verifier
-import logger
+from . import binradar_config
+from . import binradar_fuzzer
+from . import binradar_minimizer
+from . import binradar_runtime
+from . import binradar_verifier
+from . import logger
 
 OPTIONAL_EVIDENCE_PHASES = frozenset({
     "fuzzolic", "directed", "fuzzer", "binradar", "feedback",

@@ -7,14 +7,14 @@ from pathlib import Path
 import re
 import shutil
 
-import binradar_evidence as evidence
-import binradar_verifier as verifier
-from binradar_feedback_capture import (
+from . import binradar_evidence as evidence
+from . import binradar_verifier as verifier
+from .binradar_feedback_capture import (
     BINS, decode_ids, encode_ids, file_sha256, pack_branches, read_case,
     read_header, unpack_branches,
 )
-from binradar_feedback_bundle import VERSION, observed_class, write_row
-from binradar_taosc_predicates import REGISTER_TO_VAR, load_runtime_predicates, parse_cached_snapshots
+from .binradar_feedback_bundle import VERSION, observed_class, write_row
+from .binradar_taosc_predicates import REGISTER_TO_VAR, load_runtime_predicates, parse_cached_snapshots
 
 
 def _label(trace, reference, *, mutation=False):

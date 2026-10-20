@@ -1,14 +1,8 @@
 """Tests for the Valgrind/QASAN address normalization."""
 
-import importlib.util
-from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent.parent
-SPEC = importlib.util.spec_from_file_location(
-    "binradar_test", ROOT / "fuzzolic" / "binradar-test.py")
-binradar_test = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(binradar_test)
+from fuzzolic import binradar_test
 
 
 def test_tracer_reference_requires_explicit_valid_v2_row():
@@ -40,8 +34,8 @@ def test_standalone_current_request_reference_and_full_width_finding():
 
 
 def test_standalone_live_probe_requires_current_policy(monkeypatch, tmp_path):
-    import binradar_utils
-    from binradar_verifier import MEMCHECK_POLICY
+    from fuzzolic import binradar_utils
+    from fuzzolic.binradar_verifier import MEMCHECK_POLICY
     (tmp_path / "guest.orig").write_bytes(b"toy")
     (tmp_path / "out").mkdir()
     (tmp_path / "out/plt_info.txt").write_text("malloc free")
@@ -73,8 +67,8 @@ def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path)
     as a valid-looking v2 reference at its kill PC. That is not the subject's
     observed crash, so the probe must report it as failed rather than
     returning the salvaged address."""
-    import binradar_utils
-    from binradar_verifier import tracer_execution_cancelled
+    from fuzzolic import binradar_utils
+    from fuzzolic.binradar_verifier import tracer_execution_cancelled
     import signal as signal_module
 
     salvaged = (
@@ -203,8 +197,8 @@ def test_overhead_never_reports_ratio_for_failed_or_incomplete_runs():
 
 
 def test_overhead_checker_rows_cannot_mask_timeout_or_nonzero_exit():
-    from binradar_utils import ExecutionResult
-    from binradar_verifier import MEMCHECK_POLICY
+    from fuzzolic.binradar_utils import ExecutionResult
+    from fuzzolic.binradar_verifier import MEMCHECK_POLICY
 
     logs = {
         "orig": "",

@@ -1,23 +1,15 @@
-import importlib.util
 import os
-import sys
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_config
-import binradar_runtime
 
-SPEC = importlib.util.spec_from_file_location(
-    "binradar_runtime_contract", ROOT / "fuzzolic" / "binradar.py")
-assert SPEC is not None and SPEC.loader is not None
-binradar = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(binradar)
+from fuzzolic import binradar_config
+from fuzzolic import binradar_runtime
+
+from fuzzolic import binradar
 
 
 def test_shared_memory_keys_are_named_distinct_and_fixed_width(monkeypatch):

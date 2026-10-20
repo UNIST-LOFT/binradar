@@ -1,12 +1,11 @@
 """Strict collection state and harmless subprocess capacity cutoff fixtures."""
 import json
 import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fuzzolic"))
-import binradar_runtime as runtime
+
+from fuzzolic import binradar_runtime as runtime
 
 
 def status_row(complete=False, reason="expr-capacity"):

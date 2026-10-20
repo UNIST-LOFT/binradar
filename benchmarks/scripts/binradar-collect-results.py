@@ -35,7 +35,7 @@ Subcommands:
 
     sdfuzz
         Collect external-fuzzer evaluation results from <workdir>/<fuzzer>
-        (output of fuzzolic/binradar-evaluation.py). For each experiment:
+        (output of binradar-evaluation.py). For each experiment:
           1. Checks <workdir>/<fuzzer> exists
           2. Parses final.sbsv for remaining_patches and per-patch verdicts
           3. Parses evaluation.log for minimized/verifier testcase counts and errors
@@ -89,10 +89,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
-sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "fuzzolic"))
+sys.path.insert(0, str(SCRIPT_DIR.parent.parent))
 
-import binradar_evidence
-import binradar_utils
+from fuzzolic import binradar_evidence, binradar_utils
 
 
 def _result_artifact(run_dir: str, stem: str) -> str:
@@ -1606,7 +1605,7 @@ def collect_sdfuzz_experiment(exp_dir: str, workdir_name: str,
     Collect results of an external-fuzzer evaluation for a single experiment.
 
     Reads <workdir>/<fuzzer>/, the output layout of
-    fuzzolic/binradar-evaluation.py:
+    binradar-evaluation.py:
       final.sbsv        final remaining patches + per-patch verdicts
       verified.br       compact concrete-verifier result
       evaluation.log    evaluation log (minimizer/verifier counts, errors)

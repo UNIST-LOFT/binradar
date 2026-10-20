@@ -49,13 +49,14 @@ RUN /root/.cargo/bin/cargo install just
 WORKDIR /root/fuzzolic
 COPY pyproject.toml uv.lock ./
 
-RUN /root/.local/bin/uv venv && /root/.local/bin/uv sync
+RUN /root/.local/bin/uv venv && /root/.local/bin/uv sync --no-install-project
 
 ENV VIRTUAL_ENV=/root/fuzzolic/.venv
 ENV PATH="$VIRTUAL_ENV/bin:/root/.local/bin:/root/.cargo/bin:$PATH"
 
 # fuzzolic
 COPY . .
+RUN /root/.local/bin/uv sync
 
 # Build QEMU tracer
 RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && make -j 32 

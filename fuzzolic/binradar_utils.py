@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import logger
+from . import logger
 
 # E9 runtime metadata keys in binradar.env, prefixed per artifact so a
 # future .brcached can never borrow .brpatched layout values.  All current

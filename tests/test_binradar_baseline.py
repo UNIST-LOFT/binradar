@@ -19,17 +19,15 @@ import hashlib
 import json
 import signal
 import struct
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_baseline
-import binradar_verifier
+
+from fuzzolic import binradar_baseline
+from fuzzolic import binradar_verifier
 
 
 REFERENCE = binradar_verifier.TracerFaultReference(0x44eced, "provenance-access")

@@ -3,15 +3,13 @@ import select
 import stat
 import struct
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-import binradar_runtime
+
+from fuzzolic import binradar_runtime
 
 
 @pytest.mark.parametrize("result,stop", [(4, 0), (0, 5), (4, 1)])

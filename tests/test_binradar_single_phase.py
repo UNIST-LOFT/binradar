@@ -3,27 +3,19 @@
 minimizer-verifier phase (minimizer + concrete verifier running concurrently
 over already-produced testcases)."""
 
-import importlib.util
 import os
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_artifacts
-import binradar_config
-import binradar_verifier
 
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None
-assert _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
+from fuzzolic import binradar_artifacts
+from fuzzolic import binradar_config
+from fuzzolic import binradar_verifier
+
+from fuzzolic import binradar
 
 
 def _probe(exit_info="ok", fault_addr=0x1234):

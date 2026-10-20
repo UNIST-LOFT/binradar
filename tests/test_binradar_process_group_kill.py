@@ -21,14 +21,12 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-import binradar_runtime  # noqa: E402
-import binradar_utils  # noqa: E402
+
+from fuzzolic import binradar_runtime
+from fuzzolic import binradar_utils
 
 
 def _alive(pid: int) -> bool:

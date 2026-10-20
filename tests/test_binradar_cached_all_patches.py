@@ -10,23 +10,16 @@ boundary between the two artifacts: the expansion, the artifact selection that
 must follow it, and the refusal to run such an id on .brpatched.
 """
 
-import importlib.util
 import json
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None and _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
-import binradar_artifacts
+
+from fuzzolic import binradar
+from fuzzolic import binradar_artifacts
 
 binradar_verifier = binradar.binradar_verifier
 
@@ -268,7 +261,7 @@ def test_verifier_never_runs_an_uncompiled_id_on_brpatched(tmp_path):
 
 
 def test_feedback_singleton_selects_usable_cache(tmp_path, monkeypatch):
-    import binradar_feedback_capture
+    from fuzzolic import binradar_feedback_capture
 
     monkeypatch.setattr(binradar_feedback_capture.CaptureJournal, "__init__",
                         lambda self, *args, **kwargs: None)

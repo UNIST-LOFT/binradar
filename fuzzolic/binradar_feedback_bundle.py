@@ -14,10 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import sbsv
-from binradar_feedback_capture import (
+from .binradar_feedback_capture import (
     BINS, decode_ids, file_sha256, parse_id_ranges, unpack_branches,
 )
-from binradar_taosc_predicates import (
+from .binradar_taosc_predicates import (
     parse_cached_snapshots, load_runtime_predicates, evaluate_cached_predicate,
 )
 

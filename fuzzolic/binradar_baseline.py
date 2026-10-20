@@ -12,9 +12,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import sbsv
 
-import binradar_utils
-import binradar_verifier
-import logger
+from . import binradar_utils
+from . import binradar_verifier
+from . import logger
 
 TRACER_BIN = os.path.join(
     os.path.dirname(os.path.realpath(__file__)),

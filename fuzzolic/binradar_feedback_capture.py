@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 
-from binradar_taosc_predicates import (
+from .binradar_taosc_predicates import (
     CachedSnapshot, CACHED_SNAPSHOT_HEADER, CACHED_SNAPSHOT_MAGIC,
     CACHED_SNAPSHOT_VERSION, CACHED_SNAPSHOT_FLAG_CWE805,
     CACHED_SNAPSHOT_CLAMPS, CACHED_SNAPSHOT_REGS,

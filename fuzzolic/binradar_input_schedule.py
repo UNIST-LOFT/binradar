@@ -11,9 +11,9 @@ import sys
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-import binradar_runtime
-import binradar_utils
-from binradar_taosc_predicates import (
+from . import binradar_runtime
+from . import binradar_utils
+from .binradar_taosc_predicates import (
     CachedSnapshot, ParsedPredicate, PredicateTrap, _compile_patch_str,
     evaluate_cached_branch, wrap64,
 )
@@ -279,7 +279,11 @@ class NoveltyScorer:
             parent, child = socket.socketpair()
             try:
                 process = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "--worker", str(child.fileno())],
+                    [sys.executable, "-m", "fuzzolic.binradar_input_schedule",
+                     "--worker", str(child.fileno())],
+                    # The worker consumes only IPC data. This also makes source
+                    # wrappers usable before installation, from any workdir.
+                    cwd=Path(__file__).resolve().parent.parent,
                     pass_fds=(child.fileno(),), start_new_session=True,
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

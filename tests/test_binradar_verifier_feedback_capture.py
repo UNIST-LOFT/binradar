@@ -1,13 +1,11 @@
 """Verifier feedback records real executions at whole-vector group boundaries."""
 
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fuzzolic"))
-import binradar_evidence
-import binradar_verifier as verifier_module
+
+from fuzzolic import binradar_evidence
+from fuzzolic import binradar_verifier as verifier_module
 
 
 class RecordingJournal:

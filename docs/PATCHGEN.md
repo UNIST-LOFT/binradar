@@ -112,7 +112,7 @@ hooks.
 ## Setup and prefilter
 ```shell
 just setup
-# uv run /path/to/binradar/fuzzolic/binradar-setup.py setup -w workdir
+# uv run /path/to/binradar/binradar-setup.py setup -w workdir
 ```
 This setup script runs the offline prefilter, classifies the workdir, generates
 `workdir/binradar.env` with the necessary configuration (including

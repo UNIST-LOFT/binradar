@@ -3,7 +3,7 @@
 Taosc predicate management for BinRadar workdir setup.
 Parsing, classification, evaluation, and lowering of the Taosc predicate
 families (generic ERM, CWE-805 ERM, CWE-805 direct, taosc-specialized),
-plus the allocator-trace instrumentation spec shared by patched artifacts.  Split out of fuzzolic/binradar-setup.py.
+plus the allocator-trace instrumentation spec shared by patched artifacts.  Shared with fuzzolic.binradar_setup.
 """
 
 import enum

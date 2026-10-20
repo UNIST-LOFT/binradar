@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, Dict, List, NoReturn, Optional, Tuple
 
-import binradar_utils
-import logger
+from . import binradar_utils
+from . import logger
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SOLVER_SMT_BIN = str(SCRIPT_DIR / "../solver/build/solver-smt")

@@ -1,27 +1,18 @@
 #!/usr/bin/env python3
 """Tests for disabling the optional BinRadar phase."""
 
-import importlib.util
 import json
-import sys
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import binradar_config
+from fuzzolic import binradar_config
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None
-assert _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
-import binradar_artifacts  # noqa: E402  (same fuzzolic module path)
-import binradar_utils  # noqa: E402  (same fuzzolic module path)
+
+from fuzzolic import binradar
+from fuzzolic import binradar_artifacts
+from fuzzolic import binradar_utils
 
 
 def _stub_executor(tmp_path):

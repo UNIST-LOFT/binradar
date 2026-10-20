@@ -1,20 +1,11 @@
-import importlib.util
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-SPEC = importlib.util.spec_from_file_location(
-    "binradar_environment", ROOT / "fuzzolic" / "binradar.py")
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("failed to load fuzzolic/binradar.py")
-binradar = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(binradar)
-import binradar_artifacts
-import binradar_config
+
+from fuzzolic import binradar
+from fuzzolic import binradar_artifacts
+from fuzzolic import binradar_config
 from test_binradar_e9_metadata import _write_bound_identity_artifacts
 
 

@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """PATCH_TYPE / TAOSC_TOTAL_PATCHES / FILTER_TOTAL_PATCHES in binradar.env."""
 
-import importlib.util
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-_spec = importlib.util.spec_from_file_location(
-    "binradar_setup", ROOT / "fuzzolic" / "binradar-setup.py")
-assert _spec is not None and _spec.loader is not None
-binradar_setup = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar_setup)
 
-import binradar_taosc_predicates
+from fuzzolic import binradar_setup
+
+from fuzzolic import binradar_taosc_predicates
 
 
 def _fake_run(calls):

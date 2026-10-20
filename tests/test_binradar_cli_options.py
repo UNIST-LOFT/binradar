@@ -2,20 +2,13 @@
 """Focused tests for binradar's public boolean and target-count options."""
 
 import argparse
-import importlib.util
 import sys
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None and _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
-import binradar_config
+
+from fuzzolic import binradar
+from fuzzolic import binradar_config
 
 
 def _run_main(monkeypatch, tmp_path, extra_args, extra_env=""):

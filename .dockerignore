@@ -3,6 +3,7 @@
 # python
 __pycache__
 *.pyc
+*.egg-info
 .venv
 
 # docker

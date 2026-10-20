@@ -7,11 +7,11 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import binradar_evidence
-import binradar_verifier
-from binradar_feedback_export import write_classification
-from binradar_taosc_predicates import parse_cached_snapshots
-import logger
+from . import binradar_evidence
+from . import binradar_verifier
+from .binradar_feedback_export import write_classification
+from .binradar_taosc_predicates import parse_cached_snapshots
+from . import logger
 import sbsv
 
 

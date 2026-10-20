@@ -6,8 +6,8 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
-import binradar_utils
-import logger
+from . import binradar_utils
+from . import logger
 import sbsv
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

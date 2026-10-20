@@ -8,24 +8,18 @@ proceeding on the historical one.
 """
 
 import contextlib
-import importlib.util
 import io
 import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_evidence
-import binradar_verifier
 
-_spec = importlib.util.spec_from_file_location(
-    "binradar_evaluation", ROOT / "fuzzolic" / "binradar-evaluation.py")
-assert _spec is not None and _spec.loader is not None
-evaluation = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(evaluation)
+from fuzzolic import binradar_evidence
+from fuzzolic import binradar_verifier
+
+from fuzzolic import binradar_evaluation as evaluation
 
 
 def _probe_row(version: int) -> str:

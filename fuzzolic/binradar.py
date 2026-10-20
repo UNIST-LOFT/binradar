@@ -15,20 +15,20 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import binradar_artifacts
-import binradar_baseline
-import binradar_config
-import binradar_feedback
-from binradar_feedback_capture import write_mutation_context
-import binradar_fuzzer
-import binradar_minimizer
-import binradar_pipeline
-import binradar_results
-import binradar_run_records
-import binradar_runtime
-import binradar_utils
-import binradar_verifier
-import logger
+from . import binradar_artifacts
+from . import binradar_baseline
+from . import binradar_config
+from . import binradar_feedback
+from .binradar_feedback_capture import write_mutation_context
+from . import binradar_fuzzer
+from . import binradar_minimizer
+from . import binradar_pipeline
+from . import binradar_results
+from . import binradar_run_records
+from . import binradar_runtime
+from . import binradar_utils
+from . import binradar_verifier
+from . import logger
 import sbsv
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -2105,6 +2105,10 @@ class BinRadarExecutor:
 
     
 def main():
+    # Keep the original -u CLI's immediate text output for every entrypoint.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True, write_through=True)
     setlimits()
     signal.signal(signal.SIGINT, binradar_runtime.abort_handler)
     signal.signal(signal.SIGTERM, binradar_runtime.abort_handler)

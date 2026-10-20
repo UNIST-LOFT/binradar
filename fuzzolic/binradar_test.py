@@ -22,12 +22,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
 
-import binradar_utils
-import binradar_verifier
-from binradar_verifier import (
+from . import binradar_utils
+from . import binradar_verifier
+from .binradar_verifier import (
     BinRadarProbeResult,
     BinRadarQemuRunner,
     QEMU_STACKTRACE_RELEASE,
@@ -42,7 +40,7 @@ Run tests on binradar benchmark subjects listed in exp.list.
 
 Usage:
     cd benchmarks/loftix
-    uv run ../../fuzzolic/binradar-test.py qasan [options]
+    uv run ../../binradar-test.py qasan [options]
 
 Subcommands:
     overhead

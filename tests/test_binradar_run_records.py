@@ -1,14 +1,8 @@
 """Behavioral coverage for BinRadar progress and run records."""
 
-import importlib.util
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location(
-    "binradar_run_records", ROOT / "fuzzolic" / "binradar_run_records.py")
-assert _spec is not None and _spec.loader is not None
-binradar_run_records = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar_run_records)
+from fuzzolic import binradar_run_records
 
 
 def test_progress_loads_latest_matching_run_and_phase_flags(tmp_path):

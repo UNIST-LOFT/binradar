@@ -18,13 +18,13 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
 
 import sbsv
 
-import logger
+from . import logger
 
-import binradar_evidence
-import binradar_utils
-from binradar_feedback_capture import CaptureJournal
-from binradar_input_schedule import InputScore, split_score
-from binradar_taosc_predicates import (
+from . import binradar_evidence
+from . import binradar_utils
+from .binradar_feedback_capture import CaptureJournal
+from .binradar_input_schedule import InputScore, split_score
+from .binradar_taosc_predicates import (
     CachedSnapshot,
     GenericEnvironments,
     ParsedPredicate,
@@ -1274,7 +1274,7 @@ class BinRadarQemuRunner:
         command = self.get_qemu_stacktrace_command_for_binary(binary, testcase)
         # Keep ownership explicit even when pipe creation, spawning, or a
         # host cancellation raises before execute_await can clean up.
-        from binradar_runtime import PROCESS_REGISTRY
+        from .binradar_runtime import PROCESS_REGISTRY
         self.run_results = None
         owned_fds: Set[int] = set()
         readers: List[threading.Thread] = []
@@ -2198,7 +2198,7 @@ class BinRadarConcreteVerifier:
         cached = context["descriptor_digest"] != "none"
         if cached:
             # Local import keeps the capture owner out of verifier's import cycle.
-            from binradar_input_features import descriptor_digest
+            from .binradar_input_features import descriptor_digest
             coverage = load_cached_predicate_set(
                 Path(self.dir) / "brpatches.json", Path(self.runner.cached_binary()),
                 self.runner.patch_kind, self.runner.brcache_stack_size, self.patches)

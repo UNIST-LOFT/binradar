@@ -3,14 +3,12 @@
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-import binradar_runtime
+
+from fuzzolic import binradar_runtime
 
 
 @pytest.fixture(scope="module")
@@ -198,7 +196,7 @@ def test_capacity_before_and_after_forkserver_banner(
 ])
 def test_binradar_keeps_guest_outcomes_after_symbolic_capacity(
         tmp_path, capacity_guest, entry, mode, count, reason, outcome):
-    import binradar_evidence
+    from fuzzolic import binradar_evidence
 
     guest, addresses = capacity_guest
     env = collection_environment(tmp_path)

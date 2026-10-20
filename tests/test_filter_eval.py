@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """Unit tests for Taosc predicate parsing, evaluation, and filter mapping."""
 
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location(
-    "binradar_taosc_predicates",
-    ROOT / "fuzzolic" / "binradar_taosc_predicates.py")
-binradar_taosc_predicates = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar_taosc_predicates)
+from fuzzolic import binradar_taosc_predicates
 
 eval_patch_str = binradar_taosc_predicates.eval_patch_str
 predicate_to_patch_str = binradar_taosc_predicates.predicate_to_patch_str

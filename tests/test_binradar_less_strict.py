@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Tests for the opt-in --less-strict orchestration policy."""
 
-import importlib.util
-import sys
 import threading
 import time
 from pathlib import Path
@@ -10,15 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import binradar_config
+from fuzzolic import binradar_config
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-_spec = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec is not None and _spec.loader is not None
-binradar = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar)
+
+from fuzzolic import binradar
 
 
 def _policy_executor(tmp_path, less_strict):

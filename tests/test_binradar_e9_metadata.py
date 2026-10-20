@@ -6,7 +6,7 @@ production code and pass once the exact-interval and relocated-call
 propagation contracts land (Phases 1-2).
 
 P0-1: disjoint E9 trampoline/reserve maps are collapsed into one min..max
-      envelope by fuzzolic/binradar-setup.py::extract_trampoline_info,
+      envelope by fuzzolic.binradar_setup.extract_trampoline_info,
       excluding unmapped gaps (39.5 MiB for xmllint, 1.93 GiB for tiffcp).
 P0-2: phase-environment construction must set E9_RELOCATED_CALL_JUMPS for the
       selected symbolic tracer artifact, and the .orig memcheck run receives the
@@ -17,7 +17,6 @@ parsed by parse_e9patch_config) so the tests exercise the real production
 parser without invoking e9tool.
 """
 
-import importlib.util
 import signal
 import struct
 import subprocess
@@ -28,27 +27,14 @@ from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-_spec = importlib.util.spec_from_file_location(
-    "binradar_setup", ROOT / "fuzzolic" / "binradar-setup.py")
-assert _spec is not None and _spec.loader is not None
-binradar_setup = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(binradar_setup)
 
-_spec_utils = importlib.util.spec_from_file_location(
-    "binradar_utils", ROOT / "fuzzolic" / "binradar_utils.py")
-assert _spec_utils is not None and _spec_utils.loader is not None
-binradar_utils = importlib.util.module_from_spec(_spec_utils)
-_spec_utils.loader.exec_module(binradar_utils)
+from fuzzolic import binradar_setup
 
-_spec2 = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec2 is not None and _spec2.loader is not None
-binradar = importlib.util.module_from_spec(_spec2)
-_spec2.loader.exec_module(binradar)
-import binradar_artifacts
+from fuzzolic import binradar_utils
+
+from fuzzolic import binradar
+from fuzzolic import binradar_artifacts
 
 PAGE = binradar_setup.PAGE_SIZE
 TRAMPOLINE = binradar_setup.E9MapType.TRAMPOLINE

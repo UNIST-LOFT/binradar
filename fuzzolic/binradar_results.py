@@ -5,9 +5,9 @@ import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
-import binradar_evidence
-import binradar_verifier
-import logger
+from . import binradar_evidence
+from . import binradar_verifier
+from . import logger
 import sbsv
 
 IterationResults = tuple[int, dict[int, dict]]

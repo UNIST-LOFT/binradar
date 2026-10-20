@@ -2,14 +2,12 @@
 """Regression tests for typed BinRadar tracer fault references."""
 
 from pathlib import Path
-import sys
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_verifier
+
+from fuzzolic import binradar_verifier
 
 
 def _probe(reference):
@@ -245,7 +243,7 @@ def test_historical_probe_cannot_claim_current_concrete_oracle(version):
 
 @pytest.mark.parametrize("defect", ["raw-id", "family", "partial", "hit-count", "text-id"])
 def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, monkeypatch, defect):
-    import binradar_taosc_predicates as predicates
+    from fuzzolic import binradar_taosc_predicates as predicates
 
     runner = binradar_verifier.BinRadarQemuRunner(
         str(tmp_path), "target", "@@", "0x1000", patch_kind="generic-erm")

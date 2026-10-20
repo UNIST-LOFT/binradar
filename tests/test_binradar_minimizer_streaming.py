@@ -7,7 +7,6 @@ gracefully finalizes evidence at its deadline, cancels on verifier errors,
 and keeps standalone snapshot behavior.
 """
 
-import importlib.util
 import os
 import queue
 import subprocess
@@ -19,24 +18,18 @@ from types import SimpleNamespace
 
 import pytest
 
-import binradar_config
+from fuzzolic import binradar_config
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar_evidence
-import binradar_fuzzer
-import binradar_minimizer
-import binradar_runtime
-import binradar_utils
-import binradar_verifier
 
-_spec_bin = importlib.util.spec_from_file_location(
-    "binradar", ROOT / "fuzzolic" / "binradar.py")
-assert _spec_bin is not None
-assert _spec_bin.loader is not None
-binradar = importlib.util.module_from_spec(_spec_bin)
-_spec_bin.loader.exec_module(binradar)
+from fuzzolic import binradar_evidence
+from fuzzolic import binradar_fuzzer
+from fuzzolic import binradar_minimizer
+from fuzzolic import binradar_runtime
+from fuzzolic import binradar_utils
+from fuzzolic import binradar_verifier
+
+from fuzzolic import binradar
 
 
 def _probe(exit_info="ok", fault_addr=0x1234):
@@ -120,7 +113,7 @@ def _verifier_result(run_dir: Path):
 
 def _scheduled_stream(tmp_path, monkeypatch, scores, patches=(1,)):
     import hashlib
-    from binradar_input_schedule import InputScore
+    from fuzzolic.binradar_input_schedule import InputScore
 
     run_dir = tmp_path / "run"
     (run_dir / "minimized").mkdir(parents=True)
@@ -208,7 +201,7 @@ def test_live_newcomer_overtakes_pending_without_batch_wait(tmp_path, monkeypatc
 @pytest.mark.parametrize("policy", ["fifo", "novelty"])
 def test_slow_input_yields_and_ingests_new_input_between_turns(
         tmp_path, monkeypatch, policy):
-    from binradar_input_schedule import split_score
+    from fuzzolic.binradar_input_schedule import split_score
 
     verifier, path, row = _scheduled_stream(
         tmp_path, monkeypatch, [9, 0], patches=(1, 2, 3))
@@ -412,7 +405,7 @@ def test_scheduled_stream_rejects_inconsistent_protocol(tmp_path, monkeypatch, d
     verifier, path, _ = _scheduled_stream(tmp_path, monkeypatch, [1, 2])
     text = path.read_text() + "[minimizer] [done] [time 1]\n"
     if damage == "missing-score":
-        from binradar_input_schedule import split_score
+        from fuzzolic.binradar_input_schedule import split_score
         text = "\n".join(split_score(line)[0] if "[id 0]" in line else line
                          for line in text.split("\n"))
     elif damage == "duplicate-sequence":

@@ -6,17 +6,13 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-
-import binradar_config
-import binradar_evidence
-from binradar_feedback import FeedbackExportRequest, export_feedback
-import binradar_minimizer
-import binradar_utils
-import binradar_verifier
-import logger
+from . import binradar_config
+from . import binradar_evidence
+from .binradar_feedback import FeedbackExportRequest, export_feedback
+from . import binradar_minimizer
+from . import binradar_utils
+from . import binradar_verifier
+from . import logger
 import sbsv
 
 """
@@ -42,7 +38,7 @@ Output layout (relative to --workdir):
     <workdir>/<fuzzer>/evaluation.log      debug log
 
 Usage:
-    uv run fuzzolic/binradar-evaluation.py \
+    uv run binradar-evaluation.py \
         --fuzzer sdfuzz \
         --fuzz-out /path/to/work-sdfuzz/out \
         --workdir /path/to/loftix/workdir

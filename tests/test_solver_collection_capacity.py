@@ -2,14 +2,13 @@
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
-import binradar_runtime
+
+from fuzzolic import binradar_runtime
 
 
 @pytest.fixture(scope="module")

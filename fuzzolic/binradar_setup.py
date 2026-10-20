@@ -17,13 +17,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 
-import binradar_taosc_predicates
-import binradar_utils
-import binradar_verifier
-from binradar_taosc_predicates import (
+from . import binradar_taosc_predicates
+from . import binradar_utils
+from . import binradar_verifier
+from .binradar_taosc_predicates import (
     AllocatorTrace,
     CWE805PointerPredicate,
     CWE805SizePredicate,
@@ -68,7 +66,7 @@ compact survivor set.  The verification pipeline therefore starts with only
 POC-surviving candidates and has no separate FILTER phase.
 
 Usage:
-  uv run fuzzolic/binradar-setup.py setup -w <workdir>
+  uv run binradar-setup.py setup -w <workdir>
 
 The compiled `.brpatched` table contains at most the top 30 setup-filter
 survivors.  `brpatches.json` and `.brcached` cover every survivor so

@@ -4,8 +4,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import binradar_utils
-import binradar_verifier
+from . import binradar_utils
+from . import binradar_verifier
 
 FORKSERVER_CHILD_TIMEOUT_DEFAULT = 900
 SYMBOLIC_MUTATION_MODE_DEFAULT = "off"

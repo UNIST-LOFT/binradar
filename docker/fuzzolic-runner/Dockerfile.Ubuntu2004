@@ -42,13 +42,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
 WORKDIR /root/fuzzolic
 COPY pyproject.toml uv.lock ./
 
-RUN uv venv && uv sync
+RUN uv venv && uv sync --no-install-project
 
 ENV VIRTUAL_ENV=/root/fuzzolic/.venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN apt-get install -y openssh-server
 COPY . .
+RUN uv sync
 
 # Build QEMU tracer
 RUN cd tracer && mkdir build && cd build && ../configure --target-list=x86_64-linux-user && make -j 32 

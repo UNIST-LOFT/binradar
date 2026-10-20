@@ -16,12 +16,12 @@ import fcntl
 
 from typing import List, Dict, Set, Tuple, Any, Optional, Sequence
 
-import binradar_utils
-import binradar_verifier
-import binradar_config
-from binradar_feedback_capture import CaptureJournal
-from binradar_input_features import BaselineFeatureCollector
-from binradar_input_schedule import InputScore, NoveltyScorer
+from . import binradar_utils
+from . import binradar_verifier
+from . import binradar_config
+from .binradar_feedback_capture import CaptureJournal
+from .binradar_input_features import BaselineFeatureCollector
+from .binradar_input_schedule import InputScore, NoveltyScorer
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU_STACKTRACE_RELEASE = os.path.join(ROOT_DIR, "LibAFL", "fuzzers", "binary_only", "qemu_stacktrace", "target", "release", "qemu_stacktrace")

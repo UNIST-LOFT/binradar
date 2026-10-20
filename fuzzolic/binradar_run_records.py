@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import logger
+from . import logger
 import sbsv
 
 

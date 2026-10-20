@@ -12,12 +12,12 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "fuzzolic"))
 
-import binradar
-import binradar_evidence
-import binradar_results
-import binradar_verifier
+
+from fuzzolic import binradar
+from fuzzolic import binradar_evidence
+from fuzzolic import binradar_results
+from fuzzolic import binradar_verifier
 
 
 def _uleb(value: int) -> bytes:
@@ -358,7 +358,7 @@ def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):
     binradar_path = tmp_path / "binradar.br"
     _write_binradar(binradar_path)
 
-    converter = ROOT / "fuzzolic" / "binradar-evidence-to-text.py"
+    converter = ROOT / "binradar-evidence-to-text.py"
 
     def convert(path: Path, *arguments: str) -> str:
         result = subprocess.run(
@@ -735,7 +735,7 @@ def test_source_wire_history_and_rendering(tmp_path, version, source):
     assert group.fault_addr == 0
     assert group.source == (source if version == 4 else None)
     output = subprocess.run(
-        [sys.executable, str(ROOT / "fuzzolic/binradar-evidence-to-text.py"), str(path)],
+        [sys.executable, str(ROOT / "binradar-evidence-to-text.py"), str(path)],
         check=True, capture_output=True, text=True).stdout
     assert f"[source {source if version == 4 else 'unknown'}]" in output
 

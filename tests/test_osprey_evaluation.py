@@ -1,20 +1,10 @@
 import argparse
-import importlib.util
 import shutil
 import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-SPEC = importlib.util.spec_from_file_location(
-    "osprey_evaluation", ROOT / "fuzzolic" / "osprey-evaluation.py"
-)
-assert SPEC is not None and SPEC.loader is not None
-evaluation = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = evaluation
-SPEC.loader.exec_module(evaluation)
+from fuzzolic import osprey_evaluation as evaluation
 
 
 def _address(kind, image, site, offset):
