@@ -25,6 +25,7 @@ VERSION = 1
 BINS = ("crash-fail", "crash-pass", "no-crash-pass-same-br",
         "no-crash-confidence-diff-br", "no-crash-fail", "patch-crashed")
 _TOKEN = re.compile(r"[A-Za-z0-9_.:-]+\Z")
+_ID_RANGES = re.compile(r"[1-9][0-9]*(?:-[1-9][0-9]*)?(?:,[1-9][0-9]*(?:-[1-9][0-9]*)?)*")
 
 
 def file_sha256(path: str | Path) -> str:
@@ -59,13 +60,14 @@ def parse_id_ranges(text: str) -> list[tuple[int, int]]:
     """Validate sorted inclusive ranges without expanding their members."""
     if text == "none":
         return []
+    if _ID_RANGES.fullmatch(text) is None:
+        raise ValueError("invalid feedback member range")
     result = []
     previous = 0
     for part in text.split(","):
-        match = re.fullmatch(r"([1-9][0-9]*)(?:-([1-9][0-9]*))?", part)
-        if match is None:
-            raise ValueError("invalid feedback member range")
-        start, end = int(match[1]), int(match[2] or match[1])
+        first, separator, last = part.partition("-")
+        start = int(first)
+        end = int(last) if separator else start
         if start <= previous or end < start or end > 0xffffffff:
             raise ValueError("unordered feedback member range")
         result.append((start, end))

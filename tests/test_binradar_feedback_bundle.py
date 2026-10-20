@@ -378,6 +378,11 @@ def test_reader_accepts_adjacent_intervals_with_identical_membership(tmp_path):
     ("[members 1,3-4]", "[members 3-4,1]"),
     ("[members 1,3-4]", "[members 1,4-3]"),
     ("[members 1,3-4]", "[members 01,3-4]"),
+    ("[members 1,3-4]", "[members 1,3-04]"),
+    ("[members 1,3-4]", "[members 1,3-4,]"),
+    ("[members 1,3-4]", "[members 1,,3-4]"),
+    ("[members 1,3-4]", "[members 1,3--4]"),
+    ("[members 1,3-4]", "[members 1,٣-4]"),
     ("[members 1,3-4]", "[members none]"),
     ("[not-run 7-8]", "[not-run 2,7-8]"),
     ("[not-run 7-8]", "[not-run 4,7-8]"),
@@ -428,6 +433,100 @@ def test_reader_rejects_inconsistent_evidence_not_just_syntax(tmp_path, damage):
         path.write_text(text)
     with pytest.raises(ValueError, match="disagrees|checksum mismatch"):
         bundle_reader.load_bundle(path)
+
+
+def test_fragmented_groups_preserve_counter_carries_and_reject_overlap(tmp_path):
+    run = _CaptureRun(tmp_path, candidates=range(1, 130))
+    even = list(range(2, 130, 2))
+    for case in range(17):
+        run.case(case)
+        odd = [patch for patch in range(1, 130, 2) if patch % 5 or case < 15]
+        run.trace(case, 1, members=odd, values=[0])
+        if case < 16:
+            run.trace(case, 2, members=even, branches=[1],
+                      observation="no-crash-confidence-diff-br")
+    run.case(17)
+    run.trace(17, 1, members=list(range(1, 65)), values=[0])
+    bundle = run.export()
+    for patch in bundle.selected:
+        same = ((15 if patch % 5 == 0 else 17) if patch % 2 else 0) + (patch <= 64)
+        different = 0 if patch % 2 else 16
+        assert bundle.predicates[patch]["concrete-counts"] == f"0,0,{same},{different},0,0"
+        assert bundle.predicates[patch]["mutation-counts"] == "0,0,0,0,0,0"
+        observations = list(bundle.observations_for(patch))
+        assert sum(row["bin"] == "no-crash-pass-same-br" for row in observations) == same
+        assert sum(row["bin"] == "no-crash-confidence-diff-br" for row in observations) == different
+
+    path = bundle.root / "feedback.sbsv"
+    members = ",".join(map(str, even))
+    path.write_text(path.read_text().replace(f"[members {members}]", f"[members 1,{members}]", 1))
+    with pytest.raises(ValueError, match="duplicate candidate/input"):
+        bundle_reader.load_bundle(path)
+
+
+@pytest.mark.parametrize("selected", [
+    tuple(range(1, 131)) + (0xfffffffe, 0xffffffff),
+    (1, 17, 0x80000001, 0xffffffff),
+])
+def test_membership_matches_sets_at_byte_word_and_sparse_id_boundaries(selected):
+    pool = bundle_reader._MemberPool(selected)
+    subsets = [set(), set(selected), set(selected[::2]), set(selected[1::2]),
+               set(selected[:64]), set(selected[-2:]), {selected[0], selected[-1]}]
+    for expected in subsets:
+        row = {"members": ",".join(map(str, sorted(expected))) or "none"}
+        members = pool.intern(row, "members")
+        assert members.mask() == sum(1 << index for index, patch in enumerate(selected) if patch in expected)
+        for index in range(-1, len(selected) + 2):
+            assert members.contains(index) == (0 <= index < len(selected) and selected[index] in expected)
+    # Both endpoints exist, but an inclusive ID range must not bridge holes.
+    with pytest.raises(ValueError, match="outside candidate universe"):
+        pool.intern({"members": f"{selected[0]}-{selected[-1]}"}, "members")
+
+
+def test_relative_symlink_root_remains_anchored_after_chdir(tmp_path, monkeypatch):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    trace = run.trace(0, 1)
+    bundle = run.export()
+    alias = tmp_path / "bundle-alias"
+    alias.symlink_to(bundle.root, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    loaded = bundle_reader.load_bundle("bundle-alias")
+    monkeypatch.chdir(tmp_path.parent)
+    assert loaded.states(trace)[0].registers[0] == 8
+    assert loaded.evaluate(1, trace) == [1]
+
+
+def test_lazy_state_rechecks_symlink_containment_even_for_identical_bytes(tmp_path):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    trace = run.trace(0, 1)
+    bundle = run.export()
+    payload = bundle.root / bundle.traces[trace]["state"]
+    inside = bundle.root / "relocated.brch"
+    payload.rename(inside)
+    payload.symlink_to(inside)
+    assert bundle.states(trace)[0].registers[0] == 8
+    outside = tmp_path / "outside.brch"
+    outside.write_bytes(inside.read_bytes())
+    payload.unlink()
+    payload.symlink_to(outside)
+    with pytest.raises(ValueError, match="outside bundle"):
+        bundle.states(trace)
+
+
+def test_loader_rejects_input_symlink_escape_even_with_matching_hash(tmp_path):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    bundle = run.export()
+    payload = bundle.root / bundle.inputs["c0"]["file"]
+    outside = tmp_path / "outside-input"
+    outside.write_bytes(payload.read_bytes())
+    payload.unlink()
+    payload.symlink_to(outside)
+    with pytest.raises(ValueError, match="outside bundle"):
+        bundle_reader.load_bundle(bundle.root)
 
 
 @pytest.mark.parametrize("damage", ["absent", "wrong-count", "truncated", "trailing", "duplicate-field"])
