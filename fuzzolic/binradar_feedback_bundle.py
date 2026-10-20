@@ -13,7 +13,7 @@ from collections.abc import Iterator
 
 import sbsv
 from binradar_feedback_capture import (
-    BINS, decode_ids, file_sha256, unpack_branches,
+    BINS, decode_ids, file_sha256, parse_id_ranges, unpack_branches,
 )
 from binradar_taosc_predicates import (
     parse_cached_snapshots, load_runtime_predicates, evaluate_cached_predicate,
@@ -126,6 +126,42 @@ def observed_class(counts: list[int]) -> str:
             else ("superset" if counts[3] else "ground-truth-equivalent"))
 
 
+def _disjoint_union(groups):
+    """Coalesce adjacent intervals; None means duplicate membership."""
+    result = []
+    for start, end in sorted(span for group in groups for span in group):
+        if result and start <= result[-1][1]:
+            return None
+        if result and start == result[-1][1] + 1:
+            result[-1] = (result[-1][0], end)
+        else:
+            result.append((start, end))
+    return result
+
+
+def _ranges_subset(ranges, universe):
+    position = 0
+    for start, end in ranges:
+        while position < len(universe) and universe[position][1] < start:
+            position += 1
+        if (position == len(universe) or start < universe[position][0]
+                or end > universe[position][1]):
+            return False
+    return True
+
+
+def _contains_id(ranges, patch):
+    # Binary search the last interval starting at or before this candidate.
+    low, high = 0, len(ranges)
+    while low < high:
+        middle = (low + high) // 2
+        if ranges[middle][0] <= patch:
+            low = middle + 1
+        else:
+            high = middle
+    return low > 0 and patch <= ranges[low - 1][1]
+
+
 @dataclass
 class FeedbackBundle:
     root: Path
@@ -137,6 +173,19 @@ class FeedbackBundle:
     coverage: dict[str, dict] = field(default_factory=dict)
     predicates: dict[int, dict] = field(default_factory=dict)
     excluded: dict[int, dict] = field(default_factory=dict)
+    _id_ranges: dict[str, list[tuple[int, int]]] = field(default_factory=dict, repr=False)
+
+    def observations_for(self, predicate_id: int) -> Iterator[dict]:
+        """Yield this candidate's evidence in file order, without ID expansion.
+
+        Includes ignored/unusable observations and globally excluded candidates;
+        callers collecting counter contributions should filter by BINS.
+        """
+        if predicate_id not in self.selected:
+            raise ValueError("predicate outside feedback scope")
+        for row in self.observations:
+            if _contains_id(self._id_ranges[row["members"]], predicate_id):
+                yield row
 
     def states(self, trace_key: str):
         trace = self.traces[trace_key]
@@ -183,7 +232,18 @@ def load_bundle(path: str | Path) -> FeedbackBundle:
         if file_sha256(bundle_path(path.parent, relative)) != digest:
             raise ValueError("feedback artifact checksum mismatch")
     selected = set(decode_ids(header["candidates"]))
+    selected_ranges = _disjoint_union([parse_id_ranges(header["candidates"])])
     bundle = FeedbackBundle(path.parent, metadata, selected)
+
+    def ranges(text):
+        cached = bundle._id_ranges.get(text)
+        if cached is None:
+            cached = parse_id_ranges(text)
+            if not _ranges_subset(cached, selected_ranges):
+                raise ValueError("feedback member outside candidate universe")
+            bundle._id_ranges[text] = cached
+        return cached
+
     for name, row in rows:
         if name == "input":
             if row["key"] in bundle.inputs or row["domain"] not in ("concrete", "mutation"):
@@ -202,10 +262,10 @@ def load_bundle(path: str | Path) -> FeedbackBundle:
             bundle.traces[row["key"]] = row
         elif name == "observation":
             trace = bundle.traces.get(row["trace"])
-            members = decode_ids(row["members"], universe=selected)
+            members = ranges(row["members"])
             if (trace is None or trace["input"] != row["input"] or not members
                     or row["bin"] not in _OBSERVATIONS
-                    or (trace["representative"] and trace["representative"] not in members)):
+                    or (trace["representative"] and not _contains_id(members, trace["representative"]))):
                 raise ValueError("invalid feedback observation join")
             bundle.observations.append(row)
         elif name == "coverage":
@@ -213,9 +273,8 @@ def load_bundle(path: str | Path) -> FeedbackBundle:
                 raise ValueError("invalid/duplicate feedback input coverage")
             if row["status"] not in ("complete", "partial", "unavailable"):
                 raise ValueError("invalid feedback coverage status")
-            groups = [set(decode_ids(row[key], universe=selected))
-                      for key in ("not-run", "unusable", "skipped")]
-            if any(groups[i] & groups[j] for i in range(3) for j in range(i)):
+            groups = [ranges(row[key]) for key in ("not-run", "unusable", "skipped")]
+            if _disjoint_union(groups) is None:
                 raise ValueError("overlapping feedback coverage groups")
             bundle.coverage[row["input"]] = row
         elif name in ("predicate", "excluded"):
@@ -252,31 +311,45 @@ def load_bundle(path: str | Path) -> FeedbackBundle:
                                    or bundle.traces[baseline]["representative"] != 0):
             raise ValueError("feedback baseline join mismatch")
     observations = {key: [] for key in bundle.inputs}
-    totals = {patch: {domain: [0] * len(BINS) for domain in ("concrete", "mutation")}
-              for patch in selected}
+    ordered = sorted(selected)
+    positions = {patch: index for index, patch in enumerate(ordered)}
+    # Each member interval contributes +1 at its first candidate and -1 after
+    # its last. Prefix sums validate every summary without visiting each member
+    # of every observation group. Coordinates are candidate indices, not ids.
+    changes = {domain: [[0] * (len(ordered) + 1) for _ in BINS]
+               for domain in ("concrete", "mutation")}
     for row in bundle.observations:
         observations[row["input"]].append(row)
     for key, item in bundle.inputs.items():
-        observed, usable = set(), set()
+        observed_groups, usable_groups = [], []
         for row in observations[key]:
-            members = set(decode_ids(row["members"], universe=selected))
-            if observed & members:
-                raise ValueError("duplicate candidate/input feedback observation")
-            observed.update(members)
+            members = ranges(row["members"])
+            observed_groups.append(members)
             if row["bin"] in BINS:
-                usable.update(members)
-                for patch in members:
-                    totals[patch][item["domain"]][BINS.index(row["bin"])] += 1
+                usable_groups.append(members)
+                delta = changes[item["domain"]][BINS.index(row["bin"])]
+                for start, end in members:
+                    delta[positions[start]] += 1
+                    delta[positions[end] + 1] -= 1
+        observed = _disjoint_union(observed_groups)
+        if observed is None:
+            raise ValueError("duplicate candidate/input feedback observation")
+        usable = _disjoint_union(usable_groups)
         coverage = bundle.coverage[key]
-        missing, unusable, skipped = [set(decode_ids(coverage[field], universe=selected))
+        missing, unusable, skipped = [ranges(coverage[field])
                                       for field in ("not-run", "unusable", "skipped")]
         expected_status = ("complete" if not (missing or unusable or skipped) else
                            "partial" if observed else "unavailable")
-        if (observed & (missing | skipped) or missing != selected - observed - skipped
-                or unusable != observed - usable or coverage["status"] != expected_status):
+        if (_disjoint_union([observed, missing, skipped]) != selected_ranges
+                or _disjoint_union([usable, unusable]) != observed
+                or coverage["status"] != expected_status):
             raise ValueError("feedback coverage disagrees with observations")
-    for patch, row in {**bundle.predicates, **bundle.excluded}.items():
-        if any(_counts(row[domain + "-counts"]) != totals[patch][domain]
-               for domain in ("concrete", "mutation")):
-            raise ValueError("feedback summary disagrees with observations")
+    for domain, deltas in changes.items():
+        totals = [0] * len(BINS)
+        for index, patch in enumerate(ordered):
+            for bin_index, delta in enumerate(deltas):
+                totals[bin_index] += delta[index]
+            row = bundle.predicates.get(patch) or bundle.excluded[patch]
+            if _counts(row[domain + "-counts"]) != totals:
+                raise ValueError("feedback summary disagrees with observations")
     return bundle

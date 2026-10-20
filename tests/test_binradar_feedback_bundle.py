@@ -38,7 +38,7 @@ class _CaptureRun:
         (self.workdir / "brpatches.json").write_text(json.dumps({
             "version": 1, "kind": "generic-erm", "predicates": [
                 {"id": patch, "source_line": 2 * patch,
-                 "descriptor": ">v0p5"} for patch in candidates]}))
+                 "descriptor": ">v0p5"} for patch in range(1, max(candidates, default=0) + 1)]}))
         self.baseline = CaptureJournal(str(self.run_dir), "baseline",
                                       workdir=str(self.workdir), candidates=candidates)
         self.verifier = CaptureJournal(str(self.run_dir), "verifier",
@@ -64,11 +64,12 @@ class _CaptureRun:
 
     def trace(self, case, patch, *, branches=(0,), values=None,
               outcome="normal", fault=0, observation="no-crash-pass-same-br",
-              captured=True):
+              captured=True, members=None):
         if values is None:
             values = [8] * len(branches or ())
         return self.verifier.record(
-            case, f"case-{case}", representative=patch, members=[patch],
+            case, f"case-{case}", representative=patch,
+            members=[patch] if members is None else members,
             probe=_probe(outcome, fault), branches=branches,
             artifact=str(self.workdir / "target.orig"),
             snapshots=_states(patch, values, branches) if captured else None,
@@ -315,6 +316,98 @@ def test_mutation_label_comes_from_baseline_and_write_sets_must_agree(tmp_path, 
     trace = bundle.traces[bundle.observations[0]["trace"]]
     assert trace["state"].startswith("binradar/")
     assert bundle.states(trace["key"])[0].branch == 1
+
+
+def test_candidate_lookup_preserves_grouped_evidence_and_sparse_counter_boundaries(tmp_path):
+    run = _CaptureRun(tmp_path, candidates=(1, 3, 4, 7, 8))
+    run.case(0)
+    run.trace(0, 1, members=[1, 3, 4], values=[0])
+    run.case(1)
+    run.trace(1, 3, members=[3, 4, 7], branches=[1],
+              observation="no-crash-confidence-diff-br")
+    run.case(2, outcome="crash")
+    run.trace(2, 1, members=[1, 3, 4, 7, 8], branches=[1], observation="crash-pass")
+    run.case(3)
+    run.trace(3, 8, outcome="timeout", branches=None,
+              observation="no-crash-timeout", captured=False)
+    run.case(4)
+    run.trace(4, 7, outcome="crash", fault=0x1234, observation="no-crash-fail")
+    bundle = run.export()
+
+    def observations(patch):
+        return [(row["input"], row["bin"]) for row in bundle.observations_for(patch)]
+
+    assert observations(1) == [("c0", "no-crash-pass-same-br"), ("c2", "crash-pass")]
+    assert observations(3) == observations(4) == [
+        ("c0", "no-crash-pass-same-br"), ("c1", "no-crash-confidence-diff-br"),
+        ("c2", "crash-pass")]
+    assert observations(8) == [("c2", "crash-pass"), ("c3", "unusable")]
+    assert observations(7) == [("c1", "no-crash-confidence-diff-br"),
+                               ("c2", "crash-pass"), ("c4", "no-crash-fail")]
+    assert bundle.excluded[7]["concrete-counts"] == "0,1,0,1,1,0"
+    assert {patch: row["concrete-counts"] for patch, row in bundle.predicates.items()} == {
+        1: "0,1,1,0,0,0", 3: "0,1,1,1,0,0", 4: "0,1,1,1,0,0", 8: "0,1,0,0,0,0"}
+    for missing in (0, 2, 5, 6, 9):
+        with pytest.raises(ValueError):
+            list(bundle.observations_for(missing))
+
+
+def test_reader_accepts_adjacent_intervals_with_identical_membership(tmp_path):
+    run = _CaptureRun(tmp_path, candidates=(1, 3, 4, 7, 8))
+    run.case(0)
+    run.trace(0, 1, members=[1, 3, 4], values=[0])
+    bundle = run.export()
+    path = bundle.root / "feedback.sbsv"
+    path.write_text(path.read_text()
+                    .replace("[members 1,3-4]", "[members 1,3,4]")
+                    .replace("[candidates 1,3-4,7-8]", "[candidates 1,3,4,7,8]")
+                    .replace("[not-run 7-8]", "[not-run 7,8]"))
+    restored = bundle_reader.load_bundle(path)
+    assert [(row["input"], row["bin"]) for row in restored.observations_for(4)] == [
+        ("c0", "no-crash-pass-same-br")]
+    assert restored.predicates[4]["concrete-counts"] == "0,0,1,0,0,0"
+    assert list(restored.observations_for(7)) == []
+
+
+@pytest.mark.parametrize("before,after", [
+    ("[members 1,3-4]", "[members 1-4]"),
+    ("[members 1,3-4]", "[members 1,3-4,9]"),
+    ("[members 1,3-4]", "[members 0,1,3-4]"),
+    ("[members 1,3-4]", "[members 1,3-4,4294967296]"),
+    ("[members 1,3-4]", "[members 1,3-4,4]"),
+    ("[members 1,3-4]", "[members 3-4,1]"),
+    ("[members 1,3-4]", "[members 1,4-3]"),
+    ("[members 1,3-4]", "[members 01,3-4]"),
+    ("[members 1,3-4]", "[members none]"),
+    ("[not-run 7-8]", "[not-run 2,7-8]"),
+    ("[not-run 7-8]", "[not-run 4,7-8]"),
+    ("[unusable none]", "[unusable 3]"),
+    ("[skipped none]", "[skipped 7]"),
+])
+def test_reader_rejects_range_holes_overlaps_and_invalid_members(tmp_path, before, after):
+    run = _CaptureRun(tmp_path, candidates=(1, 3, 4, 7, 8))
+    run.case(0)
+    run.trace(0, 1, members=[1, 3, 4], values=[0])
+    bundle = run.export()
+    path = bundle.root / "feedback.sbsv"
+    path.write_text(path.read_text().replace(before, after))
+    with pytest.raises(ValueError):
+        bundle_reader.load_bundle(path)
+
+
+def test_reader_rejects_duplicate_group_even_with_consistent_row_totals(tmp_path):
+    run = _CaptureRun(tmp_path)
+    run.case(0)
+    run.trace(0, 1)
+    bundle = run.export()
+    path = bundle.root / "feedback.sbsv"
+    rows = path.read_text().splitlines(keepends=True)
+    observation = next(row for row in rows if row.startswith("[observation]"))
+    rows.insert(-1, observation)
+    rows[-1] = rows[-1].replace("[observations 1]", "[observations 2]")
+    path.write_text("".join(rows))
+    with pytest.raises(ValueError):
+        bundle_reader.load_bundle(path)
 
 
 @pytest.mark.parametrize("damage", ["coverage", "summary", "input-bytes"])

@@ -55,7 +55,8 @@ def encode_ids(ids) -> str:
     return ",".join(parts) or "none"
 
 
-def decode_ids(text: str, *, universe: set[int] | None = None) -> list[int]:
+def parse_id_ranges(text: str) -> list[tuple[int, int]]:
+    """Validate sorted inclusive ranges without expanding their members."""
     if text == "none":
         return []
     result = []
@@ -67,6 +68,14 @@ def decode_ids(text: str, *, universe: set[int] | None = None) -> list[int]:
         start, end = int(match[1]), int(match[2] or match[1])
         if start <= previous or end < start or end > 0xffffffff:
             raise ValueError("unordered feedback member range")
+        result.append((start, end))
+        previous = end
+    return result
+
+
+def decode_ids(text: str, *, universe: set[int] | None = None) -> list[int]:
+    result = []
+    for start, end in parse_id_ranges(text):
         # A corrupt range must not allocate gigabytes before membership checks.
         if universe is None and end - start > 1_000_000:
             raise ValueError("feedback range requires a candidate universe")
@@ -76,7 +85,6 @@ def decode_ids(text: str, *, universe: set[int] | None = None) -> list[int]:
             if universe is not None and value not in universe:
                 raise ValueError("feedback member outside candidate universe")
             result.append(value)
-        previous = end
     return result
 
 
