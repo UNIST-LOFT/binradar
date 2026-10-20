@@ -11,11 +11,11 @@ import pytest
 
 
 
-from fuzzolic import binradar_artifacts
-from fuzzolic import binradar_config
-from fuzzolic import binradar_verifier
+from binradar import binradar_artifacts
+from binradar import binradar_config
+from binradar import binradar_verifier
 
-from fuzzolic import binradar
+from binradar import cli as binradar
 
 
 def _probe(exit_info="ok", fault_addr=0x1234):

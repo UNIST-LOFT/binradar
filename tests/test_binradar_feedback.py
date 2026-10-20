@@ -7,10 +7,10 @@ import pytest
 
 
 
-from fuzzolic import binradar
+from binradar import cli as binradar
 
-from fuzzolic import binradar_evidence as evidence
-from fuzzolic import binradar_taosc_predicates as predicates
+from binradar import binradar_evidence as evidence
+from binradar import binradar_taosc_predicates as predicates
 from test_binradar_evidence import _frame, _group
 
 
@@ -41,7 +41,7 @@ def _feedback_executor(tmp_path):
     executor.run_id = 0
     progress = []
     executor.save_progress = progress.append
-    from fuzzolic.binradar_feedback_capture import CaptureJournal
+    from binradar.binradar_feedback_capture import CaptureJournal
     for channel in ("baseline", "verifier"):
         CaptureJournal(str(run_dir), channel, workdir=str(workdir), candidates=[1, 2])
     return executor, run_dir, progress
@@ -97,7 +97,7 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
 
 
 def _commits(run_dir, frames, *, truncated_tail=False):
-    from fuzzolic.binradar_feedback_capture import write_mutation_context
+    from binradar.binradar_feedback_capture import write_mutation_context
     workdir = run_dir.parents[1]
     write_mutation_context(str(run_dir), workdir=str(workdir),
                            artifact=str(workdir / "target.orig"), candidates=[1, 2],
@@ -143,7 +143,7 @@ def test_concrete_feedback_classifies_actual_oracle_not_tracer_and_deduplicates(
         (run_dir / "minimized" / filename).write_bytes(b"benign" if name == "duplicate" else name.encode())
         row = _full_row(index, filename, outcome, fault, hit, version)
         if scheduled:
-            from fuzzolic.binradar_input_schedule import InputScore
+            from binradar.binradar_input_schedule import InputScore
             row = row.replace("[time 1]", InputScore(index, 0, 0, 1, "unsupported").serialize() + " [time 1]")
         rows.append(row)
     (run_dir / "minimizer.sbsv").write_text("".join(rows))

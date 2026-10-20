@@ -26,8 +26,8 @@ import pytest
 
 
 
-from fuzzolic import binradar_baseline
-from fuzzolic import binradar_verifier
+from binradar import binradar_baseline
+from binradar import binradar_verifier
 
 
 REFERENCE = binradar_verifier.TracerFaultReference(0x44eced, "provenance-access")

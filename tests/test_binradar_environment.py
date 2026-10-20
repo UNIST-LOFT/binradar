@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 
-from fuzzolic import binradar
-from fuzzolic import binradar_artifacts
-from fuzzolic import binradar_config
+from binradar import cli as binradar
+from binradar import binradar_artifacts
+from binradar import binradar_config
 from test_binradar_e9_metadata import _write_bound_identity_artifacts
 
 

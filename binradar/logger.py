@@ -1,6 +1,6 @@
 import logging
 
-logger = logging.getLogger("fuzzolic")
+logger = logging.getLogger("binradar")
 logger.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)

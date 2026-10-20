@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-from fuzzolic import binradar_taosc_predicates
+from binradar import binradar_taosc_predicates
 
 eval_patch_str = binradar_taosc_predicates.eval_patch_str
 predicate_to_patch_str = binradar_taosc_predicates.predicate_to_patch_str

@@ -14,10 +14,10 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-from fuzzolic import binradar
-from fuzzolic import binradar_evidence
-from fuzzolic import binradar_results
-from fuzzolic import binradar_verifier
+from binradar import cli as binradar
+from binradar import binradar_evidence
+from binradar import binradar_results
+from binradar import binradar_verifier
 
 
 def _uleb(value: int) -> bytes:

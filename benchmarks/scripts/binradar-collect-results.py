@@ -91,7 +91,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 LOFTIX_DIR = SCRIPT_DIR.parent / "loftix"
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent))
 
-from fuzzolic import binradar_evidence, binradar_utils
+from binradar import binradar_evidence, binradar_utils
 
 
 def _result_artifact(run_dir: str, stem: str) -> str:
@@ -368,7 +368,7 @@ class TaoscResult:
 
 
 # Observation classes of BinRadarConcreteVerifier._test_result
-# (fuzzolic/binradar_verifier.py), mapped to the short keys used by the
+# (binradar/binradar_verifier.py), mapped to the short keys used by the
 # binradar-stats output. Each compact counter or legacy verifier.sbsv row
 # name maps to exactly one class; note that a naive substring match is unsafe (e.g. "crash-fail" is
 # a substring of "no-crash-fail"), so the row action is matched exactly.

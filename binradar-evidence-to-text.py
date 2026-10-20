@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from fuzzolic.binradar_evidence_to_text import main
+from binradar.binradar_evidence_to_text import main
 
 
 if __name__ == "__main__":

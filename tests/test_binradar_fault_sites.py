@@ -10,11 +10,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-from fuzzolic import binradar_baseline
-from fuzzolic import binradar_evidence as evidence
-from fuzzolic import binradar_feedback
-from fuzzolic import binradar_results
-from fuzzolic import binradar_verifier as verifier
+from binradar import binradar_baseline
+from binradar import binradar_evidence as evidence
+from binradar import binradar_feedback
+from binradar import binradar_results
+from binradar import binradar_verifier as verifier
 from test_binradar_evidence import _frame, _group, _final_request
 from test_binradar_feedback import _feedback_executor, _full_row
 
@@ -220,7 +220,7 @@ def test_feedback_keeps_concrete_and_dso_tracer_oracles_separate(tmp_path):
 
 @pytest.mark.parametrize("source", ["provenance-access", "syscall-request"])
 def test_plan_diagnostics_compare_sites_and_preserve_main_history(source):
-    from fuzzolic import binradar
+    from binradar import cli as binradar
     row = {"patch0-exit": "crash", "patch0-fault-valid": "true",
            "patch0-fault-source": source, "patch0-fault-addr": "9000123"}
     reference = verifier.TracerFaultReference(0x7000123, "provenance-access", IMAGE, 0x123)
@@ -266,7 +266,7 @@ def test_feedback_sidecar_rejects_missing_malformed_or_normal_sites(line):
 
 
 def test_standalone_reader_preserves_dso_reference():
-    from fuzzolic import binradar_test
+    from binradar import binradar_test
     reference = binradar_test.extract_tracer_fault_reference(
         "[snapshot] [fault-reference] [version 3] [valid true] "
         f"[source provenance-access] [address 9000123] [image {IMAGE}] [image-offset 123]\n")

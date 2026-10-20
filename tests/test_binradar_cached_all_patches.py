@@ -18,8 +18,8 @@ import pytest
 
 
 
-from fuzzolic import binradar
-from fuzzolic import binradar_artifacts
+from binradar import cli as binradar
+from binradar import binradar_artifacts
 
 binradar_verifier = binradar.binradar_verifier
 
@@ -261,7 +261,7 @@ def test_verifier_never_runs_an_uncompiled_id_on_brpatched(tmp_path):
 
 
 def test_feedback_singleton_selects_usable_cache(tmp_path, monkeypatch):
-    from fuzzolic import binradar_feedback_capture
+    from binradar import binradar_feedback_capture
 
     monkeypatch.setattr(binradar_feedback_capture.CaptureJournal, "__init__",
                         lambda self, *args, **kwargs: None)

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from fuzzolic import binradar_run_records
+from binradar import binradar_run_records
 
 
 def test_progress_loads_latest_matching_run_and_phase_flags(tmp_path):

@@ -5,7 +5,7 @@ import sys
 import pytest
 
 
-from fuzzolic import binradar_runtime as runtime
+from binradar import binradar_runtime as runtime
 
 
 def status_row(complete=False, reason="expr-capacity"):

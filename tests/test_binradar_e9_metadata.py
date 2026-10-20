@@ -6,7 +6,7 @@ production code and pass once the exact-interval and relocated-call
 propagation contracts land (Phases 1-2).
 
 P0-1: disjoint E9 trampoline/reserve maps are collapsed into one min..max
-      envelope by fuzzolic.binradar_setup.extract_trampoline_info,
+      envelope by binradar.binradar_setup.extract_trampoline_info,
       excluding unmapped gaps (39.5 MiB for xmllint, 1.93 GiB for tiffcp).
 P0-2: phase-environment construction must set E9_RELOCATED_CALL_JUMPS for the
       selected symbolic tracer artifact, and the .orig memcheck run receives the
@@ -29,12 +29,12 @@ import pytest
 
 
 
-from fuzzolic import binradar_setup
+from binradar import binradar_setup
 
-from fuzzolic import binradar_utils
+from binradar import binradar_utils
 
-from fuzzolic import binradar
-from fuzzolic import binradar_artifacts
+from binradar import cli as binradar
+from binradar import binradar_artifacts
 
 PAGE = binradar_setup.PAGE_SIZE
 TRAMPOLINE = binradar_setup.E9MapType.TRAMPOLINE

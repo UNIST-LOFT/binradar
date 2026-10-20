@@ -1,26 +1,26 @@
 [project]
-name = "fuzzolic"
-version = "0.1.0"
+name = "binradar"
+version = "0.2.0"
 description = "BinRadar verification pipeline and reusable analysis tools"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pyelftools>=0.31",
     "pytest>=8.3.5",
-    "sbsv==0.3.1",
+    "sbsv==0.3.2",
 ]
 
 [project.scripts]
-binradar = "fuzzolic.binradar:main"
-binradar-setup = "fuzzolic.binradar_setup:main"
-binradar-evaluation = "fuzzolic.binradar_evaluation:main"
-binradar-evidence-to-text = "fuzzolic.binradar_evidence_to_text:main"
-binradar-test = "fuzzolic.binradar_test:main"
-osprey-evaluation = "fuzzolic.osprey_evaluation:main"
+binradar = "binradar.cli:main"
+binradar-setup = "binradar.binradar_setup:main"
+binradar-evaluation = "binradar.binradar_evaluation:main"
+binradar-evidence-to-text = "binradar.binradar_evidence_to_text:main"
+binradar-test = "binradar.binradar_test:main"
+osprey-evaluation = "binradar.osprey_evaluation:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["fuzzolic"]
+packages = ["binradar"]

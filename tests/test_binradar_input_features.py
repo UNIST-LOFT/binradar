@@ -12,10 +12,10 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 
-from fuzzolic import binradar_input_features as features
-from fuzzolic import binradar_utils
-from fuzzolic import binradar_verifier as verifier
-from fuzzolic.binradar_taosc_predicates import (
+from binradar import binradar_input_features as features
+from binradar import binradar_utils
+from binradar import binradar_verifier as verifier
+from binradar.binradar_taosc_predicates import (
     CACHED_SNAPSHOT_HEADER as HEADER, CACHED_SNAPSHOT_MAGIC as MAGIC,
     CACHED_SNAPSHOT_REGS as REGS, CACHED_SNAPSHOT_CLAMPS as CLAMPS,
 )
@@ -315,8 +315,8 @@ def test_capture_only_never_allocates_map_and_preserves_repeated_states(
 @pytest.mark.parametrize("supported", [True, False])
 def test_fifo_feedback_publishes_durable_states_before_baseline_row(
         runner, monkeypatch, tmp_path, supported):
-    from fuzzolic import binradar_minimizer
-    from fuzzolic.binradar_feedback_capture import CaptureJournal
+    from binradar import binradar_minimizer
+    from binradar.binradar_feedback_capture import CaptureJournal
 
     if not supported:
         runner.patch_kind = "CWE805-direct"
@@ -369,11 +369,11 @@ def test_fifo_feedback_publishes_durable_states_before_baseline_row(
 @pytest.mark.parametrize("enabled,stale_mode", [(True, None), (True, "0"), (False, "1")])
 def test_main_feedback_setting_controls_executed_concrete_evidence(
         runner, monkeypatch, tmp_path, enabled, stale_mode):
-    from fuzzolic import binradar_artifacts
-    from fuzzolic import binradar_config
-    from fuzzolic import binradar_evidence
-    from fuzzolic.binradar_feedback_bundle import load_bundle
-    from fuzzolic import binradar
+    from binradar import binradar_artifacts
+    from binradar import binradar_config
+    from binradar import binradar_evidence
+    from binradar.binradar_feedback_bundle import load_bundle
+    from binradar import cli as binradar
 
     _child(runner, monkeypatch, hits=3, capture=_record() * 3)
     monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env", lambda *args: runner)
@@ -433,7 +433,7 @@ def test_main_feedback_setting_controls_executed_concrete_evidence(
 def test_feedback_interruption_never_claims_complete_capture(
         runner, monkeypatch, tmp_path, termination):
     import queue
-    from fuzzolic import binradar_minimizer
+    from binradar import binradar_minimizer
 
     monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env", lambda *args: runner)
     run_dir = tmp_path / "run"

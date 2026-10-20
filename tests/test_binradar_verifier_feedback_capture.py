@@ -4,8 +4,8 @@
 import pytest
 
 
-from fuzzolic import binradar_evidence
-from fuzzolic import binradar_verifier as verifier_module
+from binradar import binradar_evidence
+from binradar import binradar_verifier as verifier_module
 
 
 class RecordingJournal:

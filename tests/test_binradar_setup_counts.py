@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 
 
-from fuzzolic import binradar_setup
+from binradar import binradar_setup
 
-from fuzzolic import binradar_taosc_predicates
+from binradar import binradar_taosc_predicates
 
 
 def _fake_run(calls):

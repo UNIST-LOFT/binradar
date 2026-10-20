@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from fuzzolic.binradar_setup import main
+from binradar.binradar_setup import main
 
 
 if __name__ == "__main__":

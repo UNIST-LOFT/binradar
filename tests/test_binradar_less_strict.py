@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from fuzzolic import binradar_config
+from binradar import binradar_config
 
 
-from fuzzolic import binradar
+from binradar import cli as binradar
 
 
 def _policy_executor(tmp_path, less_strict):

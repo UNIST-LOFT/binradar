@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 
-from fuzzolic import binradar_runtime
+from binradar import binradar_runtime
 
 
 @pytest.mark.parametrize("result,stop", [(4, 0), (0, 5), (4, 1)])

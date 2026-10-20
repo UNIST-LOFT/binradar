@@ -199,7 +199,7 @@ static void state_to_env(const struct STATE *state, int64_t env[16])
 
 /*
  * Typed predicate table (generated in brpatches.inc by
- * fuzzolic/binradar-setup.py).  Entry 0 is BR_PRED_FALSE ("p0").  Generic
+ * binradar/binradar_setup.py).  Entry 0 is BR_PRED_FALSE ("p0").  Generic
  * entries are the encoded ``predicate == 0`` prefix strings; CWE-805
  * entries are compact descriptors containing only validated enum/integer
  * fields, never source text:

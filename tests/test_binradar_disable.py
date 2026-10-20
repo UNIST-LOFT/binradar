@@ -7,12 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from fuzzolic import binradar_config
+from binradar import binradar_config
 
 
-from fuzzolic import binradar
-from fuzzolic import binradar_artifacts
-from fuzzolic import binradar_utils
+from binradar import cli as binradar
+from binradar import binradar_artifacts
+from binradar import binradar_utils
 
 
 def _stub_executor(tmp_path):

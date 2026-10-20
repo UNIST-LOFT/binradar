@@ -4,7 +4,7 @@ import pytest
 
 
 
-from fuzzolic import binradar_pipeline
+from binradar import binradar_pipeline
 
 
 class RecordingRegistry:

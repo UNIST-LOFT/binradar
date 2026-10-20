@@ -8,7 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
-from fuzzolic import binradar_runtime
+from binradar import binradar_runtime
 
 
 @pytest.fixture(scope="module")

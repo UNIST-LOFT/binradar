@@ -25,8 +25,8 @@ import time
 import pytest
 
 
-from fuzzolic import binradar_runtime
-from fuzzolic import binradar_utils
+from binradar import binradar_runtime
+from binradar import binradar_utils
 
 
 def _alive(pid: int) -> bool:

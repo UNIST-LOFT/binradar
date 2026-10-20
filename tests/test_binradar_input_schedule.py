@@ -6,9 +6,9 @@ import pytest
 
 
 
-from fuzzolic import binradar_input_schedule as schedule
-from fuzzolic import binradar_runtime
-from fuzzolic.binradar_taosc_predicates import CachedSnapshot, parse_predicate_descriptor
+from binradar import binradar_input_schedule as schedule
+from binradar import binradar_runtime
+from binradar.binradar_taosc_predicates import CachedSnapshot, parse_predicate_descriptor
 
 
 def snapshot(value):

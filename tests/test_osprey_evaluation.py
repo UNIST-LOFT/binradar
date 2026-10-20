@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from fuzzolic import osprey_evaluation as evaluation
+from binradar import osprey_evaluation as evaluation
 
 
 def _address(kind, image, site, offset):

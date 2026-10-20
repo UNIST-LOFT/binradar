@@ -6,10 +6,10 @@ import pytest
 
 from test_binradar_feedback import _commits, _feedback_executor, _full_row
 from test_binradar_evidence import _group
-from fuzzolic import binradar_feedback_bundle as bundle_reader
-from fuzzolic.binradar_feedback_capture import CaptureJournal, decode_ids, unpack_branches
-from fuzzolic.binradar_taosc_predicates import CachedSnapshot
-from fuzzolic import binradar_verifier as verifier
+from binradar import binradar_feedback_bundle as bundle_reader
+from binradar.binradar_feedback_capture import CaptureJournal, decode_ids, unpack_branches
+from binradar.binradar_taosc_predicates import CachedSnapshot
+from binradar import binradar_verifier as verifier
 
 
 def _probe(outcome="normal", fault=0):
@@ -231,7 +231,7 @@ def test_missing_capture_headers_do_not_replace_valid_feedback(tmp_path, channel
 
 
 def test_nonfeedback_verifier_cannot_publish_feedback_even_with_capture_headers(tmp_path):
-    from fuzzolic import binradar_evidence as evidence
+    from binradar import binradar_evidence as evidence
     run = _CaptureRun(tmp_path)
     run.case(0)
     run.trace(0, 1)
@@ -279,7 +279,7 @@ def test_unidentified_candidate_crash_remains_unusable_not_export_failure(tmp_pa
 
 
 def test_terminal_hard_reject_is_excluded_when_its_witness_was_not_published(tmp_path):
-    from fuzzolic import binradar_evidence as evidence
+    from binradar import binradar_evidence as evidence
     run = _CaptureRun(tmp_path)
     run.case(0)
     records = [evidence.VerifierPatchResult(

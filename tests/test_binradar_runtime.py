@@ -6,10 +6,10 @@ import pytest
 
 
 
-from fuzzolic import binradar_config
-from fuzzolic import binradar_runtime
+from binradar import binradar_config
+from binradar import binradar_runtime
 
-from fuzzolic import binradar
+from binradar import cli as binradar
 
 
 def test_shared_memory_keys_are_named_distinct_and_fixed_width(monkeypatch):

@@ -16,10 +16,10 @@ import pytest
 
 
 
-from fuzzolic import binradar_evidence
-from fuzzolic import binradar_verifier
+from binradar import binradar_evidence
+from binradar import binradar_verifier
 
-from fuzzolic import binradar_evaluation as evaluation
+from binradar import binradar_evaluation as evaluation
 
 
 def _probe_row(version: int) -> str:

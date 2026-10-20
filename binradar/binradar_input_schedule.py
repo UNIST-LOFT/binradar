@@ -279,7 +279,7 @@ class NoveltyScorer:
             parent, child = socket.socketpair()
             try:
                 process = subprocess.Popen(
-                    [sys.executable, "-m", "fuzzolic.binradar_input_schedule",
+                    [sys.executable, "-m", "binradar.binradar_input_schedule",
                      "--worker", str(child.fileno())],
                     # The worker consumes only IPC data. This also makes source
                     # wrappers usable before installation, from any workdir.

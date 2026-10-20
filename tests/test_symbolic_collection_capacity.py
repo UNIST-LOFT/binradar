@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-from fuzzolic import binradar_runtime
+from binradar import binradar_runtime
 
 
 @pytest.fixture(scope="module")
@@ -196,7 +196,7 @@ def test_capacity_before_and_after_forkserver_banner(
 ])
 def test_binradar_keeps_guest_outcomes_after_symbolic_capacity(
         tmp_path, capacity_guest, entry, mode, count, reason, outcome):
-    from fuzzolic import binradar_evidence
+    from binradar import binradar_evidence
 
     guest, addresses = capacity_guest
     env = collection_environment(tmp_path)

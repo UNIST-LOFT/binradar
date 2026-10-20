@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from fuzzolic.osprey_evaluation import main
+from binradar.osprey_evaluation import main
 
 
 if __name__ == "__main__":

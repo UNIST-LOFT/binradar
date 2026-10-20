@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "taosc-61f9f3a"
 TAOSC_REV = "61f9f3a6ad09bb0a7a6712a71c32d9da922333ed"
 
-from fuzzolic import binradar_setup
+from binradar import binradar_setup
 
 predicate_to_branch_patch_str = binradar_setup.predicate_to_branch_patch_str
 load_predicates = binradar_setup.load_predicates

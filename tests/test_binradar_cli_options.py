@@ -7,8 +7,8 @@ import sys
 import pytest
 
 
-from fuzzolic import binradar
-from fuzzolic import binradar_config
+from binradar import cli as binradar
+from binradar import binradar_config
 
 
 def _run_main(monkeypatch, tmp_path, extra_args, extra_env=""):

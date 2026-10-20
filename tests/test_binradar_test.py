@@ -2,7 +2,7 @@
 
 
 
-from fuzzolic import binradar_test
+from binradar import binradar_test
 
 
 def test_tracer_reference_requires_explicit_valid_v2_row():
@@ -34,8 +34,8 @@ def test_standalone_current_request_reference_and_full_width_finding():
 
 
 def test_standalone_live_probe_requires_current_policy(monkeypatch, tmp_path):
-    from fuzzolic import binradar_utils
-    from fuzzolic.binradar_verifier import MEMCHECK_POLICY
+    from binradar import binradar_utils
+    from binradar.binradar_verifier import MEMCHECK_POLICY
     (tmp_path / "guest.orig").write_bytes(b"toy")
     (tmp_path / "out").mkdir()
     (tmp_path / "out/plt_info.txt").write_text("malloc free")
@@ -67,8 +67,8 @@ def test_tracer_probe_rejects_an_externally_cancelled_run(monkeypatch, tmp_path)
     as a valid-looking v2 reference at its kill PC. That is not the subject's
     observed crash, so the probe must report it as failed rather than
     returning the salvaged address."""
-    from fuzzolic import binradar_utils
-    from fuzzolic.binradar_verifier import tracer_execution_cancelled
+    from binradar import binradar_utils
+    from binradar.binradar_verifier import tracer_execution_cancelled
     import signal as signal_module
 
     salvaged = (
@@ -197,8 +197,8 @@ def test_overhead_never_reports_ratio_for_failed_or_incomplete_runs():
 
 
 def test_overhead_checker_rows_cannot_mask_timeout_or_nonzero_exit():
-    from fuzzolic.binradar_utils import ExecutionResult
-    from fuzzolic.binradar_verifier import MEMCHECK_POLICY
+    from binradar.binradar_utils import ExecutionResult
+    from binradar.binradar_verifier import MEMCHECK_POLICY
 
     logs = {
         "orig": "",

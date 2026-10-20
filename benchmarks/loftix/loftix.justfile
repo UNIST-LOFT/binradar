@@ -40,7 +40,7 @@ binradar-fo workdir="workdir" binradar_image="fuzzolic:2204": (_ensure_binradar_
 
 binradar-dev workdir="workdir" binradar_image="fuzzolic:2204":
     ABS_WORKDIR=$(cd "{{workdir}}" && pwd); \
-    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v {{FUZZOLIC_ROOT}}/fuzzolic:/workspace/fuzzolic/fuzzolic:ro -v {{FUZZOLIC_ROOT}}/binradar.py:/workspace/fuzzolic/binradar.py:ro -v {{FUZZOLIC_ROOT}}/tracer/build:/workspace/fuzzolic/tracer/build:ro -v {{FUZZOLIC_ROOT}}/solver/build:/workspace/fuzzolic/solver/build:ro -v {{FUZZOLIC_ROOT}}/LibAFL:/workspace/fuzzolic/LibAFL:ro -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/binradar.py -w /workdir
+    docker run --user $(id -u):$(id -g) -v $ABS_WORKDIR:/workdir -v {{FUZZOLIC_ROOT}}/binradar:/workspace/fuzzolic/binradar:ro -v {{FUZZOLIC_ROOT}}/binradar.py:/workspace/fuzzolic/binradar.py:ro -v {{FUZZOLIC_ROOT}}/tracer/build:/workspace/fuzzolic/tracer/build:ro -v {{FUZZOLIC_ROOT}}/solver/build:/workspace/fuzzolic/solver/build:ro -v {{FUZZOLIC_ROOT}}/LibAFL:/workspace/fuzzolic/LibAFL:ro -v /gnu/store:/gnu/store:ro -v /var/guix:/var/guix:ro --rm {{binradar_image}} /workspace/fuzzolic/.venv/bin/python /workspace/fuzzolic/binradar.py -w /workdir
 
 binradar-guix workdir="workdir":
     guix shell binradar -- binradar -w {{workdir}}

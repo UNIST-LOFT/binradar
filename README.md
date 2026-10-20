@@ -31,20 +31,20 @@ uv sync --locked
 uv run binradar --help
 uv run binradar-setup setup -w /path/to/workdir
 # Equivalent main entrypoints:
-uv run python -m fuzzolic --help
+uv run python -m binradar --help
 uv run binradar.py --help
 ```
 
-The root scripts are thin CLI wrappers; implementations live in the `fuzzolic`
+The root scripts are thin CLI wrappers; implementations live in the `binradar`
 package. Import reusable code through that namespace:
 
 ```python
-from fuzzolic import binradar_verifier
-from fuzzolic.binradar_evidence import read_binradar
-from fuzzolic.binradar_feedback_bundle import load_bundle
+from binradar import binradar_verifier
+from binradar.binradar_evidence import read_binradar
+from binradar.binradar_feedback_bundle import load_bundle
 ```
 
-Do not execute `fuzzolic/binradar.py` directly or put `fuzzolic/` on
+Do not execute `binradar/cli.py` directly or put `binradar/` on
 `PYTHONPATH`. From another directory, use the installed commands or
 `uv run --project /path/to/checkout binradar ...`. Native tools still require
 the built checkout; the Python wheel does not bundle tracer/solver/AFL/E9.
@@ -190,8 +190,8 @@ Verdicts:
 ## Structure
 ### Orchestrator
 - `binradar.py`: thin CLI entry point for the verification process.
-- `fuzzolic/binradar.py`: CLI implementation and phase orchestration.
-- `fuzzolic/binradar_verifier.py`: implementation of the verification logic.
+- `binradar/cli.py`: CLI implementation and phase orchestration.
+- `binradar/binradar_verifier.py`: implementation of the verification logic.
 - `tracer/linux-user/osprey-{facts,relations,graph,rules,infer,decode,runtime}.c`: experimental in-process OSPREY path.
 
 These are main phases:
