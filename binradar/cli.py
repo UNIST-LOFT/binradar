@@ -2143,8 +2143,8 @@ def main():
               "phase always runs with the advisor off"))
     parser.add_argument(
         "--concrete-input-schedule", choices=binradar_config.CONCRETE_INPUT_SCHEDULES,
-        default="novelty",
-        help=("concrete testcase ordering (default: novelty, or "
+        default=None,
+        help=("concrete testcase ordering (default: fifo, or "
               "BINRADAR_CONCRETE_INPUT_SCHEDULE from binradar.env; "
               "novelty prioritizes fixed admission scores)"))
     parser.add_argument(
