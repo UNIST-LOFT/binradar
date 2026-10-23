@@ -12,7 +12,7 @@ default:
     just --list
 
 build:
-    guix build --no-substitutes {{guix_spec}}
+    guix build {{guix_spec}}
 
 taosc workdir="workdir":
     mkdir -p {{workdir}}

@@ -40,7 +40,7 @@ def _e9_executables(monkeypatch):
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "taosc-61f9f3a"
 
-from binradar import binradar_setup
+from binradar import binradar_setup, binradar_taosc_predicates
 
 predicate_to_branch_patch_str = binradar_setup.predicate_to_branch_patch_str
 load_predicates = binradar_setup.load_predicates
@@ -329,10 +329,9 @@ def test_parse_CWE805_rejects_malformed():
 
 
 def test_detect_family_generic():
-    family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "generic")
-    assert family is binradar_setup.PredicateFamily.GENERIC_ERM
-    assert allocator is None
+    loaded = binradar_setup.load_setup_predicates(FIXTURES / "generic")
+    assert loaded.family is binradar_setup.PredicateFamily.GENERIC_ERM
+    assert loaded.allocator is None
 
 
 def test_detect_family_generic_ignores_empty_allocator_trace(tmp_path):
@@ -353,34 +352,33 @@ def test_detect_family_generic_ignores_empty_allocator_trace(tmp_path):
     (workdir / "patch-format").write_text("ERM generic\n")
     (workdir / "predicates").write_text("max1 - rdx == ~max1\n")
 
-    family, allocator = binradar_setup.detect_predicate_family(workdir)
-    assert family is binradar_setup.PredicateFamily.GENERIC_ERM
-    assert allocator is None
+    loaded = binradar_setup.load_setup_predicates(workdir)
+    assert loaded.family is binradar_setup.PredicateFamily.GENERIC_ERM
+    assert loaded.allocator is None
 
 
 def test_detect_family_CWE805_erm():
-    family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "cwe805-erm")
-    assert family is binradar_setup.PredicateFamily.CWE805_ERM
-    assert allocator is not None
-    assert allocator.kind == "realloc"
-    assert allocator.calls[0] == (0, "486b4f")
-    assert allocator.returns[0] == "486b55"
+    loaded = binradar_setup.load_setup_predicates(FIXTURES / "cwe805-erm")
+    assert loaded.family is binradar_setup.PredicateFamily.CWE805_ERM
+    assert loaded.allocator is not None
+    assert loaded.allocator.kind == "realloc"
+    assert loaded.allocator.calls[0] == (0, "486b4f")
+    assert loaded.allocator.returns[0] == "486b55"
 
 
 def test_detect_family_CWE805_direct():
-    family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "cwe805-direct")
-    assert family is binradar_setup.PredicateFamily.CWE805_DIRECT
-    assert allocator is not None
-    assert allocator.kind == "malloc"
+    loaded = binradar_setup.load_setup_predicates(FIXTURES / "cwe805-direct")
+    assert loaded.family is binradar_setup.PredicateFamily.CWE805_DIRECT
+    assert loaded.allocator is not None
+    assert loaded.allocator.kind == "malloc"
+    assert loaded.records == []
 
 
 def test_detect_family_taosc_specialized():
-    family, allocator = binradar_setup.detect_predicate_family(
-        FIXTURES / "taosc-specialized")
-    assert family is binradar_setup.PredicateFamily.TAOSC_SPECIALIZED
-    assert allocator is None
+    loaded = binradar_setup.load_setup_predicates(FIXTURES / "taosc-specialized")
+    assert loaded.family is binradar_setup.PredicateFamily.TAOSC_SPECIALIZED
+    assert loaded.allocator is None
+    assert loaded.records == []
 
 
 def test_detect_family_mixed_file_rejected(tmp_path):
@@ -391,7 +389,7 @@ def test_detect_family_mixed_file_rejected(tmp_path):
         "max1 - rdx == ~max1\n"
         "s->rax >= i->begin && s->rax < i->end\n")
     try:
-        binradar_setup.detect_predicate_family(workdir)
+        binradar_setup.load_setup_predicates(workdir)
     except ValueError as e:
         assert "predicates:2:" in str(e)
     else:
@@ -403,7 +401,7 @@ def test_detect_family_unknown_punctuation_rejected(tmp_path):
     workdir.mkdir()
     (workdir / "predicates").write_text("max1 ? rdx == ~max1\n")
     try:
-        binradar_setup.detect_predicate_family(workdir)
+        binradar_setup.load_setup_predicates(workdir)
     except ValueError as e:
         assert "predicates:1:" in str(e)
     else:
@@ -520,9 +518,9 @@ def test_emit_brpatches_inc_generic_and_CWE805(tmp_path):
 
 def test_filter_meta_identity(tmp_path):
     """filter.sbsv metadata pins kind + predicates SHA-256."""
-    load = binradar_setup.load_filter_passed_ids
+    load = binradar_taosc_predicates.load_filter_passed_ids
     write = binradar_setup.write_filter
-    sha = binradar_setup.predicates_sha256
+    sha = binradar_taosc_predicates.predicates_sha256
 
     predicates = tmp_path / "predicates"
     predicates.write_text("max1 - rdx == ~max1\n")
@@ -552,11 +550,7 @@ def test_filter_meta_identity(tmp_path):
         f"[filter] [meta] [version 1] [kind generic-erm] [sha256 {sha(predicates)}]\n")
 
 
-def test_predicates_sha256_stable():
-    sha = binradar_setup.predicates_sha256
-    assert sha(FIXTURES / "generic" / "predicates") == \
-        sha(FIXTURES / "generic" / "predicates")
-    assert len(sha(FIXTURES / "generic" / "predicates")) == 64
+
 
 
 # ---------------------------------------------------------------------------

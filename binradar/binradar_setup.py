@@ -31,17 +31,14 @@ from .binradar_taosc_predicates import (
     RegisterCell,
     StackCell,
     _emit_brpatches_inc,
-    _parse_predicate_records,
     build_instrumentation_spec,
-    detect_predicate_family,
+    load_setup_predicates,
     e9tool_command,
     load_predicates,
-    load_filter_passed_ids,
     parse_CWE805_predicate,
     parse_allocator_trace,
     predicate_stack_bytes,
     predicate_to_branch_patch_str,
-    predicates_sha256,
     read_patch_format,
     tokenize_generic,
     write_filter,
@@ -1256,7 +1253,11 @@ def extract_e9_runtime_metadata(
     return E9RuntimeMetadata(exclude_ranges, relocated_calls)
 
 
-def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
+def prepare_patch(
+    configdir: Path, workdir: Path, binradar_env: Dict[str, str],
+    predicates: binradar_taosc_predicates.SetupPredicates,
+    survivors: Optional[List[int]] = None,
+):
     print(f"Preparing patch in {workdir}")
     predicates_file = workdir / "predicates"
     original_binary = workdir / f"{binradar_env['BINARY']}.orig"
@@ -1266,12 +1267,7 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
         print(f"Error: original binary {original_binary.name} not found in {workdir}")
         exit(1)
 
-    # Classify the workdir before any predicate parsing (plan §6.1).
-    try:
-        family, allocator = detect_predicate_family(workdir)
-    except ValueError as e:
-        print(f"Error: {e}")
-        exit(1)
+    family, allocator = predicates.family, predicates.allocator
     binradar_env["BINRADAR_PATCH_KIND"] = family.value
     patch_format = read_patch_format(workdir)
     if patch_format is not None:
@@ -1396,68 +1392,25 @@ def prepare_patch(configdir: Path, workdir: Path, binradar_env: Dict[str, str]):
               f"brpatched binary in {workdir}; building with zero "
               f"candidate patches")
 
-    # GENERIC_ERM or CWE805_ERM: parse every line strictly.  A missing
-    # predicates file (specialized family without a prebuilt binary) is
-    # treated as an empty list.
-    predicate_records: List[PredicateRecord] = []
-    if predicates_file.exists():
-        try:
-            predicate_records = _parse_predicate_records(predicates_file,
-                                                         family)
-        except ValueError as e:
-            print(f"Error: {e}")
-            exit(1)
+    predicate_records = predicates.records
     if not predicate_records:
-        # Empty predicate list: build the artifacts with zero candidates
-        # (TOTAL_PATCHES=0); binradar.py handles the no-patch case.
-        print(f"Warning: {predicates_file.name} is empty in {workdir}; "
+        print(f"Warning: no ERM predicates in {workdir}; "
               f"building with zero candidate patches")
 
-    # PATCH_TYPE and the patch counters describe the pipeline inputs:
-    # TAOSC_TOTAL_PATCHES counts the predicates Taosc generated, and
-    # FILTER_TOTAL_PATCHES the ones that survive setup filtering.  During
-    # the bootstrap build they are equal; the second build applies the fresh
-    # filter.sbsv mapping.
+    # Filter IDs index this invocation's validated source snapshot, not a
+    # persisted filter from a previous run. Only final runtime IDs change.
+    patch_records = predicate_records
+    if survivors is not None:
+        patch_records = []
+        for new_id, patch_id in enumerate(survivors, start=1):
+            record = predicate_records[patch_id - 1]
+            patch_records.append(PredicateRecord(
+                new_id, record.source_line, record.source_text, record.parsed))
+        print(f"[filter] selected {len(patch_records)} of "
+              f"{len(predicate_records)} predicates")
     binradar_env["PATCH_TYPE"] = family.value
     binradar_env["TAOSC_TOTAL_PATCHES"] = str(len(predicate_records))
-    binradar_env["FILTER_TOTAL_PATCHES"] = str(len(predicate_records))
-
-    patch_records = [
-        PredicateRecord(patch_id, record.source_line, record.source_text,
-                        record.parsed)
-        for patch_id, record in enumerate(predicate_records, start=1)
-    ]
-    # Apply the setup filter results, if any.  Predicates whose row evaluates
-    # to true survive; the rest are discarded before the top-30 cap, so the
-    # verification pipeline only sees candidates that passed the POC.  Fail
-    # open on parse trouble.  The filter metadata
-    # (family + predicates-file SHA-256) must match, so a stale filter
-    # from a different predicate file or family is never applied.
-    filter_file = workdir / "filter.sbsv"
-    if filter_file.exists():
-        passed_ids = load_filter_passed_ids(
-            filter_file,
-            expected_kind=family.value,
-            expected_sha256=predicates_sha256(predicates_file),
-        )
-        if passed_ids is None:
-            print(f"Warning: failed to parse {filter_file.name} "
-                  f"(or metadata mismatch); using all predicates (fail-open)")
-        else:
-            predicate_by_id = {record.source_line: record
-                               for record in predicate_records}
-            survived = list()
-            for source_id, new_id in sorted(
-                    passed_ids.items(), key=lambda item: item[1]):
-                record = predicate_by_id.get(source_id)
-                if record is not None:
-                    survived.append(PredicateRecord(
-                        new_id, record.source_line, record.source_text,
-                        record.parsed))
-            print(f"[filter] loaded {len(predicate_records)} predicates, "
-                  f"{len(survived)} survived")
-            binradar_env["FILTER_TOTAL_PATCHES"] = str(len(survived))
-            patch_records = survived
+    binradar_env["FILTER_TOTAL_PATCHES"] = str(len(patch_records))
 
     # Get patch destination
     destinations_file = workdir / "patch-destination"
@@ -1617,6 +1570,7 @@ def run_setup_filter(
     configdir: Path,
     workdir: Path,
     binradar_env: Dict[str, str],
+    predicates: binradar_taosc_predicates.SetupPredicates,
 ) -> List[int]:
     """Filter prepared candidates by executing the POC.
 
@@ -1627,17 +1581,9 @@ def run_setup_filter(
     kept fail-open, matching the former pipeline FILTER policy.
     """
     start = time.time()
-    family = PredicateFamily(binradar_env["BINRADAR_PATCH_KIND"])
-    predicates_file = workdir / "predicates"
-    runtime_records: List[PredicateRecord] = []
+    family = predicates.family
     if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
-        if predicates_file.exists():
-            runtime_records = [
-                PredicateRecord(runtime_id, record.source_line,
-                                record.source_text, record.parsed)
-                for runtime_id, record in enumerate(
-                    _parse_predicate_records(predicates_file, family), start=1)
-            ]
+        runtime_records = predicates.records
     else:
         runtime_records = [
             PredicateRecord(patch_id, patch_id, family.value, family.value)
@@ -1649,8 +1595,7 @@ def run_setup_filter(
         write_filter(
             filter_file, [], time.time() - start,
             kind=family.value,
-            sha256=(predicates_sha256(predicates_file)
-                    if predicates_file.exists() else None),
+            sha256=predicates.sha256,
         )
         binradar_env["FILTER_TOTAL_PATCHES"] = "0"
         return []
@@ -1822,8 +1767,7 @@ def run_setup_filter(
     write_filter(
         filter_file, results, time.time() - start,
         kind=family.value,
-        sha256=(predicates_sha256(predicates_file)
-                if predicates_file.exists() else None),
+        sha256=predicates.sha256,
     )
     survivors = [patch_id for patch_id in all_ids if decisions[patch_id][0]]
     binradar_env["FILTER_TOTAL_PATCHES"] = str(len(survivors))
@@ -1847,17 +1791,22 @@ def cmd_setup(configdir: Path, workdir: Path):
     binradar_env = create_binradar_env(configdir, config_path, workdir)
     binradar_env_path = workdir / "binradar.env"
 
-    # The first build must contain every Taosc candidate. Never let a stale
-    # setup-filter result narrow the bootstrap artifact.
-    (workdir / "filter.sbsv").unlink(missing_ok=True)
-    prepare_patch(configdir, workdir, binradar_env)
-    survivors = run_setup_filter(configdir, workdir, binradar_env)
+    # Pin validation and filter metadata to one source snapshot. All stages
+    # share its records; a later setup invocation loads a new snapshot.
+    try:
+        predicates = load_setup_predicates(workdir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
 
-    family = PredicateFamily(binradar_env["BINRADAR_PATCH_KIND"])
-    if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
-        # Apply the newly written source-id -> compact-id mapping and rebuild
-        # both artifacts from the actual POC survivor set.
-        prepare_patch(configdir, workdir, binradar_env)
+    # Never let a stale filter narrow the bootstrap artifact. The result file
+    # remains persisted evidence, not an intermediate input to this invocation.
+    (workdir / "filter.sbsv").unlink(missing_ok=True)
+    prepare_patch(configdir, workdir, binradar_env, predicates)
+    survivors = run_setup_filter(configdir, workdir, binradar_env, predicates)
+
+    if predicates.family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        prepare_patch(configdir, workdir, binradar_env, predicates, survivors)
     else:
         # Direct and specialized singleton artifacts have no predicate table
         # to rebuild; the persisted count alone hides a rejected candidate.

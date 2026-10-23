@@ -755,9 +755,10 @@ def test_detect_family_CWE805_erm_empty_predicates_no_raise(tmp_path):
     (trace / "crash.address").write_text("410735")
     (workdir / "patch-location").write_text("410736")
     (workdir / "predicates").write_text("")
-    family, allocator = binradar_setup.detect_predicate_family(workdir)
-    assert family is binradar_setup.PredicateFamily.CWE805_ERM
-    assert allocator is not None
+    loaded = binradar_setup.load_setup_predicates(workdir)
+    assert loaded.family is binradar_setup.PredicateFamily.CWE805_ERM
+    assert loaded.allocator is not None
+    assert loaded.records == []
 
 
 def test_detect_family_CWE805_erm_missing_predicates_no_raise(tmp_path):
@@ -769,9 +770,10 @@ def test_detect_family_CWE805_erm_missing_predicates_no_raise(tmp_path):
     (trace / "realloc.returns").write_text("4066f0\n")
     (trace / "crash.address").write_text("410735")
     (workdir / "patch-location").write_text("410736")
-    family, allocator = binradar_setup.detect_predicate_family(workdir)
-    assert family is binradar_setup.PredicateFamily.CWE805_ERM
-    assert allocator is not None
+    loaded = binradar_setup.load_setup_predicates(workdir)
+    assert loaded.family is binradar_setup.PredicateFamily.CWE805_ERM
+    assert loaded.allocator is not None
+    assert loaded.records == []
 
 
 def test_prepare_patch_empty_predicates_builds_zero_candidates(
@@ -800,7 +802,7 @@ def test_prepare_patch_empty_predicates_builds_zero_candidates(
         binradar_setup, "extract_e9_runtime_metadata",
         lambda *args, **kwargs: metadata)
 
-    binradar_setup.prepare_patch(tmp_path, workdir, binradar_env)
+    binradar_setup.prepare_patch(tmp_path, workdir, binradar_env, binradar_setup.load_setup_predicates(workdir))
     assert binradar_env["TOTAL_PATCHES"] == "0"
     assert binradar_env["BRPATCHED_E9_EXCLUDE_RANGES"] == \
         "0x42209000-0x4220a000"
@@ -810,47 +812,7 @@ def test_prepare_patch_empty_predicates_builds_zero_candidates(
     assert (workdir / "brpatches.inc").exists()
 
 
-def test_cmd_setup_builds_filters_then_rebuilds_erm(tmp_path, monkeypatch):
-    """The cache-capable bootstrap build precedes filtering and compaction."""
-    configdir = tmp_path / "config"
-    workdir = tmp_path / "workdir"
-    (configdir / "poc").mkdir(parents=True)
-    workdir.mkdir()
-    (configdir / "config.env").write_text(
-        'BINARY="imginfo"\n'
-        'POC_INPUT="poc/input"\n'
-        'POC_DIR="poc"\n'
-        'TEST_CMD="./imginfo @@"\n')
-    (workdir / "patch-location").write_text("410735\n")
-    (workdir / "binradar.env").write_text(
-        'PREFILTER_TOTAL_PATCHES="stale"\n'
-        'PREFILTER_E9_EXCLUDE_RANGES="stale"\n'
-        'PREFILTER_E9_RELOCATED_CALL_JUMPS="stale"\n')
 
-    events = []
-
-    def fake_prepare(configdir_arg, workdir_arg, env_arg):
-        events.append("prepare")
-        env_arg["BINRADAR_PATCH_KIND"] = "generic-erm"
-        env_arg["TAOSC_TOTAL_PATCHES"] = "2"
-        env_arg["FILTER_TOTAL_PATCHES"] = "2"
-        env_arg["TOTAL_PATCHES"] = "2"
-
-    def fake_filter(configdir_arg, workdir_arg, env_arg):
-        events.append("filter")
-        env_arg["FILTER_TOTAL_PATCHES"] = "1"
-        return [1]
-
-    monkeypatch.setattr(binradar_setup, "prepare_patch", fake_prepare)
-    monkeypatch.setattr(binradar_setup, "run_setup_filter", fake_filter)
-
-    binradar_setup.cmd_setup(configdir, workdir)
-
-    assert events == ["prepare", "filter", "prepare"]
-    saved = binradar_setup.load_env(workdir / "binradar.env")
-    assert "PREFILTER_TOTAL_PATCHES" not in saved
-    assert "PREFILTER_E9_EXCLUDE_RANGES" not in saved
-    assert "PREFILTER_E9_RELOCATED_CALL_JUMPS" not in saved
 
 
 # ---------------------------------------------------------------------------

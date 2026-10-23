@@ -9,6 +9,7 @@ plus the allocator-trace instrumentation spec shared by patched artifacts.  Shar
 import enum
 import functools
 import hashlib
+import io
 import json
 import re
 import struct
@@ -200,12 +201,7 @@ def parse_CWE805_predicate(line: str) -> CWE805Predicate:
     raise ValueError("not a CWE-805 predicate")
 
 
-def classify_predicate_line(line: str) -> Optional[str]:
-    """Return the family of one non-empty predicate line, or None if it is
-    neither a generic nor a CWE-805 predicate."""
-    if "i->begin" in line or "i->end" in line or "s->" in line:
-        return PredicateFamily.CWE805_ERM.value
-    return PredicateFamily.GENERIC_ERM.value
+
 
 
 def predicates_sha256(predicates_file: Path) -> str:
@@ -443,6 +439,15 @@ class AllocatorTrace:
 
 
 @dataclass(frozen=True)
+class SetupPredicates:
+    """One validated source snapshot shared by all setup stages."""
+    family: PredicateFamily
+    allocator: Optional[AllocatorTrace]
+    records: List[PredicateRecord]
+    sha256: Optional[str]
+
+
+@dataclass(frozen=True)
 class InstrumentationSpec:
     """Ordered E9 instrumentation: (address, plugin-action) pairs.
 
@@ -554,122 +559,55 @@ def parse_allocator_trace(trace_dir: Path) -> Optional[AllocatorTrace]:
     return AllocatorTrace(kind, calls, returns)
 
 
-def _family_from_patch_format(
-    family: PredicateFamily,
-    predicates_file: Path,
-    allocator: Optional[AllocatorTrace],
-) -> Tuple[PredicateFamily, Optional[AllocatorTrace]]:
-    """Validate a patch-format-derived family against the workdir artifacts.
-
-    Taosc's patch-format is the authoritative classifier, but the artifacts
-    must still be consistent so a stale or mismatched patch-format is caught
-    rather than silently mis-classified.
-    """
-    if family in (PredicateFamily.CWE805_DIRECT,
-                  PredicateFamily.CWE805_ERM):
-        if allocator is None:
-            raise ValueError(
-                f"patch-format says {family.value} but no allocator trace "
-                "found in trace/")
-        return family, allocator
-    if family == PredicateFamily.GENERIC_ERM:
-        if not predicates_file.exists():
-            raise ValueError(
-                "patch-format says ERM generic but no predicates file found")
-        records = load_predicates(predicates_file)
-        if not records:
-            raise ValueError(
-                "patch-format says ERM generic but predicates is empty")
-        for source_line, predicate in records:
-            if classify_predicate_line(predicate) \
-                    != PredicateFamily.GENERIC_ERM.value:
-                raise ValueError(
-                    f"predicates:{source_line}: not a generic predicate: "
-                    f"{predicate!r}")
-            try:
-                predicate_to_branch_patch_str(predicate)
-            except ValueError as e:
-                raise ValueError(
-                    f"predicates:{source_line}: {e}") from e
-        return PredicateFamily.GENERIC_ERM, None
-    # TAOSC_SPECIALIZED (Single CWE-369/617/823): no predicates, no
-    # allocator trace.
-    return PredicateFamily.TAOSC_SPECIALIZED, None
 
 
-def detect_predicate_family(workdir: Path) -> Tuple[PredicateFamily, Optional[AllocatorTrace]]:
-    """Classify the workdir's patch family (plan §6.1).
 
-    The Taosc ``patch-format`` file is the primary classifier when present;
-    otherwise the workdir artifacts (allocator trace, crash/patch addresses,
-    predicates grammar) are used.  Returns (family, allocator_trace).  Raises
-    ValueError with a predicates:<line>: <reason> diagnostic on malformed
-    predicate files.
+def load_setup_predicates(workdir: Path) -> SetupPredicates:
+    """Classify artifacts and validate/lower each source predicate once.
+
+    The digest and records describe the same input bytes. Runtime IDs are
+    consecutive; source lines retain their physical positions, including gaps.
+    Direct and specialized families ignore stale predicate expressions.
     """
     predicates_file = workdir / "predicates"
     trace_dir = workdir / "trace"
+    declared = parse_patch_format(workdir)
+    # Generic/specialized formats must ignore leftover allocator traces.
+    allocator = None
+    if declared not in (PredicateFamily.GENERIC_ERM,
+                        PredicateFamily.TAOSC_SPECIALIZED):
+        allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
+    if declared in (PredicateFamily.CWE805_DIRECT, PredicateFamily.CWE805_ERM) \
+            and allocator is None:
+        raise ValueError(
+            f"patch-format says {declared.value} but no allocator trace found in trace/")
 
-    patch_format_family = parse_patch_format(workdir)
-    if patch_format_family is not None:
-        # Only the CWE-805 families use the allocator trace.  Generic ERM
-        # and taosc-specialized patches ignore it: taosc may leave an empty
-        # or malformed trace/ artifact behind (e.g. a POC that crashes
-        # inside the very first allocator call, so no call/return pair is
-        # recorded), and that must not abort a generic classification
-        # (zziplib/CVE-2017-5979).
-        if patch_format_family in (PredicateFamily.CWE805_DIRECT,
-                                   PredicateFamily.CWE805_ERM):
-            allocator = parse_allocator_trace(trace_dir) \
-                if trace_dir.is_dir() else None
+    family = declared
+    if family is None:
+        if allocator is None:
+            family = PredicateFamily.GENERIC_ERM
         else:
-            allocator = None
-        return _family_from_patch_format(
-            patch_format_family, predicates_file, allocator)
+            crash_file = trace_dir / "crash.address"
+            location_file = workdir / "patch-location"
+            crash = crash_file.read_text().strip() if crash_file.exists() else ""
+            location = location_file.read_text().strip() if location_file.exists() else ""
+            family = (PredicateFamily.CWE805_DIRECT if crash == location
+                      else PredicateFamily.CWE805_ERM)
 
-    allocator = parse_allocator_trace(trace_dir) if trace_dir.is_dir() else None
-    if allocator is not None:
-        crash_address = (trace_dir / "crash.address").read_text().strip() \
-            if (trace_dir / "crash.address").exists() else ""
-        patch_location = (workdir / "patch-location").read_text().strip() \
-            if (workdir / "patch-location").exists() else ""
-        if crash_address == patch_location:
-            return PredicateFamily.CWE805_DIRECT, allocator
-        # Missing or empty predicates are valid: setup still builds the
-        # artifacts with zero candidates (TOTAL_PATCHES=0) and binradar.py
-        # handles the no-patch case.
-        if not predicates_file.exists():
-            return PredicateFamily.CWE805_ERM, allocator
-        records = load_predicates(predicates_file)
-        if not records:
-            return PredicateFamily.CWE805_ERM, allocator
-        for source_line, predicate in records:
-            if classify_predicate_line(predicate) != PredicateFamily.CWE805_ERM.value:
-                raise ValueError(
-                    f"predicates:{source_line}: not a CWE-805 predicate: "
-                    f"{predicate!r}")
-            try:
-                parse_CWE805_predicate(predicate)
-            except ValueError as e:
-                raise ValueError(
-                    f"predicates:{source_line}: {e}") from e
-        return PredicateFamily.CWE805_ERM, allocator
-
-    if not predicates_file.exists():
-        return PredicateFamily.TAOSC_SPECIALIZED, None
-    records = load_predicates(predicates_file)
-    if not records:
-        return PredicateFamily.TAOSC_SPECIALIZED, None
-    for source_line, predicate in records:
-        if classify_predicate_line(predicate) != PredicateFamily.GENERIC_ERM.value:
-            raise ValueError(
-                f"predicates:{source_line}: not a generic predicate: "
-                f"{predicate!r}")
-        try:
-            predicate_to_branch_patch_str(predicate)
-        except ValueError as e:
-            raise ValueError(
-                f"predicates:{source_line}: {e}") from e
-    return PredicateFamily.GENERIC_ERM, None
+    records = []
+    digest = None
+    if predicates_file.exists():
+        data = predicates_file.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if family in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+            records = _parse_predicate_records(data.decode("utf-8"), family)
+    elif declared == PredicateFamily.GENERIC_ERM:
+        raise ValueError("patch-format says ERM generic but no predicates file found")
+    if family == PredicateFamily.GENERIC_ERM and not records:
+        if declared == PredicateFamily.GENERIC_ERM:
+            raise ValueError("patch-format says ERM generic but predicates is empty")
+        family = PredicateFamily.TAOSC_SPECIALIZED
+    return SetupPredicates(family, allocator, records, digest)
 
 
 def load_filter_passed_ids(filter_file: Path,
@@ -1312,30 +1250,19 @@ def _emit_brpatches_inc(brpatches_inc: Path,
         f.write("default:\n\treturn \"p0\";\n")
 
 
-def _parse_predicate_records(predicates_file: Path,
-                             family: PredicateFamily) -> List[PredicateRecord]:
-    """Parse every non-empty predicate line into a PredicateRecord.
-
-    Raises ValueError with a predicates:<line>: <reason> diagnostic on any
-    malformed or mixed-family line.
-    """
+def _parse_predicate_records(text: str, family: PredicateFamily) -> List[PredicateRecord]:
+    """Validate every nonempty line and assign compact initial runtime IDs."""
     records: List[PredicateRecord] = []
-    with predicates_file.open("r") as f:
-        for line_number, line in enumerate(f, start=1):
-            predicate = line.strip()
-            if not predicate:
-                continue
-            if family == PredicateFamily.CWE805_ERM:
-                try:
-                    parsed = parse_CWE805_predicate(predicate)
-                except ValueError as e:
-                    raise ValueError(
-                        f"predicates:{line_number}: {e}") from e
-            else:
-                try:
-                    parsed = predicate_to_branch_patch_str(predicate)
-                except ValueError as e:
-                    raise ValueError(
-                        f"predicates:{line_number}: {e}") from e
-            records.append(PredicateRecord(0, line_number, predicate, parsed))
+    for line_number, line in enumerate(io.StringIO(text, newline=None), start=1):
+        predicate = line.strip()
+        if not predicate:
+            continue
+        try:
+            parsed = (parse_CWE805_predicate(predicate)
+                      if family == PredicateFamily.CWE805_ERM
+                      else predicate_to_branch_patch_str(predicate))
+        except ValueError as e:
+            raise ValueError(f"predicates:{line_number}: {e}") from e
+        records.append(PredicateRecord(
+            len(records) + 1, line_number, predicate, parsed))
     return records
