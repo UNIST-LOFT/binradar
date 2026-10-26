@@ -95,8 +95,9 @@ def main():
     mode = "w:gz" if output.name.endswith((".tar.gz", ".tgz")) else "w"
 
     with tarfile.open(output, mode) as tar:
-        for target in targets:
+        for i, target in enumerate(targets):
             # Preserve the complete relative directory structure.
+            print(f"{i}/{len(targets)} - {target}")
             tar.add(target, arcname=target)
 
     print(f"[DONE] created: {output}")

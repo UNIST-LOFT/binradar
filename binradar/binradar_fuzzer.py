@@ -12,7 +12,8 @@ from . import paths
 import sbsv
 
 class BinRadarFuzzer:
-    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str, patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
+    def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str,
+                 patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -44,8 +45,8 @@ class BinRadarFuzzer:
             afl_exec_timeout=env.get("BINRADAR_AFL_EXEC_TIMEOUT", "10000+"),
         )
     
-    def get_patched_binary_path(self) -> str:
-        return os.path.join(self.workdir, f"{self.binary}.brpatched")
+    def get_original_binary_path(self) -> str:
+        return os.path.join(self.workdir, f"{self.binary}.orig")
 
     def start(self) -> subprocess.Popen:
         raise NotImplementedError("start() method must be implemented in subclasses")
@@ -81,7 +82,7 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
         env["LC_ALL"] = "C"
-        command = self.get_qemu_targeted_simple_command(self.get_patched_binary_path(), self.poc_input)
+        command = self.get_qemu_targeted_simple_command(self.get_original_binary_path(), self.poc_input)
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)
@@ -112,7 +113,7 @@ class AFLppFuzzer(BinRadarFuzzer):
         # Currently, all benchmarks are using poc/testcases
         # But if it's not, it can be problematic
         input_dir = os.path.dirname(self.poc_input)
-        command = self.get_aflpp_command(self.get_patched_binary_path(), input_dir)
+        command = self.get_aflpp_command(self.get_original_binary_path(), input_dir)
         logger.info(f"Running command: {' '.join(command)}")
         with open(os.path.join(self.outdir, "fuzzer.log"), "w") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=self.workdir, start_new_session=True, env=env)

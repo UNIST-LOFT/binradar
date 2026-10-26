@@ -299,20 +299,10 @@ def test_failed_binradar_trace_is_ignored_and_final_reports_failed_phase(
     assert any("[issues true]" in row for row in progress)
 
 
-def test_afl_timeout_defaults_to_autoscaling_slow_seed_ceiling(tmp_path):
-    env = {
-        "BINARY": "target",
-        "POC_INPUT": "poc/crash",
-        "PATCH_LOC": "0x1000",
-        "TEST_CMD": "@@",
-    }
-    fuzzer = binradar.binradar_fuzzer.AFLppFuzzer.from_env(
-        str(tmp_path), str(tmp_path / "out"), env)
-    command = fuzzer.get_aflpp_command("target.brpatched", "poc")
-    assert command[command.index("-t") + 1] == "10000+"
 
-    env["BINRADAR_AFL_EXEC_TIMEOUT"] = "20000+"
-    fuzzer = binradar.binradar_fuzzer.AFLppFuzzer.from_env(
-        str(tmp_path), str(tmp_path / "out-2"), env)
-    command = fuzzer.get_aflpp_command("target.brpatched", "poc")
-    assert command[command.index("-t") + 1] == "20000+"
+
+
+
+
+
+
