@@ -23,6 +23,7 @@ from .binradar_feedback_capture import write_mutation_context
 from . import binradar_fuzzer
 from . import binradar_minimizer
 from . import binradar_pipeline
+from .binradar_probe_diagnostics import ProbeTraceDiagnostics
 from . import binradar_results
 from . import binradar_run_records
 from . import binradar_runtime
@@ -1164,36 +1165,69 @@ class BinRadarExecutor:
         # Never accept a reference from a killed run.
         probe_timeout = max(
             float(self.forkserver_child_timeout), PROBE_TRACER_TIMEOUT_MIN)
-        tracer_result = binradar_utils.execute(
-            tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=probe_timeout,
-            verbose=False)
+        diagnostics = ProbeTraceDiagnostics(
+            self.run_dir, command=tracer_cmd, cwd=self.workdir,
+            environment=tracer_env, testcase=self.resolved_poc_input(),
+            timeout=probe_timeout)
+        tracer_started = time.monotonic()
+        try:
+            tracer_result = binradar_utils.execute(
+                tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=probe_timeout,
+                verbose=False)
+        except Exception as exc:
+            diagnostics.record["elapsed_seconds"] = time.monotonic() - tracer_started
+            diagnostics.publish(reason="missing-or-unusable-terminal", error=exc)
+            raise
+        diagnostics.record["elapsed_seconds"] = time.monotonic() - tracer_started
+        diagnostics.retain_output(tracer_result)
         tracer_fault_reference = None
-        policy_acknowledged = binradar_verifier.tracer_memcheck_policy_acknowledged(
-            tracer_result.stderr or "")
-        if not policy_acknowledged:
-            sys.exit(
-                f"ERROR: tracer did not acknowledge memcheck policy {binradar_verifier.MEMCHECK_POLICY}; "
-                "use an updated tracer and start a fresh run with --run-id n.")
-        probe_result.memcheck_policy = binradar_verifier.MEMCHECK_POLICY
-        if tracer_result.timed_out:
-            logger.warning(
-                f"[PROBE] Tracer reference run exceeded {probe_timeout:g}s and "
-                "was killed; no normalized fault reference is published from a "
-                "killed run (its salvaged SIGTERM fault identity would name the "
-                "kill PC, not the fault).")
-        elif binradar_verifier.tracer_execution_cancelled(
-                tracer_result.exit_code):
-            # QEMU self-signals on genuine guest faults (including SIGSEGV),
-            # so a negative return code alone is not a host cancellation.
-            # Ignore the external cancellation signals that can salvage the
-            # interrupted guest PC as a plausible guest-signal reference.
-            logger.warning(
-                "[PROBE] Tracer reference process ended on a termination "
-                "signal; no normalized fault reference is published from "
-                "its salvaged output.")
-        elif tracer_result.success:
-            tracer_fault_reference = binradar_verifier.read_snapshot_fault_reference(
-                tracer_result.stderr, require_current=True)
+        admission_reason = "policy-error"
+        admission_error = None
+        try:
+            policy_acknowledged = binradar_verifier.tracer_memcheck_policy_acknowledged(
+                tracer_result.stderr or "")
+            diagnostics.record["memcheck_policy_acknowledged"] = policy_acknowledged
+            if not policy_acknowledged:
+                sys.exit(
+                    f"ERROR: tracer did not acknowledge memcheck policy {binradar_verifier.MEMCHECK_POLICY}; "
+                    "use an updated tracer and start a fresh run with --run-id n.")
+            probe_result.memcheck_policy = binradar_verifier.MEMCHECK_POLICY
+            admission_reason = "missing-or-unusable-terminal"
+            if tracer_result.timed_out:
+                admission_reason = "managed-timeout"
+                logger.warning(
+                    f"[PROBE] Tracer reference run exceeded {probe_timeout:g}s and "
+                    "was killed; no normalized fault reference is published from a "
+                    "killed run (its salvaged SIGTERM fault identity would name the "
+                    "kill PC, not the fault).")
+            elif binradar_verifier.tracer_execution_cancelled(
+                    tracer_result.exit_code):
+                # communicate() success is not guest success. Genuine guest
+                # SIGSEGV/BUS/ABRT remain eligible; host cancellation does not.
+                admission_reason = "external-cancellation"
+                logger.warning(
+                    "[PROBE] Tracer reference process ended on a termination "
+                    "signal; no normalized fault reference is published from "
+                    "its salvaged output.")
+            elif tracer_result.success:
+                admission_reason = "reference-error"
+                tracer_fault_reference = binradar_verifier.read_snapshot_fault_reference(
+                    tracer_result.stderr, require_current=True)
+                if tracer_fault_reference is not None:
+                    admission_reason = "validated-reference"
+                elif diagnostics.record["terminal_kind"] == "normal":
+                    admission_reason = "normal-without-reference"
+                elif diagnostics.record["terminal_kind"] == "signal":
+                    admission_reason = "signal-with-unavailable-identity"
+                else:
+                    admission_reason = "missing-or-unusable-terminal"
+        except BaseException as exc:
+            admission_error = exc
+            raise
+        finally:
+            diagnostics.publish(reason=admission_reason,
+                                reference=tracer_fault_reference,
+                                error=admission_error)
 
         if tracer_fault_reference is None:
             logger.warning(
