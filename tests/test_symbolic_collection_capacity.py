@@ -158,6 +158,38 @@ def test_real_collection_capacity(tmp_path, capacity_guest, mode, count, reason)
             assert status["expr_bytes"] == status["expr_capacity_bytes"]
 
 
+@pytest.mark.parametrize("symbolic", [False, True], ids=["memcheck", "symbolic"])
+@pytest.mark.parametrize("metadata", ["missing", "directory", "empty-file", "unset", "empty-path"])
+def test_model_metadata_startup(tmp_path, capacity_guest, symbolic, metadata):
+    guest, _ = capacity_guest
+    env = collection_environment(tmp_path)
+    env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    model_file = tmp_path / "models.plt"
+    if metadata == "directory":
+        model_file.mkdir()
+    elif metadata == "empty-file":
+        model_file.write_text("")
+    if metadata != "unset":
+        env["PLT_INFO_FILE"] = "" if metadata == "empty-path" else str(model_file)
+    marker = tmp_path / "completed"
+    command = [paths.TRACER_BIN]
+    if symbolic:
+        command.append("-symbolic")
+    result = subprocess.run(
+        command + [str(guest), env["SYMBOLIC_TESTCASE_NAME"], "q", "1", str(marker)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=30, check=False)
+    if metadata in ("missing", "directory"):
+        assert result.returncode != 0
+        assert not marker.exists(), "unreadable model metadata must stop before guest execution"
+        log = (tmp_path / "tracer.log").read_text() if (tmp_path / "tracer.log").exists() else ""
+        assert "[snapshot] [exit] [normal]" not in log
+        assert "[snapshot] [crash]" not in log
+    else:
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        assert marker.read_bytes() == b"done"
+
+
 @pytest.mark.parametrize("entry", ["trace_entry", "after_collection"])
 def test_capacity_before_and_after_forkserver_banner(
         tmp_path, capacity_guest, entry):

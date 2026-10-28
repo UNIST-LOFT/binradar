@@ -16,7 +16,6 @@ import sbsv
 from . import binradar_verifier
 from .binradar_feedback_capture import file_sha256
 
-
 # Record the effective values of an explicit allowlist, not the inherited
 # environment (which can contain credentials and is not a replay manifest).
 _SETTINGS = (
@@ -67,9 +66,18 @@ def _terminal_kind(result):
     return kind
 
 
+_LOG_FILES = {
+    "stdout": "probe-tracer.stdout.log",
+    "stderr": "probe-tracer.stderr.log",
+}
+_RESULT_FILE = "probe-tracer-result.json"
+
+
 class ProbeTraceDiagnostics:
     def __init__(self, run_dir, *, command, cwd, environment, testcase, timeout):
         self.root = Path(run_dir)
+        self._staged_logs = {}
+        self._retained = False
         # execute() resolves bare command names using the child's PATH.
         tracer = command[0]
         if os.path.dirname(tracer) == "":
@@ -104,13 +112,28 @@ class ProbeTraceDiagnostics:
     def retain_output(self, result):
         # These are the decoded strings returned by execute(), including its
         # post-timeout drain, not a claim of byte-for-byte subprocess capture.
-        # Publish neither an admission result nor a successful archive on error.
-        for name in ("stdout", "stderr"):
-            path = self.root / f"probe-tracer.{name}.log"
-            with path.open("w", encoding="utf-8") as stream:
-                stream.write(getattr(result, name) or "")
-                stream.flush()
-                os.fsync(stream.fileno())
+        # Stage both logs; publish() installs them together with the result so a
+        # failed retry can never pair new output with a previous result record.
+        staged = {}
+        try:
+            for name in ("stdout", "stderr"):
+                fd, temporary = tempfile.mkstemp(
+                    prefix=f".probe-tracer-{name}-", dir=self.root)
+                staged[name] = temporary
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(getattr(result, name) or "")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except BaseException:
+            for temporary in staged.values():
+                os.unlink(temporary)
+            raise
+        # A retained-but-unpublished previous attempt is superseded here.
+        for temporary in self._staged_logs.values():
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+        self._staged_logs = staged
+        self._retained = True
         self.record.update(
             exit_code=result.exit_code, success=result.success,
             timed_out=result.timed_out,
@@ -122,14 +145,37 @@ class ProbeTraceDiagnostics:
                            reference=asdict(reference) if reference is not None else None,
                            error=str(error) if error is not None else None)
         # Match the existing capture/evidence fsync + replace publication rule.
-        fd, temporary = tempfile.mkstemp(prefix=".probe-tracer-", dir=self.root)
+        # Stage the record first so a failure leaves the previous archive intact;
+        # then invalidate the previous result before any log is replaced, so the
+        # only reachable end states are the old complete unit, no result, or the
+        # new complete unit. A result record is never paired with foreign logs.
+        result_path = self.root / _RESULT_FILE
+        temporary = None
         try:
+            fd, temporary = tempfile.mkstemp(prefix=".probe-tracer-result-", dir=self.root)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(self.record, stream, sort_keys=True, separators=(",", ":"))
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.root / "probe-tracer-result.json")
+            if os.path.lexists(result_path):
+                os.unlink(result_path)
+            staged = self._staged_logs if self._retained else {}
+            for name, filename in _LOG_FILES.items():
+                target = self.root / filename
+                if name in staged:
+                    os.replace(staged[name], target)
+                    del staged[name]
+                elif os.path.lexists(target):
+                    os.unlink(target)
+            os.replace(temporary, result_path)
+            temporary = None
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            # Unpublished staging is discarded; installed files were already
+            # removed from this map. The result is replaced last, so no surviving
+            # record can be paired with logs from another execution.
+            for path in (temporary, *self._staged_logs.values()):
+                if path is not None and os.path.lexists(path):
+                    os.unlink(path)
+            self._staged_logs = {}
+            self._retained = False

@@ -6,19 +6,20 @@ exercise the built tracer. Only the unrelated QASAN/filetrace boundary is stubbe
 
 import hashlib
 import json
-from pathlib import Path
 import platform
+import resource
 import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from binradar import cli
 from binradar import binradar_verifier as verifier
-
+from binradar import cli
+from binradar.binradar_probe_diagnostics import ProbeTraceDiagnostics
 
 POLICY = f"[memcheck] [policy {verifier.MEMCHECK_POLICY}]\n"
 NORMAL = "[snapshot] [exit] [normal] [entrypoint-hit 1]\n"
@@ -277,6 +278,92 @@ def test_restored_probe_is_read_only_and_diagnostics_are_not_backfilled(probe, m
     assert probe.calls == []
     assert (probe.run / "probe-results.sbsv").read_bytes() == saved
     assert not list(probe.run.glob("probe-tracer*"))
+
+
+def test_successful_retry_replaces_logs_and_result_as_one_unit(probe, monkeypatch):
+    # A later PROBE stage failure leaves diagnostics but no authoritative
+    # probe-results.sbsv, so run_probe() retries the reference execution.
+    monkeypatch.setenv("QEMU_RAND_SEED", "1234")
+    _emit(probe, monkeypatch, POLICY + NORMAL)
+    probe.instance.run_probe()
+    first = _record(probe)
+    (probe.run / "probe-results.sbsv").unlink()
+    (probe.run / "probe-tracer.stdout.log").unlink()
+
+    monkeypatch.setenv("QEMU_RAND_SEED", "5678")
+    _emit(probe, monkeypatch, POLICY + CRASH + REFERENCE,
+          "os.kill(os.getpid(), signal.SIGSEGV)\n")
+    probe.instance.run_probe()
+    record = _record(probe)
+    assert first["settings"]["QEMU_RAND_SEED"] == "1234"
+    assert record["settings"]["QEMU_RAND_SEED"] == "5678"
+    assert record["exit_code"] == -signal.SIGSEGV
+    assert record["reference_admission_reason"] == "validated-reference"
+    assert (probe.run / "probe-tracer.stdout.log").read_text() == "reference stdout\n"
+    assert verifier.read_snapshot_fault_reference(
+        (probe.run / "probe-tracer.stderr.log").read_text(),
+        require_current=True).address == 0x401234
+    assert not list(probe.run.glob(".probe-tracer-*"))
+
+
+def test_failed_result_publication_leaves_previous_unit_intact(probe, monkeypatch):
+    _emit(probe, monkeypatch, POLICY + NORMAL)
+    probe.instance.run_probe()
+    old = _record(probe)
+    old_logs = {name: (probe.run / name).read_bytes()
+                for name in ("probe-tracer.stdout.log", "probe-tracer.stderr.log")}
+
+    # Real process-local EMFILE inside atomic publication, matching the observed
+    # retry failure: no production seam is patched.
+    diag = ProbeTraceDiagnostics(
+        str(probe.run), command=old["command"],
+        cwd=str(probe.work),
+        environment={key: value for key, value in old["settings"].items()
+                     if value is not None} | {
+                         "BINRADAR_MEMCHECK_POLICY": verifier.MEMCHECK_POLICY},
+        testcase=str(probe.work / "poc"), timeout=5.0)
+    diag.retain_output(SimpleNamespace(stdout="new stdout\n", stderr=CRASH,
+                                       exit_code=-signal.SIGSEGV, success=True,
+                                       timed_out=False))
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (0, limits[1]))
+        with pytest.raises(OSError):
+            diag.publish(reason="validated-reference")
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+    assert _record(probe) == old
+    assert {name: (probe.run / name).read_bytes() for name in old_logs} == old_logs
+    assert not list(probe.run.glob(".probe-tracer-*"))
+
+
+def test_failed_retry_never_leaves_stale_result_beside_new_logs(probe, monkeypatch):
+    _emit(probe, monkeypatch, POLICY + NORMAL)
+    probe.instance.run_probe()
+    (probe.run / "probe-results.sbsv").unlink()
+    # stdout is installed first. Fail the stderr rename only after the retry's
+    # distinguishable stdout has replaced the previous execution's output.
+    (probe.run / "probe-tracer.stderr.log").unlink()
+    (probe.run / "probe-tracer.stderr.log").mkdir()
+
+    _emit(probe, monkeypatch, POLICY + CRASH + REFERENCE,
+          "sys.stdout.write('retry stdout\\n'); sys.stdout.flush()\n"
+          "os.kill(os.getpid(), signal.SIGSEGV)\n")
+    with pytest.raises(IsADirectoryError):
+        probe.instance.run_probe()
+    assert (probe.run / "probe-tracer.stdout.log").read_text() == (
+        "reference stdout\nretry stdout\n")
+    assert not (probe.run / "probe-tracer-result.json").exists()
+    assert not (probe.run / "probe-results.sbsv").exists()
+    assert not list(probe.run.glob(".probe-tracer-*"))
+
+    (probe.run / "probe-tracer.stderr.log").rmdir()
+    _emit(probe, monkeypatch, POLICY + NORMAL)
+    probe.instance.run_probe()
+    record = _record(probe)
+    assert record["reference_admission_reason"] == "normal-without-reference"
+    assert record["exit_code"] == 0
+    assert (probe.run / "probe-tracer.stdout.log").read_text() == "reference stdout\n"
 
 
 @pytest.mark.parametrize("failure", ["raw-log", "atomic-result"])
