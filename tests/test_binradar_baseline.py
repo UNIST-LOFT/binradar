@@ -88,7 +88,8 @@ def _classify(log, *, reference=REFERENCE, result=None):
 @pytest.mark.parametrize("ack", [
     "", "[memcheck] [policy old]\n", "[memcheck] [policy coverage-v1]\n",
     "[memcheck] [policy coverage-v2]\n", "[memcheck] [policy coverage-v3]\n",
-    "[memcheck] [policy coverage-v4]\n", "[memcheck] [policy coverage-v5]\n"])
+    "[memcheck] [policy coverage-v4]\n", "[memcheck] [policy coverage-v5]\n",
+    "[memcheck] [policy coverage-v6]\n"])
 @pytest.mark.parametrize("outcome", [NORMAL_ROW, _reference_row(REFERENCE.address)])
 def test_missing_or_mismatched_policy_ack_is_unusable(ack, outcome):
     check = _classify(ack + outcome + "\n")
@@ -96,7 +97,7 @@ def test_missing_or_mismatched_policy_ack_is_unusable(ack, outcome):
     assert check.reference is None
 
 
-@pytest.mark.parametrize("policy", [None, "old", "unavailable", "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5"])
+@pytest.mark.parametrize("policy", [None, "old", "unavailable", "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "coverage-v6"])
 def test_stale_probe_policy_prevents_baseline_execution(tmp_path, monkeypatch, policy):
     calls = []
     monkeypatch.setattr(binradar_baseline, "_run_tracer", lambda *a: calls.append(a))

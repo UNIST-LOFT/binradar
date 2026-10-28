@@ -240,7 +240,7 @@ def test_binradar_keeps_guest_outcomes_after_symbolic_capacity(
         "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "60",
         "BINRADAR_FORKSERVER_ITERATION_TIMEOUT": "120",
         "BINRADAR_MEMCHECK_ENABLE": "1",
-        "BINRADAR_MEMCHECK_POLICY": "coverage-v6",
+        "BINRADAR_MEMCHECK_POLICY": "coverage-v7",
         "BINRADAR_OSPREY_ENABLE": "1",
         "BINRADAR_PATCH_CNT": "2",
         "BINRADAR_EVIDENCE_FILE": str(evidence),

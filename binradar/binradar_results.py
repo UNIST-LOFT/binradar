@@ -233,10 +233,10 @@ def write_final_result(request: FinalResultRequest) -> None:
     skip_binradar_analysis = (
         request.disable_binradar or request.binradar_failed)
     compact_binradar = False
-    # coverage-v5 introduced source-bearing canonical evidence. Its historical
-    # format contract survives the live-policy cutover to coverage-v6.
+    # coverage-v5 introduced source-bearing canonical evidence. Historical
+    # coverage-v5/v6 FINAL retains this contract after the live-policy cutover.
     source_bearing_policy = request.probe_memcheck_policy in (
-        "coverage-v5", binradar_verifier.MEMCHECK_POLICY)
+        "coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY)
     stop = _run_stop(request.run_dir, request.run_prefix, request.run_id)
     if request.disable_binradar:
         logger.info(
@@ -258,7 +258,7 @@ def write_final_result(request: FinalResultRequest) -> None:
                 and request.tracer_fault_reference.source == "syscall-request"
                 and (version != 4 or not source_bearing_policy)):
             raise ValueError(
-                "syscall-request FINAL requires coverage-v5 or coverage-v6 "
+                "syscall-request FINAL requires coverage-v5, coverage-v6, or coverage-v7 "
                 "and canonical BINRADAR v4 evidence")
         compact_binradar = True
         binradar_iterations = binradar_evidence.read_binradar(

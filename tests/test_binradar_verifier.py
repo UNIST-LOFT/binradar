@@ -96,7 +96,7 @@ def test_new_policy_restoration_preserves_valid_pc_zero(tmp_path):
     assert restored._probe_serialization_version == 4
 
 
-@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "older-policy", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "coverage-v6", "older-policy", "unavailable"])
 def test_freshness_rejects_unacknowledged_or_mismatched_policy(policy):
     probe = _probe(binradar_verifier.TracerFaultReference(0, "guest-signal"))
     probe.memcheck_policy = policy
@@ -104,6 +104,24 @@ def test_freshness_rejects_unacknowledged_or_mismatched_policy(policy):
         "[probe-info] " + probe.serialize())
     with pytest.raises(ValueError, match="--run-id n"):
         restored.require_current_memcheck_policy()
+
+
+@pytest.mark.parametrize("policy", ["coverage-v5", "coverage-v6"])
+@pytest.mark.parametrize("source", ["guest-signal", "provenance-access", "syscall-request"])
+def test_prior_source_bearing_probe_is_readable_but_not_live(tmp_path, policy, source):
+    original = _probe(binradar_verifier.TracerFaultReference(0, source))
+    original.memcheck_policy = policy
+    row = "[probe-info] " + original.serialize()
+    path = tmp_path / "historical.sbsv"
+    path.write_text(row + "\n[file-trace] [need-file-hook false]\n")
+    for restored in (
+            binradar_verifier.BinRadarProbeResult.from_sbsv(str(path)),
+            binradar_verifier.BinRadarProbeResult.deserialize(row)):
+        assert restored.memcheck_policy == policy
+        assert restored.tracer_fault_reference == original.tracer_fault_reference
+        with pytest.raises(ValueError, match="--run-id n"):
+            restored.require_current_memcheck_policy()
+    assert path.read_text() == row + "\n[file-trace] [need-file-hook false]\n"
 
 
 def test_v2_valid_reference_is_historical_read_only(tmp_path):

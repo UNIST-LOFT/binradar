@@ -1780,6 +1780,7 @@ def test_two_hop_rewrite_chain_reaches_the_trampoline(tmp_path):
 
 @pytest.mark.parametrize("policy_ack", [
     f"[memcheck] [policy {binradar.binradar_verifier.MEMCHECK_POLICY}]\n",
+    "[memcheck] [policy coverage-v6]\n",
     "[memcheck] [policy coverage-v5]\n", "[memcheck] [policy coverage-v4]\n",
     "[memcheck] [policy coverage-v3]\n",
     "[memcheck] [policy coverage-v2]\n",

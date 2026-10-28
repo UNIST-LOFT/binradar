@@ -128,7 +128,7 @@ class ConcreteInputSweep:
         return index
 
 
-MEMCHECK_POLICY = "coverage-v6"
+MEMCHECK_POLICY = "coverage-v7"
 PROBE_RESULT_SCHEMA_V3 = PROBE_RESULT_SCHEMA_V2.replace(
     "[tracer-fault-addr: hex]", "[tracer-fault-addr: hex] "
     "[tracer-fault-image: str] [tracer-fault-image-offset: hex] "

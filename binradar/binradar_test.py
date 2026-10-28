@@ -101,7 +101,8 @@ Subcommands:
         exp.list. Runs afl-qemu-trace (--asan host) and the fuzzolic
         tracer (tracer/build/.../qemu-x86_64, no -symbolic) on .orig
         with the POC and checks both report the same fault address
-        (the faulting instruction's code address).
+        (main-code PC, or a tracked main-frame reference for a signal
+        outside main code).
 
         Verdicts:
           PASS          - tracer and afl-qemu-trace report the same

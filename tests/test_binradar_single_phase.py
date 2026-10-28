@@ -112,7 +112,7 @@ def _make_workdir(tmp_path):
     return workdir, rundir
 
 
-@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "old", "unavailable"])
+@pytest.mark.parametrize("policy", [None, "coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "coverage-v6", "old", "unavailable"])
 def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, policy):
     workdir, rundir = _make_workdir(tmp_path)
     probe_file = rundir / "probe-results.sbsv"

@@ -372,7 +372,7 @@ def test_feedback_same_fault_is_spatial_while_sources_are_authenticated(tmp_path
 
 
 @pytest.mark.parametrize("source", ["guest-signal", "provenance-access", "syscall-request"])
-@pytest.mark.parametrize("tamper", [None, "child", "poc", "normal", "history", "coverage-v4", "coverage-v5"])
+@pytest.mark.parametrize("tamper", [None, "child", "poc", "normal", "history", "coverage-v4", "coverage-v5", "coverage-v6"])
 def test_current_feedback_authenticates_source_separately_from_site(tmp_path, source, tamper):
     executor, run_dir, _ = _feedback_executor(tmp_path)
     executor.probe_result.tracer_fault_reference = binradar.binradar_verifier.TracerFaultReference(0x1234, source)
@@ -392,7 +392,7 @@ def test_current_feedback_authenticates_source_separately_from_site(tmp_path, so
         mutation = struct.pack("<II", 2, 1) + _group(1, 2, 0x1234, [1], [1])
         (run_dir / "binradar.br").write_bytes(evidence.HEADER_STRUCT.pack(
             evidence.MAGIC, 3, 3, 0) + _frame(4, baseline) + _frame(4, mutation))
-    elif tamper in ("coverage-v4", "coverage-v5"):
+    elif tamper in ("coverage-v4", "coverage-v5", "coverage-v6"):
         executor.probe_result.memcheck_policy = tamper
     if tamper is None:
         executor.run_feedback()

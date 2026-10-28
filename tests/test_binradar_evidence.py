@@ -133,7 +133,7 @@ def test_binradar_v2_accepts_gaps_but_rejects_bad_ids(tmp_path):
         binradar_evidence.EvidenceKind.BINRADAR
 
 
-@pytest.mark.parametrize("policy", ["coverage-v2", "coverage-v5", binradar_verifier.MEMCHECK_POLICY])
+@pytest.mark.parametrize("policy", ["coverage-v2", "coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
 def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
     _write_binradar(tmp_path / "binradar.br")
     binradar_evidence.write_verifier(
@@ -159,7 +159,7 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
     executor.phase_failure_lock = threading.Lock()
     executor.save_progress = lambda _row: None
 
-    if policy in ("coverage-v5", binradar_verifier.MEMCHECK_POLICY):
+    if policy in ("coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY):
         with pytest.raises(ValueError, match="canonical BINRADAR v4"):
             executor.run_final()
         assert not (tmp_path / "final.sbsv").exists()
@@ -703,7 +703,7 @@ def test_representative_budget_cutoff_is_never_complete_coverage(tmp_path,
     assert "[binradar-coverage complete]" not in report
 
 
-@pytest.mark.parametrize("policy", ["coverage-v5", binradar_verifier.MEMCHECK_POLICY])
+@pytest.mark.parametrize("policy", ["coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
 @pytest.mark.parametrize("reference_source", ["guest-signal", "provenance-access", "syscall-request"])
 def test_source_bearing_policy_never_uses_text_as_canonical(tmp_path, policy, reference_source):
     import dataclasses
@@ -756,7 +756,7 @@ def test_invalid_source_outcome_pairs_with_valid_crc(tmp_path, version, outcome,
 
 
 @pytest.mark.parametrize("version", [1, 2, 3])
-@pytest.mark.parametrize("policy", ["coverage-v5", binradar_verifier.MEMCHECK_POLICY])
+@pytest.mark.parametrize("policy", ["coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
 def test_source_bearing_policy_rejects_source_less_canonical_evidence(tmp_path, version, policy):
     import dataclasses
     _write_binradar(tmp_path / "binradar.br", version=version)
@@ -777,7 +777,7 @@ def test_source_bearing_policy_rejects_source_less_canonical_evidence(tmp_path, 
 
 
 @pytest.mark.parametrize("reference_source", ["guest-signal", "provenance-access", "syscall-request"])
-@pytest.mark.parametrize("policy", ["coverage-v5", binradar_verifier.MEMCHECK_POLICY])
+@pytest.mark.parametrize("policy", ["coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
 def test_source_bearing_final_site_equality_remains_source_independent(tmp_path, reference_source, policy):
     import dataclasses
     frames = [struct.pack("<II", 1, 1) + _group(
