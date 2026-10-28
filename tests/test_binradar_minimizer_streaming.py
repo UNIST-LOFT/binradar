@@ -112,6 +112,211 @@ def _verifier_result(run_dir: Path):
 
 
 
+@pytest.mark.parametrize("total_patches", [0, 3])
+def test_original_minimizer_retains_unique_reached_bytes_and_real_observations(
+        tmp_path, monkeypatch, total_patches):
+    import hashlib
+
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    payloads = {
+        "a-normal": b"normal\x00\xff",
+        "b-duplicate": b"normal\x00\xff",
+        "c-other-crash": b"other-crash",
+        "d-no-hit": b"no-hit",
+        "e-unusable": b"unusable",
+    }
+    for name, data in payloads.items():
+        _publish(inputs / name, data)
+    (inputs / "ignored.binradar-part").write_bytes(b"partial")
+    observations = {
+        payloads["a-normal"]: _probe(),
+        payloads["c-other-crash"]: _probe("crash", 0x5678),
+        payloads["d-no-hit"]: _probe(),
+        payloads["e-unusable"]: None,
+    }
+    observations[b"no-hit"].patch_hit_cnt = 0
+    executed = []
+
+    def original(testcase, verbose=False):
+        data = Path(testcase).read_bytes()
+        executed.append(data)
+        # Mutation after snapshot publication must not change retained bytes.
+        if len(executed) == 1:
+            (inputs / "a-normal").write_bytes(b"changed-after-snapshot")
+        return observations[data]
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+    # No patched/cached artifact, map, manifest, capture, or novelty machinery
+    # may be consulted, even when stale candidate configuration is nonzero.
+    def forbidden(*args, **kwargs):
+        pytest.fail("original baseline consulted patched feature machinery")
+
+    monkeypatch.setattr(binradar_minimizer, "BaselineFeatureCollector", forbidden)
+    monkeypatch.setattr(binradar_minimizer, "NoveltyScorer", forbidden)
+    monkeypatch.setattr(binradar_minimizer, "CaptureJournal", forbidden)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    minimizer = binradar_minimizer.BinRadarMinimizer(
+        str(tmp_path), str(run_dir), _probe("crash"), [str(inputs)],
+        {"TOTAL_PATCHES": str(total_patches)},
+        baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    assert not minimizer.run_testcases()
+    retained = {p.name: p.read_bytes() for p in (run_dir / "minimized").iterdir()}
+    assert retained == {"0_a-normal": payloads["a-normal"],
+                        "1_c-other-crash": payloads["c-other-crash"]}
+    assert executed == [payloads[name] for name in
+                        ("a-normal", "c-other-crash", "d-no-hit", "e-unusable")]
+    text = (run_dir / "minimizer.sbsv").read_text()
+    assert text.splitlines()[0] == "[minimizer] [baseline] [version 1] [baseline original]"
+    parser = binradar_verifier.sbsv.parser()
+    parser.add_schema(
+        "[testcase] [original-result] [id: int] [file: str] [input-sha256: str] "
+        + binradar_verifier.PROBE_RESULT_SCHEMA_V4.removeprefix("[probe-info] ")
+        + " [time: int]")
+    rows = [row for line in text.splitlines()
+            if (row := parser.parse_line_detached(line)) is not None]
+    assert len(rows) == 2
+    for row, name in zip(rows, ("a-normal", "c-other-crash")):
+        data = payloads[name]
+        assert retained[row["file"]] == data
+        assert row["input-sha256"] == hashlib.sha256(data).hexdigest()
+        assert row["exit"] == observations[data].exit_info
+        assert row["fault-addr"] == observations[data].fault_addr
+        assert row["patch-hit"] == observations[data].patch_hit_cnt
+    assert "[pid " not in text and "[br [" not in text
+    assert "[minimizer] [done]" in text
+    assert not (run_dir / "feedback-capture").exists()
+
+
+def test_original_stream_drains_final_atomic_publication(tmp_path, monkeypatch):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    _publish(inputs / "a", b"first")
+    partial = inputs / "b.binradar-part"
+    partial.write_bytes(b"second")
+    alive = [True]
+    observed = []
+
+    def original(testcase, verbose=False):
+        observed.append(Path(testcase).read_bytes())
+        if alive[0]:
+            partial.replace(inputs / "b")
+            alive[0] = False
+        return _probe()
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+    minimizer = _make_minimizer(
+        tmp_path, [str(inputs)], min_file_age=0,
+        baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    assert not minimizer.run_testcases(
+        producer_threads=[SimpleNamespace(is_alive=lambda: alive[0])],
+        scan_interval=0, poll_interval=0)
+    assert observed == [b"first", b"second"]
+    assert {p.read_bytes() for p in (tmp_path / "run" / "minimized").iterdir()} == {
+        b"first", b"second"}
+    assert "[minimizer] [done]" in (tmp_path / "run" / "minimizer.sbsv").read_text()
+
+
+def test_original_minimizer_deadline_preserves_only_completed_evidence(tmp_path, monkeypatch):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    _publish(inputs / "a", b"first")
+    _publish(inputs / "b", b"second")
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(binradar_minimizer.time, "monotonic", lambda: clock[0])
+
+    def original(testcase, verbose=False):
+        calls.append(Path(testcase).read_bytes())
+        if len(calls) == 2:
+            clock[0] = 2.0
+        return _probe()
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+    minimizer = _make_minimizer(
+        tmp_path, [str(inputs)], baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    assert minimizer.run_testcases(timeout=1)
+    assert calls == [b"first", b"second"]
+    assert {p.name: p.read_bytes() for p in (tmp_path / "run" / "minimized").iterdir()} == {
+        "0_a": b"first"}
+    text = (tmp_path / "run" / "minimizer.sbsv").read_text()
+    assert text.count("[original-result]") == 1
+    assert "[minimizer] [stopped] [reason wall-time-reached]" in text
+    assert "[minimizer] [done]" not in text
+
+
+@pytest.mark.parametrize("config", [
+    {"BINRADAR_CONCRETE_INPUT_SCHEDULE": "novelty"},
+    {"BINRADAR_FEEDBACK_MODE": "1"},
+])
+def test_original_invalid_options_preserve_existing_outputs(tmp_path, config):
+    run_dir = tmp_path / "run"
+    minimized = run_dir / "minimized"
+    minimized.mkdir(parents=True)
+    (minimized / "existing").write_bytes(b"keep me")
+    log = run_dir / "minimizer.sbsv"
+    log.write_text("existing evidence\n")
+    with pytest.raises(ValueError):
+        binradar_minimizer.BinRadarMinimizer(
+            str(tmp_path), str(run_dir), _probe(), [], config,
+            baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    assert (minimized / "existing").read_bytes() == b"keep me"
+    assert log.read_text() == "existing evidence\n"
+
+
+@pytest.mark.parametrize("patches", [(), (1,)])
+@pytest.mark.parametrize("with_header", [True, False])
+def test_verifier_fails_closed_on_original_only_stream(tmp_path, patches, with_header):
+    verifier = _make_verifier(tmp_path, patches=patches)
+    path = tmp_path / "run" / "minimizer.sbsv"
+    header = "[minimizer] [baseline] [version 1] [baseline original]\n"
+    row = ("[testcase] [original-result] [id 0] [file 0_input] "
+           f"[input-sha256 {'a' * 64}] {_probe().serialize()} [time 1]\n")
+    path.write_text((header if with_header else "") + row + "[minimizer] [done] [time 1]\n")
+    with pytest.raises(ValueError, match="original"):
+        verifier.run_verification_streaming(str(path))
+    assert not (tmp_path / "run" / "verifier.br").exists()
+    assert verifier.verdicts == {}
+    assert verifier.testcases == []
+
+
+@pytest.mark.parametrize("artifact", ["original", "patched", "cached"])
+def test_original_qasan_environment_does_not_inherit_patched_controls(
+        tmp_path, monkeypatch, artifact):
+    inherited = (
+        "AFL_QEMU_INST_RANGES", "AFL_QEMU_EXCLUDE_RANGES",
+        "AFL_QEMU_INST_START", "AFL_QEMU_INST_END", "E9_EXCLUDE_RANGES",
+        "E9_RELOCATED_CALL_JUMPS", "E9_RELOCATED_INSTRUCTIONS",
+        "PATCH_FD", "PATCH_CACHED_FD", "TAOSC_PRED", "BRCACHE_STACK_SIZE",
+        "__AFL_SHM_ID",
+    )
+    for key in inherited:
+        monkeypatch.setenv(key, "inherited")
+    monkeypatch.setenv("UNRELATED_SETTING", "preserved")
+    runner = binradar_verifier.BinRadarQemuRunner(
+        str(tmp_path), "fixture", "@@", "0x1000",
+        e9_metadata={"brpatched": ("0x2000-0x3000", []),
+                     "brcached": ("0x4000-0x5000", [])})
+    binary = getattr(runner, f"{artifact}_binary")()
+    env = runner.get_env_for_exec("0", binary=binary)
+    assert env["AFL_USE_QASAN"] == "1"
+    assert env["UNRELATED_SETTING"] == "preserved"
+    if artifact == "original":
+        assert all(key not in env for key in inherited)
+    else:
+        assert env["PATCH_CACHED_FD"] == "inherited"
+        assert env["TAOSC_PRED"] == "inherited"
+        assert env["AFL_QEMU_INST_RANGES"] == (
+            "0x2000-0x3000" if artifact == "patched" else "0x4000-0x5000")
+
+
 def _scheduled_stream(tmp_path, monkeypatch, scores, patches=(1,)):
     import hashlib
     from binradar.binradar_input_schedule import InputScore
@@ -1066,7 +1271,7 @@ def test_run_fuzzer_rejects_unexpected_exit(tmp_path, monkeypatch):
     executor = _stub_executor(tmp_path)
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor._worker_environment = lambda: {}
     progress = []
     executor.save_progress = progress.append
@@ -1095,7 +1300,7 @@ def test_run_fuzzer_accepts_configured_timeout(tmp_path, monkeypatch):
     executor = _stub_executor(tmp_path)
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor._worker_environment = lambda: {}
     progress = []
     executor.save_progress = progress.append
@@ -1168,7 +1373,7 @@ def test_concolic_solver_deadline_is_graceful(
     executor = _stub_executor(tmp_path)
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor._phase_environment = lambda phase, run_dir: {}
     progress = []
     executor.save_progress = progress.append
@@ -1242,7 +1447,7 @@ def test_concolic_non_timeout_solver_exit_is_failure(tmp_path, monkeypatch):
     executor = _stub_executor(tmp_path)
     executor.run_dir = str(tmp_path / "run")
     Path(executor.run_dir).mkdir()
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor._phase_environment = lambda phase, run_dir: {}
     executor.save_progress = lambda row: None
 
@@ -1326,7 +1531,7 @@ def test_run_multithreaded_starts_minimizer_while_producers_run(
     executor = _stub_executor(tmp_path)
     events = []
     executor.run_probe = lambda: None
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor.run_directed = lambda: None
     executor.run_fuzzer = lambda: None
     executor.run_final = lambda: events.append("final")

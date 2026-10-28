@@ -3,6 +3,7 @@
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 
 from . import binradar_utils
 from . import binradar_verifier
@@ -84,6 +85,23 @@ def resolve_concrete_input_schedule(
     return validate_concrete_input_schedule(
         cli_value if cli_value is not None else env.get(
             "BINRADAR_CONCRETE_INPUT_SCHEDULE", CONCRETE_INPUT_SCHEDULE_DEFAULT))
+
+
+class ConcreteBaseline(str, Enum):
+    """Whether concrete admission observes an original or patch-capable binary."""
+
+    ORIGINAL = "original"
+    PATCHED = "patched"
+
+
+def validate_original_baseline(input_schedule: str, feedback_mode: bool) -> None:
+    """Reject patch-dependent features before original-only work has side effects."""
+    if input_schedule != "fifo":
+        raise ValueError(
+            "--generate-concrete requires fifo; novelty requires patch observations")
+    if feedback_mode:
+        raise ValueError(
+            "--generate-concrete cannot enable feedback; feedback requires patch capture")
 
 
 def validate_symbolic_schedule(value: str) -> str:
@@ -208,10 +226,21 @@ class RunConfig:
     concrete_input_schedule: str = CONCRETE_INPUT_SCHEDULE_DEFAULT
     qemu_exec_timeout: float = binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT
     probe_tracer_timeout: float = binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT
+    generate_concrete: bool = False
+
+    @property
+    def concrete_baseline(self) -> ConcreteBaseline:
+        return (ConcreteBaseline.ORIGINAL if self.generate_concrete
+                else ConcreteBaseline.PATCHED)
 
     @classmethod
     def from_environment(
             cls, workdir: str, env: Mapping[str, str]) -> "RunConfig":
+        generate_concrete = env.get("BINRADAR_GENERATE_CONCRETE", "0") == "1"
+        input_schedule = resolve_concrete_input_schedule(None, env)
+        feedback_mode = env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
+        if generate_concrete:
+            validate_original_baseline(input_schedule, feedback_mode)
         child_timeout = int(env.get(
             "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP",
             str(FORKSERVER_CHILD_TIMEOUT_DEFAULT)))
@@ -219,21 +248,24 @@ class RunConfig:
             raise ValueError(
                 "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP must be positive")
 
-        prefix = env.get("E9_METADATA_PREFIX", "brpatched")
+        prefix = "brpatched" if generate_concrete else env.get("E9_METADATA_PREFIX", "brpatched")
         # Validate the name before any executor preparation starts.
         binradar_utils.e9_metadata_keys(prefix)
 
         retained = {}
-        for artifact in binradar_utils.E9_METADATA_PREFIXES:
-            ranges_key, calls_key = binradar_utils.e9_metadata_keys(artifact)
-            for key in (ranges_key, calls_key):
-                if key in env:
-                    retained[key] = env[key]
-        for key in _RETAINED_ENVIRONMENT_KEYS:
+        if not generate_concrete:
+            for artifact in binradar_utils.E9_METADATA_PREFIXES:
+                ranges_key, calls_key = binradar_utils.e9_metadata_keys(artifact)
+                for key in (ranges_key, calls_key):
+                    if key in env:
+                        retained[key] = env[key]
+        retained_keys = (("BINRADAR_AFL_EXEC_TIMEOUT",) if generate_concrete
+                         else _RETAINED_ENVIRONMENT_KEYS)
+        for key in retained_keys:
             if key in env:
                 retained[key] = env[key]
 
-        total_patches = int(env["TOTAL_PATCHES"])
+        total_patches = 0 if generate_concrete else int(env["TOTAL_PATCHES"])
         symbolic_mode = validate_symbolic_mutation_mode(env.get(
             "BINRADAR_SYMBOLIC_MUTATION_MODE",
             SYMBOLIC_MUTATION_MODE_DEFAULT))
@@ -268,18 +300,18 @@ class RunConfig:
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
             total_patches=total_patches,
-            brpatched_total_patches=int(env.get(
-                "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"])),
-            filter_total_patches=int(env.get(
-                "FILTER_TOTAL_PATCHES", env["TOTAL_PATCHES"])),
+            brpatched_total_patches=(0 if generate_concrete else int(env.get(
+                "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"]))),
+            filter_total_patches=(0 if generate_concrete else int(env.get(
+                "FILTER_TOTAL_PATCHES", env["TOTAL_PATCHES"]))),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=(
                 env.get("BINRADAR_REVERSE_DIRECTED", "0") == "1"),
-            disable_binradar=(
-                env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1"),
+            disable_binradar=(generate_concrete or
+                              env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1"),
             less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
-            feedback_mode=(
-                env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"),
+            feedback_mode=feedback_mode,
+            generate_concrete=generate_concrete,
             forkserver_child_timeout=child_timeout,
             qemu_exec_timeout=binradar_utils.parse_positive_timeout(
                 "BINRADAR_QEMU_EXEC_TIMEOUT", env.get(
@@ -306,7 +338,7 @@ class RunConfig:
             invocation=env.get("BINRADAR_INVOCATION", ""),
             e9_metadata_prefix=prefix,
             retained_environment=tuple(retained.items()),
-            concrete_input_schedule=resolve_concrete_input_schedule(None, env),
+            concrete_input_schedule=input_schedule,
         )
 
     def resolved_poc_input(self) -> str:
@@ -351,6 +383,7 @@ def build_worker_environment(
         "PATCH_LOC": config.patch_loc,
         "E9_METADATA_PREFIX": config.e9_metadata_prefix,
         "TOTAL_PATCHES": str(config.total_patches),
+        "BINRADAR_GENERATE_CONCRETE": "1" if config.generate_concrete else "0",
         "BINRADAR_FEEDBACK_MODE": "1" if config.feedback_mode else "0",
         "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
     })

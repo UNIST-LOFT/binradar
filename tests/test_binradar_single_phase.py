@@ -135,10 +135,11 @@ def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, pol
     assert probe_file.read_text() == row
 
 
-def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
+def _build_executor(workdir: Path, *, generate_concrete: bool = False) -> "binradar.BinRadarExecutor":
     run_config = binradar_config.RunConfig.from_environment(str(workdir), {
         "BINRADAR_OUTDIR": str(workdir / "out"),
         "BINRADAR_TIMEOUT": "60",
+        "BINRADAR_GENERATE_CONCRETE": "1" if generate_concrete else "0",
         "BINARY": "nm",
         "POC_INPUT": "poc/x",
         "TEST_CMD": "-l @@",
@@ -168,6 +169,8 @@ def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
     executor.disable_binradar = run_config.disable_binradar
     executor.less_strict = run_config.less_strict
     executor.feedback_mode = run_config.feedback_mode
+    executor.generate_concrete = run_config.generate_concrete
+    executor.concrete_baseline = run_config.concrete_baseline
     executor.symbolic_mutation_mode = run_config.symbolic_mutation_mode
     executor.symbolic_schedule = run_config.symbolic_schedule
     executor.mutation_portfolio = run_config.mutation_portfolio
@@ -181,16 +184,69 @@ def _build_executor(workdir: Path) -> "binradar.BinRadarExecutor":
     executor.config = binradar_config.build_base_environment(
         run_config, str(workdir / "out" / "plt_info.txt"))
     executor.artifacts = binradar_artifacts.ArtifactSet(
-        str(workdir), "nm", "", 0, 2)
+        str(workdir), "nm", "", 0, run_config.brpatched_total_patches)
     executor.progress_filename = str(workdir / "out" / "progress.sbsv")
     executor.previous_progress = None
     executor.start_time = time.time()
     executor.probe_result = None
-    executor.filter_result = [1, 2]
+    executor.filter_result = list(range(1, run_config.total_patches + 1))
     executor.run_id = -1
     executor.run_prefix = ""
     executor.run_dir = ""
     return executor
+
+
+@pytest.mark.parametrize("run_id", ["0", "l"])
+def test_original_single_minimizer_reuses_probe_and_prior_corpus(
+        tmp_path, monkeypatch, run_id):
+    workdir, rundir = _make_workdir(tmp_path)
+    (workdir / "nm.brpatched").unlink()
+    probe_bytes = (rundir / "probe-results.sbsv").read_bytes()
+    progress = workdir / "out" / "progress.sbsv"
+    progress.write_text(
+        f"[rundir] [set] [prefix run] [id 0] [dir {rundir}] [time 0]\n")
+
+    class OriginalRunner(StubQemuRunner):
+        def test_with_original(self, testcase, verbose=False):
+            return _probe()
+
+        def test_with_patched(self, *args, **kwargs):
+            pytest.fail("original-only replay must not execute a patch")
+
+    monkeypatch.setattr(
+        binradar_verifier.BinRadarQemuRunner, "from_env",
+        staticmethod(lambda directory, env: OriginalRunner(
+            directory, "nm", "-l @@", "0x1000")))
+    executor = _build_executor(workdir, generate_concrete=True)
+    executor.run_single_phase("run", run_id, binradar.BinRadarPhase.MINIMIZER)
+
+    assert (rundir / "probe-results.sbsv").read_bytes() == probe_bytes
+    assert {p.read_bytes() for p in (rundir / "minimized").iterdir()} == {b"aaa", b"bbb"}
+    assert (rundir / "fuzzolic-tests" / "tc_0.dat").read_bytes() == b"aaa"
+    assert (rundir / "fuzzolic-tests" / "tc_1.dat").read_bytes() == b"bbb"
+    rows = (rundir / "minimizer.sbsv").read_text()
+    assert "[baseline original]" in rows and "[minimizer] [done]" in rows
+    assert not (rundir / "verifier.br").exists()
+    assert not (rundir / "final.sbsv").exists()
+    assert not (workdir / "out" / "run-00001").exists()
+
+
+@pytest.mark.parametrize("phase", [
+    binradar.BinRadarPhase.VERIFIER,
+    binradar.BinRadarPhase.MINIMIZER_VERIFIER,
+    binradar.BinRadarPhase.BINRADAR,
+    binradar.BinRadarPhase.FINAL,
+    binradar.BinRadarPhase.FEEDBACK,
+])
+def test_original_single_phase_rejects_patch_work_before_run_mutation(tmp_path, phase):
+    workdir, rundir = _make_workdir(tmp_path)
+    probe_bytes = (rundir / "probe-results.sbsv").read_bytes()
+    executor = _build_executor(workdir, generate_concrete=True)
+    with pytest.raises(ValueError):
+        executor.run_single_phase("run", "0", phase)
+    assert (rundir / "probe-results.sbsv").read_bytes() == probe_bytes
+    assert not (rundir / "binradar-setting.sbsv").exists()
+    assert not (workdir / "out" / "progress.sbsv").exists()
 
 
 def test_phase_name_mapping_accepts_dashed_names():

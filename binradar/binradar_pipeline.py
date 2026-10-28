@@ -174,9 +174,13 @@ class ConcreteWorkerFactory:
     patches: tuple[int, ...]
     verifier_binary: Optional[str]
     patched_binary_patches: tuple[int, ...]
+    baseline: binradar_config.ConcreteBaseline = binradar_config.ConcreteBaseline.PATCHED
 
     def __post_init__(self) -> None:
         resolved = binradar_config.resolve_concrete_input_schedule(None, self.config)
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            binradar_config.validate_original_baseline(
+                resolved, self.config.get("BINRADAR_FEEDBACK_MODE", "0") == "1")
         config = dict(self.config)
         config["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = resolved
         object.__setattr__(self, "config", config)
@@ -186,7 +190,9 @@ class ConcreteWorkerFactory:
             cls, workdir: str, run_dir: str, probe_result: Any,
             config: dict[str, str], fuzzer_outdir: str,
             patches: Sequence[int], verifier_binary: Optional[str],
-            patched_binary_patches: Sequence[int]) -> "ConcreteWorkerFactory":
+            patched_binary_patches: Sequence[int], *,
+            baseline: binradar_config.ConcreteBaseline =
+            binradar_config.ConcreteBaseline.PATCHED) -> "ConcreteWorkerFactory":
         policy = binradar_config.resolve_concrete_input_schedule(None, config)
         config = dict(config, BINRADAR_CONCRETE_INPUT_SCHEDULE=policy)
         testcase_dirs = [
@@ -209,6 +215,7 @@ class ConcreteWorkerFactory:
             patches=tuple(patches),
             verifier_binary=verifier_binary,
             patched_binary_patches=tuple(patched_binary_patches),
+            baseline=baseline,
         )
 
     @property
@@ -219,10 +226,13 @@ class ConcreteWorkerFactory:
         logger.info("TESTCASE_DIRS: " + ", ".join(self.testcase_dirs))
         return binradar_minimizer.BinRadarMinimizer(
             self.workdir, self.run_dir, self.probe_result,
-            list(self.testcase_dirs), self.config, patches=list(self.patches))
+            list(self.testcase_dirs), self.config, patches=list(self.patches),
+            baseline=self.baseline)
 
     def build_verifier(
             self) -> binradar_verifier.BinRadarConcreteVerifier:
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            raise RuntimeError("Original-only concrete generation has no patch verifier")
         if self.verifier_binary is None:
             raise RuntimeError("Concrete verifier artifact was not selected")
         runner = binradar_verifier.BinRadarQemuRunner.from_env(

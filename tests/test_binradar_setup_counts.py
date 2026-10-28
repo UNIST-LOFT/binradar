@@ -388,3 +388,167 @@ def test_patch_format_mismatch_rejected(tmp_path):
         assert "no allocator trace" in str(e)
     else:
         raise AssertionError("mismatched patch-format must be rejected")
+
+
+def _concrete_subject(tmp_path):
+    configdir = tmp_path / "config"
+    configdir.mkdir()
+    (configdir / "config.env").write_text(
+        'BINARY="benign"\nPOC_DIR="poc"\nPOC_INPUT="poc/input"\n'
+        'TEST_CMD="@@"\nBINRADAR_QEMU_EXEC_TIMEOUT="2.5"\n'
+        'BINRADAR_PROBE_TRACER_TIMEOUT="11"\n'
+        'BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP="9"\n'
+        'BINRADAR_AFL_EXEC_TIMEOUT="1200+"\n'
+        'BINRADAR_SYMBOLIC_SCHEDULE="existing"\n')
+    (configdir / "patch-location").write_text("401000\n")
+    (configdir / "poc").mkdir()
+    (configdir / "poc" / "input").write_bytes(b"benign source")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "benign.orig").write_bytes(b"original fixture")
+    return configdir, workdir
+
+
+def _forbid_patch_setup(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("original-only setup must not invoke patch tools")
+
+    for name in ("run_fix", "load_setup_predicates", "prepare_patch",
+                 "run_setup_filter"):
+        monkeypatch.setattr(binradar_setup, name, forbidden)
+    monkeypatch.setattr(binradar_setup.paths, "e9tool", forbidden)
+    monkeypatch.setattr(binradar_setup.paths, "e9compile", forbidden)
+    monkeypatch.setattr(binradar_setup.subprocess, "run", forbidden)
+
+
+def test_generate_concrete_cli_isolated_environment(tmp_path, monkeypatch):
+    import sys
+
+    configdir, workdir = _concrete_subject(tmp_path)
+    protected = {
+        "binradar.env": b'BINARY="must-not-load"\n',
+        "predicates": b"invalid predicate data\n",
+        "patch-destination": b"unchanged destination\n",
+        "filter.sbsv": b"unchanged filter\n",
+        "brpatches.json": b"unchanged metadata\n",
+        "benign.brpatched": b"unchanged patched executable",
+    }
+    for name, data in protected.items():
+        (workdir / name).write_bytes(data)
+    _forbid_patch_setup(monkeypatch)
+    load_env = binradar_setup.load_env
+
+    def guarded_load(path):
+        assert path.name != "binradar.env"
+        return load_env(path)
+
+    monkeypatch.setattr(binradar_setup, "load_env", guarded_load)
+    monkeypatch.setattr(sys, "argv", [
+        "binradar-setup", "--generate-concrete", "-c", str(configdir),
+        "-w", str(workdir)])
+    binradar_setup.main()
+    saved = load_env(workdir / "generate-concrete.env")
+    expected = {
+        "BINARY": "benign", "PATCH_LOC": "0x401000", "TOTAL_PATCHES": "0",
+        "BINRADAR_GENERATE_CONCRETE": "1", "BINRADAR_CONCRETE_INPUT_SCHEDULE": "fifo",
+        "BINRADAR_SYMBOLIC_SCHEDULE": "existing", "BINRADAR_QEMU_EXEC_TIMEOUT": "2.5",
+        "BINRADAR_PROBE_TRACER_TIMEOUT": "11", "BINRADAR_AFL_EXEC_TIMEOUT": "1200+",
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP": "9",
+    }
+    assert expected.items() <= saved.items()
+    assert not {"PATCH_TYPE", "BINRADAR_PATCH_KIND", "TAOSC_TOTAL_PATCHES",
+                "FILTER_TOTAL_PATCHES"}.intersection(saved)
+    assert (workdir / "poc" / "input").read_bytes() == b"benign source"
+    assert (workdir / "benign.orig").read_bytes() == b"original fixture"
+    for name, data in protected.items():
+        assert (workdir / name).read_bytes() == data
+
+
+def test_generate_concrete_requires_no_patch_artifacts(tmp_path, monkeypatch):
+    configdir, workdir = _concrete_subject(tmp_path)
+    _forbid_patch_setup(monkeypatch)
+    binradar_setup._generate_concrete(configdir, workdir)
+    assert (workdir / "generate-concrete.env").is_file()
+    assert not (workdir / "binradar.env").exists()
+    assert not (workdir / "patch-destination").exists()
+    assert not (workdir / "predicates").exists()
+
+
+def test_generate_concrete_preserves_poc_snapshot_and_copies_missing_files(
+        tmp_path, monkeypatch):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (workdir / "poc").mkdir()
+    (workdir / "poc" / "input").write_bytes(b"existing snapshot")
+    (workdir / "poc" / "local").write_bytes(b"local only")
+    (configdir / "poc" / "nested").mkdir()
+    (configdir / "poc" / "nested" / "other").write_bytes(b"other source")
+    _forbid_patch_setup(monkeypatch)
+    binradar_setup._generate_concrete(configdir, workdir)
+    assert (workdir / "poc" / "input").read_bytes() == b"existing snapshot"
+    assert (workdir / "poc" / "local").read_bytes() == b"local only"
+    assert (workdir / "poc" / "nested" / "other").read_bytes() == b"other source"
+    (configdir / "poc" / "input").unlink()
+    binradar_setup._generate_concrete(configdir, workdir)
+    assert (workdir / "poc" / "input").read_bytes() == b"existing snapshot"
+
+
+@pytest.mark.parametrize("setting", [
+    'BINRADAR_QEMU_EXEC_TIMEOUT="nan"\n',
+    'BINRADAR_PROBE_TRACER_TIMEOUT="0"\n',
+    'BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP="1.5"\n',
+    'BINRADAR_CONCRETE_INPUT_SCHEDULE="novelty"\n',
+    'BINRADAR_FEEDBACK_MODE="1"\n',
+])
+@pytest.mark.parametrize("existing", [False, True])
+def test_generate_concrete_invalid_config_never_publishes(
+        tmp_path, monkeypatch, setting, existing):
+    configdir, workdir = _concrete_subject(tmp_path)
+    with (configdir / "config.env").open("a") as stream:
+        stream.write(setting)
+    output = workdir / "generate-concrete.env"
+    if existing:
+        output.write_bytes(b"previous complete environment")
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises(ValueError):
+        binradar_setup._generate_concrete(configdir, workdir)
+    if existing:
+        assert output.read_bytes() == b"previous complete environment"
+    else:
+        assert not output.exists()
+    assert not list(workdir.glob(".generate-concrete-*"))
+
+
+@pytest.mark.parametrize("missing", ["config.env", "patch-location", "poc/input"])
+def test_generate_concrete_missing_prerequisites_do_not_run_taosc(
+        tmp_path, monkeypatch, missing):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / missing).unlink()
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises(FileNotFoundError):
+        binradar_setup._generate_concrete(configdir, workdir)
+    assert not (workdir / "generate-concrete.env").exists()
+
+
+def test_generate_concrete_publishes_complete_env_atomically(tmp_path, monkeypatch):
+    configdir, workdir = _concrete_subject(tmp_path)
+    output = workdir / "generate-concrete.env"
+    output.write_bytes(b"previous environment")
+    replace = binradar_setup.os.replace
+    observed = []
+
+    def publish(source, destination):
+        assert destination == output
+        assert source.parent == workdir
+        assert output.read_bytes() == b"previous environment"
+        assert binradar_setup.load_env(source)["TOTAL_PATCHES"] == "0"
+        observed.append(source)
+        replace(source, destination)
+
+    _forbid_patch_setup(monkeypatch)
+    monkeypatch.setattr(binradar_setup.os, "replace", publish)
+    binradar_setup._generate_concrete(configdir, workdir)
+    assert len(observed) == 1
+    assert not observed[0].exists()
+    assert binradar_setup.load_env(output)["BINRADAR_GENERATE_CONCRETE"] == "1"
+
+

@@ -19,6 +19,10 @@ from typing import Dict, List, Optional, Set, Tuple
 from . import paths
 from . import binradar_taosc_predicates
 from . import binradar_utils
+from .binradar_config import (
+    resolve_concrete_input_schedule,
+    validate_original_baseline,
+)
 from . import binradar_verifier
 from .binradar_taosc_predicates import (
     AllocatorTrace,
@@ -1511,20 +1515,7 @@ def prepare_patch(
         selected_patch_records, survived=patch_records)
 
 
-def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
-    # Start from the workdir's existing binradar.env so setup preserves
-    # unrelated generated settings; config.env overlays the subject fields.
-    env = dict()
-    env_path = workdir / "binradar.env"
-    if env_path.exists():
-        env = load_env(env_path)
-        # Removed metadata keys must not survive a clean setup cutover.
-        env.pop("E9_EXCLUDE_RANGES", None)
-        env.pop("E9_RELOCATED_CALL_JUMPS", None)
-        for key in tuple(env):
-            if key.startswith("PREFILTER_"):
-                env.pop(key)
-    env.update(load_env(config_path))
+def _validate_setup_timeouts(env: Dict[str, str]) -> None:
     # Validate seconds-based subject caps before building artifacts, without
     # changing their serialized spelling or starting unrelated tools.
     for name in ("BINRADAR_QEMU_EXEC_TIMEOUT",
@@ -1539,23 +1530,99 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
             raise ValueError(f"{child_cap_key} must be a positive integer in seconds") from exc
         if child_cap <= 0:
             raise ValueError(f"{child_cap_key} must be a positive integer in seconds")
-    if "POC_INPUT" not in env:
-        print("Error: POC_INPUT not found in config.env")
-        exit(1)
-    if "POC_DIR" not in env:
-        print("Error: POC_DIR not found in config.env")
-        exit(1)
-    if not (configdir / env["POC_DIR"]).exists():
-        shutil.copytree(configdir / env["POC_DIR"], workdir / env["POC_DIR"])
 
+
+def _copy_missing_poc(source: str, destination: str) -> str:
+    """Populate missing POCs without replacing a workdir's saved snapshot."""
+    if not Path(destination).exists():
+        shutil.copy2(source, destination)
+    return destination
+
+
+def _prepare_original_settings(
+        configdir: Path, workdir: Path, env: Dict[str, str],
+        patch_location_file: Path) -> None:
+    _validate_setup_timeouts(env)
+    for key in ("POC_INPUT", "POC_DIR", "BINARY", "TEST_CMD"):
+        if key not in env or (key != "TEST_CMD" and not env[key].strip()):
+            raise ValueError(f"{key} not found or empty in config.env")
+    patch_location = patch_location_file.read_text().strip()
+    try:
+        address = int(patch_location, 16)
+    except ValueError as exc:
+        raise ValueError(f"invalid patch-location in {patch_location_file}") from exc
+    if address < 0:
+        raise ValueError(f"invalid patch-location in {patch_location_file}")
+    env["PATCH_LOC"] = f"0x{address:x}"
+
+    source = configdir / env["POC_DIR"]
+    destination = workdir / env["POC_DIR"]
+    if source.is_dir() and source.resolve() != destination.resolve():
+        shutil.copytree(source, destination, dirs_exist_ok=True,
+                        copy_function=_copy_missing_poc)
+    if not destination.is_dir():
+        raise FileNotFoundError(f"POC_DIR not found: {destination} (source: {source})")
+    poc = workdir / env["POC_INPUT"]
+    if not poc.is_file():
+        source_poc = configdir / env["POC_INPUT"]
+        if not source_poc.is_file():
+            raise FileNotFoundError(f"POC_INPUT not found: {poc} (source: {source_poc})")
+        poc.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_poc, poc)
+
+
+def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Dict[str, str]:
+    # Ordinary setup retains generated settings; original-only setup never
+    # reads this file and starts exclusively from the subject configuration.
+    env = dict()
+    env_path = workdir / "binradar.env"
+    if env_path.exists():
+        env = load_env(env_path)
+        env.pop("E9_EXCLUDE_RANGES", None)
+        env.pop("E9_RELOCATED_CALL_JUMPS", None)
+        for key in tuple(env):
+            if key.startswith("PREFILTER_"):
+                env.pop(key)
+    env.update(load_env(config_path))
+    _prepare_original_settings(configdir, workdir, env, workdir / "patch-location")
+    return env
+
+
+def _generate_concrete(configdir: Path, workdir: Path) -> None:
+    """Prepare only original execution inputs; never invoke patch setup."""
+    configdir = configdir.resolve()
+    workdir = workdir.resolve()
+    env = load_env(configdir / "config.env")
+    schedule = resolve_concrete_input_schedule(None, env)
+    validate_original_baseline(
+        schedule, env.get("BINRADAR_FEEDBACK_MODE", "0") == "1")
     patch_location_file = workdir / "patch-location"
     if not patch_location_file.exists():
-        print(f"Error: {patch_location_file.name} file not found in {workdir}")
-        exit(1)
-    with patch_location_file.open("r") as f:
-        patch_location = f.read().strip()
-        env["PATCH_LOC"] = f"0x{patch_location}"
-    return env
+        patch_location_file = configdir / "patch-location"
+    # Missing location must fail before creating a workdir, not run Taosc.
+    if not patch_location_file.is_file():
+        raise FileNotFoundError(f"patch-location not found in {workdir} or {configdir}")
+    workdir.mkdir(parents=True, exist_ok=True)
+    _prepare_original_settings(configdir, workdir, env, patch_location_file)
+    original = ensure_original_binary(workdir, configdir, env)
+    if not original.is_file():
+        raise FileNotFoundError(f"original binary not found: {original}")
+    # These are execution settings, not fabricated patch-family metadata.
+    env["TOTAL_PATCHES"] = "0"
+    env["BINRADAR_GENERATE_CONCRETE"] = "1"
+    env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = schedule
+    output = workdir / "generate-concrete.env"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                dir=workdir, prefix=".generate-concrete-", delete=False) as stream:
+            temporary = Path(stream.name)
+        save_env(env, temporary)
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print(f"original execution environment saved to {output}")
 
 
 def _setup_filter_decision(
@@ -1833,10 +1900,16 @@ def cmd_setup(configdir: Path, workdir: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="binradar-setup: build patched artifacts and filter "
-                    "candidate patches against the POC")
-    subparsers = parser.add_subparsers(
-        dest="command", required=True, metavar="setup")
+        description="binradar-setup: prepare original-only execution inputs or "
+                    "build and filter patched artifacts")
+    parser.add_argument("--generate-concrete", action="store_true",
+                        help="prepare generate-concrete.env for original execution only")
+    parser.add_argument("-c", "--configdir", type=Path, default=Path.cwd(),
+                        help="Config directory (default: current directory)")
+    parser.add_argument("-w", "--workdir", type=Path,
+                        default=Path.cwd() / "workdir",
+                        help="Working directory (default: ./workdir)")
+    subparsers = parser.add_subparsers(dest="command", metavar="setup")
 
     setup_parser = subparsers.add_parser(
         "setup", help="filter candidate patches and generate "
@@ -1849,7 +1922,17 @@ def main():
                               help="Working directory (default: ./workdir)")
 
     args = parser.parse_args()
-    cmd_setup(args.configdir, args.workdir)
+    if args.generate_concrete:
+        if args.command is not None:
+            parser.error("--generate-concrete cannot be combined with setup")
+        try:
+            _generate_concrete(args.configdir, args.workdir)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.exit(1, f"Error: {exc}\n")
+    elif args.command == "setup":
+        cmd_setup(args.configdir, args.workdir)
+    else:
+        parser.error("choose setup or --generate-concrete")
 
 
 if __name__ == "__main__":

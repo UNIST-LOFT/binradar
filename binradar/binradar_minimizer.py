@@ -97,14 +97,23 @@ class BinRadarMinimizer:
     start_time: float
     def __init__(self, work_dir: str, run_dir: str, probe_result: binradar_verifier.BinRadarProbeResult, testcases_dirs: List[str], config: Dict[str, str],
                  min_file_age: float = 10.0, *,
-                 patches: Optional[Sequence[int]] = None):
+                 patches: Optional[Sequence[int]] = None,
+                 baseline: binradar_config.ConcreteBaseline = binradar_config.ConcreteBaseline.PATCHED):
+        self.baseline = binradar_config.ConcreteBaseline(baseline)
         self.input_schedule = binradar_config.resolve_concrete_input_schedule(None, config)
-        self.patches = list(patches) if patches is not None else list(
-            range(1, int(config.get("TOTAL_PATCHES", "0")) + 1))
+        self.feedback_mode = config.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            binradar_config.validate_original_baseline(
+                self.input_schedule, self.feedback_mode)
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            self.patches = []
+        elif patches is not None:
+            self.patches = list(patches)
+        else:
+            self.patches = list(range(1, int(config.get("TOTAL_PATCHES", "0")) + 1))
         self._candidate_digest = binradar_verifier.concrete_candidate_digest(self.patches)
         self._collector: Optional[BaselineFeatureCollector] = None
         self._scorer: Optional[NoveltyScorer] = None
-        self.feedback_mode = config.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
         self._capture_journal: Optional[CaptureJournal] = None
         self.work_dir = work_dir
         self.run_dir = run_dir
@@ -125,6 +134,8 @@ class BinRadarMinimizer:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.seek(0)
             f.truncate()
+            if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+                f.write("[minimizer] [baseline] [version 1] [baseline original]\n")
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -342,6 +353,33 @@ class BinRadarMinimizer:
         self.log(f"[testcase] [try] [id {id}] / {len(self.testcases)}: [file {testcase.filename}]")
         with open(current_testcase, "wb") as stream:
             stream.write(testcase.data)
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            return self._process_original(runner, testcase, id, current_testcase, check)
+        return self._process_patched(runner, testcase, id, current_testcase, check)
+
+    def _save_testcase(self, testcase: TestcaseInfo, id: int) -> str:
+        save_file = f"{id}_{os.path.basename(testcase.filename)}"
+        with open(os.path.join(self.minimized_dir, save_file), "wb") as stream:
+            stream.write(testcase.data)
+        return save_file
+
+    def _process_original(self, runner, testcase: TestcaseInfo, id: int,
+                          current_testcase: str, check) -> int:
+        run_res = runner.test_with_original(current_testcase, verbose=False)
+        check()
+        if run_res is None:
+            self.log(f"Failed {testcase.filename} with error.")
+            return id
+        if not run_res.patch_hit():
+            self.log(f"[testcase] [skip] [id {id}] [file {testcase.filename}] {run_res.serialize()}")
+            return id
+        save_file = self._save_testcase(testcase, id)
+        self.log(f"[testcase] [original-result] [id {id}] [file {save_file}] "
+                 f"[input-sha256 {testcase.hash}] {run_res.serialize()}")
+        return id + 1
+
+    def _process_patched(self, runner, testcase: TestcaseInfo, id: int,
+                         current_testcase: str, check) -> int:
         features = None
         if self._collector is not None:
             features = self._collector.run(current_testcase)
@@ -374,9 +412,7 @@ class BinRadarMinimizer:
                 score = InputScore(id, 0, 0, 0, "ineligible", "ineligible")
             score_suffix = " " + score.serialize()
         check()
-        save_file = f"{id}_{os.path.basename(testcase.filename)}"
-        with open(os.path.join(self.minimized_dir, save_file), "wb") as stream:
-            stream.write(testcase.data)
+        save_file = self._save_testcase(testcase, id)
         if self._capture_journal is not None:
             assert features is not None and self._collector is not None
             self._capture_journal.record(

@@ -60,6 +60,44 @@ def test_child_timeout_cli_overrides_only_when_explicit(
     assert config.forkserver_child_timeout == expected
 
 
+@pytest.mark.parametrize("extra_args,setting", [
+    (["--concrete-input-schedule", "novelty"], ""),
+    ([], 'BINRADAR_CONCRETE_INPUT_SCHEDULE="novelty"\n'),
+    (["--feedback"], ""),
+    ([], 'BINRADAR_FEEDBACK_MODE="1"\n'),
+    (["--fuzzer-only"], ""),
+    (["--run-single-phase", "binradar"], ""),
+    (["--run-single-phase", "verifier"], ""),
+    (["--run-single-phase", "minimizer-verifier"], ""),
+    (["--run-single-phase", "final"], ""),
+    (["--run-single-phase", "feedback"], ""),
+    (["--run-id", "l"], ""),
+])
+def test_generation_rejects_patch_features_and_reuse_before_preparation(
+        tmp_path, monkeypatch, extra_args, setting):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    # The normal environment deliberately disagrees: generation must load its
+    # own file and reject its effective policy, without touching existing runs.
+    (workdir / "binradar.env").write_text('BINRADAR_CONCRETE_INPUT_SCHEDULE="fifo"\n')
+    (workdir / "generate-concrete.env").write_text(
+        'BINARY="guest"\nPOC_INPUT="poc"\nTEST_CMD="@@"\n'
+        'PATCH_LOC="0x401000"\nTOTAL_PATCHES="0"\n' + setting)
+    saved = workdir / "out" / "run-00000" / "minimized" / "existing"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"preserved corpus")
+    monkeypatch.setattr(binradar, "setlimits", lambda: None)
+    monkeypatch.setattr(binradar.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", [
+        "binradar", "-w", str(workdir), "--generate-concrete", *extra_args])
+    with pytest.raises(SystemExit) as failure:
+        binradar.main()
+    assert failure.value.code == 2
+    assert saved.read_bytes() == b"preserved corpus"
+    assert not (workdir / "out" / "progress.sbsv").exists()
+    assert not (workdir / "out" / "plt_info.txt").exists()
+
+
 def test_boolean_parser_accepts_true_false_values():
     assert binradar.parse_bool("true") is True
     assert binradar.parse_bool("false") is False

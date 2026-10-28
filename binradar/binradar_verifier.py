@@ -1033,6 +1033,17 @@ class BinRadarQemuRunner:
         env = os.environ.copy()
         # env["LC_ALL"] = "C"
         env["AFL_USE_QASAN"] = "1"
+        selected_binary = binary if binary is not None else self.patched_binary()
+        if selected_binary == self.original_binary():
+            # Original probes must not borrow instrumentation scope or capture
+            # channels from a parent executing an E9-patched/cached artifact.
+            for key in ("AFL_QEMU_INST_RANGES", "AFL_QEMU_EXCLUDE_RANGES",
+                        "AFL_QEMU_INST_START", "AFL_QEMU_INST_END",
+                        "E9_EXCLUDE_RANGES", "E9_RELOCATED_CALL_JUMPS",
+                        "E9_RELOCATED_INSTRUCTIONS", "PATCH_FD",
+                        "PATCH_CACHED_FD", "TAOSC_PRED", "BRCACHE_STACK_SIZE",
+                        "__AFL_SHM_ID"):
+                env.pop(key, None)
         env["PATCH_ID"] = patch_id
         if patch_fd is not None:
             env["PATCH_FD"] = str(patch_fd)
@@ -1046,8 +1057,7 @@ class BinRadarQemuRunner:
         # E9_EXCLUDE_RANGES hex-interval syntax is exactly what the
         # AFL_QEMU_INST_RANGES parser expects).  The original binary has no
         # E9 metadata and is left untouched.
-        ranges, _ = self.e9_metadata_for_binary(
-            binary if binary is not None else self.patched_binary())
+        ranges, _ = self.e9_metadata_for_binary(selected_binary)
         if ranges:
             env["AFL_QEMU_INST_RANGES"] = ranges
         return env
@@ -2309,6 +2319,12 @@ class BinRadarConcreteVerifier:
                     torn = complete != len(data)
                     for line in data[:complete].decode("utf-8").splitlines():
                         self._raise_if_timed_out(deadline)
+                        if "[minimizer] [baseline]" in line:
+                            raise ValueError(
+                                "concrete verifier cannot consume an original-only baseline stream")
+                        if "[testcase] [original-result]" in line:
+                            raise ValueError(
+                                "concrete verifier cannot consume original-result rows")
                         if "[minimizer] [schedule]" in line:
                             if scheduled or rows_seen or done_seen or stop_reason is not None:
                                 raise ValueError("duplicate or late concrete schedule header")

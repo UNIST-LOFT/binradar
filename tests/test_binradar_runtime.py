@@ -391,7 +391,7 @@ def _binradar_executor(tmp_path, timeout):
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
     executor.disable_binradar = False
     executor.resolved_poc_input = lambda: "poc"
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor.probe_result = SimpleNamespace(fault_addr=0)
     executor.artifacts = SimpleNamespace(
         manifest=str(tmp_path / "manifest.json"),
@@ -594,7 +594,7 @@ def _binradar_loop_executor(tmp_path):
     executor._phase_environment = lambda *a, **k: {}
     executor._validate_baseline = lambda *a, **k: None
     executor.resolved_poc_input = lambda: "poc"
-    executor.check_requirements = lambda: None
+    executor.check_requirements = lambda **kwargs: None
     executor.forkserver_child_timeout = (
         binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
     executor.symbolic_schedule = binradar_config.SYMBOLIC_SCHEDULE_DEFAULT
