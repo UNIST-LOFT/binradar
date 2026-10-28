@@ -965,10 +965,14 @@ class BinRadarQemuRunner:
     e9_metadata: Dict[str, Tuple[str, List[str]]]
     patch_kind: str
     brcache_stack_size: int
+    exec_timeout: float
     run_results: Optional[binradar_utils.ExecutionResult]
     def __init__(self, dir: str, binary: str, test_cmd: str, patch_loc: str,
                  e9_metadata: Optional[Dict[str, Tuple[str, List[str]]]] = None,
-                 patch_kind: str = "", brcache_stack_size: int = 0):
+                 patch_kind: str = "", brcache_stack_size: int = 0,
+                 exec_timeout: float = binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT):
+        self.exec_timeout = binradar_utils.parse_positive_timeout(
+            "BINRADAR_QEMU_EXEC_TIMEOUT", exec_timeout)
         self.dir = dir
         self.binary = binary
         self.test_cmd = test_cmd
@@ -1007,6 +1011,10 @@ class BinRadarQemuRunner:
             e9_metadata=e9_metadata,
             patch_kind=env.get("BINRADAR_PATCH_KIND", ""),
             brcache_stack_size=int(env.get("BRCACHE_STACK_SIZE", "0"), 0),
+            exec_timeout=binradar_utils.parse_positive_timeout(
+                "BINRADAR_QEMU_EXEC_TIMEOUT",
+                env.get("BINRADAR_QEMU_EXEC_TIMEOUT",
+                        binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT)),
         )
 
     def e9_metadata_for_binary(self, binary_path: str) -> Tuple[str, List[str]]:
@@ -1224,7 +1232,9 @@ class BinRadarQemuRunner:
     def test_with_original(self, testcase: str, verbose: bool = True) -> Optional[BinRadarProbeResult]:
         command = self.get_qemu_stacktrace_command(False, testcase)
         env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
-        result = binradar_utils.execute(command, cwd=self.dir, verbose=verbose, env=env)
+        result = binradar_utils.execute(
+            command, cwd=self.dir, verbose=verbose, env=env,
+            timeout=self.exec_timeout)
         if not result.success:
             logger.error(f"Failed to run test_with_original on testcase {testcase}: "
                          f"exit status {result.decode_status()}; "
@@ -1234,8 +1244,11 @@ class BinRadarQemuRunner:
     
     def test_with_file_trace(
         self, testcase: str, patch_func_entry: int, verbose: bool = True,
-        timeout: float = 60.0,
+        timeout: Optional[float] = None,
     ) -> Optional[BinRadarProbeResult]:
+        timeout = (self.exec_timeout if timeout is None
+                   else binradar_utils.parse_positive_timeout(
+                       "file-trace timeout", timeout))
         command = self.get_qemu_stacktrace_command(
             False, testcase, patch_func_entry=patch_func_entry)
         env = self.get_env_for_exec(patch_id="0", binary=self.original_binary())
@@ -1311,7 +1324,7 @@ class BinRadarQemuRunner:
                 readers.append(cache_thread)
                 owned_fds.remove(cache_rfd)
             result = binradar_utils.execute_await(
-                proc, timeout=60.0, verbose=verbose)
+                proc, timeout=self.exec_timeout, verbose=verbose)
             self.run_results = result
         finally:
             try:
@@ -1331,7 +1344,7 @@ class BinRadarQemuRunner:
                 for reader in readers:
                     reader.join()
         if not result.success:
-            reason = (f"timed out after 60s" if result.timed_out
+            reason = (f"timed out after {self.exec_timeout:g}s" if result.timed_out
                       else f"exit status {result.decode_status()}")
             logger.error(f"Failed to run probe on {binary} (patch_id={patch_id}, "
                          f"testcase={testcase}): {reason}; "

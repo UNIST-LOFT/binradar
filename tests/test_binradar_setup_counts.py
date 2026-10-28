@@ -275,6 +275,47 @@ def test_setup_persists_new_env_keys(tmp_path, monkeypatch):
     assert saved["TOTAL_PATCHES"] == "2"
 
 
+@pytest.mark.parametrize("name", [
+    "BINRADAR_QEMU_EXEC_TIMEOUT", "BINRADAR_PROBE_TRACER_TIMEOUT",
+    "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"])
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "malformed"])
+def test_setup_rejects_invalid_duration_before_artifact_work(tmp_path, name, value):
+    workdir, _ = _prepare_workdir(tmp_path, "")
+    # Missing POC fields deliberately prove timeout validation runs first.
+    config = tmp_path / "config.env"
+    config.write_text(f'{name}="{value}"\n')
+    with pytest.raises(ValueError, match=name):
+        binradar_setup.create_binradar_env(tmp_path, config, workdir)
+    assert not (workdir / "imginfo.brpatched").exists()
+
+
+def test_setup_rejects_fractional_forkserver_child_cap(tmp_path):
+    workdir, _ = _prepare_workdir(tmp_path, "")
+    config = tmp_path / "config.env"
+    config.write_text('BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP="1.5"\n')
+    with pytest.raises(ValueError, match="BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"):
+        binradar_setup.create_binradar_env(tmp_path, config, workdir)
+
+
+def test_setup_original_filter_honors_configured_qemu_cap(tmp_path, monkeypatch):
+    import sys
+
+    workdir, env = _prepare_workdir(tmp_path, "rax == +max1\n", extra={
+        "POC_INPUT": "input", "TEST_CMD": "@@",
+        "BINRADAR_QEMU_EXEC_TIMEOUT": "0.1"})
+    (workdir / "input").write_text("benign")
+    script = "import pathlib,time; time.sleep(0.4); pathlib.Path('completed').touch()"
+    monkeypatch.setattr(
+        binradar_setup.binradar_verifier.BinRadarQemuRunner,
+        "get_qemu_stacktrace_command_for_binary",
+        lambda *args, **kwargs: [sys.executable, "-c", script])
+
+    with pytest.raises(RuntimeError, match="could not probe the original"):
+        binradar_setup.run_setup_filter(
+            tmp_path, workdir, env, binradar_setup.load_setup_predicates(workdir))
+    assert not (workdir / "completed").exists()
+
+
 def test_patch_format_erm_generic_classifies_generic(tmp_path, monkeypatch):
     """patch-format 'ERM generic' drives the generic-erm family."""
     workdir, env = _prepare_workdir(

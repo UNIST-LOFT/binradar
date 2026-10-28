@@ -1525,6 +1525,20 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
             if key.startswith("PREFILTER_"):
                 env.pop(key)
     env.update(load_env(config_path))
+    # Validate seconds-based subject caps before building artifacts, without
+    # changing their serialized spelling or starting unrelated tools.
+    for name in ("BINRADAR_QEMU_EXEC_TIMEOUT",
+                 "BINRADAR_PROBE_TRACER_TIMEOUT"):
+        if name in env:
+            binradar_utils.parse_positive_timeout(name, env[name])
+    child_cap_key = "BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"
+    if child_cap_key in env:
+        try:
+            child_cap = int(env[child_cap_key])
+        except ValueError as exc:
+            raise ValueError(f"{child_cap_key} must be a positive integer in seconds") from exc
+        if child_cap <= 0:
+            raise ValueError(f"{child_cap_key} must be a positive integer in seconds")
     if "POC_INPUT" not in env:
         print("Error: POC_INPUT not found in config.env")
         exit(1)

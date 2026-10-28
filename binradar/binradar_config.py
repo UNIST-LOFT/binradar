@@ -206,6 +206,8 @@ class RunConfig:
     e9_metadata_prefix: str
     retained_environment: tuple[tuple[str, str], ...]
     concrete_input_schedule: str = CONCRETE_INPUT_SCHEDULE_DEFAULT
+    qemu_exec_timeout: float = binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT
+    probe_tracer_timeout: float = binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT
 
     @classmethod
     def from_environment(
@@ -279,6 +281,14 @@ class RunConfig:
             feedback_mode=(
                 env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"),
             forkserver_child_timeout=child_timeout,
+            qemu_exec_timeout=binradar_utils.parse_positive_timeout(
+                "BINRADAR_QEMU_EXEC_TIMEOUT", env.get(
+                    "BINRADAR_QEMU_EXEC_TIMEOUT",
+                    binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT)),
+            probe_tracer_timeout=binradar_utils.parse_positive_timeout(
+                "BINRADAR_PROBE_TRACER_TIMEOUT", env.get(
+                    "BINRADAR_PROBE_TRACER_TIMEOUT",
+                    binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT)),
             symbolic_mutation_mode=symbolic_mode,
             symbolic_schedule=symbolic_schedule,
             mutation_portfolio=mutation_portfolio,
@@ -309,6 +319,8 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
     """Build the executor's stable environment after preparation completes."""
     environment = {
         "BINRADAR_TIMEOUT": str(config.timeout),
+        "BINRADAR_QEMU_EXEC_TIMEOUT": f"{config.qemu_exec_timeout:g}",
+        "BINRADAR_PROBE_TRACER_TIMEOUT": f"{config.probe_tracer_timeout:g}",
         "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
         "BINRADAR_SYMBOLIC_MUTATION_MODE": config.symbolic_mutation_mode,
         "BINRADAR_SYMBOLIC_SCHEDULE": config.symbolic_schedule,
@@ -369,7 +381,7 @@ def build_phase_environment(
         phase: PhaseEnvironmentConfig,
         *,
         inherited_environment: Mapping[str, str] | None = None,
-        forkserver_read_timeout: float = 1800,
+        forkserver_read_timeout: float = 2100,
         forkserver_analyze_margin: float = 300) -> dict[str, str]:
     """Build a phase environment without touching files or process state."""
     environment = dict(
@@ -443,20 +455,16 @@ def build_phase_environment(
 
     if phase.forkserver_child_timeout <= 0:
         raise RuntimeError("forkserver child timeout cap must be positive")
-    child_timeout = phase.forkserver_child_timeout
+    iteration_timeout = int(forkserver_read_timeout - forkserver_analyze_margin)
+    if iteration_timeout <= 0:
+        raise RuntimeError("forkserver response timeout must leave a positive attempt budget")
+    child_timeout = min(phase.forkserver_child_timeout, iteration_timeout)
     if phase.timeout > 0:
         child_timeout = min(child_timeout, phase.timeout)
-    if forkserver_read_timeout <= child_timeout + forkserver_analyze_margin:
-        raise RuntimeError(
-            f"forkserver iteration timeout {child_timeout}s + analyze margin "
-            f"{forkserver_analyze_margin:g}s must stay below the forkserver "
-            f"read timeout {forkserver_read_timeout:g}s; lower "
-            f"--forkserver-child-timeout")
 
     environment["BINRADAR_FORKSERVER_ENABLE"] = "1"
     environment["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(int(child_timeout))
-    environment["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] = str(
-        int(child_timeout))
+    environment["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] = str(iteration_timeout)
     if mode == "directed":
         environment["BINRADAR_REVERSE_DIRECTED"] = (
             "1" if phase.reverse_directed else "0")

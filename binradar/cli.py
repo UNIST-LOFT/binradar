@@ -34,11 +34,6 @@ from . import paths
 import sbsv
 
 MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
-# Floor for the PROBE normalized-fault-reference tracer run.  The reference
-# run instruments the whole original binary, so it is far slower than the
-# QASAN probe; the historical hard-coded 60 s killed slow subjects mid-run and
-# their SIGTERM salvage published a `guest-signal` identity at the kill PC.
-PROBE_TRACER_TIMEOUT_MIN = 600.0
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 
 
@@ -97,7 +92,8 @@ def phase_from_name(name: str) -> BinRadarPhase:
 # Forkserver budget constants as configured for production.  Snapshotted at
 # import so the stop row's margin arithmetic reports the real limits even when
 # a test substitutes the executor class.
-FORKSERVER_READ_TIMEOUT = binradar_runtime.TracerExecutor.forkserver_timeout
+FORKSERVER_READ_TIMEOUT = (
+    binradar_runtime.TracerExecutor.forkserver_response_timeout())
 FORKSERVER_ANALYZE_MARGIN = (
     binradar_runtime.TracerExecutor.forkserver_analyze_margin)
 
@@ -725,6 +721,7 @@ class BinRadarExecutor:
         self.outdir = config.outdir
         self.timeout = config.timeout
         self.forkserver_child_timeout = config.forkserver_child_timeout
+        self.probe_tracer_timeout = config.probe_tracer_timeout
         self.binary = config.binary
         self.poc_input = config.poc_input
         self.total_patches = config.total_patches
@@ -997,7 +994,8 @@ class BinRadarExecutor:
                 e9_relocated_calls=relocated_calls,
                 e9_relocated_instructions=relocated_instructions,
             ),
-            forkserver_read_timeout=binradar_runtime.TracerExecutor.forkserver_timeout,
+            forkserver_read_timeout=(
+                binradar_runtime.TracerExecutor.forkserver_response_timeout()),
             forkserver_analyze_margin=binradar_runtime.TracerExecutor.forkserver_analyze_margin,
         )
 
@@ -1154,17 +1152,10 @@ class BinRadarExecutor:
         # publishing an identity that makes `same-fault` unreachable.
         if probe_result.patch_func_entry:
             tracer_env["BINRADAR_ENTRYPOINT"] = hex(probe_result.patch_func_entry)
-        # The reference run instruments the whole original binary with the
-        # memcheck/provenance policy, so on a slow subject it costs far more
-        # than the un-instrumented PROBE. A short timeout can kill it before it
-        # reaches the fault; SIGTERM salvage may still emit a plausible-looking
-        # guest-signal row at the interrupted PC, which is not a fault identity.
-        # Give this standalone PROBE run a finite budget based on the
-        # configured forkserver child cap, with a 600s floor for instrumentation
-        # overhead. Unlike BINRADAR preflight, it has no PhaseSession deadline.
-        # Never accept a reference from a killed run.
-        probe_timeout = max(
-            float(self.forkserver_child_timeout), PROBE_TRACER_TIMEOUT_MIN)
+        # This standalone reference pass has its own execution budget, not
+        # the QASAN or forkserver-child cap. Cancellation salvage must never
+        # authorize the interrupted PC as a fault reference.
+        probe_timeout = self.probe_tracer_timeout
         diagnostics = ProbeTraceDiagnostics(
             self.run_dir, command=tracer_cmd, cwd=self.workdir,
             environment=tracer_env, testcase=self.resolved_poc_input(),
@@ -1249,8 +1240,7 @@ class BinRadarExecutor:
         file_trace_result = file_trace_runner.test_with_file_trace(
             self.resolved_poc_input(),
             patch_func_entry=probe_result.patch_func_entry,
-            verbose=True,
-            timeout=probe_timeout)
+            verbose=True)
         if file_trace_result is None:
             logger.info("[PROBE] Failed to get file trace result. Check if patch location is set or qemu_stacktrace is available.")
             sys.exit(1)
@@ -2232,12 +2222,12 @@ def main():
               "skip fuzzolic, directed, and binradar"))
     parser.add_argument("--target-patches", choices=["top-30", "all"], default="all")
     parser.add_argument("--forkserver-child-timeout", type=positive_int,
-                        default=binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT,
-                        help=("per-iteration cap in seconds for one forkserver "
-                              "child in the directed/binradar tracer phases "
-                              "(default: 900); must stay below the forkserver "
-                              "read timeout (1800s) minus the analyze margin "
-                              "(300s)"))
+                        default=None,
+                        help=("per-child cap in seconds for directed/binradar; "
+                              "overrides BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP "
+                              "from binradar.env (default: 900). The effective "
+                              "cap is bounded by the 1800s attempt budget and "
+                              "a positive phase timeout"))
     # The following argument is for experiments and debugging
     parser.add_argument("--run-single-phase", default="", 
         choices=SINGLE_PHASE_NAMES, help="run a specific phase")
@@ -2324,7 +2314,8 @@ def main():
     }, env)
     env.update(binradar_config.SymbolicBudgets.from_mapping(budgets)
                .environment())
-    env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
+    if args.forkserver_child_timeout is not None:
+        env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     env["BINRADAR_INVOCATION"] = shlex.join(sys.argv)
     candidate_set = binradar_artifacts.resolve_candidate_set(
         workdir, env, args.target_patches)

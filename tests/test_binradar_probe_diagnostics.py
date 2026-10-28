@@ -59,7 +59,7 @@ def probe(tmp_path, monkeypatch):
     instance.run_id = 0
     instance.config = {"PLT_INFO_FILE": str(work / "plt.txt")}
     instance._worker_environment = dict
-    instance.forkserver_child_timeout = 5.0
+    instance.probe_tracer_timeout = 5.0
     instance.artifacts = SimpleNamespace(original=str(work / "guest.orig"))
     instance.save_progress = lambda _row: None
     instance.probe_result = None
@@ -81,7 +81,6 @@ def probe(tmp_path, monkeypatch):
                              test_with_file_trace=filetrace)
     monkeypatch.setattr(verifier.BinRadarQemuRunner, "from_env",
                         lambda *_args: runner)
-    monkeypatch.setattr(cli, "PROBE_TRACER_TIMEOUT_MIN", 0.0)
     return SimpleNamespace(instance=instance, work=work, run=run,
                            result=result, calls=calls)
 
@@ -116,7 +115,7 @@ def _assert_archive(probe, record, reason, *, stderr=None):
     assert record["command"][1:] == [str(probe.work / "guest.orig"),
                                        str(probe.work / "poc")]
     assert record["elapsed_seconds"] >= 0
-    assert record["timeout_seconds"] == probe.instance.forkserver_child_timeout
+    assert record["timeout_seconds"] == probe.instance.probe_tracer_timeout
     assert record["memcheck_policy_requested"] == verifier.MEMCHECK_POLICY
     assert record["entrypoint"] == hex(probe.result.patch_func_entry)
     assert (probe.run / "probe-tracer.stdout.log").is_file()
@@ -182,7 +181,7 @@ def test_reference_subprocess_admission(
 def test_managed_timeout_retains_drained_kill_pc_but_rejects_reference(probe, monkeypatch, pending):
     # Install the handler before publishing readiness/output; the deadline is
     # deliberately generous for interpreter startup but far shorter than sleep.
-    probe.instance.forkserver_child_timeout = 1.0
+    probe.instance.probe_tracer_timeout = 1.0
     salvage = CRASH + REFERENCE + "drained after SIGTERM\n"
     prefix = POLICY + (PENDING if pending else "")
     body = (
@@ -409,7 +408,7 @@ def test_real_tracer_static_guest_admission(probe, monkeypatch, crash):
     entry = next(int(row.split()[0], 16) for row in symbols.stdout.splitlines()
                  if row.split()[-1] == "_start")
     probe.result.patch_func_entry = entry
-    probe.instance.forkserver_child_timeout = 15.0
+    probe.instance.probe_tracer_timeout = 15.0
     # Disable cores in the child only, then exec the actual tracer unchanged.
     _launcher(probe, monkeypatch,
               f"os.execv({str(tracer.resolve())!r}, [{str(tracer.resolve())!r}] + sys.argv[1:])\n")

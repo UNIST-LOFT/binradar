@@ -108,6 +108,7 @@ def test_probe_tracer_cannot_inherit_osprey(monkeypatch, tmp_path):
     instance._worker_environment = dict
     instance.forkserver_child_timeout = (
         binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
+    instance.probe_tracer_timeout = 30.0
     instance.artifacts = SimpleNamespace(
         original=str(workdir / "target.orig"))
     instance.save_progress = lambda _row: None

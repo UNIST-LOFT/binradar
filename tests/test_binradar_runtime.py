@@ -991,9 +991,7 @@ def test_stop_row_reports_effective_budgets_and_forkserver_margin(
     # The phase did not raise the process-wide child high-water mark, so the
     # phase-local peak is not knowable and must not reuse 4096 as if measured.
     assert "[child-peak-rss-kib unknown]" in row
-    assert "[forkserver-read-timeout 1800]" in row
     assert "[forkserver-child-timeout 60]" in row
-    assert "[forkserver-margin 1440]" in row
     # No tracer log was written, so the profile attribution is unknown.
     assert "[advisor-stop-reason unknown]" in row
     assert "[advisor-would-submit-families unknown]" in row

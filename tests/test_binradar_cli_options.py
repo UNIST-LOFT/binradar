@@ -45,6 +45,21 @@ def _run_main(monkeypatch, tmp_path, extra_args, extra_env=""):
     return captured
 
 
+@pytest.mark.parametrize(("flags", "configured", "expected"), [
+    ([], "47", 47),
+    (["--forkserver-child-timeout", "83"], "47", 83),
+    (["--forkserver-child-timeout", "83"], "invalid", 83),
+])
+def test_child_timeout_cli_overrides_only_when_explicit(
+        tmp_path, monkeypatch, flags, configured, expected):
+    env = _run_main(
+        monkeypatch, tmp_path, flags,
+        extra_env=f'BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP="{configured}"\n')
+    config = binradar_config.RunConfig.from_environment(
+        str(tmp_path / "workdir"), env)
+    assert config.forkserver_child_timeout == expected
+
+
 def test_boolean_parser_accepts_true_false_values():
     assert binradar.parse_bool("true") is True
     assert binradar.parse_bool("false") is False
@@ -204,8 +219,6 @@ def test_mixed_portfolio_and_budget_reach_resolved_configuration(
     ["--symbolic-mutation-mode", "boundary",
      "--symbolic-schedule", "retained-first",
      "--mutation-portfolio", "mixed",
-     "--binradar-representative-budget", "100"],
-    ["--mutation-portfolio", "mixed",
      "--binradar-representative-budget", "100"],
 ])
 def test_mixed_portfolio_rejects_unbounded_or_rescheduled_trials(

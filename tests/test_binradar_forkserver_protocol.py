@@ -183,6 +183,8 @@ def run_summaries(summaries):
         if mode == "stall_after_command":
             time.sleep(3)
             return
+        if mode == "delayed_summary":
+            time.sleep(0.4)
         summary = struct.pack("<IIIII", attempt, representative_runs,
                               remaining, attempt_result, stop_reason)
         if mode in ("partial_summary", "close_during_summary"):
@@ -378,7 +380,9 @@ def make_executor(tmp_path, monkeypatch, fake_script, mode="check_unread", statu
         binradar_runtime.Deadline.from_timeout(1),
     )
     executor.forkserver_init_timeout = 0.5
-    executor.forkserver_timeout = 0.25
+    monkeypatch.setattr(binradar_runtime.TracerExecutor, "forkserver_timeout", 0.25)
+    monkeypatch.setattr(
+        binradar_runtime.TracerExecutor, "forkserver_analyze_margin", 0.5)
     return executor, log_path
 
 
@@ -505,6 +509,42 @@ def test_idle_parent_close_terminates_tracer(monkeypatch, tmp_path, fake_script)
     stop_executor(executor)
     assert time.monotonic() - started < 1.5
     assert "parent-eof" in log_path.read_text(encoding="ascii").splitlines()
+
+
+def test_summary_arriving_during_response_grace_is_accepted(
+        monkeypatch, tmp_path, fake_script):
+    executor, log_path = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="delayed_summary",
+        statuses=[(1, 1, 0, 0, 1)])
+    try:
+        executor.start()
+        started = time.monotonic()
+        summary = executor.run()
+        elapsed = time.monotonic() - started
+        assert elapsed > executor.forkserver_timeout
+        assert summary.success and summary.terminal
+        assert summary.attempt == 1
+        assert summary.representative_runs == 1
+    finally:
+        stop_executor(executor)
+    assert "summary:1:1:0" in log_path.read_text(encoding="ascii").splitlines()
+
+
+def test_phase_deadline_wins_over_response_grace(
+        monkeypatch, tmp_path, fake_script):
+    executor, log_path = make_executor(
+        tmp_path, monkeypatch, fake_script, mode="delayed_summary",
+        statuses=[(1, 1, 0, 0, 1)])
+    try:
+        executor.start()
+        executor.deadline = binradar_runtime.Deadline.from_timeout(0.1)
+        with pytest.raises(TimeoutError, match="forkserver response"):
+            executor.run()
+        assert executor.deadline.expired()
+        assert "summary:1:1:0" not in log_path.read_text(
+            encoding="ascii").splitlines()
+    finally:
+        stop_executor(executor)
 
 
 @pytest.mark.parametrize("mode", ["stall_after_command", "partial_summary"])

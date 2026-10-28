@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for the forkserver child-timeout cap (br-test 2026-09-08 F1).
+"""Child caps share the native attempt budget, not Python's response grace.
 
-The tracer parent waits for a hung forkserver child up to
-BINRADAR_FORKSERVER_CHILD_TIMEOUT.  That value used to be the whole-run
-budget (21600 s) while python's forkserver read timeout is a fixed
-1800 s, so any hung child failed the phase at exactly 1800 s. Phase environment
-construction must set the child cap well below the python read timeout, and a
-misconfigured cap must fail the startup invariant instead of silently
-exceeding the read timeout.
+A configured child cap may reach the full native attempt budget; larger caps
+are clamped. A positive phase budget caps children; the runtime independently
+bounds response waiting by the remaining phase deadline.
 """
 
 import argparse
@@ -19,7 +15,6 @@ import pytest
 from binradar import cli as binradar
 from binradar import binradar_artifacts
 from binradar import binradar_config
-from binradar import binradar_runtime
 from test_binradar_e9_metadata import _write_bound_identity_artifacts
 
 
@@ -54,25 +49,17 @@ def _phase_env(executor, mode, run_dir):
     return executor._phase_environment(mode, str(run_dir), artifact)
 
 
-def test_binradar_env_child_timeout_is_capped_below_read_timeout(tmp_path):
-    executor = _executor(tmp_path, timeout=21600)
-    env = _phase_env(executor, "binradar", tmp_path)
-    child_timeout = int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"])
-    assert child_timeout == binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT
-    assert child_timeout < binradar_runtime.TracerExecutor.forkserver_timeout
-    # Invariant from the F1 plan: child cap + analyze margin stays below
-    # python's forkserver read timeout.
-    assert (child_timeout + binradar_runtime.TracerExecutor.forkserver_analyze_margin
-            < binradar_runtime.TracerExecutor.forkserver_timeout)
-
-
-def test_directed_env_gets_the_same_cap(tmp_path):
-    executor = _executor(tmp_path, timeout=21600)
-    env = _phase_env(executor, "directed", tmp_path)
-    assert (int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"])
-            == binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
-    assert (int(env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"])
-            == binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)
+@pytest.mark.parametrize("mode", ["binradar", "directed"])
+@pytest.mark.parametrize("timeout", [0, -1, 21600])
+@pytest.mark.parametrize("cap,expected", [
+    (600, 600), (1500, 1500), (1700, 1700), (1800, 1800), (2400, 1800),
+])
+def test_child_cap_does_not_shrink_or_exceed_native_attempt_budget(
+        tmp_path, mode, timeout, cap, expected):
+    executor = _executor(tmp_path, timeout=timeout, cap=cap)
+    env = _phase_env(executor, mode, tmp_path)
+    assert int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"]) == expected
+    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "1800"
 
 
 def test_reverse_directed_is_enabled_only_for_directed_mode(tmp_path):
@@ -83,28 +70,13 @@ def test_reverse_directed_is_enabled_only_for_directed_mode(tmp_path):
         assert _phase_env(executor, mode, tmp_path)["BINRADAR_REVERSE_DIRECTED"] == "0"
 
 
-def test_cap_is_clamped_to_the_run_budget(tmp_path):
-    # A short whole-run budget caps both child and logical-iteration waits.
-    executor = _executor(tmp_path, timeout=600, cap=900)
-    env = _phase_env(executor, "binradar", tmp_path)
-    assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "600"
-    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "600"
-
-
-@pytest.mark.parametrize("timeout", [0, -1])
-def test_non_positive_run_timeout_keeps_positive_child_cap(tmp_path, timeout):
-    # Unlimited whole-run execution still bounds children and each iteration.
-    executor = _executor(tmp_path, timeout=timeout, cap=900)
-    env = _phase_env(executor, "binradar", tmp_path)
-    assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "900"
-    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "900"
-
-
-def test_custom_cap_flag_is_honoured(tmp_path):
-    executor = _executor(tmp_path, timeout=21600, cap=600)
-    env = _phase_env(executor, "binradar", tmp_path)
-    assert env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] == "600"
-    assert env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] == "600"
+@pytest.mark.parametrize("mode", ["binradar", "directed"])
+@pytest.mark.parametrize("cap,expected", [(300, 300), (900, 600), (2400, 600)])
+def test_positive_phase_budget_bounds_children(
+        tmp_path, mode, cap, expected):
+    executor = _executor(tmp_path, timeout=600, cap=cap)
+    env = _phase_env(executor, mode, tmp_path)
+    assert int(env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"]) == expected
 
 
 @pytest.mark.parametrize("cap", [0, -1])
@@ -118,21 +90,6 @@ def test_non_positive_cap_is_rejected_at_phase_start(tmp_path, cap):
 def test_non_positive_cap_is_rejected_by_cli_type(cap):
     with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
         binradar.positive_int(str(cap))
-
-
-def test_cap_above_read_timeout_fails_at_phase_start(tmp_path):
-    # A cap that would exceed python's read timeout must fail loudly at
-    # phase start, not silently reintroduce the 1800 s TimeoutError.
-    executor = _executor(tmp_path, timeout=21600, cap=1700)
-    with pytest.raises(RuntimeError, match="forkserver iteration timeout"):
-        _phase_env(executor, "binradar", tmp_path)
-
-
-def test_cap_of_one_marginal_second_fails(tmp_path):
-    # 1500 + 300 == 1800 is not strictly below the read timeout.
-    executor = _executor(tmp_path, timeout=21600, cap=1500)
-    with pytest.raises(RuntimeError, match="forkserver iteration timeout"):
-        _phase_env(executor, "binradar", tmp_path)
 
 
 def test_fuzzolic_mode_does_not_enable_forkserver(tmp_path):
@@ -173,16 +130,3 @@ def test_from_env_rejects_non_positive_cap(tmp_path, cap):
         binradar.BinRadarExecutor.from_env(str(tmp_path), env)
 
 
-def test_from_env_defaults_to_900(tmp_path):
-    env = {
-        "BINRADAR_OUTDIR": str(tmp_path),
-        "BINRADAR_TIMEOUT": "3600",
-        "BINARY": "bin",
-        "POC_INPUT": "poc",
-        "TEST_CMD": "./bin @@",
-        "PATCH_LOC": "0x1234",
-        "TOTAL_PATCHES": "1",
-    }
-    executor = binradar.BinRadarExecutor.from_env(str(tmp_path), env)
-    assert (executor.forkserver_child_timeout
-            == binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT)

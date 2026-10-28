@@ -471,6 +471,11 @@ class TracerExecutor:
     process_cleanup_wait = 0.25
     process_reap_timeout = 0.5
 
+    @classmethod
+    def forkserver_response_timeout(cls) -> float:
+        """Allow the native attempt budget plus grace for its final summary."""
+        return cls.forkserver_timeout + cls.forkserver_analyze_margin
+
     def __init__(
             self, mode: str, env: Dict[str, str], workdir: str, rundir: str,
             binary: str, test_cmd: str, testcase: str, deadline: Deadline,
@@ -657,7 +662,7 @@ class TracerExecutor:
             self.transport.write_u32(0)
             attempt, representative_runs, remaining_plans, attempt_result, \
                 stop_reason = self.transport.read_summary(
-                    self.deadline.remaining(self.forkserver_timeout))
+                    self.deadline.remaining(self.forkserver_response_timeout()))
             try:
                 parsed_result = AttemptResult(attempt_result)
                 parsed_stop = StopReason(stop_reason)

@@ -1,3 +1,4 @@
+import math
 import os
 import signal
 import subprocess
@@ -18,6 +19,20 @@ E9_METADATA_PREFIXES = {
 
 # Canonical notation for a planned, graceful wall-clock cutoff.
 WALL_TIME_REACHED = "wall-time-reached"
+
+QEMU_EXEC_TIMEOUT_DEFAULT = 60.0
+PROBE_TRACER_TIMEOUT_DEFAULT = 900.0
+
+
+def parse_positive_timeout(name: str, value: str | float) -> float:
+    """Parse a finite per-execution deadline in seconds; zero is not unlimited."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite positive number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be a finite positive number of seconds")
+    return timeout
 
 
 def e9_metadata_keys(prefix: str) -> Tuple[str, str]:

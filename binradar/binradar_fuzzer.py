@@ -13,7 +13,7 @@ import sbsv
 
 class BinRadarFuzzer:
     def __init__(self, workdir: str, outdir: str, binary: str, poc_input: str,
-                 patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000+"):
+                 patch_loc: str, test_cmd: str, afl_exec_timeout: str = "10000"):
         self.workdir = workdir
         self.outdir = outdir
         os.makedirs(self.outdir, exist_ok=True)
@@ -42,7 +42,7 @@ class BinRadarFuzzer:
             poc_input=env["POC_INPUT"],
             patch_loc=env["PATCH_LOC"],
             test_cmd=env["TEST_CMD"],
-            afl_exec_timeout=env.get("BINRADAR_AFL_EXEC_TIMEOUT", "10000+"),
+            afl_exec_timeout=env.get("BINRADAR_AFL_EXEC_TIMEOUT", "10000"),
         )
     
     def get_original_binary_path(self) -> str:

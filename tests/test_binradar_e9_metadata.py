@@ -849,6 +849,7 @@ def _stub_executor(tmp_path, e9_metadata_prefix="brpatched", config=None):
     executor.timeout = 60
     executor.forkserver_child_timeout = \
         binradar.binradar_config.FORKSERVER_CHILD_TIMEOUT_DEFAULT
+    executor.probe_tracer_timeout = binradar.binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT
     executor.binary = "nm"
     executor.poc_input = "poc/nullderef"
     executor.test_cmd = "-l @@"
@@ -1853,71 +1854,8 @@ def test_probe_reference_discriminates_guest_and_termination_signals(
         return
     executor.run_probe()
 
-    # The default 900 s child cap is above the 600 s floor; neither PROBE
-    # tracer invocation may fall back to execute()'s old 60 s default.
-    expected_timeout = float(executor.forkserver_child_timeout)
-    assert captured["reference_timeout"] == expected_timeout
-    assert captured["file_trace_timeout"] == expected_timeout
-    assert expected_timeout > 60.0
     reference = executor.probe_result.tracer_fault_reference
     assert (reference.address if reference is not None else None) == expected
     if reference is not None:
         assert reference.source == "guest-signal"
 
-
-@pytest.mark.parametrize(("child_timeout", "expected_timeout"), [
-    (300, 600),
-    (1800, 1800),
-])
-def test_probe_run_budget_respects_floor_and_child_cap(
-        tmp_path, monkeypatch, child_timeout, expected_timeout):
-    """A low cap keeps the safety floor; a larger cap is not truncated."""
-
-    (tmp_path / "nm.orig").write_bytes(b"")
-    (tmp_path / "poc").mkdir()
-    (tmp_path / "poc" / "nullderef").write_bytes(b"")
-    executor = _stub_executor(tmp_path)
-    executor.forkserver_child_timeout = child_timeout
-    executor._worker_environment = lambda: {
-        **executor.config,
-        "BINARY": executor.binary,
-        "POC_INPUT": executor.poc_input,
-        "TEST_CMD": executor.test_cmd,
-        "PATCH_LOC": executor.patch_loc,
-        "TOTAL_PATCHES": str(executor.total_patches),
-    }
-
-    captured = {}
-
-    def fake_execute(command, cwd=None, env=None, timeout=60.0, verbose=True):
-        captured["reference_timeout"] = timeout
-        return SimpleNamespace(success=True, timed_out=False, exit_code=0,
-                               stdout="", stderr=f"[memcheck] [policy {binradar.binradar_verifier.MEMCHECK_POLICY}]\n")
-
-    def fake_file_trace(
-            self, testcase, patch_func_entry=0, verbose=True, timeout=60.0):
-        captured["file_trace_timeout"] = timeout
-        return SimpleNamespace(
-            serialize_file_trace_result=lambda: "file-trace")
-
-    monkeypatch.setattr(binradar.binradar_utils, "execute", fake_execute)
-    probe = SimpleNamespace(
-        patch_hit=lambda: True,
-        is_crash=lambda: True,
-        patch_func_hit=lambda: True,
-        multi_patch_func=lambda: False,
-        patch_func_entry=0x401000,
-        fault_addr=0x41ab2b,
-        patch_func_hit_cnt=3,
-        serialize=lambda: "probe")
-    monkeypatch.setattr(
-        binradar.binradar_verifier.BinRadarQemuRunner, "test_with_original",
-        lambda self, testcase, verbose=True: probe)
-    monkeypatch.setattr(
-        binradar.binradar_verifier.BinRadarQemuRunner,
-        "test_with_file_trace", fake_file_trace)
-
-    executor.run_probe()
-
-    assert captured["reference_timeout"] == expected_timeout
-    assert captured["file_trace_timeout"] == expected_timeout

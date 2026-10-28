@@ -285,6 +285,74 @@ def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, mo
     assert cached is None
 
 
+def _sleeping_runner(tmp_path, monkeypatch, timeout=None):
+    import sys
+
+    env = {"BINARY": "target", "TEST_CMD": "", "PATCH_LOC": "0x1000"}
+    if timeout is not None:
+        env["BINRADAR_QEMU_EXEC_TIMEOUT"] = str(timeout)
+    runner = binradar_verifier.BinRadarQemuRunner.from_env(str(tmp_path), env)
+    script = (
+        "import pathlib, sys, time; time.sleep(0.4); "
+        "pathlib.Path('completed').touch(); "
+        "sys.stderr.write('[patch-info] [set true] [location 1000]\\n'"
+        " + '[exit] [result ok]\\n')")
+    monkeypatch.setattr(
+        runner, "get_qemu_stacktrace_command_for_binary",
+        lambda *args, **kwargs: [sys.executable, "-c", script])
+    return runner
+
+
+@pytest.mark.parametrize("mode", ["original", "file-trace", "patched", "cached"])
+def test_configured_qemu_cap_terminates_real_child(tmp_path, monkeypatch, mode):
+    runner = _sleeping_runner(tmp_path, monkeypatch, timeout=0.1)
+    if mode in ("patched", "cached"):
+        identity, _, _, _ = _identity_runner(
+            tmp_path, artifact="brpatched" if mode == "patched" else "brcached")
+        runner.e9_metadata = identity.e9_metadata
+    if mode == "original":
+        assert runner.test_with_original("input", verbose=False) is None
+    elif mode == "file-trace":
+        assert runner.test_with_file_trace("input", 0, verbose=False) is None
+    elif mode == "patched":
+        assert runner.test_with_patched("1", "input") == (None, None)
+        assert runner.run_results.timed_out
+    else:
+        assert runner.test_with_cached(1, "=p0p0", "input") == (None, None)
+        assert runner.run_results.timed_out
+    assert not (tmp_path / "completed").exists()
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_qemu_default_and_explicit_diagnostic_cap_allow_completion(
+        tmp_path, monkeypatch, override):
+    runner = _sleeping_runner(
+        tmp_path, monkeypatch, timeout=0.1 if override else None)
+    if override:
+        result = runner.test_with_file_trace("input", 0, verbose=False, timeout=3)
+    else:
+        result = runner.test_with_original("input", verbose=False)
+    assert result is not None
+    assert result.is_normal_exit()
+    assert (tmp_path / "completed").exists()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "bad", ""])
+def test_runner_rejects_invalid_configured_duration(tmp_path, value):
+    with pytest.raises(ValueError, match="BINRADAR_QEMU_EXEC_TIMEOUT"):
+        binradar_verifier.BinRadarQemuRunner.from_env(str(tmp_path), {
+            "BINARY": "target", "TEST_CMD": "", "PATCH_LOC": "0x1000",
+            "BINRADAR_QEMU_EXEC_TIMEOUT": value})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1, "bad"])
+def test_file_trace_rejects_invalid_override_before_launch(tmp_path, monkeypatch, value):
+    runner = _sleeping_runner(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="file-trace timeout"):
+        runner.test_with_file_trace("input", 0, verbose=False, timeout=value)
+    assert not (tmp_path / "completed").exists()
+
+
 def test_concrete_only_probe_does_not_claim_tracer_policy():
     probe = binradar_verifier.BinRadarProbeResult.from_log(
         "[patch-info] [set true] [location 1000]\n[exit] [result crash]\n")
