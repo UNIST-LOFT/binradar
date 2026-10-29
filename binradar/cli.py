@@ -2207,7 +2207,7 @@ def main():
         "-w", "--workdir", required=True,
         help="set the working directory for binradar")
     parser.add_argument(
-        "-t", "--timeout", type=int, default=-1,
+        "-t", "--timeout", type=int, default=7200,
         help="set the base timeout in seconds (minimizer/verifier use timeout + 600 seconds; 0 is unlimited)")
     parser.add_argument(
         "-o", "--output", default="",
@@ -2366,11 +2366,7 @@ def main():
                 args.feedback_mode or env.get("BINRADAR_FEEDBACK_MODE", "0") == "1")
         except ValueError as exc:
             parser.error(str(exc))
-    if args.timeout >= 0:
-        env["BINRADAR_TIMEOUT"] = str(args.timeout)
-    else:
-        env["BINRADAR_TIMEOUT"] = "3600" # 1 hours
-
+    env["BINRADAR_TIMEOUT"] = str(args.timeout)
     env["BINRADAR_WORKDIR"] = os.path.abspath(workdir)
     env["BINRADAR_FUZZY"] = "1" if args.fuzzy else "0"
     env["BINRADAR_REVERSE_DIRECTED"] = "1" if args.reverse_directed else "0"
