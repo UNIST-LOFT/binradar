@@ -304,13 +304,17 @@ def test_single_phase_names_include_minimizer_verifier():
     assert "filter" not in binradar.SINGLE_PHASE_NAMES
 
 
-def test_minimizer_verifier_timeout_is_one_and_a_half_times_configured():
+@pytest.mark.parametrize("timeout, expected", [
+    (1, 601),
+    (3600, 4200),
+    (6 * 60 * 60, 6 * 60 * 60 + 600),
+    (0, None),
+    (-1, None),
+])
+def test_minimizer_verifier_timeout_adds_fixed_grace(timeout, expected):
     executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
-    executor.timeout = 6 * 60 * 60
-    assert executor.minimizer_verifier_timeout() == 9 * 60 * 60
-
-    executor.timeout = 0
-    assert executor.minimizer_verifier_timeout() is None
+    executor.timeout = timeout
+    assert executor.minimizer_verifier_timeout() == expected
 
 
 def test_historical_final_loads_legacy_probe_without_regeneration(tmp_path):

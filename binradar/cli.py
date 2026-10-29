@@ -33,7 +33,7 @@ from . import logger
 from . import paths
 import sbsv
 
-MINIMIZER_VERIFIER_TIMEOUT_FACTOR = 1.5
+MINIMIZER_VERIFIER_TIMEOUT_GRACE_SECONDS = 600
 MAX_VIRTUAL_MEMORY = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB (for ASAN shadow mapping)
 
 
@@ -875,11 +875,6 @@ class BinRadarExecutor:
                 f"[{phase}] [wall-time-reached] [prefix {self.run_prefix}] "
                 f"[id {self.run_id}]")
 
-    def phase_deadline(
-            self, factor: float = 1.0) -> binradar_runtime.Deadline:
-        """Create the single absolute monotonic deadline for a phase."""
-        return binradar_runtime.Deadline.from_timeout(self.timeout, factor)
-
     @staticmethod
     def remaining_concrete_timeout(
             deadline: binradar_runtime.Deadline) -> Optional[float]:
@@ -889,13 +884,13 @@ class BinRadarExecutor:
         """Wall-clock budget for each minimizer/verifier phase.
 
         These concrete phases may need to drain testcases produced during the
-        configured producer budget, so they receive 50% additional time.
+        configured producer budget, so they receive 600 additional seconds.
         As elsewhere in the pipeline, a non-positive configured timeout means
         no phase deadline.
         """
         if self.timeout <= 0:
             return None
-        return self.timeout * MINIMIZER_VERIFIER_TIMEOUT_FACTOR
+        return self.timeout + MINIMIZER_VERIFIER_TIMEOUT_GRACE_SECONDS
 
     def _run_record_store(self) -> binradar_run_records.RunRecordStore:
         store = getattr(self, "run_records", None)
@@ -1458,7 +1453,8 @@ class BinRadarExecutor:
                   else self.artifacts.patched)
         self.check_requirements(binary=binary)
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
+        deadline = binradar_runtime.Deadline.from_timeout(
+            self.minimizer_verifier_timeout())
         minimizer = self._concrete_worker_factory(
             require_verifier=False).build_minimizer()
         timed_out = minimizer.run_testcases(
@@ -1480,7 +1476,8 @@ class BinRadarExecutor:
             sys.exit(1)
 
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
+        deadline = binradar_runtime.Deadline.from_timeout(
+            self.minimizer_verifier_timeout())
         timed_out = factory.build_verifier().run_verification_streaming(
             factory.minimizer_result_file,
             timeout=self.remaining_concrete_timeout(deadline))
@@ -1497,7 +1494,8 @@ class BinRadarExecutor:
         self.check_requirements(binary=factory.verifier_binary)
         self.save_progress(f"[minimizer] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         self.save_progress(f"[verifier] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        deadline = self.phase_deadline(MINIMIZER_VERIFIER_TIMEOUT_FACTOR)
+        deadline = binradar_runtime.Deadline.from_timeout(
+            self.minimizer_verifier_timeout())
         timed_out = binradar_minimizer.run_minimizer_and_verifier(
             factory.build_minimizer(), factory.build_verifier(),
             factory.minimizer_result_file,
@@ -2210,7 +2208,7 @@ def main():
         help="set the working directory for binradar")
     parser.add_argument(
         "-t", "--timeout", type=int, default=-1,
-        help="set the base timeout in seconds (minimizer/verifier use 1.5x)")
+        help="set the base timeout in seconds (minimizer/verifier use timeout + 600 seconds; 0 is unlimited)")
     parser.add_argument(
         "-o", "--output", default="",
         help="set the output directory for fuzzolic (default: workdir/out)")
