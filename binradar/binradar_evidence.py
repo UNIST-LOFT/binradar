@@ -16,7 +16,7 @@ import os
 import struct
 import tempfile
 import zlib
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import BinaryIO
 
@@ -493,7 +493,7 @@ def _parse_binradar_iteration(payload: bytes, version: int = BINRADAR_VERSION) -
     return BinradarIteration(iteration, groups)
 
 
-def read_binradar(path: os.PathLike[str] | str) -> Iterator[BinradarIteration]:
+def read_binradar(path: os.PathLike[str] | str) -> Generator[BinradarIteration, None, None]:
     """Expand one compact BINRADAR attempt frame at a time.
 
     Version 2 permits strictly increasing attempt ids with gaps: a discarded

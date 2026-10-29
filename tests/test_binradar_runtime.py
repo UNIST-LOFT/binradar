@@ -12,6 +12,39 @@ from binradar import binradar_runtime
 from binradar import cli as binradar
 
 
+def test_generation_requires_valid_cache_even_with_stale_patched_binary(tmp_path):
+    from binradar.binradar_artifacts import ArtifactSet, ArtifactUnavailableError
+
+    (tmp_path / "guest.orig").write_bytes(b"original")
+    (tmp_path / "guest.brpatched").write_bytes(b"stale patched")
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.generate_binradar = True
+    executor.disable_binradar = False
+    executor.feedback_mode = True
+    executor.filter_result = []
+    executor.workdir = str(tmp_path)
+    executor.poc_input = "poc"
+    executor.artifacts = ArtifactSet(str(tmp_path), "guest", "generic-erm", 0, 0)
+    with pytest.raises(ArtifactUnavailableError):
+        executor.run_binradar()
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "guest.brpatched", "guest.orig"]
+
+
+@pytest.mark.parametrize("disabled,feedback,candidates", [
+    (True, True, []), (False, False, []), (False, True, [1]),
+])
+def test_generation_runtime_rejects_mutated_invariants_before_capture(
+        disabled, feedback, candidates):
+    executor = binradar.BinRadarExecutor.__new__(binradar.BinRadarExecutor)
+    executor.generate_binradar = True
+    executor.disable_binradar = disabled
+    executor.feedback_mode = feedback
+    executor.filter_result = candidates
+    with pytest.raises(ValueError, match="requires enabled feedback and patch 0 only"):
+        executor.run_binradar()
+
+
 def test_shared_memory_keys_are_named_distinct_and_fixed_width(monkeypatch):
     generated = iter((0, 0xA, 0xA, 0xFFFFFFFF, 1, 2))
     monkeypatch.setattr(

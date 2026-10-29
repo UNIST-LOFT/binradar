@@ -63,7 +63,8 @@ def _full_row(testcase_id, filename, exit_info, fault_addr, patch_hit=1, version
         + "[pid 0] [br [0]] [time 1]\n")
 
 
-def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fault=0, writes=True, source=None, poc_source="guest-signal"):
+def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fault=0,
+          writes=True, source=None, poc_source="guest-signal", poc_fault=0x1234):
     if outcome == "crash" and source is None:
         raise ValueError("crash feedback fixture requires an explicit source")
     directory = run_dir / "binradar-feedback"
@@ -75,7 +76,7 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
             patch, branch, 0, 0) + predicates.CACHED_SNAPSHOT_REGS.pack(*range(16))
         for branch in branches or ())
     (directory / (stem + ".brch")).write_bytes(capture)
-    same = outcome == "crash" and fault == 0x1234
+    same = outcome == "crash" and poc_fault is not None and fault == poc_fault
     valid = outcome == "crash"
     result = "benign" if outcome == "normal" else "malicious" if same else "ignored"
     header = (
@@ -85,7 +86,9 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
         f"[outcome {outcome}] [fault-addr {fault:x}] "
         f"[fault-valid {'true' if valid else 'false'}] "
         f"[fault-source {source if valid else 'unavailable'}] "
-        f"[poc-fault-addr 1234] [poc-fault-valid true] [poc-fault-source {poc_source}] "
+        f"[poc-fault-addr {poc_fault if poc_fault is not None else 0:x}] "
+        f"[poc-fault-valid {'true' if poc_fault is not None else 'false'}] "
+        f"[poc-fault-source {poc_source if poc_fault is not None else 'unavailable'}] "
         f"[same-fault {'true' if same else 'false'}] [result {result}] "
         f"[mutation-writes {int(writes)}] "
         "[fault-image none] [fault-image-offset 0] "
@@ -96,14 +99,16 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
     return directory / (stem + ".brch"), directory / (stem + ".sbsv")
 
 
-def _commits(run_dir, frames, *, truncated_tail=False):
+def _commits(run_dir, frames, *, truncated_tail=False, baseline=None, version=4):
     from binradar.binradar_feedback_capture import write_mutation_context
     workdir = run_dir.parents[1]
     write_mutation_context(str(run_dir), workdir=str(workdir),
                            artifact=str(workdir / "target.orig"), candidates=[1, 2],
                            input_file=str(workdir / "poc/input"))
-    baseline = struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])
-    data = struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0) + _frame(4, baseline)
+    if baseline is None:
+        baseline = _group(0, 2, 0x1234, [0], [0], source="guest-signal")
+    first = struct.pack("<II", 1, 1) + baseline
+    data = struct.pack("<8sHHI", b"BRDATAB1", version, 3, 0) + _frame(4, first)
     for iteration, groups in frames:
         data += _frame(4, struct.pack("<II", iteration, len(groups)) + b"".join(groups))
     if truncated_tail:
@@ -309,10 +314,19 @@ def test_mutation_dso_identity_uses_image_offset_not_raw_poc_pc(tmp_path, commit
     group[5] |= 2
     header_size = evidence.BINRADAR_GROUP_STRUCT.size
     group[header_size:header_size] = bytes.fromhex(image) + struct.pack("<Q", committed_offset)
-    _commits(run_dir, [(2, [bytes(group)])])
+    baseline = bytearray(_group(0, 2, 0x7000123, [], [0], source="provenance-access"))
+    baseline[5] |= 2
+    baseline[header_size:header_size] = bytes.fromhex(image) + struct.pack("<Q", 0x123)
+    # Archived re-export must ignore a different original-PROBE reference.
+    executor.probe_result.tracer_fault_reference = binradar.binradar_verifier.TracerFaultReference(
+        0xdead, "guest-signal")
+    _commits(run_dir, [(2, [bytes(group)])], baseline=bytes(baseline))
     if committed_offset == 0x123:
         executor.run_feedback()
         assert (run_dir / "feedback/binradar" / sidecar.name).read_bytes() == sidecar.read_bytes()
+        metadata = json.loads((run_dir / "feedback/metadata.json").read_text())
+        assert metadata["oracles"]["mutation_reference"] == {
+            "address": 0x7000123, "source": "provenance-access", "image": image, "offset": 0x123}
     else:
         with pytest.raises(ValueError):
             executor.run_feedback()
@@ -379,7 +393,8 @@ def test_current_feedback_authenticates_source_separately_from_site(tmp_path, so
     (run_dir / "minimizer.sbsv").write_text("")
     brch, sidecar = _pair(run_dir, outcome="crash", fault=0x1234,
                           source=source, poc_source=source)
-    _commits(run_dir, [(2, [_group(1, 2, 0x1234, [1], [1], source=source)])])
+    _commits(run_dir, [(2, [_group(1, 2, 0x1234, [1], [1], source=source)])],
+             baseline=_group(0, 2, 0x1234, [], [0], source=source))
     other = "provenance-access" if source != "provenance-access" else "syscall-request"
     if tamper in ("child", "poc"):
         prefix = "poc-" if tamper == "poc" else ""
@@ -406,3 +421,42 @@ def test_current_feedback_authenticates_source_separately_from_site(tmp_path, so
             executor.run_feedback()
         assert (previous / "keep").read_bytes() == b"previous"
         assert (brch.read_bytes(), sidecar.read_bytes()) == sources
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("poc_fault", [None, 0x1234])
+def test_unavailable_artifact_reference_never_falls_back_to_probe(tmp_path, legacy, poc_fault):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    (run_dir / "minimizer.sbsv").write_text("")
+    _, sidecar = _pair(run_dir, poc_fault=poc_fault)
+    _commits(run_dir, [(2, [_group(1, 1, 0, [1], [1])])],
+             baseline=_group(0, 2, 0x1234, [], [0]) if legacy else _group(0, 1, 0, [], [0]),
+             version=3 if legacy else 4)
+    previous = run_dir / "feedback"
+    previous.mkdir()
+    (previous / "keep").write_bytes(b"prior export")
+    if legacy or poc_fault is not None:
+        with pytest.raises(ValueError, match="canonical BINRADAR v4" if legacy else "POC reference mismatch"):
+            executor.run_feedback()
+        assert (previous / "keep").read_bytes() == b"prior export"
+    else:
+        executor.run_feedback()
+        assert (previous / "binradar" / sidecar.name).read_bytes() == sidecar.read_bytes()
+        metadata = json.loads((previous / "metadata.json").read_text())
+        assert metadata["oracles"]["mutation_reference"] is None
+
+
+def test_probe_based_sidecar_disagreeing_with_saved_artifact_is_never_relabelled(tmp_path):
+    executor, run_dir, _ = _feedback_executor(tmp_path)
+    (run_dir / "minimizer.sbsv").write_text("")
+    brch, sidecar = _pair(run_dir)  # Old producer used original-PROBE 0x1234.
+    _commits(run_dir, [(2, [_group(1, 1, 0, [1], [1])])],
+             baseline=_group(0, 2, 0x5678, [], [0], source="provenance-access"))
+    previous = run_dir / "feedback"
+    previous.mkdir()
+    (previous / "keep").write_bytes(b"published")
+    saved = brch.read_bytes(), sidecar.read_bytes()
+    with pytest.raises(ValueError, match="POC reference mismatch"):
+        executor.run_feedback()
+    assert (previous / "keep").read_bytes() == b"published"
+    assert (brch.read_bytes(), sidecar.read_bytes()) == saved

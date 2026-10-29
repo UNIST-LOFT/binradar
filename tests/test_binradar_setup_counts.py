@@ -552,3 +552,152 @@ def test_generate_concrete_publishes_complete_env_atomically(tmp_path, monkeypat
     assert binradar_setup.load_env(output)["BINRADAR_GENERATE_CONCRETE"] == "1"
 
 
+@pytest.mark.parametrize("patch_format,family,stack_size", [
+    ("ERM generic", "generic-erm", 0),
+    ("ERM CWE-805", "CWE805-erm", 4096),
+    ("ERM CWE-805", "CWE805-erm", 0),
+])
+@pytest.mark.parametrize("predicates", [None, "not even valid predicate syntax!"])
+def test_generate_binradar_builds_patchless_capture(
+        tmp_path, monkeypatch, patch_format, family, stack_size, predicates):
+    import sys
+
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / "patch-format").write_text(patch_format)
+    (configdir / "destinations").write_text("401040\n")
+    if predicates is not None:
+        (workdir / "predicates").write_text(predicates)
+    if family == "CWE805-erm":
+        trace = configdir / "trace"
+        trace.mkdir()
+        (trace / "malloc.calls").write_text("0 401010\n")
+        (trace / "malloc.returns").write_text("401015\n")
+        (configdir / "stack-size").write_text(str(stack_size))
+    with (configdir / "config.env").open("a") as stream:
+        stream.write('BRPATCHED_E9_EXCLUDE_RANGES="stale"\n'
+                     'BRCACHED_E9_RELOCATED_CALL_JUMPS="stale"\n'
+                     'TAOSC_TOTAL_PATCHES="99"\n'
+                     'BINRADAR_CONCRETE_INPUT_SCHEDULE="stale"\n')
+    protected = {
+        "binradar.env": b"existing ordinary environment",
+        "generate-concrete.env": b"existing concrete environment",
+        "benign.brpatched": b"existing patched binary",
+        "benign.orig": b"original fixture",
+        "filter.sbsv": b"existing filter",
+    }
+    for name, data in protected.items():
+        (workdir / name).write_bytes(data)
+    calls = []
+    monkeypatch.setattr(binradar_setup.subprocess, "run", _fake_run(calls))
+    _patch_extract(monkeypatch)
+    monkeypatch.setattr(sys, "argv", [
+        "binradar-setup", "--generate-binradar", "-c", str(configdir),
+        "-w", str(workdir)])
+    binradar_setup.main()
+
+    saved = binradar_setup.load_env(workdir / "generate-binradar.env")
+    assert saved["BINRADAR_PATCH_KIND"] == family
+    assert saved["BINRADAR_GENERATE_BINRADAR"] == "1"
+    assert saved["BINRADAR_GENERATE_CONCRETE"] == "0"
+    assert saved["BINRADAR_FEEDBACK_MODE"] == "1"
+    assert saved["BRCACHE_STACK_SIZE"] == str(stack_size)
+    assert all(saved[key] == "0" for key in (
+        "TOTAL_PATCHES", "BRPATCHED_TOTAL_PATCHES", "FILTER_TOTAL_PATCHES"))
+    assert not {"BRPATCHED_E9_EXCLUDE_RANGES", "TAOSC_TOTAL_PATCHES",
+                "BINRADAR_CONCRETE_INPUT_SCHEDULE"}.intersection(saved)
+    loaded_family, loaded = binradar_taosc_predicates.load_runtime_predicates(
+        workdir / "brpatches.json")
+    assert loaded_family.value == family
+    assert loaded == {}
+    assert (workdir / "benign.brcached").is_file()
+    assert (workdir / "benign.brcached.json").is_file()
+    assert not (workdir / "brpatches.inc").exists()
+    for name, data in protected.items():
+        assert (workdir / name).read_bytes() == data
+    assert (workdir / "poc" / "input").read_bytes() == b"benign source"
+    if predicates is not None:
+        assert (workdir / "predicates").read_text() == predicates
+
+
+@pytest.mark.parametrize("patch_format", ["Single CWE-805", "Single CWE-617", "unknown future format"])
+def test_generate_binradar_unsupported_replaces_stale_env_quietly(
+        tmp_path, monkeypatch, capsys, patch_format):
+    configdir = tmp_path / "config"
+    configdir.mkdir()
+    (configdir / "patch-format").write_text("ERM generic")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "patch-format").write_text(patch_format)
+    output = workdir / "generate-binradar.env"
+    output.write_text('BINRADAR_PATCH_KIND="generic-erm"\nBINARY="stale"\n')
+    (workdir / "subject.orig").write_bytes(b"original")
+    (workdir / "subject.brpatched").write_bytes(b"patched")
+    _forbid_patch_setup(monkeypatch)
+    binradar_setup._generate_binradar(configdir, workdir)
+    assert capsys.readouterr() == ("", "")
+    assert binradar_setup.load_env(output) == {
+        "BINRADAR_GENERATE_BINRADAR": "1", "BINRADAR_PATCH_KIND": "unsupported",
+        "TOTAL_PATCHES": "0", "BINRADAR_GENERATION_PATCH_FORMAT": patch_format,
+    }
+    assert (workdir / "subject.orig").read_bytes() == b"original"
+    assert (workdir / "subject.brpatched").read_bytes() == b"patched"
+    assert not (workdir / "brpatches.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["patch-format", "patch-location", "destinations"])
+def test_generate_binradar_missing_metadata_preserves_published_env(
+        tmp_path, monkeypatch, missing):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / "patch-format").write_text("ERM generic")
+    (configdir / "destinations").write_text("401040\n")
+    (configdir / missing).unlink()
+    output = workdir / "generate-binradar.env"
+    output.write_bytes(b"previous complete environment")
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises((ValueError, FileNotFoundError), match=missing.replace("destinations", "destination")):
+        binradar_setup._generate_binradar(configdir, workdir)
+    assert output.read_bytes() == b"previous complete environment"
+
+
+@pytest.mark.parametrize("stack_size", [None, "", "invalid", "-1", "1048577"])
+def test_generate_binradar_cwe805_requires_valid_capture_size(
+        tmp_path, monkeypatch, stack_size):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / "patch-format").write_text("ERM CWE-805")
+    (configdir / "destinations").write_text("401040\n")
+    trace = workdir / "trace"
+    trace.mkdir()
+    (trace / "malloc.calls").write_text("0 401010\n")
+    (trace / "malloc.returns").write_text("401015\n")
+    if stack_size is not None:
+        (workdir / "stack-size").write_text(stack_size)
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises((ValueError, FileNotFoundError), match="stack-size"):
+        binradar_setup._generate_binradar(configdir, workdir)
+    assert not (workdir / "generate-binradar.env").exists()
+
+
+def test_generate_binradar_empty_workdir_format_is_not_unsupported(
+        tmp_path, monkeypatch):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / "patch-format").write_text("ERM generic")
+    (workdir / "patch-format").write_text(" \n")
+    output = workdir / "generate-binradar.env"
+    output.write_bytes(b"previous complete environment")
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises(ValueError, match="patch-format is empty"):
+        binradar_setup._generate_binradar(configdir, workdir)
+    assert output.read_bytes() == b"previous complete environment"
+
+
+def test_generate_binradar_cwe805_missing_trace_is_error(tmp_path, monkeypatch):
+    configdir, workdir = _concrete_subject(tmp_path)
+    (configdir / "patch-format").write_text("ERM CWE-805")
+    (configdir / "destinations").write_text("401040\n")
+    (workdir / "stack-size").write_text("0")
+    _forbid_patch_setup(monkeypatch)
+    with pytest.raises(ValueError, match="allocator trace"):
+        binradar_setup._generate_binradar(configdir, workdir)
+    assert not (workdir / "generate-binradar.env").exists()
+
+

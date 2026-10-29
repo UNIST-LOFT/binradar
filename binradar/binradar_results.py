@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
+from . import binradar_baseline
 from . import binradar_evidence
 from . import binradar_verifier
 from . import logger
@@ -24,7 +25,6 @@ class FinalResultRequest:
     run_prefix: str
     run_id: int
     candidates: Sequence[int]
-    tracer_fault_reference: binradar_verifier.TracerFaultReference | None
     probe_memcheck_policy: str | None
     disable_binradar: bool
     binradar_failed: bool
@@ -254,19 +254,11 @@ def write_final_result(request: FinalResultRequest) -> None:
         if source_bearing_policy and version != 4:
             raise ValueError(
                 f"{request.probe_memcheck_policy} FINAL requires canonical BINRADAR v4 evidence")
-        if (request.tracer_fault_reference is not None
-                and request.tracer_fault_reference.source == "syscall-request"
-                and (version != 4 or not source_bearing_policy)):
-            raise ValueError(
-                "syscall-request FINAL requires coverage-v5, coverage-v6, or coverage-v7 "
-                "and canonical BINRADAR v4 evidence")
         compact_binradar = True
         binradar_iterations = binradar_evidence.read_binradar(
             binradar_evidence_file)
     elif os.path.exists(trace_msg_log_file):
-        if (source_bearing_policy
-                or (request.tracer_fault_reference is not None
-                    and request.tracer_fault_reference.source == "syscall-request")):
+        if source_bearing_policy:
             raise ValueError("source-bearing FINAL requires canonical BINRADAR v4 evidence")
         binradar_iterations = iter_legacy_binradar_results(
             trace_msg_log_file)
@@ -281,15 +273,9 @@ def write_final_result(request: FinalResultRequest) -> None:
             remaining_patches.discard(patch_id)
     binradar_remaining_patches = remaining_patches.copy()
     binradar_reject_reasons: dict[int, tuple[str, int]] = {}
-    fault_reference = request.tracer_fault_reference
-    fault_reference_valid = (
-        fault_reference is not None and fault_reference.valid)
-    poc_fault_loc = fault_reference.identity_key if fault_reference_valid else None
-    if not skip_binradar_analysis and not fault_reference_valid:
-        logger.warning(
-            "[FINAL] No validated tracer fault reference; BINRADAR hard-crash "
-            "classification is unavailable. Concrete verdicts and "
-            "normal/normal confidence evidence remain available.")
+    fault_reference = None
+    fault_reference_valid = False
+    poc_fault_loc = None
 
     expected_candidates = set(candidates)
     processed_iterations = raw_committed = patch0_no_observation = 0
@@ -300,6 +286,17 @@ def write_final_result(request: FinalResultRequest) -> None:
         if compact_binradar:
             assert isinstance(frame, binradar_evidence.BinradarIteration)
             iteration = frame.iteration
+            if iteration == 1:
+                fault_reference = binradar_baseline.reference_from_baseline(frame)
+                if (fault_reference is not None
+                        and fault_reference.source == "syscall-request"
+                        and not source_bearing_policy):
+                    raise ValueError(
+                        "syscall-request FINAL requires coverage-v5, coverage-v6, or coverage-v7 "
+                        "and canonical BINRADAR v4 evidence")
+                fault_reference_valid = fault_reference is not None
+                poc_fault_loc = (fault_reference.identity_key
+                                 if fault_reference_valid else None)
             actual = {member for group in frame.groups for member in group.members}
             expected = {0} if iteration == 1 else expected_candidates | {0}
             if actual != expected:
@@ -376,6 +373,11 @@ def write_final_result(request: FinalResultRequest) -> None:
                         if not same_branch:
                             normal_branch_differences += 1
 
+    if not skip_binradar_analysis and not fault_reference_valid:
+        logger.warning(
+            "[FINAL] No validated artifact baseline fault reference; BINRADAR hard-crash "
+            "classification is unavailable. Concrete verdicts and "
+            "normal/normal confidence evidence remain available.")
     if not skip_binradar_analysis:
         logger.info(
             f"[FINAL] Processed {processed_iterations} complete "

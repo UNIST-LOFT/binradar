@@ -227,6 +227,23 @@ class RunConfig:
     qemu_exec_timeout: float = binradar_utils.QEMU_EXEC_TIMEOUT_DEFAULT
     probe_tracer_timeout: float = binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT
     generate_concrete: bool = False
+    generate_binradar: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.generate_binradar:
+            return
+        if self.generate_concrete:
+            raise ValueError("Generation modes are mutually exclusive")
+        if self.disable_binradar:
+            raise ValueError("--generate-binradar requires the BINRADAR phase")
+        if not self.feedback_mode:
+            raise ValueError("--generate-binradar requires feedback capture")
+        if any((self.total_patches, self.brpatched_total_patches,
+                self.filter_total_patches)):
+            raise ValueError("--generate-binradar requires patch 0 only")
+        if dict(self.retained_environment).get("BINRADAR_PATCH_KIND") not in (
+                "generic-erm", "CWE805-erm"):
+            raise ValueError("--generate-binradar requires an ERM patch family")
 
     @property
     def concrete_baseline(self) -> ConcreteBaseline:
@@ -237,8 +254,10 @@ class RunConfig:
     def from_environment(
             cls, workdir: str, env: Mapping[str, str]) -> "RunConfig":
         generate_concrete = env.get("BINRADAR_GENERATE_CONCRETE", "0") == "1"
+        generate_binradar = env.get("BINRADAR_GENERATE_BINRADAR", "0") == "1"
+        baseline_only = generate_concrete or generate_binradar
         input_schedule = resolve_concrete_input_schedule(None, env)
-        feedback_mode = env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
+        feedback_mode = generate_binradar or env.get("BINRADAR_FEEDBACK_MODE", "0") == "1"
         if generate_concrete:
             validate_original_baseline(input_schedule, feedback_mode)
         child_timeout = int(env.get(
@@ -265,7 +284,7 @@ class RunConfig:
             if key in env:
                 retained[key] = env[key]
 
-        total_patches = 0 if generate_concrete else int(env["TOTAL_PATCHES"])
+        total_patches = 0 if baseline_only else int(env["TOTAL_PATCHES"])
         symbolic_mode = validate_symbolic_mutation_mode(env.get(
             "BINRADAR_SYMBOLIC_MUTATION_MODE",
             SYMBOLIC_MUTATION_MODE_DEFAULT))
@@ -300,9 +319,9 @@ class RunConfig:
             test_cmd=env["TEST_CMD"],
             patch_loc=env["PATCH_LOC"],
             total_patches=total_patches,
-            brpatched_total_patches=(0 if generate_concrete else int(env.get(
+            brpatched_total_patches=(0 if baseline_only else int(env.get(
                 "BRPATCHED_TOTAL_PATCHES", env["TOTAL_PATCHES"]))),
-            filter_total_patches=(0 if generate_concrete else int(env.get(
+            filter_total_patches=(0 if baseline_only else int(env.get(
                 "FILTER_TOTAL_PATCHES", env["TOTAL_PATCHES"]))),
             fuzzy=env.get("BINRADAR_FUZZY", "0") == "1",
             reverse_directed=(
@@ -312,6 +331,7 @@ class RunConfig:
             less_strict=env.get("BINRADAR_LESS_STRICT", "0") == "1",
             feedback_mode=feedback_mode,
             generate_concrete=generate_concrete,
+            generate_binradar=generate_binradar,
             forkserver_child_timeout=child_timeout,
             qemu_exec_timeout=binradar_utils.parse_positive_timeout(
                 "BINRADAR_QEMU_EXEC_TIMEOUT", env.get(
@@ -367,6 +387,15 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
     if config.timeout > 0:
         environment["SOLVER_TIMEOUT"] = str(int(config.timeout * 1000))
     environment.update(config.retained_environment)
+    if config.generate_binradar:
+        environment.update({
+            "BINRADAR_GENERATE_BINRADAR": "1",
+            "BINRADAR_GENERATE_CONCRETE": "0",
+            "BINRADAR_FEEDBACK_MODE": "1",
+            "TOTAL_PATCHES": "0",
+            "BRPATCHED_TOTAL_PATCHES": "0",
+            "FILTER_TOTAL_PATCHES": "0",
+        })
     return environment
 
 
@@ -384,6 +413,7 @@ def build_worker_environment(
         "E9_METADATA_PREFIX": config.e9_metadata_prefix,
         "TOTAL_PATCHES": str(config.total_patches),
         "BINRADAR_GENERATE_CONCRETE": "1" if config.generate_concrete else "0",
+        "BINRADAR_GENERATE_BINRADAR": "1" if config.generate_binradar else "0",
         "BINRADAR_FEEDBACK_MODE": "1" if config.feedback_mode else "0",
         "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
     })

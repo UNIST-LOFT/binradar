@@ -98,6 +98,76 @@ def test_generation_rejects_patch_features_and_reuse_before_preparation(
     assert not (workdir / "out" / "plt_info.txt").exists()
 
 
+def test_binradar_generation_unsupported_exits_without_run_side_effects(
+        tmp_path, monkeypatch, capsys):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "binradar.env").write_text('BINARY="stale"\n')
+    (workdir / "generate-binradar.env").write_text(
+        'BINRADAR_GENERATE_BINRADAR="1"\n'
+        'BINRADAR_PATCH_KIND="unsupported"\nTOTAL_PATCHES="0"\n'
+        'BINRADAR_GENERATION_PATCH_FORMAT="Single CWE-369"\n')
+    output = tmp_path / "custom-output"
+    monkeypatch.setattr(binradar, "setlimits", lambda: None)
+    monkeypatch.setattr(binradar.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", [
+        "binradar", "-w", str(workdir), "--generate-binradar", "-o", str(output)])
+    binradar.main()
+    assert not output.exists()
+    assert not (workdir / "out").exists()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--generate-concrete"], ["--disable-binradar"], ["--fuzzer-only"],
+    ["--run-id", "l"], ["--run-single-phase", "final"],
+    ["--run-single-phase", "feedback"], ["--run-single-phase", "verifier"],
+])
+def test_binradar_generation_rejects_incompatible_modes_before_output(
+        tmp_path, monkeypatch, arguments):
+    monkeypatch.setattr(binradar, "setlimits", lambda: None)
+    monkeypatch.setattr(binradar.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", [
+        "binradar", "-w", str(tmp_path), "--generate-binradar", *arguments])
+    with pytest.raises(SystemExit) as failure:
+        binradar.main()
+    assert failure.value.code == 2
+    assert not (tmp_path / "out").exists()
+
+
+def test_binradar_generation_config_forces_baseline_feedback_and_retains_cache(tmp_path):
+    from dataclasses import replace
+
+    env = {
+        "BINRADAR_GENERATE_BINRADAR": "1", "BINRADAR_OUTDIR": str(tmp_path / "out"),
+        "BINRADAR_TIMEOUT": "60", "BINARY": "guest", "POC_INPUT": "poc",
+        "TEST_CMD": "@@", "PATCH_LOC": "0x401000", "TOTAL_PATCHES": "invalid",
+        "BRPATCHED_TOTAL_PATCHES": "stale", "FILTER_TOTAL_PATCHES": "stale",
+        "BINRADAR_FEEDBACK_MODE": "0", "BINRADAR_PATCH_KIND": "CWE805-erm",
+        "BRCACHE_STACK_SIZE": "4096", "E9_METADATA_PREFIX": "brcached",
+        "BRCACHED_E9_EXCLUDE_RANGES": "0x1000-0x2000",
+    }
+    config = binradar_config.RunConfig.from_environment(str(tmp_path), env)
+    assert config.feedback_mode and not config.disable_binradar
+    assert (config.total_patches, config.brpatched_total_patches,
+            config.filter_total_patches) == (0, 0, 0)
+    base = binradar_config.build_base_environment(config, "plt.txt")
+    assert base["BINRADAR_PATCH_KIND"] == "CWE805-erm"
+    assert base["BRCACHE_STACK_SIZE"] == "4096"
+    assert base["BRCACHED_E9_EXCLUDE_RANGES"] == "0x1000-0x2000"
+    worker = binradar_config.build_worker_environment(config, {"BINRADAR_FEEDBACK_MODE": "0"})
+    assert worker["BINRADAR_FEEDBACK_MODE"] == "1"
+    assert worker["BINRADAR_GENERATE_BINRADAR"] == "1"
+    for invalid in ({"disable_binradar": True}, {"feedback_mode": False},
+                    {"total_patches": 1}, {"brpatched_total_patches": 1},
+                    {"filter_total_patches": 1}, {"generate_concrete": True}):
+        with pytest.raises(ValueError):
+            replace(config, **invalid)
+    with pytest.raises(ValueError, match="requires the BINRADAR phase"):
+        binradar_config.RunConfig.from_environment(
+            str(tmp_path), {**env, "BINRADAR_DISABLE_BINRADAR": "1"})
+
+
 def test_boolean_parser_accepts_true_false_values():
     assert binradar.parse_bool("true") is True
     assert binradar.parse_bool("false") is False

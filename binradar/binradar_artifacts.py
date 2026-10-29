@@ -145,10 +145,13 @@ class ArtifactSet:
         return ArtifactSelection(
             self.patched, "brpatched", False, requested, reason)
 
-    def select_tracer(self, patches: Sequence[int]) -> ArtifactSelection:
-        """Choose a tracer artifact without exceeding .brpatched capacity."""
-        required = self.requires_cache(patches)
-        requested = self._cache_requested(patches)
+    def select_tracer(self, patches: Sequence[int], *,
+                      baseline_only: bool = False) -> ArtifactSelection:
+        """Choose a tracer artifact; baseline feedback always requires cache."""
+        if baseline_only and patches:
+            raise ValueError("baseline-only capture cannot execute candidate patches")
+        required = baseline_only or self.requires_cache(patches)
+        requested = baseline_only or self._cache_requested(patches)
         if not requested:
             return ArtifactSelection(
                 self.patched, "brpatched", False, False,
@@ -159,7 +162,10 @@ class ArtifactSet:
                 raise ArtifactUnavailableError(reason)
             return ArtifactSelection(
                 self.patched, "brpatched", False, True, reason)
-        coverage = self.cached_predicate_set(patches)
+        coverage = (binradar_verifier.load_cached_predicate_set(
+            Path(self.manifest), Path(self.cached), self.patch_kind,
+            self.stack_size, [], allow_empty=True) if baseline_only
+            else self.cached_predicate_set(patches))
         if coverage.predicates is None:
             if required:
                 raise ArtifactUnavailableError(coverage.reason)

@@ -384,7 +384,6 @@ def main():
                 poc_source=os.path.join(workdir, env["POC_INPUT"]),
                 run_prefix=args.fuzzer, run_id=0, save_progress=logger.info,
                 candidate_ids=tuple(survived),
-                poc_fault_reference=probe_result.tracer_fault_reference,
                 poc_concrete_fault_addr=probe_result.concrete_fault_addr,
                 poc_memcheck_policy=probe_result.memcheck_policy))
 

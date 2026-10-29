@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import sbsv
 
+from . import binradar_evidence
 from . import binradar_utils
 from . import binradar_verifier
 from . import logger
@@ -69,6 +70,43 @@ class BaselineResult:
         for entry in self.checks:
             parts.append(f"[{entry.artifact} {entry.status.value}]")
         return " ".join(parts)
+
+
+def reference_from_baseline(
+        frame: binradar_evidence.BinradarIteration,
+) -> Optional[binradar_verifier.TracerFaultReference]:
+    """Use only the selected artifact's committed, unmutated patch 0.
+
+    PROBE and preflight observations are separate diagnostics. A normal or
+    historical untyped baseline cannot authorize hard-crash classifications,
+    and a later mutation must never supply the missing reference.
+    """
+    if (frame.iteration != 1 or len(frame.groups) != 1
+            or frame.groups[0].representative != 0
+            or frame.groups[0].members != [0]):
+        raise ValueError("BINRADAR reference requires unmutated baseline patch 0")
+    group = frame.groups[0]
+    if group.outcome != "crash" or group.source is None:
+        return None
+    reference = binradar_verifier.TracerFaultReference(
+        group.fault_addr, group.source, group.image_id, group.image_offset)
+    if not reference.valid:
+        raise ValueError("BINRADAR baseline has an invalid fault reference")
+    return reference
+
+
+def read_mutation_reference(
+        evidence_path: os.PathLike[str] | str,
+) -> Optional[binradar_verifier.TracerFaultReference]:
+    """Recover the immutable mutation oracle without rerunning an artifact."""
+    if not os.path.isfile(evidence_path):
+        return None
+    frames = binradar_evidence.read_binradar(evidence_path)
+    try:
+        frame = next(frames, None)
+        return reference_from_baseline(frame) if frame is not None else None
+    finally:
+        frames.close()
 
 
 def _parser() -> sbsv.parser:
@@ -236,19 +274,25 @@ def validate_patch_zero_baseline(
         phase_deadline: Optional[float] = None,
         identity_runner: binradar_verifier.BinRadarQemuRunner,
         probe_policy: Optional[str] = None,
+        selected_only: bool = False,
 ) -> BaselineResult:
-    """Validate the POC on `.orig`, `.brpatched`, and `.brcached` patch 0.
+    """Validate original and patch-zero artifacts against the saved POC.
+
+    Baseline-only feedback excludes unrelated patched artifacts, including
+    their identity maps; ordinary verification still checks every artifact.
     """
     if probe_policy != binradar_verifier.MEMCHECK_POLICY:
         raise ValueError(
             "PROBE memcheck policy is old, absent, or mismatched; "
             "start a fresh run with --run-id n")
 
-    # Validate every artifact before the first tracer launch. Each path uses
-    # its own bound map, never a union or the selected phase's inherited data.
+    # Validate every executed artifact before the first tracer launch. Each
+    # path uses its own bound map, never inherited data from another artifact.
+    patched_paths = ([selected_binary] if selected_only else [
+        original[:-len(".orig")] + suffix
+        for suffix in (".brpatched", ".brcached")])
     instruction_pairs = {original: ""}
-    for suffix in (".brpatched", ".brcached"):
-        path = original[:-len(".orig")] + suffix
+    for path in patched_paths:
         if os.path.exists(path):
             instruction_pairs[path] = identity_runner.tracer_instruction_pairs(path)
 
@@ -293,10 +337,10 @@ def validate_patch_zero_baseline(
             (BaselineCheck(".orig", BaselineStatus.UNUSABLE, None,
                            "the original binary is missing"),))
 
-    for suffix in (".brpatched", ".brcached"):
-        path = original[: -len(".orig")] + suffix
+    for path in patched_paths:
         if not os.path.exists(path):
             continue
+        suffix = suffix_of(path)
         ranges, records = metadata_for(path)
         result = run_artifact(path, ranges, records, True)
         check = _classify(suffix, result, reference)

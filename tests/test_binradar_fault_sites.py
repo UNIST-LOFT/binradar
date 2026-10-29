@@ -175,13 +175,18 @@ def test_final_compares_dso_site_not_raw_pc(tmp_path, image, offset, expected, v
         + _frame(4, baseline) + _frame(4, mutation))
     evidence.write_verifier(tmp_path / "verifier.br", [evidence.VerifierPatchResult(
         1, True, 0, 0, {})])
-    request = dataclasses.replace(_final_request(tmp_path, [1], reference),
+    request = dataclasses.replace(_final_request(tmp_path, [1]),
         probe_memcheck_policy=verifier.MEMCHECK_POLICY if version == 4 else "coverage-v4")
     binradar_results.write_final_result(request)
     report = (tmp_path / "final.sbsv").read_text()
-    assert ("[reason same-crash]" in report) is expected
-    assert "[original-poc-crash 2]" in report
-    assert f"[image {IMAGE}] [image-offset 123]" in report
+    assert ("[reason same-crash]" in report) is (expected and version == 4)
+    if version == 4:
+        assert "[original-poc-crash 2]" in report
+        assert f"[image {IMAGE}] [image-offset 123]" in report
+        assert "[source syscall-request]" in report
+    else:
+        assert "[original-unclassified-crash 2]" in report
+        assert "[fault-reference-valid false]" in report
 
 
 @pytest.mark.parametrize("image,offset,expected", [

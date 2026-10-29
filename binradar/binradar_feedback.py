@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import binradar_baseline
 from . import binradar_evidence
 from . import binradar_verifier
 from .binradar_feedback_export import write_classification
@@ -25,7 +26,6 @@ class FeedbackExportRequest:
     run_id: int
     save_progress: Callable[[str], None]
     candidate_ids: tuple[int, ...]
-    poc_fault_reference: binradar_verifier.TracerFaultReference | None = None
     poc_concrete_fault_addr: int | None = None
     poc_memcheck_policy: str | None = None
 
@@ -81,7 +81,7 @@ _MUTATION_SCHEMA = (
     "[size: int] [value: str] [target-extent: int]")
 
 
-def _validate_mutation_pair(request, pair, iteration, group, parser) -> None:
+def _validate_mutation_pair(reference, pair, iteration, group, parser) -> None:
     snapshot_path, sidecar_path = pair
     with open(sidecar_path, "r", encoding="utf-8") as sidecar:
         line = sidecar.readline()
@@ -100,7 +100,7 @@ def _validate_mutation_pair(request, pair, iteration, group, parser) -> None:
                 "image": header[prefix + "fault-image"],
                 "image-offset": header[prefix + "fault-image-offset"]}))
         observed, poc = references
-        expected_poc = request.poc_fault_reference
+        expected_poc = reference
         expected_key = (expected_poc.identity_key
                         if expected_poc is not None and expected_poc.valid else None)
         if ((poc.identity_key if poc is not None else None) != expected_key
@@ -144,7 +144,9 @@ def _validate_mutation_pair(request, pair, iteration, group, parser) -> None:
         raise ValueError(f"Invalid or inconsistent BRCH pair {snapshot_path}: {error or 'vector/count/id mismatch'}")
 
 
-def _committed_mutation_pairs(request: FeedbackExportRequest) -> list[tuple[str, str]]:
+def _committed_mutation_pairs(
+        request: FeedbackExportRequest,
+        reference: binradar_verifier.TracerFaultReference | None) -> list[tuple[str, str]]:
     """Preflight without changing source or the previous export.
 
     A split rename or truncated final evidence frame is an interruption remnant,
@@ -205,7 +207,7 @@ def _committed_mutation_pairs(request: FeedbackExportRequest) -> list[tuple[str,
         for group in frame.groups:
             pair = candidates.pop((frame.iteration, group.representative), None)
             if pair is not None:
-                _validate_mutation_pair(request, pair, frame.iteration, group, parser)
+                _validate_mutation_pair(reference, pair, frame.iteration, group, parser)
                 pairs.append(pair)
     for pair in candidates.values():
         logger.warning(f"[FEEDBACK] Skipping pair without a committed representative: {pair[1]}")
@@ -219,7 +221,9 @@ def export_feedback(request: FeedbackExportRequest) -> None:
         raise FileNotFoundError(
             f"Minimizer result file not found: {minimizer_result_file}")
 
-    mutation_pairs = _committed_mutation_pairs(request)
+    reference = binradar_baseline.read_mutation_reference(
+        os.path.join(request.run_dir, "binradar.br"))
+    mutation_pairs = _committed_mutation_pairs(request, reference)
 
     request.save_progress(
         f"[feedback] [start] [prefix {request.run_prefix}] "
@@ -230,7 +234,7 @@ def export_feedback(request: FeedbackExportRequest) -> None:
     # leave a hidden staging directory, never a split pair under feedback/.
     with tempfile.TemporaryDirectory(prefix=".feedback-", dir=request.run_dir) as staging:
         staged_bundle = os.path.join(staging, "bundle")
-        _write_feedback_bundle(request, staged_bundle, mutation_pairs)
+        _write_feedback_bundle(request, staged_bundle, mutation_pairs, reference)
         if os.path.exists(feedback_dir):
             shutil.rmtree(feedback_dir)
         os.replace(staged_bundle, feedback_dir)
@@ -240,7 +244,8 @@ def export_feedback(request: FeedbackExportRequest) -> None:
 
 
 def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
-                           mutation_pairs: list[tuple[str, str]]) -> None:
+                           mutation_pairs: list[tuple[str, str]],
+                           reference: binradar_verifier.TracerFaultReference | None) -> None:
     os.makedirs(feedback_dir)
     shutil.copyfile(
         os.path.join(request.workdir, "binradar.env"),
@@ -275,10 +280,10 @@ def _write_feedback_bundle(request: FeedbackExportRequest, feedback_dir: str,
     os.makedirs(benign_dir, exist_ok=True)
     os.makedirs(malicious_dir, exist_ok=True)
     with open(os.path.join(concrete_dir, "oracle.sbsv"), "w", encoding="utf-8") as oracle:
-        reference = request.poc_concrete_fault_addr
+        concrete_reference = request.poc_concrete_fault_addr
         oracle.write(
             f"[concrete-feedback] [version 1] [oracle {binradar_verifier.CONCRETE_ORACLE}] "
-            f"[poc-fault-valid {'true' if reference is not None else 'false'}] "
-            f"[poc-fault-addr {reference if reference is not None else 0:x}]\n")
+            f"[poc-fault-valid {'true' if concrete_reference is not None else 'false'}] "
+            f"[poc-fault-addr {concrete_reference if concrete_reference is not None else 0:x}]\n")
 
-    write_classification(request, feedback_dir, mutation_pairs)
+    write_classification(request, feedback_dir, mutation_pairs, reference)

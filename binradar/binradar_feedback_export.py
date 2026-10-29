@@ -257,7 +257,7 @@ class _Writer:
                         usable.update(members)
                 self.coverage(key, observed, usable, skipped)
 
-    def mutation(self, pairs, context):
+    def mutation(self, pairs, context, reference):
         path = Path(self.request.run_dir) / "binradar.br"
         if not path.exists():
             return
@@ -314,14 +314,14 @@ class _Writer:
             sidecars = [f"binradar/{Path(pair[1]).name}" for _, _, pair in traces if pair]
             self.emit("input", key=key, domain="mutation", file="none", sha256="none",
                       baseline=baseline["key"] if baseline else "none",
-                      label=_label(baseline, self.request.poc_fault_reference, mutation=True),
+                      label=_label(baseline, reference, mutation=True),
                       mutation=sidecars[0] if sidecars else "none")
             for trace, members, pair in traces:
                 self.trace(key, trace,
                            source=pair[0] if pair and trace["state_reason"] == "none" else None,
                            sidecar=f"binradar/{Path(pair[1]).name}" if pair else "none")
                 if members:
-                    observation = (_observation(baseline, trace, self.request.poc_fault_reference, mutation=True)
+                    observation = (_observation(baseline, trace, reference, mutation=True)
                                    if context else "unclassified")
                     self.observe(key, "mutation", trace, members, observation)
                     if observation in BINS:
@@ -329,7 +329,7 @@ class _Writer:
             self.coverage(key, observed - {0}, usable, set())
 
 
-def write_classification(request, root, pairs):
+def write_classification(request, root, pairs, reference):
     """Stream per-input evidence; only per-candidate counters survive each input."""
     root = Path(root)
     selected = set(request.candidate_ids)
@@ -390,7 +390,6 @@ def write_classification(request, root, pairs):
                 "MINIMIZER/VERIFIER with --feedback-mode in a new run")
         terminal_hard_rejects = {patch for patch, record in terminal_result.patches.items()
                                  if not record.feedback_accepted}
-    reference = request.poc_fault_reference
     metadata = {
         "version": VERSION, "family": family, "files": files,
         "run": {"prefix": request.run_prefix, "id": request.run_id},
@@ -420,7 +419,7 @@ def write_classification(request, root, pairs):
                     "metadata": "metadata.json", "metadata-sha256": file_sha256(root / "metadata.json"),
                     "bins": ",".join(BINS), "semantics": "observed"})
         writer.concrete(headers)
-        writer.mutation(pairs, mutation_context)
+        writer.mutation(pairs, mutation_context, reference)
         for patch, domains in sorted(writer.counts.items()):
             concrete, mutation = domains["concrete"], domains["mutation"]
             values = {"id": patch, "concrete-counts": ",".join(map(str, concrete)),

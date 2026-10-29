@@ -135,11 +135,14 @@ def test_live_restoration_rejects_stale_probe_with_valid_reference(tmp_path, pol
     assert probe_file.read_text() == row
 
 
-def _build_executor(workdir: Path, *, generate_concrete: bool = False) -> "binradar.BinRadarExecutor":
+def _build_executor(workdir: Path, *, generate_concrete: bool = False,
+                    generate_binradar: bool = False) -> "binradar.BinRadarExecutor":
     run_config = binradar_config.RunConfig.from_environment(str(workdir), {
         "BINRADAR_OUTDIR": str(workdir / "out"),
         "BINRADAR_TIMEOUT": "60",
         "BINRADAR_GENERATE_CONCRETE": "1" if generate_concrete else "0",
+        "BINRADAR_GENERATE_BINRADAR": "1" if generate_binradar else "0",
+        "BINRADAR_PATCH_KIND": "generic-erm",
         "BINARY": "nm",
         "POC_INPUT": "poc/x",
         "TEST_CMD": "-l @@",
@@ -170,6 +173,7 @@ def _build_executor(workdir: Path, *, generate_concrete: bool = False) -> "binra
     executor.less_strict = run_config.less_strict
     executor.feedback_mode = run_config.feedback_mode
     executor.generate_concrete = run_config.generate_concrete
+    executor.generate_binradar = run_config.generate_binradar
     executor.concrete_baseline = run_config.concrete_baseline
     executor.symbolic_mutation_mode = run_config.symbolic_mutation_mode
     executor.symbolic_schedule = run_config.symbolic_schedule
@@ -247,6 +251,39 @@ def test_original_single_phase_rejects_patch_work_before_run_mutation(tmp_path, 
     assert (rundir / "probe-results.sbsv").read_bytes() == probe_bytes
     assert not (rundir / "binradar-setting.sbsv").exists()
     assert not (workdir / "out" / "progress.sbsv").exists()
+
+
+@pytest.mark.parametrize("run_id", ["0", "l"])
+def test_binradar_generation_probe_reuses_saved_original_observation(tmp_path, run_id):
+    workdir, rundir = _make_workdir(tmp_path)
+    probe_bytes = (rundir / "probe-results.sbsv").read_bytes()
+    executor = _build_executor(workdir, generate_binradar=True)
+    executor.run_single_phase("run", run_id, binradar.BinRadarPhase.PROBE)
+    assert (rundir / "probe-results.sbsv").read_bytes() == probe_bytes
+    settings = (rundir / "binradar-setting.sbsv").read_text()
+    assert "generate-binradar-single-phase-probe" in settings
+    assert executor.filter_result == []
+    assert executor.feedback_mode
+    assert not (rundir / "final.sbsv").exists()
+    assert not (workdir / "out" / "run-00001").exists()
+
+
+@pytest.mark.parametrize("phase", [
+    phase for phase in binradar.BinRadarPhase
+    if phase not in (binradar.BinRadarPhase.PROBE, binradar.BinRadarPhase.BINRADAR)
+])
+@pytest.mark.parametrize("run_id", ["n", "l", "0"])
+def test_binradar_generation_rejects_other_phases_before_run_mutation(
+        tmp_path, phase, run_id):
+    workdir, rundir = _make_workdir(tmp_path)
+    probe_bytes = (rundir / "probe-results.sbsv").read_bytes()
+    executor = _build_executor(workdir, generate_binradar=True)
+    with pytest.raises(ValueError, match="--generate-binradar does not support"):
+        executor.run_single_phase("run", run_id, phase)
+    assert (rundir / "probe-results.sbsv").read_bytes() == probe_bytes
+    assert not (rundir / "binradar-setting.sbsv").exists()
+    assert not (workdir / "out" / "progress.sbsv").exists()
+    assert not (workdir / "out" / "run-00001").exists()
 
 
 def test_phase_name_mapping_accepts_dashed_names():

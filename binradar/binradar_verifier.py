@@ -450,14 +450,16 @@ class CachedPredicateSet(NamedTuple):
 
 def load_cached_predicate_set(manifest: Path, cached_binary: Path,
                               patch_kind: str, brcache_stack_size: int,
-                              patches: List[int]) -> CachedPredicateSet:
+                              patches: List[int], *,
+                              allow_empty: bool = False) -> CachedPredicateSet:
     """Validate that `.brcached` + `brpatches.json` cover ``patches``.
 
     ``patches`` are the runtime candidate ids that must be executable on the
     cached artifact. Returns the parsed manifest on success, otherwise an
-    explanation of the first failing precondition.
+    explanation of the first failing precondition. ``allow_empty`` is for
+    patch-zero capture, which still requires a valid artifact and manifest.
     """
-    if not patches:
+    if not patches and not allow_empty:
         return CachedPredicateSet(None, None, "no candidate patches")
     if not manifest.is_file():
         return CachedPredicateSet(None, None, "brpatches.json missing")

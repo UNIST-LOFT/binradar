@@ -103,6 +103,12 @@ SINGLE_PHASE_NAMES = ["probe", "fuzzolic", "directed", "fuzzer",
                       "binradar", "feedback", "final"]
 
 
+def _require_binradar_generation_phase(phase: BinRadarPhase) -> None:
+    if phase not in (BinRadarPhase.PROBE, BinRadarPhase.BINRADAR):
+        name = phase.name.lower().replace("_", "-")
+        raise ValueError(f"--generate-binradar does not support phase {name!r}")
+
+
 def _require_original_phase(phase: BinRadarPhase) -> None:
     if phase not in (BinRadarPhase.PROBE, BinRadarPhase.FUZZOLIC,
                      BinRadarPhase.DIRECTED, BinRadarPhase.FUZZER,
@@ -699,6 +705,7 @@ class BinRadarExecutor:
     symbolic_schedule: str
     concrete_input_schedule: str = binradar_config.CONCRETE_INPUT_SCHEDULE_DEFAULT
     generate_concrete: bool = False
+    generate_binradar: bool = False
     concrete_baseline = binradar_config.ConcreteBaseline.PATCHED
     # P4c C1 family portfolio and Python-owned complete-attempt budget.
     mutation_portfolio: str
@@ -745,6 +752,7 @@ class BinRadarExecutor:
         self.symbolic_schedule = config.symbolic_schedule
         self.concrete_input_schedule = config.concrete_input_schedule
         self.generate_concrete = config.generate_concrete
+        self.generate_binradar = config.generate_binradar
         self.concrete_baseline = config.concrete_baseline
         self.mutation_portfolio = config.mutation_portfolio
         self.representative_budget = config.representative_budget
@@ -1037,8 +1045,10 @@ class BinRadarExecutor:
         # environment uses, so a hanging baseline can never consume more
         # than one child's budget.
         identity_runner = self._identity_runner()
-        for path in (self.artifacts.original[:-len(".orig")] + suffix
-                     for suffix in (".brpatched", ".brcached")):
+        identity_paths = ([tracer_binary] if self.generate_binradar else [
+            self.artifacts.original[:-len(".orig")] + suffix
+            for suffix in (".brpatched", ".brcached")])
+        for path in identity_paths:
             if os.path.exists(path):
                 identity_runner.tracer_instruction_pairs(path)
         timeout = deadline.remaining(float(self.forkserver_child_timeout))
@@ -1061,6 +1071,7 @@ class BinRadarExecutor:
                 timeout=timeout,
                 phase_deadline=deadline.expires_at,
                 identity_runner=identity_runner,
+                **({"selected_only": True} if self.generate_binradar else {}),
             )
         except Exception as exc:
             logger.warning(
@@ -1138,9 +1149,9 @@ class BinRadarExecutor:
             logger.info("[PROBE] Multiple patch function hits found. Current implementation does not support this case.")
             sys.exit(1)
         self.probe_result = probe_result
-        # Run the tracer on .orig to obtain a normalized fault reference.
-        # It is used for BINRADAR analysis in FINAL; QASAN's concrete address
-        # remains a separate observation.
+        # Preserve the original tracer reference for artifact preflight
+        # diagnostics. BINRADAR uses its own committed unmutated baseline;
+        # QASAN's concrete address remains a separate observation.
         tracer_cmd = [paths.TRACER_BIN, self.artifacts.original] + shlex.split(
             self.test_cmd.replace("@@", self.resolved_poc_input()))
         tracer_env = os.environ.copy()
@@ -1501,11 +1512,16 @@ class BinRadarExecutor:
         return timed_out
 
     def run_binradar(self):
+        if self.generate_binradar and (
+                self.disable_binradar or not self.feedback_mode or self.filter_result):
+            raise ValueError("--generate-binradar requires enabled feedback and patch 0 only")
         if self.disable_binradar:
             logger.info("[BINRADAR] BinRadar phase disabled; skipping execution.")
             return
         testcase = self.resolved_poc_input()
-        artifact = self.artifacts.select_tracer(self.filter_result)
+        artifact = (self.artifacts.select_tracer(
+            self.filter_result, baseline_only=True) if self.generate_binradar
+            else self.artifacts.select_tracer(self.filter_result))
         self.check_requirements(binary=artifact.path)
         exec_mode = "binradar"
         logger.info(f"[BINRADAR] Running {exec_mode} in directory: {self.run_dir} with testcase: {testcase}")
@@ -1521,9 +1537,12 @@ class BinRadarExecutor:
         if self.feedback_mode:
             if os.path.exists(feedback_staging):
                 shutil.rmtree(feedback_staging)
+            context_options = ({"configuration_file": "generate-binradar.env"}
+                               if self.generate_binradar else {})
             write_mutation_context(
                 self.run_dir, workdir=self.workdir, artifact=tracer_binary,
-                candidates=self.filter_result, input_file=testcase)
+                candidates=self.filter_result, input_file=testcase,
+                **context_options)
         if artifact.cache_enabled:
             binradar_env["BINRADAR_PATCH_CACHE_ENABLE"] = "1"
             binradar_env["BINRADAR_PATCH_MANIFEST"] = str(
@@ -1531,23 +1550,6 @@ class BinRadarExecutor:
             if self.feedback_mode:
                 os.makedirs(feedback_staging)
                 binradar_env["BINRADAR_FEEDBACK_DIR"] = feedback_staging
-                reference = self.probe_result.tracer_fault_reference
-                reference_valid = (reference is not None and reference.valid)
-                binradar_env["BINRADAR_POC_FAULT_VALID"] = (
-                    "1" if reference_valid else "0")
-                binradar_env["BINRADAR_POC_FAULT_SOURCE"] = (
-                    reference.source if reference_valid else "unavailable")
-                binradar_env["BINRADAR_POC_FAULT_IMAGE_OFFSET"] = hex(
-                    reference.image_offset if reference_valid and reference.image_id is not None else 0)
-                if reference_valid and reference.image_id is not None:
-                    binradar_env["BINRADAR_POC_FAULT_IMAGE"] = reference.image_id
-                else:
-                    binradar_env.pop("BINRADAR_POC_FAULT_IMAGE", None)
-                if reference_valid:
-                    binradar_env["BINRADAR_POC_FAULT_ADDR"] = hex(
-                        reference.address)
-                else:
-                    binradar_env.pop("BINRADAR_POC_FAULT_ADDR", None)
         else:
             if self.feedback_mode:
                 logger.warning(
@@ -1588,6 +1590,7 @@ class BinRadarExecutor:
         queue_bins_row: Optional[Dict[str, str]] = None
         queue_bins_persisted = False
         mutation_diagnostics: List[Dict[str, object]] = []
+        mutation_reference = None
 
         def save_mutation_diagnostic(row: str) -> None:
             try:
@@ -1628,7 +1631,7 @@ class BinRadarExecutor:
                     attempt_id, protocol_result or "unknown")
             assert row is not None
             outcome = _classify_plan_attempt_outcome(
-                row, getattr(self.probe_result, "tracer_fault_reference", None)
+                row, mutation_reference
             ) if available else "unknown"
             rendered = _render_plan_attempt_progress(
                 row, outcome=outcome, diagnostic_available=available,
@@ -1709,6 +1712,8 @@ class BinRadarExecutor:
                             planned = 0
                         elif summary.attempt == 1:
                             planned = summary.remaining_plans
+                            mutation_reference = binradar_baseline.read_mutation_reference(
+                                os.path.join(self.run_dir, "binradar.br"))
                         elif summary.attempt > 1:
                             mutation_attempted += 1
                             if summary.attempt_result == \
@@ -1936,7 +1941,6 @@ class BinRadarExecutor:
                 original_binary=self.artifacts.original,
                 poc_source=self.resolved_poc_input(),
                 candidate_ids=tuple(self.filter_result),
-                poc_fault_reference=self.probe_result.tracer_fault_reference,
                 poc_concrete_fault_addr=self.probe_result.concrete_fault_addr,
                 poc_memcheck_policy=self.probe_result.memcheck_policy,
                 run_prefix=self.run_prefix,
@@ -1949,7 +1953,6 @@ class BinRadarExecutor:
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run final analysis.")
             raise RuntimeError("Probe result not found.")
-        skip_binradar = self.disable_binradar or self.binradar_failed
         binradar_results.write_final_result(
             binradar_results.FinalResultRequest(
                 run_dir=self.run_dir,
@@ -1957,9 +1960,6 @@ class BinRadarExecutor:
                 run_id=self.run_id,
                 candidates=self.filter_result,
                 probe_memcheck_policy=self.probe_result.memcheck_policy,
-                tracer_fault_reference=(
-                    None if skip_binradar
-                    else self.probe_result.tracer_fault_reference),
                 disable_binradar=self.disable_binradar,
                 binradar_failed=self.binradar_failed,
                 wall_time_reached=self.wall_time_reached,
@@ -1979,6 +1979,21 @@ class BinRadarExecutor:
             binradar_pipeline.Producer("directed", self.run_directed),
             binradar_pipeline.Producer("fuzzer", self.run_fuzzer),
         ]
+
+    def run_generate_binradar(self, run_prefix: str = "run") -> None:
+        """Capture program-state mutations of cached patch 0 only."""
+        if not self.generate_binradar:
+            raise ValueError("BinRadar generation requires generation configuration")
+        self.set_run_dir(run_prefix=run_prefix)
+        logger.set_file(os.path.join(self.run_dir, "binradar.log"))
+        self.write_run_settings("generate-binradar")
+        self.save_progress(
+            f"[generate-binradar] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self.run_probe()
+        self.run_binradar()
+        self.save_progress(
+            f"[generate-binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+        self.done()
 
     def run_generate_concrete(self, run_prefix: str = "run", *,
                               sequential: bool = False) -> None:
@@ -2070,6 +2085,8 @@ class BinRadarExecutor:
         self.done()
     
     def run_single_phase(self, run_prefix: str, run_id: str, phase: BinRadarPhase):
+        if self.generate_binradar:
+            _require_binradar_generation_phase(phase)
         if self.generate_concrete:
             _require_original_phase(phase)
         if run_id in ("n", "new"):
@@ -2083,7 +2100,8 @@ class BinRadarExecutor:
             os.makedirs(self.run_dir, exist_ok=True)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
         phase_name = phase.name.lower().replace("_", "-")
-        mode = "generate-concrete-" if self.generate_concrete else ""
+        mode = ("generate-binradar-" if self.generate_binradar else
+                "generate-concrete-" if self.generate_concrete else "")
         self.write_run_settings(f"{mode}single-phase-{phase_name}")
         if phase == BinRadarPhase.FINAL:
             probe_file = os.path.join(self.run_dir, "probe-results.sbsv")
@@ -2129,7 +2147,10 @@ class BinRadarExecutor:
         elif phase == BinRadarPhase.MINIMIZER_VERIFIER:
             self.run_minimizer_and_verifier()
         elif phase == BinRadarPhase.BINRADAR:
-            self._run_optional_phase("binradar", self.run_binradar)
+            if self.generate_binradar:
+                self.run_binradar()
+            else:
+                self._run_optional_phase("binradar", self.run_binradar)
         elif phase == BinRadarPhase.FINAL:
             self.run_final()
         elif phase == BinRadarPhase.FEEDBACK:
@@ -2204,10 +2225,15 @@ def main():
         help="prioritize directed candidates from the end of the forward trace (Z3 only); optionally pass true/false")
     parser.add_argument("--disable-binradar", action="store_true",
         help="disable the binradar phase")
-    parser.add_argument(
+    generation_modes = parser.add_mutually_exclusive_group()
+    generation_modes.add_argument(
         "--generate-concrete", action="store_true",
         help=("load generate-concrete.env and generate unique, patch-location-reaching "
               "inputs on .orig without patch verification; requires fifo"))
+    generation_modes.add_argument(
+        "--generate-binradar", action="store_true",
+        help=("load generate-binradar.env and capture cached patch-0 "
+              "program-state mutation feedback; runs PROBE then BINRADAR"))
     parser.add_argument(
         "--symbolic-mutation-mode", dest="symbolic_mutation_mode",
         choices=binradar_config.SYMBOLIC_MUTATION_MODES,
@@ -2291,6 +2317,17 @@ def main():
         parser.error(
             "--fuzzer-only cannot be combined with --run-single-phase or --seq")
 
+    if args.generate_binradar:
+        if args.fuzzer_only or args.disable_binradar:
+            parser.error("--generate-binradar cannot disable BINRADAR or use --fuzzer-only")
+        if args.run_single_phase:
+            try:
+                _require_binradar_generation_phase(phase_from_name(args.run_single_phase))
+            except ValueError as exc:
+                parser.error(str(exc))
+        elif args.run_id not in ("n", "new"):
+            parser.error("--generate-binradar requires --run-single-phase to reuse a run")
+
     if args.generate_concrete:
         if args.fuzzer_only:
             parser.error("--generate-concrete cannot be combined with --fuzzer-only")
@@ -2306,8 +2343,20 @@ def main():
     if not os.path.exists(workdir):
         sys.exit(f"ERROR: workdir {workdir} does not exist.")
 
-    env_name = "generate-concrete.env" if args.generate_concrete else "binradar.env"
+    env_name = ("generate-binradar.env" if args.generate_binradar else
+                "generate-concrete.env" if args.generate_concrete else "binradar.env")
     env = binradar_utils.load_env(os.path.join(workdir, env_name))
+    if args.generate_binradar:
+        patch_kind = env.get("BINRADAR_PATCH_KIND", "")
+        if not patch_kind:
+            parser.error("generate-binradar.env is missing BINRADAR_PATCH_KIND metadata")
+        if patch_kind not in ("generic-erm", "CWE805-erm"):
+            if not env.get("BINRADAR_GENERATION_PATCH_FORMAT", "").strip():
+                parser.error("generate-binradar.env is missing patch-format metadata")
+            return
+        if env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1":
+            parser.error("--generate-binradar requires the BINRADAR phase")
+    env["BINRADAR_GENERATE_BINRADAR"] = "1" if args.generate_binradar else "0"
     env["BINRADAR_GENERATE_CONCRETE"] = "1" if args.generate_concrete else "0"
     env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = \
         binradar_config.resolve_concrete_input_schedule(
@@ -2330,7 +2379,8 @@ def main():
     env["BINRADAR_DISABLE_BINRADAR"] = "1" if (
         args.disable_binradar or args.fuzzer_only or args.generate_concrete) else "0"
     env["BINRADAR_LESS_STRICT"] = "1" if args.less_strict else "0"
-    env["BINRADAR_FEEDBACK_MODE"] = "1" if args.feedback_mode else "0"
+    env["BINRADAR_FEEDBACK_MODE"] = "1" if (
+        args.generate_binradar or args.feedback_mode) else "0"
     # The advisor is independent of feedback: enabling one never enables the
     # other.  Precedence is CLI flag, then binradar.env, then the off default,
     # so a rollout can pin a subject in binradar.env without a flag and a flag
@@ -2390,7 +2440,10 @@ def main():
     if args.forkserver_child_timeout is not None:
         env["BINRADAR_FORKSERVER_CHILD_TIMEOUT_CAP"] = str(args.forkserver_child_timeout)
     env["BINRADAR_INVOCATION"] = shlex.join(sys.argv)
-    if args.generate_concrete:
+    if args.generate_binradar:
+        candidate_set = binradar_artifacts.CandidateSet(
+            "none", 0, 0, 0, "not-applicable", "patch-0 mutation feedback generation")
+    elif args.generate_concrete:
         candidate_set = binradar_artifacts.CandidateSet(
             "none", 0, 0, 0, "not-applicable", "original-only concrete generation")
     else:
@@ -2422,6 +2475,8 @@ def main():
     executor = BinRadarExecutor.from_env(workdir, env)
     if args.run_single_phase:
         executor.run_single_phase(args.run_prefix, args.run_id, phase_from_name(args.run_single_phase))
+    elif args.generate_binradar:
+        executor.run_generate_binradar(args.run_prefix)
     elif args.generate_concrete:
         executor.run_generate_concrete(args.run_prefix, sequential=args.seq)
     elif args.fuzzer_only:

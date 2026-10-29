@@ -318,6 +318,54 @@ def test_mutation_label_comes_from_baseline_and_write_sets_must_agree(tmp_path, 
     assert bundle.states(trace["key"])[0].branch == 1
 
 
+@pytest.mark.parametrize("artifact_fault", [0, 0x5678])
+def test_mutation_oracle_is_immutable_artifact_attempt_one_not_probe_or_later_baseline(tmp_path, artifact_fault):
+    from test_binradar_feedback import _pair
+    run = _CaptureRun(tmp_path)
+    # Concrete retains the original QASAN oracle while the selected artifact
+    # has a different (possibly zero) typed mutation reference.
+    run.case(0, outcome="crash")
+    run.trace(0, 1, observation="crash-pass")
+    _pair(run.run_dir, patch=0, branches=(0,), outcome="crash", fault=artifact_fault,
+          source="syscall-request", poc_source="provenance-access", poc_fault=artifact_fault)
+    _pair(run.run_dir, patch=1, branches=(1,), poc_source="provenance-access", poc_fault=artifact_fault)
+    _commits(run.run_dir, [
+        (2, [_group(0, 2, artifact_fault, [0], [0], source="syscall-request"),
+             _group(1, 1, 0, [1], [1])]),
+        (3, [_group(0, 2, 0x1234, [0], [0], source="guest-signal"),
+             _group(1, 1, 0, [1], [1])]),
+    ], baseline=_group(0, 2, artifact_fault, [], [0], source="provenance-access"))
+    result = run.export()
+    assert result.inputs["m2"]["label"] == "target-crash"
+    assert result.inputs["m3"]["label"] == "other-crash"
+    assert {(row["input"], row["bin"]) for row in result.observations} == {
+        ("c0", "crash-pass"), ("m2", "crash-pass"), ("m3", "ignored-other-fault")}
+    assert result.predicates[1]["mutation-counts"] == "0,1,0,0,0,0"
+    assert result.metadata["oracles"]["mutation_reference"] == {
+        "address": artifact_fault, "source": "provenance-access", "image": None, "offset": None}
+    assert result.metadata["oracles"]["concrete_reference"] == 0x1234
+
+
+@pytest.mark.parametrize("kind", ["normal", "legacy", "missing"])
+def test_unavailable_mutation_oracle_metadata_never_inherits_original_probe(tmp_path, kind):
+    run = _CaptureRun(tmp_path)
+    if kind != "missing":
+        _commits(run.run_dir, [(2, [
+            _group(0, 1, 0, [0], [0]),
+            _group(1, 2, 0x1234, [0], [1], source=None if kind == "legacy" else "guest-signal")])],
+            baseline=(_group(0, 1, 0, [], [0]) if kind == "normal"
+                      else _group(0, 2, 0x1234, [], [0])),
+            version=3 if kind == "legacy" else 4)
+    result = run.export()
+    assert result.metadata["oracles"]["mutation_reference"] is None
+    if kind == "normal":
+        assert result.inputs["m2"]["label"] == "normal"
+        assert result.observations[0]["bin"] == "unusable"
+        assert result.predicates[1]["mutation-counts"] == "0,0,0,0,0,0"
+    else:
+        assert result.inputs == {}
+
+
 def test_candidate_lookup_preserves_grouped_evidence_and_sparse_counter_boundaries(tmp_path):
     run = _CaptureRun(tmp_path, candidates=(1, 3, 4, 7, 8))
     run.case(0)

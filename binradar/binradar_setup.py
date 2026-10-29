@@ -136,12 +136,16 @@ def build_cached_binary(
     binradar_env: Dict[str, str],
     family: PredicateFamily,
     allocator: Optional[AllocatorTrace],
+    *,
+    persist_metadata: bool = True,
 ) -> "E9RuntimeMetadata":
     """Build the verifier's selected-predicate capture artifact.
 
     Generic ERM instruments only PATCH_LOC.  CWE-805 ERM uses the same
     allocator hooks and ordered multipoint specification as .brpatched.
     The selected predicate is provided per run through TAOSC_PRED.
+    Generation disables persistence to keep binradar.env untouched; its
+    caller publishes the returned metadata in generate-binradar.env instead.
     """
     if family not in (PredicateFamily.GENERIC_ERM,
                       PredicateFamily.CWE805_ERM):
@@ -152,10 +156,10 @@ def build_cached_binary(
     original_binary = ensure_original_binary(workdir, configdir, binradar_env)
     brcached = workdir / f"{binary}.brcached"
     metadata = workdir / f"{binary}.brcached.json"
-    if not (workdir / "brpatch.c").exists() \
-            or not (workdir / "brpatches.inc").exists():
-        raise RuntimeError("brpatch.c and brpatches.inc must be prepared "
-                           "before building .brcached")
+    # BINRADAR_EVAL_ONLY in brpatch-cached.c excludes the compiled
+    # candidate table: neutral capture requires no brpatches.inc.
+    if not (workdir / "brpatch.c").exists():
+        raise RuntimeError("brpatch.c must be prepared before building .brcached")
 
     shutil.copy(paths.BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
     destinations_file = workdir / "patch-destination"
@@ -210,7 +214,8 @@ def build_cached_binary(
 
     e9_metadata = extract_e9_runtime_metadata(
         brcached, metadata, original_binary, int(patch_loc, 0))
-    persist_e9_metadata(workdir, "brcached", e9_metadata)
+    if persist_metadata:
+        persist_e9_metadata(workdir, "brcached", e9_metadata)
     return e9_metadata
 
 
@@ -1588,6 +1593,110 @@ def create_binradar_env(configdir: Path, config_path: Path, workdir: Path) -> Di
     return env
 
 
+def _save_generation_env(env: Dict[str, str], output: Path) -> None:
+    """Publish a complete generation configuration, never a partial file."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                dir=output.parent, prefix=f".{output.stem}-", delete=False) as stream:
+            temporary = Path(stream.name)
+        save_env(env, temporary)
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _generation_metadata_file(configdir: Path, workdir: Path, name: str) -> Path:
+    path = workdir / name
+    if not path.exists():
+        path = configdir / name
+    if not path.is_file():
+        raise FileNotFoundError(f"{name} not found in {workdir} or {configdir}")
+    return path
+
+
+def _generate_binradar(configdir: Path, workdir: Path) -> None:
+    """Prepare neutral ERM capture without loading or synthesizing predicates."""
+    configdir = configdir.resolve()
+    workdir = workdir.resolve()
+    format_file = _generation_metadata_file(configdir, workdir, "patch-format")
+    patch_format = read_patch_format(format_file.parent)
+    if patch_format is None:
+        raise ValueError(f"patch-format is empty in {format_file}")
+    families = {"ERM generic": PredicateFamily.GENERIC_ERM,
+                "ERM CWE-805": PredicateFamily.CWE805_ERM}
+    family = families.get(patch_format)
+    output = workdir / "generate-binradar.env"
+    if family is None:
+        workdir.mkdir(parents=True, exist_ok=True)
+        _save_generation_env({
+            "BINRADAR_GENERATE_BINRADAR": "1",
+            "BINRADAR_PATCH_KIND": "unsupported",
+            "TOTAL_PATCHES": "0",
+            "BINRADAR_GENERATION_PATCH_FORMAT": patch_format,
+        }, output)
+        return
+
+    # config.env supplies settings, never a previous artifact's generated
+    # counts, E9 map, selected family, or generation schedule.
+    env = load_env(configdir / "config.env")
+    for key in tuple(env):
+        if (key.startswith(("BRPATCHED_", "BRCACHED_", "BRCACHE_", "PREFILTER_",
+                            "BINRADAR_GENERATE_", "BINRADAR_GENERATION_"))
+                or key in {"E9_EXCLUDE_RANGES", "E9_RELOCATED_CALL_JUMPS",
+                           "PATCH_LOC", "PATCH_TYPE", "BINRADAR_PATCH_KIND",
+                           "TOTAL_PATCHES", "TAOSC_TOTAL_PATCHES",
+                           "FILTER_TOTAL_PATCHES", "BINRADAR_CONCRETE_INPUT_SCHEDULE"}):
+            env.pop(key)
+    location = _generation_metadata_file(configdir, workdir, "patch-location")
+    destination = next((directory / name
+                        for directory in (workdir, configdir)
+                        for name in ("patch-destination", "destinations")
+                        if (directory / name).is_file()), None)
+    if destination is None or not destination.read_text().strip():
+        raise ValueError("patch-destination (or destinations) is required for --generate-binradar")
+    allocator = None
+    stack_size = 0
+    if family == PredicateFamily.CWE805_ERM:
+        trace = workdir / "trace"
+        if not trace.exists():
+            trace = configdir / "trace"
+        allocator = parse_allocator_trace(trace)
+        if allocator is None:
+            raise ValueError(f"ERM CWE-805 requires a complete allocator trace in {trace}")
+        stack_file = _generation_metadata_file(configdir, workdir, "stack-size")
+        try:
+            stack_size = int(stack_file.read_text().strip(), 0)
+        except ValueError as exc:
+            raise ValueError(f"invalid stack-size in {stack_file}: expected 0..1048576") from exc
+        if not 0 <= stack_size <= 0x100000:
+            raise ValueError(f"invalid stack-size in {stack_file}: expected 0..1048576")
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    _prepare_original_settings(configdir, workdir, env, location)
+    original = ensure_original_binary(workdir, configdir, env)
+    if not original.is_file():
+        raise FileNotFoundError(f"original binary not found: {original}")
+    cached_destination = workdir / "patch-destination"
+    if destination != cached_destination:
+        shutil.copy2(destination, cached_destination)
+    shutil.copy(paths.BRPATCH_SOURCE, workdir / "brpatch.c")
+    metadata = build_cached_binary(
+        workdir, configdir, env, family, allocator, persist_metadata=False)
+    write_runtime_predicates(workdir / "brpatches.json", family, [])
+    binradar_utils.set_e9_metadata(
+        env, "brcached", metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    env.update({
+        "BINRADAR_GENERATE_BINRADAR": "1", "BINRADAR_GENERATE_CONCRETE": "0",
+        "BINRADAR_FEEDBACK_MODE": "1", "BINRADAR_PATCH_KIND": family.value,
+        "TOTAL_PATCHES": "0", "BRPATCHED_TOTAL_PATCHES": "0",
+        "FILTER_TOTAL_PATCHES": "0", "BRCACHE_STACK_SIZE": str(stack_size),
+    })
+    _save_generation_env(env, output)
+    print(f"cached generation environment saved to {output}")
+
+
 def _generate_concrete(configdir: Path, workdir: Path) -> None:
     """Prepare only original execution inputs; never invoke patch setup."""
     configdir = configdir.resolve()
@@ -1612,16 +1721,7 @@ def _generate_concrete(configdir: Path, workdir: Path) -> None:
     env["BINRADAR_GENERATE_CONCRETE"] = "1"
     env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = schedule
     output = workdir / "generate-concrete.env"
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-                dir=workdir, prefix=".generate-concrete-", delete=False) as stream:
-            temporary = Path(stream.name)
-        save_env(env, temporary)
-        os.replace(temporary, output)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _save_generation_env(env, output)
     print(f"original execution environment saved to {output}")
 
 
@@ -1902,8 +2002,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="binradar-setup: prepare original-only execution inputs or "
                     "build and filter patched artifacts")
-    parser.add_argument("--generate-concrete", action="store_true",
-                        help="prepare generate-concrete.env for original execution only")
+    generation = parser.add_mutually_exclusive_group()
+    generation.add_argument("--generate-concrete", action="store_true",
+                            help="prepare generate-concrete.env for original execution only")
+    generation.add_argument("--generate-binradar", action="store_true",
+                            help="prepare generate-binradar.env and a neutral ERM cache")
     parser.add_argument("-c", "--configdir", type=Path, default=Path.cwd(),
                         help="Config directory (default: current directory)")
     parser.add_argument("-w", "--workdir", type=Path,
@@ -1922,17 +2025,19 @@ def main():
                               help="Working directory (default: ./workdir)")
 
     args = parser.parse_args()
-    if args.generate_concrete:
+    if args.generate_concrete or args.generate_binradar:
+        mode = "--generate-binradar" if args.generate_binradar else "--generate-concrete"
         if args.command is not None:
-            parser.error("--generate-concrete cannot be combined with setup")
+            parser.error(f"{mode} cannot be combined with setup")
         try:
-            _generate_concrete(args.configdir, args.workdir)
+            prepare = _generate_binradar if args.generate_binradar else _generate_concrete
+            prepare(args.configdir, args.workdir)
         except (OSError, ValueError, RuntimeError) as exc:
             parser.exit(1, f"Error: {exc}\n")
     elif args.command == "setup":
         cmd_setup(args.configdir, args.workdir)
     else:
-        parser.error("choose setup or --generate-concrete")
+        parser.error("choose setup, --generate-concrete, or --generate-binradar")
 
 
 if __name__ == "__main__":

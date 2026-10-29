@@ -348,6 +348,42 @@ def test_real_forkserver_starts_before_first_entrypoint_body(
         executor.stop()
 
 
+@pytest.mark.parametrize("family", ["generic-erm", "CWE805-erm"])
+def test_real_empty_manifest_executes_patch_zero(tmp_path, reentered_guest, family):
+    """An empty candidate list still needs selector space for neutral p0."""
+    guest, entrypoint = reentered_guest
+    manifest = tmp_path / "brpatches.json"
+    manifest.write_text(
+        '{"version":1,"kind":"' + family + '","predicates":[]}', encoding="ascii")
+    marker = tmp_path / "visits"
+    env = {
+        "PATH": os.environ["PATH"],
+        "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1",
+        "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "5",
+        "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_TRACE_FILE": "none",
+        "BINRADAR_TRACER_LOG_FILE": str(tmp_path / "tracer.log"),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+        "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+        "BINRADAR_PATCH_CNT": "0",
+        "BINRADAR_PATCH_CACHE_ENABLE": "1",
+        "BINRADAR_PATCH_MANIFEST": str(manifest),
+        "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+        "BRCACHE_STACK_SIZE": "0",
+    }
+    with binradar_runtime.PhaseSession("binradar", 10) as session:
+        session.shared_memory(env, include_patch_key=True)
+        executor = session.start_tracer(
+            mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
+            binary=str(guest), test_cmd=str(marker), testcase="/dev/null")
+        summary = executor.run()
+        assert marker.read_bytes() == b"\x01\x02\x03"
+        assert summary.attempt == 1 and summary.representative_runs == 1
+        assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+
+
 @pytest.fixture
 def fake_script(tmp_path):
     path = tmp_path / "fake_forkserver.py"

@@ -196,6 +196,43 @@ def test_cwe805_coverage_requires_only_the_used_stack_bytes(
     assert (coverage.reason == "") if expected else bool(coverage.reason)
 
 
+@pytest.mark.parametrize("kind,stack_size", [("generic-erm", 0), ("CWE805-erm", 64)])
+def test_baseline_capture_accepts_empty_manifest(tmp_path, kind, stack_size):
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin", kind, stack_size, 0)
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, [], kind=kind)
+
+    selected = artifacts.select_tracer([], baseline_only=True)
+    assert selected.path == str(tmp_path / "bin.brcached")
+    assert selected.cache_enabled
+    # Empty verification is not implicitly converted to feedback capture.
+    assert artifacts.select_tracer([]).path == str(tmp_path / "bin.brpatched")
+
+
+@pytest.mark.parametrize("invalid", ["binary", "manifest", "family", "stack"])
+def test_baseline_capture_never_falls_back_to_brpatched(tmp_path, invalid):
+    (tmp_path / "bin.brpatched").write_bytes(b"patched")
+    if invalid != "binary":
+        (tmp_path / "bin.brcached").write_bytes(b"cached")
+    if invalid != "manifest":
+        _write_manifest(tmp_path, [], kind="CWE805-erm")
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin",
+        "generic-erm" if invalid == "family" else "CWE805-erm",
+        -1 if invalid == "stack" else 0, 0)
+
+    with pytest.raises(binradar_artifacts.ArtifactUnavailableError):
+        artifacts.select_tracer([], baseline_only=True)
+
+
+def test_baseline_capture_rejects_candidate_execution(tmp_path):
+    artifacts = binradar_artifacts.ArtifactSet(
+        str(tmp_path), "bin", "generic-erm", 0, 1)
+    with pytest.raises(ValueError, match="cannot execute candidate"):
+        artifacts.select_tracer([1], baseline_only=True)
+
+
 def test_artifact_selection_prefers_brcached_for_a_cached_only_survivor(
         tmp_path):
     """A lone survivor past the compile cap can only run on .brcached."""

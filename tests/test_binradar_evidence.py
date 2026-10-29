@@ -7,7 +7,6 @@ import sys
 import threading
 import zlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -57,12 +56,18 @@ def _group(representative: int, outcome: int, fault_addr: int,
 
 
 def _write_binradar(path: Path, *, truncated_tail: bool = False,
-                    version: int = 2, attempts=(1, 2)) -> None:
+                    version: int = 2, attempts=(1, 2),
+                    original_outcome: int = 1) -> None:
+    source = "guest-signal" if version == 4 else None
     baseline = (struct.pack("<II", attempts[0], 1)
-                + _group(0, 1, 0, [0], [0]))
+                + _group(0, 2 if version == 4 else 1,
+                         0x1234 if version == 4 else 0, [0], [0], source=source))
     payload = (struct.pack("<II", attempts[1], 2)
-               + _group(0, 1, 0, [0, 1, 2, 1], [0])
-               + _group(2, 2, 0x1234, [2, 0], [1, 2, 300]))
+               + _group(0, original_outcome,
+                        0x1234 if original_outcome == 2 else 0,
+                        [0, 1, 2, 1], [0],
+                        source=source if original_outcome == 2 else None)
+               + _group(2, 2, 0x1234, [2, 0], [1, 2, 300], source=source))
     data = (struct.pack("<8sHHI", b"BRDATAB1", version, 3, 0)
             + _frame(4, baseline) + _frame(4, payload))
     if truncated_tail:
@@ -133,9 +138,11 @@ def test_binradar_v2_accepts_gaps_but_rejects_bad_ids(tmp_path):
         binradar_evidence.EvidenceKind.BINRADAR
 
 
+@pytest.mark.parametrize("original_outcome", [1, 2])
 @pytest.mark.parametrize("policy", ["coverage-v2", "coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
-def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
-    _write_binradar(tmp_path / "binradar.br")
+def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy, original_outcome):
+    _write_binradar(tmp_path / "binradar.br", version=4,
+                    original_outcome=original_outcome)
     binradar_evidence.write_verifier(
         tmp_path / "verifier.br",
         [binradar_evidence.VerifierPatchResult(
@@ -148,10 +155,12 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
     executor.run_prefix = "run"
     executor.run_id = 0
     executor.filter_result = [1, 2, 300]
-    executor.probe_result = SimpleNamespace(
-        memcheck_policy=policy,
-        tracer_fault_reference=binradar_verifier.TracerFaultReference(
-            address=0x1234, source="guest-signal"))
+    saved_probe = binradar_verifier.BinRadarProbeResult(
+        0, 0, [], "crash", 1, 1, 0, [],
+        binradar_verifier.TracerFaultReference(0xDEAD, "guest-signal"), policy)
+    probe_row = "[probe-info] " + saved_probe.serialize()
+    (tmp_path / "probe-results.sbsv").write_text(probe_row + "\n")
+    executor.probe_result = binradar_verifier.BinRadarProbeResult.deserialize(probe_row)
     executor.disable_binradar = False
     executor.binradar_failed = False
     executor.wall_time_reached = False
@@ -159,18 +168,13 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
     executor.phase_failure_lock = threading.Lock()
     executor.save_progress = lambda _row: None
 
-    if policy in ("coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY):
-        with pytest.raises(ValueError, match="canonical BINRADAR v4"):
-            executor.run_final()
-        assert not (tmp_path / "final.sbsv").exists()
-        return
     executor.run_final()
 
     final = (tmp_path / "final.sbsv").read_text()
     assert "[verifier verifier.br] [evidence binradar.br]" in final
     for patch in (1, 2, 300):
         assert (f"[final] [binradar] [patch {patch}] [res rejected] "
-                f"[reason introduced-crash] [iter 2]") in final
+                f"[reason {'same-crash' if original_outcome == 2 else 'introduced-crash'}] [iter 2]") in final
 
 
 @pytest.mark.parametrize("source,address,hard_rejection", [
@@ -185,16 +189,17 @@ def test_final_analysis_consumes_compact_equivalence_groups(tmp_path, policy):
 def test_final_requires_valid_fault_identity(tmp_path, source, address,
                                              hard_rejection, original_outcome,
                                              reason):
-    reference = (None if source is None else
-                 binradar_verifier.TracerFaultReference(address, source))
+    typed_source = source if hard_rejection else None
+    version = 4 if hard_rejection else 2
     # Baseline, one crash-classification transition, then confidence evidence.
     frames = [struct.pack("<II", 1, 1)
-              + _group(0, 2, address, [0], [0])]
+              + _group(0, 2, address, [0], [0], source=typed_source)]
     frames.append(
         struct.pack("<II", 2, 4)
-        + _group(0, original_outcome, address, [0], [0])
-        + _group(1, 2, address, [1], [1])
-        + _group(2, 2, address + 1, [1], [2])
+        + _group(0, original_outcome, address, [0], [0],
+                 source=typed_source if original_outcome == 2 else None)
+        + _group(1, 2, address, [1], [1], source=typed_source)
+        + _group(2, 2, address + 1, [1], [2], source=typed_source)
         + _group(3, 1, 0, [0], [3, 4]))
     frames.append(
         struct.pack("<II", 3, 3)
@@ -202,7 +207,7 @@ def test_final_requires_valid_fault_identity(tmp_path, source, address,
         + _group(1, 1, 0, [1], [1, 3])
         + _group(4, 1, 0, [0], [4]))
     (tmp_path / "binradar.br").write_bytes(
-        struct.pack("<8sHHI", b"BRDATAB1", 1, 3, 0)
+        struct.pack("<8sHHI", b"BRDATAB1", version, 3, 0)
         + b"".join(_frame(4, payload) for payload in frames))
     binradar_evidence.write_verifier(
         tmp_path / "verifier.br",
@@ -213,7 +218,7 @@ def test_final_requires_valid_fault_identity(tmp_path, source, address,
     binradar_results.write_final_result(binradar_results.FinalResultRequest(
         run_dir=str(tmp_path), run_prefix="regression", run_id=0,
         probe_memcheck_policy="coverage-v1",
-        candidates=[1, 2, 3, 4], tracer_fault_reference=reference,
+        candidates=[1, 2, 3, 4],
         disable_binradar=False, binradar_failed=False, wall_time_reached=False,
         failed_phases=[], save_progress=lambda _: None,
         record_wall_time_reached=lambda: None))
@@ -237,18 +242,18 @@ def test_final_requires_valid_fault_identity(tmp_path, source, address,
 
 def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
     frames = [
-        struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0]),
+        struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0], source="guest-signal"),
         struct.pack("<II", 2, 2)
         + _group(0, 1, 0, None, [0])
         + _group(1, 1, 0, [0], [1, 2, 3]),
         struct.pack("<II", 4, 4)
         + _group(0, 1, 0, [0], [0])
-        + _group(1, 2, 0x1234, [1], [1])
-        + _group(2, 2, 0x1234, [1], [2])
+        + _group(1, 2, 0x1234, [1], [1], source="guest-signal")
+        + _group(2, 2, 0x1234, [1], [2], source="guest-signal")
         + _group(3, 1, 0, [1], [3]),
     ]
     (tmp_path / "binradar.br").write_bytes(
-        struct.pack("<8sHHI", b"BRDATAB1", 2, 3, 0)
+        struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0)
         + b"".join(_frame(4, frame) for frame in frames))
     binradar_evidence.write_verifier(
         tmp_path / "verifier.br",
@@ -268,8 +273,6 @@ def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
         probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 3],
-        tracer_fault_reference=binradar_verifier.TracerFaultReference(
-            0x1234, "guest-signal"),
         disable_binradar=False, binradar_failed=False,
         wall_time_reached=False, failed_phases=[],
         save_progress=lambda _: None, record_wall_time_reached=lambda: None))
@@ -289,8 +292,6 @@ def test_final_reports_overlap_null_baseline_and_partial_queue(tmp_path):
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
         probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 3],
-        tracer_fault_reference=binradar_verifier.TracerFaultReference(
-            0x1234, "guest-signal"),
         disable_binradar=False, binradar_failed=False,
         wall_time_reached=False, failed_phases=[],
         save_progress=lambda _: None, record_wall_time_reached=lambda: None))
@@ -313,8 +314,6 @@ def test_exhausted_queue_with_full_evidence_is_complete(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
         probe_memcheck_policy="coverage-v4",
         candidates=[1, 2, 300],
-        tracer_fault_reference=binradar_verifier.TracerFaultReference(
-            0x1234, "guest-signal"),
         disable_binradar=False, binradar_failed=False,
         wall_time_reached=other_phase_cutoff, failed_phases=[],
         save_progress=lambda _: None, record_wall_time_reached=lambda: None)
@@ -382,17 +381,17 @@ def test_converter_renders_each_evidence_kind_and_filters_patch(tmp_path):
 
 
 def _write_binradar_frames(path: Path, *, frames=()) -> None:
-    """Write v2 BINRADAR evidence from caller-built frame payloads."""
-    data = (struct.pack("<8sHHI", b"BRDATAB1", 2, 3, 0)
+    """Write v4 BINRADAR evidence from caller-built frame payloads."""
+    data = (struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0)
             + b"".join(_frame(4, frame) for frame in frames))
     path.write_bytes(data)
 
 
-def _final_request(run_dir: Path, candidates, reference):
+def _final_request(run_dir: Path, candidates):
     return binradar_results.FinalResultRequest(
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
         probe_memcheck_policy="coverage-v4",
-        candidates=list(candidates), tracer_fault_reference=reference,
+        candidates=list(candidates),
         disable_binradar=False, binradar_failed=False,
         wall_time_reached=False, failed_phases=[],
         save_progress=lambda _: None, record_wall_time_reached=lambda: None)
@@ -411,10 +410,11 @@ def test_final_classifies_original_crash_by_reference_validity(
     `other` would silently turn a missing identity into a real comparison.
     """
     frames = [
-        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 1, 1) + (_group(0, 2, 0x1234, [0], [0], source="guest-signal")
+           if reference else _group(0, 1, 0, [0], [0])),
         struct.pack("<II", 2, 2)
-        + _group(0, 2, 0x9999, [0], [0])
-        + _group(1, 2, 0x9999, [1], [1]),
+        + _group(0, 2, 0x9999, [0], [0], source="guest-signal")
+        + _group(1, 2, 0x9999, [1], [1], source="guest-signal"),
     ]
     _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
     binradar_evidence.write_verifier(
@@ -423,7 +423,7 @@ def test_final_classifies_original_crash_by_reference_validity(
             patch=1, verified=True, accept_evidences=0, total_evidences=0,
             observations={})])
     binradar_results.write_final_result(
-        _final_request(tmp_path, [1], reference))
+        _final_request(tmp_path, [1]))
     report = (tmp_path / "final.sbsv").read_text()
     assert expected in report
     # Neither form may hard-reject: the addresses differ from the POC.
@@ -457,8 +457,6 @@ def test_final_reports_unavailable_coverage(tmp_path, disable,
         run_dir=str(run_dir), run_prefix="trial", run_id=0,
         probe_memcheck_policy="coverage-v4",
         candidates=[1],
-        tracer_fault_reference=binradar_verifier.TracerFaultReference(
-            0x1234, "guest-signal"),
         disable_binradar=disable, binradar_failed=binradar_failed,
         wall_time_reached=False, failed_phases=[],
         save_progress=lambda _: None, record_wall_time_reached=lambda: None)
@@ -476,9 +474,7 @@ def test_final_reports_singleton_subject_kind(tmp_path):
         [binradar_evidence.VerifierPatchResult(
             patch=7, verified=True, accept_evidences=0, total_evidences=0,
             observations={})])
-    binradar_results.write_final_result(_final_request(
-        tmp_path, [7],
-        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(tmp_path, [7]))
     report = (tmp_path / "final.sbsv").read_text()
     assert "[subject-kind singleton]" in report
     assert "[subject-kind multi]" not in report
@@ -519,9 +515,7 @@ def test_final_rejects_incomplete_candidate_coverage(tmp_path):
             patch=patch, verified=True, accept_evidences=0, total_evidences=0,
             observations={}) for patch in (1, 2, 3)])
     with pytest.raises(ValueError, match="coverage mismatch"):
-        binradar_results.write_final_result(_final_request(
-            tmp_path, [1, 2, 3],
-            binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+        binradar_results.write_final_result(_final_request(tmp_path, [1, 2, 3]))
 
 
 def test_final_publishes_exact_rejection_id_sets(tmp_path):
@@ -532,12 +526,12 @@ def test_final_publishes_exact_rejection_id_sets(tmp_path):
     the coverage row's scalar counts must agree with the emitted IDs.
     """
     frames = [
-        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0], source="guest-signal"),
         struct.pack("<II", 2, 5)
-        + _group(0, 2, 0x1234, [0], [0])
-        + _group(1, 2, 0x1234, [1], [1])
+        + _group(0, 2, 0x1234, [0], [0], source="guest-signal")
+        + _group(1, 2, 0x1234, [1], [1], source="guest-signal")
         + _group(2, 1, 0, [1], [2])
-        + _group(3, 2, 0x1234, [1], [3])
+        + _group(3, 2, 0x1234, [1], [3], source="guest-signal")
         + _group(4, 1, 0, [1], [4]),
     ]
     _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
@@ -549,9 +543,7 @@ def test_final_publishes_exact_rejection_id_sets(tmp_path):
             patch=patch, verified=patch not in (3, 4), accept_evidences=0,
             total_evidences=0, observations={})
          for patch in (1, 2, 3, 4)])
-    binradar_results.write_final_result(_final_request(
-        tmp_path, [1, 2, 3, 4],
-        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(tmp_path, [1, 2, 3, 4]))
     report = (tmp_path / "final.sbsv").read_text()
     assert ("[final] [rejection-sets] [standalone 1,3] [overlap 3] "
             "[incremental 1] [final-survivors 2] "
@@ -566,11 +558,11 @@ def test_capacity_coverage_never_fabricates_candidate_verification(tmp_path, pri
     run_dir.mkdir()
     frames = []
     if prior != "none":
-        frames.append(struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]))
+        frames.append(struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0], source="guest-signal"))
     if prior == "rejection":
         frames.append(struct.pack("<II", 2, 2)
-            + _group(0, 2, 0x1234, [0], [0])
-            + _group(1, 2, 0x1234, [1], [1]))
+            + _group(0, 2, 0x1234, [0], [0], source="guest-signal")
+            + _group(1, 2, 0x1234, [1], [1], source="guest-signal"))
     _write_binradar_frames(run_dir / "binradar.br", frames=frames)
     binradar_evidence.write_verifier(run_dir / "verifier.br", [
         binradar_evidence.VerifierPatchResult(
@@ -579,8 +571,7 @@ def test_capacity_coverage_never_fabricates_candidate_verification(tmp_path, pri
     (tmp_path / "progress.sbsv").write_text(
         "[binradar] [stop] [prefix trial] [id 0] [reason capacity] "
         "[collection-complete false] [collection-reason query-capacity]\n")
-    binradar_results.write_final_result(_final_request(
-        run_dir, [1], binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(run_dir, [1]))
     report = (run_dir / "final.sbsv").read_text()
     assert "[verifier] [patch 1] [res verified]" in report
     assert "[binradar] [patch 1] [res verified]" not in report
@@ -598,10 +589,10 @@ def test_rejection_set_serialization_is_bounded(tmp_path, monkeypatch):
     """A set past the cap is shortened only in its serialization."""
     monkeypatch.setattr(binradar_results, "REJECTION_ID_LIMIT", 2)
     frames = [
-        struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0]),
+        struct.pack("<II", 1, 1) + _group(0, 2, 0x1234, [0], [0], source="guest-signal"),
         struct.pack("<II", 2, 2)
-        + _group(0, 2, 0x1234, [0], [0])
-        + _group(5, 2, 0x1234, [1], [1, 2, 3, 4, 5]),
+        + _group(0, 2, 0x1234, [0], [0], source="guest-signal")
+        + _group(5, 2, 0x1234, [1], [1, 2, 3, 4, 5], source="guest-signal"),
     ]
     _write_binradar_frames(tmp_path / "binradar.br", frames=frames)
     binradar_evidence.write_verifier(
@@ -609,9 +600,7 @@ def test_rejection_set_serialization_is_bounded(tmp_path, monkeypatch):
         [binradar_evidence.VerifierPatchResult(
             patch=patch, verified=True, accept_evidences=0, total_evidences=0,
             observations={}) for patch in (1, 2, 3, 4, 5)])
-    binradar_results.write_final_result(_final_request(
-        tmp_path, [1, 2, 3, 4, 5],
-        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(tmp_path, [1, 2, 3, 4, 5]))
     report = (tmp_path / "final.sbsv").read_text()
     # The exact count survives in the coverage row; the ID row is marked.
     assert "[standalone-rejected 5]" in report
@@ -650,9 +639,7 @@ def test_discarded_attempt_never_reports_complete_coverage(tmp_path, reason,
         "[planned 2] [attempted 3] [mutation-attempted 2] "
         "[mutation-discarded 1] [mutation-committed 1] "
         "[mutation-pending 0] [queued 0]\n")
-    binradar_results.write_final_result(_final_request(
-        tmp_path, [1],
-        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(tmp_path, [1]))
     report = (tmp_path / "final.sbsv").read_text()
     assert f"[binradar-coverage {expected}]" in report
     assert "[binradar-coverage complete]" not in report
@@ -695,9 +682,7 @@ def test_representative_budget_cutoff_is_never_complete_coverage(tmp_path,
         "[planned 1] [attempted 2] [mutation-attempted 1] "
         "[mutation-discarded 0] [mutation-committed 1] "
         "[mutation-pending 0] [queued 0]\n")
-    binradar_results.write_final_result(_final_request(
-        run_dir, [1],
-        binradar_verifier.TracerFaultReference(0x1234, "guest-signal")))
+    binradar_results.write_final_result(_final_request(run_dir, [1]))
     report = (run_dir / "final.sbsv").read_text()
     assert f"[binradar-coverage {expected}]" in report
     assert "[binradar-coverage complete]" not in report
@@ -709,12 +694,11 @@ def test_source_bearing_policy_never_uses_text_as_canonical(tmp_path, policy, re
     import dataclasses
     (tmp_path / "binradar-tracer-msg.log").write_text(
         "[binradar] [crash] [iter 1] [patch 0] [guest_pc 0] [guest_cs_base 0] "
-        "[fault_addr 0] [host_fault_addr 0] [source syscall-request] "
+        f"[fault_addr 0] [host_fault_addr 0] [source {reference_source}] "
         "[image none] [image-offset 0]\n[binradar] [commit] [iter 1] [patch 0] [br 0]\n")
     binradar_evidence.write_verifier(tmp_path / "verifier.br", [
         binradar_evidence.VerifierPatchResult(1, True, 0, 0, {})])
-    request = dataclasses.replace(_final_request(tmp_path, [1],
-        binradar_verifier.TracerFaultReference(0, reference_source)),
+    request = dataclasses.replace(_final_request(tmp_path, [1]),
         probe_memcheck_policy=policy)
     with pytest.raises(ValueError, match="canonical BINRADAR v4"):
         binradar_results.write_final_result(request)
@@ -763,25 +747,23 @@ def test_source_bearing_policy_rejects_source_less_canonical_evidence(tmp_path, 
     binradar_evidence.write_verifier(tmp_path / "verifier.br", [
         binradar_evidence.VerifierPatchResult(patch, True, 0, 0, {})
         for patch in (1, 2, 300)])
-    reference = binradar_verifier.TracerFaultReference(0x1234, "guest-signal")
-    request = dataclasses.replace(_final_request(tmp_path, [1, 2, 300], reference),
+    request = dataclasses.replace(_final_request(tmp_path, [1, 2, 300]),
                                   probe_memcheck_policy=policy)
     with pytest.raises(ValueError, match="canonical BINRADAR v4"):
         binradar_results.write_final_result(request)
     assert not (tmp_path / "final.sbsv").exists()
-    request = dataclasses.replace(request, probe_memcheck_policy="coverage-v4",
-                                  tracer_fault_reference=binradar_verifier.TracerFaultReference(
-                                      0x1234, "syscall-request"))
-    with pytest.raises(ValueError, match="syscall-request FINAL"):
-        binradar_results.write_final_result(request)
-
+    historical = dataclasses.replace(request, probe_memcheck_policy="coverage-v4")
+    binradar_results.write_final_result(historical)
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[fault-reference-valid false]" in report
+    assert "[reason introduced-crash]" not in report
 
 @pytest.mark.parametrize("reference_source", ["guest-signal", "provenance-access", "syscall-request"])
-@pytest.mark.parametrize("policy", ["coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
+@pytest.mark.parametrize("policy", ["coverage-v4", "coverage-v5", "coverage-v6", binradar_verifier.MEMCHECK_POLICY])
 def test_source_bearing_final_site_equality_remains_source_independent(tmp_path, reference_source, policy):
     import dataclasses
     frames = [struct.pack("<II", 1, 1) + _group(
-        0, 2, 0, [0], [0], source="syscall-request"),
+        0, 2, 0, [0], [0], source=reference_source),
         struct.pack("<II", 2, 2)
         + _group(0, 2, 0, [0], [0], source="provenance-access")
         + _group(1, 2, 0, [1], [1], source="guest-signal")]
@@ -789,10 +771,77 @@ def test_source_bearing_final_site_equality_remains_source_independent(tmp_path,
         binradar_evidence.MAGIC, 4, 3, 0) + b"".join(_frame(4, frame) for frame in frames))
     binradar_evidence.write_verifier(tmp_path / "verifier.br", [
         binradar_evidence.VerifierPatchResult(1, True, 0, 0, {})])
-    request = dataclasses.replace(_final_request(tmp_path, [1],
-        binradar_verifier.TracerFaultReference(0, reference_source)),
+    request = dataclasses.replace(_final_request(tmp_path, [1]),
         probe_memcheck_policy=policy)
+    if policy == "coverage-v4" and reference_source == "syscall-request":
+        with pytest.raises(ValueError):
+            binradar_results.write_final_result(request)
+        assert not (tmp_path / "final.sbsv").exists()
+        return
     binradar_results.write_final_result(request)
     report = (tmp_path / "final.sbsv").read_text()
     assert "[reason same-crash]" in report
     assert f"[source {reference_source}]" in report
+
+
+@pytest.mark.parametrize("baseline_kind", ["normal", "legacy", "no-hit"])
+def test_final_never_promotes_later_patch_zero_to_oracle(tmp_path, baseline_kind):
+    version = 2 if baseline_kind == "legacy" else 4
+    source = None if version == 2 else "guest-signal"
+    baseline = _group(0, 1, 0, [0], [0])
+    if baseline_kind == "legacy":
+        baseline = _group(0, 2, 0x9999, [0], [0])
+    elif baseline_kind == "no-hit":
+        baseline = _group(0, 2, 0x1234, None, [0], source=source)
+    frames = [struct.pack("<II", 1, 1) + baseline,
+              struct.pack("<II", 2, 2)
+              + _group(0, 2, 0x9999, [0], [0], source=source)
+              + _group(1, 2, 0x9999, [1], [1], source=source),
+              struct.pack("<II", 3, 2)
+              + _group(0, 1, 0, [0], [0])
+              + _group(1, 2, 0x9999, [1], [1], source=source)]
+    (tmp_path / "binradar.br").write_bytes(
+        binradar_evidence.HEADER_STRUCT.pack(binradar_evidence.MAGIC, version, 3, 0)
+        + b"".join(_frame(4, frame) for frame in frames))
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(1, True, 1, 1, {})])
+    binradar_results.write_final_result(_final_request(tmp_path, [1]))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[reason same-crash]" not in report
+    assert "[reason introduced-crash]" not in report
+    assert "[verifier] [patch 1] [res verified]" in report
+    assert "[score 1.000000] [accept-evidences 1] [total-evidences 1]" in report
+    assert f"[fault-reference-valid {str(baseline_kind == 'no-hit').lower()}]" in report
+    if baseline_kind == "no-hit":
+        assert "[source guest-signal] [address 1234]" in report
+        assert "[patch0-no-observation 1]" in report
+
+
+@pytest.mark.parametrize("tail", [b"", struct.pack("<IHH", 50, 4, 0) + b"partial"])
+def test_final_without_committed_baseline_has_no_oracle(tmp_path, tail):
+    (tmp_path / "binradar.br").write_bytes(
+        binradar_evidence.HEADER_STRUCT.pack(binradar_evidence.MAGIC, 4, 3, 0) + tail)
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(1, True, 1, 1, {})])
+    binradar_results.write_final_result(_final_request(tmp_path, [1]))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[fault-reference-valid false]" in report
+    assert "[binradar-coverage unavailable]" in report
+    assert "[hard-crash-classification unavailable]" in report
+    assert "[score 1.000000] [accept-evidences 1] [total-evidences 1]" in report
+
+
+def test_historical_typed_text_cannot_grant_current_oracle(tmp_path):
+    (tmp_path / "binradar-tracer-msg.log").write_text(
+        "".join(
+            f"[binradar] [crash] [iter {iteration}] [patch {patch}] "
+            "[guest_pc 0] [guest_cs_base 0] [fault_addr 1234] [host_fault_addr 0] "
+            "[source guest-signal] [image none] [image-offset 0]\n"
+            f"[binradar] [commit] [iter {iteration}] [patch {patch}] [br 0]\n"
+            for iteration, patch in [(1, 0), (2, 0), (2, 1)]))
+    binradar_evidence.write_verifier(tmp_path / "verifier.br", [
+        binradar_evidence.VerifierPatchResult(1, True, 0, 0, {})])
+    binradar_results.write_final_result(_final_request(tmp_path, [1]))
+    report = (tmp_path / "final.sbsv").read_text()
+    assert "[fault-reference-valid false]" in report
+    assert "[reason same-crash]" not in report

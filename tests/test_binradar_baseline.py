@@ -348,6 +348,24 @@ def test_preflight_uses_each_executed_artifacts_exact_map(tmp_path, monkeypatch)
         0x4585dd, "relocated")
 
 
+def test_selected_only_preflight_ignores_stale_patched_artifact(tmp_path, monkeypatch):
+    for suffix in ("orig", "brpatched", "brcached"):
+        (tmp_path / f"guest.{suffix}").touch()
+    runner = _identity_runner(tmp_path)
+    (tmp_path / "guest.brpatched.e9map.json").unlink()
+    monkeypatch.setattr(
+        binradar_baseline, "_run_tracer",
+        lambda *args: _result(stderr=_log(_reference_row(REFERENCE.address), CRASH_ROW)))
+
+    result = binradar_baseline.validate_patch_zero_baseline(
+        str(tmp_path), {}, original=str(tmp_path / "guest.orig"),
+        probe_reference=REFERENCE, selected_binary=str(tmp_path / "guest.brcached"),
+        test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
+        probe_policy=binradar_verifier.MEMCHECK_POLICY, selected_only=True)
+    assert result.selected.status is binradar_baseline.BaselineStatus.REPRODUCED
+    assert [check.artifact for check in result.checks] == [".orig", ".brcached"]
+
+
 @pytest.mark.parametrize("corruption", ["missing", "artifact", "original", "duplicate",
                                         "conflicting", "range", "native", "uint64",
                                         "duplicate-field"])

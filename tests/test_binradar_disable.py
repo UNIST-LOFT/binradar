@@ -225,30 +225,29 @@ def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
         "[verifier-confidence] [patch 2] [score 1.0] "
         "[accept-evidences 1] [total-evidences 1]\n"
     )
-    (tmp_path / "binradar-tracer-msg.log").write_text(
-        # Iteration 1: patch 1 differs; patch 2 matches.
-        "[binradar] [normal] [iter 1] [patch 0]\n"
-        "[binradar] [commit] [iter 1] [patch 0] [br 0]\n"
-        "[binradar] [normal] [iter 1] [patch 1]\n"
-        "[binradar] [commit] [iter 1] [patch 1] [br 1]\n"
-        "[binradar] [normal] [iter 1] [patch 2]\n"
-        "[binradar] [commit] [iter 1] [patch 2] [br 0]\n"
-        # Iteration 2: patch 1 fixes the crash; patch 2 retains it.
-        "[binradar] [crash] [iter 2] [patch 0] [guest_pc 0] "
-        "[guest_cs_base 0] [fault_addr dead] [host_fault_addr 0]\n"
-        "[binradar] [commit] [iter 2] [patch 0] [br 0]\n"
-        "[binradar] [normal] [iter 2] [patch 1]\n"
-        "[binradar] [commit] [iter 2] [patch 1] [br 1]\n"
-        "[binradar] [crash] [iter 2] [patch 2] [guest_pc 0] "
-        "[guest_cs_base 0] [fault_addr dead] [host_fault_addr 0]\n"
-        "[binradar] [commit] [iter 2] [patch 2] [br 0]\n"
-    )
+    import struct
+    from binradar import binradar_evidence as evidence
+    from test_binradar_evidence import _frame, _group
+
+    baseline = (struct.pack("<II", 1, 1)
+                + _group(0, 2, 0xDEAD, [0], [0], source="guest-signal"))
+    # First mutation: patch 1 differs; patch 2 matches the normal baseline.
+    normal = (struct.pack("<II", 2, 2)
+              + _group(0, 1, 0, [0], [0, 2])
+              + _group(1, 1, 0, [1], [1]))
+    # Second mutation: patch 1 fixes the crash; patch 2 retains it.
+    crash = (struct.pack("<II", 3, 2)
+             + _group(0, 2, 0xDEAD, [0], [0, 2], source="guest-signal")
+             + _group(1, 1, 0, [1], [1]))
+    (tmp_path / "binradar.br").write_bytes(
+        evidence.HEADER_STRUCT.pack(evidence.MAGIC, 4, 3, 0)
+        + b"".join(_frame(4, row) for row in (baseline, normal, crash)))
     executor = _stub_executor(tmp_path)
     executor.disable_binradar = False
     executor.probe_result = SimpleNamespace(
-        memcheck_policy=None,
+        memcheck_policy=binradar.binradar_verifier.MEMCHECK_POLICY,
         tracer_fault_reference=binradar.binradar_verifier.TracerFaultReference(
-            0xDEAD, "guest-signal"))
+            0xBEEF, "guest-signal"))
     executor.save_progress = lambda row: None
 
     executor.run_final()
@@ -257,7 +256,7 @@ def test_final_branch_difference_reduces_confidence_but_same_crash_rejects(
     assert ("[final] [binradar] [patch 1] [res verified] "
             "[reason none] [iter -1]") in final_text
     assert ("[final] [binradar] [patch 2] [res rejected] "
-            "[reason same-crash] [iter 2]") in final_text
+            "[reason same-crash] [iter 3]") in final_text
     assert ("[final] [confidence] [patch 1] [score 0.666667] "
             "[accept-evidences 2] [total-evidences 3]") in final_text
     assert ("[final] [confidence] [patch 2] [score 0.666667] "

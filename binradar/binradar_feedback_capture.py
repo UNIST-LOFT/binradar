@@ -150,14 +150,15 @@ def concrete_result(probe) -> dict:
 
 
 def write_mutation_context(run_dir: str, *, workdir: str, artifact: str,
-                           candidates: Sequence[int], input_file: str) -> None:
+                           candidates: Sequence[int], input_file: str,
+                           configuration_file: str = "binradar.env") -> None:
     """Pin the actual tracer target before its mutation phase starts."""
     root = Path(run_dir) / "feedback-capture"
     root.mkdir(parents=True, exist_ok=True)
     context = {"version": VERSION, "candidates": encode_ids(candidates),
                "artifact": file_sha256(artifact), "artifact_name": Path(artifact).name,
                "input_sha256": file_sha256(input_file)}
-    for name in ("brpatches.json", "binradar.env"):
+    for name in ("brpatches.json", configuration_file):
         path = Path(workdir) / name
         context[name] = file_sha256(path) if path.is_file() else None
     _atomic_json(root / "mutation.json", context)
