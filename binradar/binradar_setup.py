@@ -984,12 +984,28 @@ def _extract_instruction_relocations(patched_binary: Path, metadata_path: Path,
                 for prev in reachable.values():
                     if prev[0] + len(prev[1]) != pc:
                         continue
-                    if _mnemonic(prev[2]) != "push":
+                    if _mnemonic(prev[2]) == "push":
+                        operand = prev[2].split()[-1]
+                        if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", operand) \
+                                and int(operand, 16) == ret:
+                            pushes.append(prev)
+                    # PIE cannot push an absolute image address. E9 instead
+                    # preserves RAX while putting the RIP-relative original
+                    # return on the stack:
+                    #   push rax; lea rax,[rip+disp32]; xchg [rsp],rax
+                    # Prove every reached instruction and exact boundary from
+                    # bytes, not objdump's rendered operand/comment. The xchg
+                    # restores RAX and leaves exactly one return-address slot.
+                    if prev[1] != b"\x48\x87\x04\x24":
                         continue
-                    operand = prev[2].split()[-1]
-                    if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", operand) \
-                            and int(operand, 16) == ret:
-                        pushes.append(prev)
+                    lea = reachable.get(prev[0] - 7)
+                    push = reachable.get(prev[0] - 8)
+                    if (lea is not None and push is not None
+                            and push[1] == b"\x50"
+                            and len(lea[1]) == 7
+                            and lea[1][:3] == b"\x48\x8d\x05"
+                            and lea[0] + 7 + struct.unpack_from("<i", lea[1], 3)[0] == ret):
+                        pushes.append(push)
                 if len(pushes) != 1:
                     continue
                 if kind == "direct":

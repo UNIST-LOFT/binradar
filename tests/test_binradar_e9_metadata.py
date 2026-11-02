@@ -1304,6 +1304,106 @@ def _write_instruction_artifacts(tmp_path, instruction, *, relocated=None,
     return original, metadata, patched, relocated_pc
 
 
+def _pie_call_emulation(pc, *, return_address=0x401005, target=0x401105):
+    # push rax; lea rax,[rip+disp32]; xchg [rsp],rax; jmp target.
+    return (b"\x50\x48\x8d\x05"
+            + struct.pack("<i", return_address - pc - 8)
+            + b"\x48\x87\x04\x24\xe9"
+            + struct.pack("<i", target - pc - 17))
+
+
+@pytest.mark.parametrize("trampoline", [0x301000, 0x54b000])
+def test_pie_call_return_address_is_proved_from_rip_bytes(tmp_path, trampoline):
+    import json
+    original, metadata, patched, pc = _write_instruction_artifacts(
+        tmp_path, b"\xe8\x00\x01\x00\x00",
+        trampoline_address=trampoline,
+        relocated=_pie_call_emulation(trampoline))
+    # ET_DYN has the same image-relative instruction semantics at any load bias.
+    data = bytearray(original.read_bytes())
+    struct.pack_into("<H", data, 16, 3)
+    original.write_bytes(data)
+    runtime = binradar_setup.extract_e9_runtime_metadata(
+        patched, metadata, original, 0x401000)
+    assert runtime.relocated_calls == ((pc + 12, 0x401000, 0x401005),)
+    payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+    assert payload["instructions"] == [{"relocated": pc + 12, "original": 0x401000}]
+
+
+@pytest.mark.parametrize("instruction,jump", [
+    (b"\xff\xd0", b"\xff\xe0"),  # restored rax remains the call target
+    (b"\xff\x14\x24", b"\xff\x64\x24\x08"),  # original rsp operand
+])
+def test_pie_return_sequence_preserves_indirect_call_identity(tmp_path, instruction, jump):
+    pc = 0x54b000
+    ret = 0x401000 + len(instruction)
+    code = _pie_call_emulation(pc, return_address=ret)[:12] + jump
+    original, metadata, patched, _ = _write_instruction_artifacts(
+        tmp_path, instruction, relocated=code)
+    assert binradar_setup.extract_relocated_call_jumps(
+        patched, metadata, original, 0x401000) == [(pc + 12, 0x401000, ret)]
+
+
+@pytest.mark.parametrize("defect", [
+    "displacement", "plausible-return", "target", "push-register",
+    "lea-register", "exchange-register", "gap", "absent", "unreachable-push",
+    "unreachable-sequence", "ambiguous",
+])
+def test_unproved_pie_call_return_sequence_fails_closed(tmp_path, defect):
+    pc = 0x54b000
+    code = bytearray(_pie_call_emulation(pc))
+    if defect == "displacement":
+        code[4] ^= 1
+    elif defect == "plausible-return":
+        code = bytearray(_pie_call_emulation(pc, return_address=0x501005))
+    elif defect == "target":
+        code = bytearray(_pie_call_emulation(pc, target=0x401106))
+    elif defect == "push-register":
+        code[0] = 0x51  # push rcx cannot restore rax through this xchg
+    elif defect == "lea-register":
+        code[3] = 0x0d  # lea rcx,[rip+disp32]
+    elif defect == "exchange-register":
+        code[10] = 0x0c  # xchg [rsp],rcx
+    elif defect == "gap":
+        code = code[:8] + b"\x90" + code[8:13] + struct.pack("<i", 0x401105 - pc - 18)
+    elif defect == "absent":
+        code[:12] = b"\x90" * 12
+    elif defect == "unreachable-push":
+        code = bytearray(b"\xeb\x01\x50" + _pie_call_emulation(pc + 2)[1:])
+    elif defect == "unreachable-sequence":
+        code = bytearray(b"\xeb\x0c" + _pie_call_emulation(pc + 2))
+    elif defect == "ambiguous":
+        code = bytearray(b"\x74\x3e" + _pie_call_emulation(pc + 2))
+        code.extend(b"\xcc" * (64 - len(code)))
+        code.extend(_pie_call_emulation(pc + 64))
+    original, metadata, patched, _ = _write_instruction_artifacts(
+        tmp_path, b"\xe8\x00\x01\x00\x00", relocated=bytes(code))
+    with pytest.raises(ValueError, match="expected one proved relocated call-equivalent jump"):
+        binradar_setup.extract_e9_runtime_metadata(
+            patched, metadata, original, 0x401000)
+    assert not Path(str(patched) + ".e9map.json").exists()
+
+
+@pytest.mark.parametrize("wrong_reached_return", [False, True])
+def test_pie_dead_return_copy_never_authorizes_identity(tmp_path, wrong_reached_return):
+    import json
+    pc = 0x54b000
+    code = _pie_call_emulation(
+        pc, return_address=0x501005 if wrong_reached_return else 0x401005)
+    code += b"\xcc" * (64 - len(code)) + _pie_call_emulation(pc + 64)
+    original, metadata, patched, _ = _write_instruction_artifacts(
+        tmp_path, b"\xe8\x00\x01\x00\x00", relocated=code)
+    if wrong_reached_return:
+        with pytest.raises(ValueError, match="found 0"):
+            binradar_setup.extract_e9_runtime_metadata(
+                patched, metadata, original, 0x401000)
+    else:
+        binradar_setup.extract_e9_runtime_metadata(
+            patched, metadata, original, 0x401000)
+        payload = json.loads(Path(str(patched) + ".e9map.json").read_text())
+        assert payload["instructions"] == [{"relocated": pc + 12, "original": 0x401000}]
+
+
 @pytest.mark.parametrize("instruction", [
     b"\x80\x38\x03",  # cmp byte ptr [rax],3: observed 14940 shape
     b"\x48\x8b\x00",  # mov rax,[rax]
