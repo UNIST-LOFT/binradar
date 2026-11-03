@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -u
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import enum
 import os
 import queue
@@ -24,6 +25,7 @@ from . import binradar_fuzzer
 from . import binradar_minimizer
 from . import binradar_pipeline
 from .binradar_probe_diagnostics import ProbeTraceDiagnostics
+from . import binradar_replay
 from . import binradar_results
 from . import binradar_run_records
 from . import binradar_runtime
@@ -706,6 +708,10 @@ class BinRadarExecutor:
     concrete_input_schedule: str = binradar_config.CONCRETE_INPUT_SCHEDULE_DEFAULT
     generate_concrete: bool = False
     generate_binradar: bool = False
+    replay_server: bool = False
+    # Class default so `__new__`-constructed executors (tests and library
+    # callers) can consult the resident service before `from_env` runs.
+    _replay_service: Optional["binradar_replay.ReplayServer"] = None
     concrete_baseline = binradar_config.ConcreteBaseline.PATCHED
     # P4c C1 family portfolio and Python-owned complete-attempt budget.
     mutation_portfolio: str
@@ -753,6 +759,8 @@ class BinRadarExecutor:
         self.concrete_input_schedule = config.concrete_input_schedule
         self.generate_concrete = config.generate_concrete
         self.generate_binradar = config.generate_binradar
+        self.replay_server = config.replay_server
+        self._replay_service = None
         self.concrete_baseline = config.concrete_baseline
         self.mutation_portfolio = config.mutation_portfolio
         self.representative_budget = config.representative_budget
@@ -1101,6 +1109,7 @@ class BinRadarExecutor:
             f"[prefix {self.run_prefix}] [id {self.run_id}]")
 
     def run_probe(self):
+        self._check_replay_shutdown()
         if not os.path.exists(self.artifacts.original):
             sys.exit("ERROR: binary does not exist.")
         if not os.path.exists(self.resolved_poc_input()):
@@ -1127,6 +1136,7 @@ class BinRadarExecutor:
         self.save_progress(f"[probe] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
         probe_runner = binradar_verifier.BinRadarQemuRunner.from_env(self.workdir, config)
         probe_result = probe_runner.test_with_original(self.resolved_poc_input())
+        self._check_replay_shutdown()
         if probe_result is None:
             logger.info("[PROBE] Failed to get probe result. Check if patch location is set or qemu_stacktrace is available.")
             sys.exit(1)
@@ -1151,6 +1161,9 @@ class BinRadarExecutor:
             self.test_cmd.replace("@@", self.resolved_poc_input()))
         tracer_env = os.environ.copy()
         tracer_env["BINRADAR_FORKSERVER_ENABLE"] = "0"
+        tracer_env["BINRADAR_REPLAY_SERVER"] = "0"
+        tracer_env.pop("BINRADAR_REPLAY_CANCEL_FD", None)
+        tracer_env.pop("BINRADAR_REPLAY_DIR", None)
         tracer_env["BINRADAR_OSPREY_ENABLE"] = "0"
         # The probe runs the unpatched original binary; a mutated scalar would
         # corrupt the fault-address observation this path exists to produce.
@@ -1182,9 +1195,13 @@ class BinRadarExecutor:
             timeout=probe_timeout)
         tracer_started = time.monotonic()
         try:
+            # The reference pass runs the same way in both modes.  Resident
+            # replay never keeps this process; it only gates startup shutdown
+            # between the two awaited steps.
             tracer_result = binradar_utils.execute(
-                tracer_cmd, cwd=self.workdir, env=tracer_env, timeout=probe_timeout,
-                verbose=False)
+                tracer_cmd, cwd=self.workdir, env=tracer_env,
+                timeout=probe_timeout, verbose=False)
+            self._check_replay_shutdown()
         except Exception as exc:
             diagnostics.record["elapsed_seconds"] = time.monotonic() - tracer_started
             diagnostics.publish(reason="missing-or-unusable-terminal", error=exc)
@@ -1509,7 +1526,91 @@ class BinRadarExecutor:
         self.save_progress(f"[verifier] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
         return timed_out
 
+    @contextmanager
+    def _replay_listener(self):
+        """Own the external listener for the whole resident session.
+
+        The socket binds before PROBE so an independent client can observe
+        ``starting``; generation completion never closes it.
+        """
+        if not self.replay_server:
+            yield
+            return
+        artifact = self.artifacts.select_tracer([], baseline_only=True)
+        with open(artifact.path, "rb") as stream:
+            header = stream.read(20)
+        if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01":
+            raise ValueError(
+                "Replay requires an ELF64 little-endian cached artifact")
+        if int.from_bytes(header[16:18], "little") == 3:
+            raise ValueError("Nonneutral PIE cached replay is not supported")
+        family = self.config["BINRADAR_PATCH_KIND"]
+        if family not in ("generic-erm", "CWE805-erm"):
+            raise ValueError(
+                f"--replay-server requires a supported ERM family, got {family!r}")
+        service = binradar_replay.ReplayServer(
+            self.run_dir, family,
+            int(self.config.get("BRCACHE_STACK_SIZE", "0")))
+        service.start()
+        logger.info(f"[REPLAY] Listening on {service.path}")
+        self._replay_service = service
+        try:
+            yield service
+        finally:
+            self._replay_service = None
+            service.close()
+
+    def _check_replay_shutdown(self):
+        if (self._replay_service is not None and
+                self._replay_service.shutdown_requested.is_set()):
+            raise InterruptedError("Replay server shutdown requested")
+
     def run_binradar(self):
+        if not self.replay_server:
+            self._run_binradar_generation()
+            return
+        self._run_resident_binradar()
+
+    def _run_resident_binradar(self) -> None:
+        """Generate, then keep the same snapshot alive as a replay server.
+
+        One PhaseSession owns the tracer, solver, channels and mappings across
+        generation and every replay request.  Generation deadlines bound only
+        generation; resident idle and replay are explicit operations.
+        """
+        service = self._replay_service
+        if service is None:
+            raise RuntimeError("Replay requires an active listener")
+        self._check_replay_shutdown()
+        service.update_generation(state="generating")
+        session = binradar_runtime.PhaseSession("binradar", self.timeout)
+        try:
+            tracer, stop_reason = self._run_binradar_generation(session)
+            self._check_replay_shutdown()
+            if tracer is None:
+                raise RuntimeError(
+                    "Generation stopped before a replay snapshot was available")
+            if stop_reason == "baseline-unavailable":
+                # No sound mutation source exists; never advertise a replay
+                # service over a snapshot that cannot reproduce the baseline.
+                raise RuntimeError(
+                    "Generation ended without a usable baseline; the replay "
+                    "server was not started")
+            service.update_generation(generation_stop=stop_reason)
+            info = tracer.finish_generation()
+            self.save_progress(
+                f"[generate-binradar] [done] [prefix {self.run_prefix}] "
+                f"[id {self.run_id}] [reason {stop_reason}] "
+                f"[retained-mutations {info['retained_mutations']}]")
+            service.serve(tracer, info["mutation_ids"], stop_reason,
+                          info["remaining_plans"])
+            tracer.shutdown_replay()
+        finally:
+            # Tracer/solver/channels/mappings live until the service ends.
+            session.close()
+
+    def _run_binradar_generation(self, resident_session=None):
+        self._check_replay_shutdown()
         if self.generate_binradar and (
                 self.disable_binradar or not self.feedback_mode or self.filter_result):
             raise ValueError("--generate-binradar requires enabled feedback and patch 0 only")
@@ -1563,7 +1664,9 @@ class BinRadarExecutor:
         phase_start = time.monotonic()
         child_peak_rss_before = resource.getrusage(
             resource.RUSAGE_CHILDREN).ru_maxrss
-        session = binradar_runtime.PhaseSession(exec_mode, self.timeout)
+        session = resident_session or binradar_runtime.PhaseSession(exec_mode, self.timeout)
+        tracer = None
+        stop_reason = None
         timed_out = False
         budget_stop_reason: Optional[str] = None
         # One complete forkserver attempt runs patch 0 plus at most every
@@ -1648,9 +1751,10 @@ class BinRadarExecutor:
             })
 
         try:
-            with session:
+            with (nullcontext(session) if resident_session is not None else session):
                 self._validate_baseline(
                     tracer_binary, testcase, binradar_env, session.deadline)
+                self._check_replay_shutdown()
                 if session.deadline.expired():
                     timed_out = True
                 elif (self.representative_budget > 0 and
@@ -1660,6 +1764,10 @@ class BinRadarExecutor:
                     # trial that cannot admit even baseline attempt 1.
                     budget_stop_reason = "representative-budget-unavailable"
                 else:
+                    if self.replay_server:
+                        binradar_env["BINRADAR_REPLAY_SERVER"] = "1"
+                        binradar_env["BINRADAR_REPLAY_DIR"] = os.path.join(
+                            self.run_dir, "replay")
                     session.shared_memory(binradar_env, include_patch_key=True)
                     session.start_solver(
                         mode=exec_mode, testcase=testcase, run_dir=self.run_dir,
@@ -1668,8 +1776,11 @@ class BinRadarExecutor:
                         mode=exec_mode, env=binradar_env,
                         workdir=self.workdir, rundir=self.run_dir,
                         binary=tracer_binary, test_cmd=self.test_cmd,
-                        testcase=testcase)
+                        testcase=testcase, replay_mode=self.replay_server)
+                    if self._replay_service is not None:
+                        self._replay_service.attach_tracer(tracer)
                     while True:
+                        self._check_replay_shutdown()
                         if session.deadline.expired():
                             timed_out = True
                             break
@@ -1686,6 +1797,10 @@ class BinRadarExecutor:
                             tracer.iter + 1 if tracer.forkserver_mode else 0)
                         attempted += 1
                         summary = tracer.run()
+                        if self._replay_service is not None:
+                            self._replay_service.update_generation(
+                                remaining_plans=summary.remaining_plans,
+                                retained_mutations=summary.retained_mutations)
                         collection = binradar_runtime.aggregate_collection_status(
                             collection, summary.collection)
                         if summary.representative_runs == 0:
@@ -1927,7 +2042,8 @@ class BinRadarExecutor:
             f"[binradar] [done] [prefix {self.run_prefix}] "
             f"[id {self.run_id}] "
             f"{(collection if collection is not None else binradar_runtime.CollectionStatus()).serialize()}")
-    
+        return tracer, stop_reason
+
     def run_feedback(self):
         if self.probe_result is None:
             logger.error("Probe result not found. Cannot run feedback analysis.")
@@ -1987,10 +2103,13 @@ class BinRadarExecutor:
         self.write_run_settings("generate-binradar")
         self.save_progress(
             f"[generate-binradar] [start] [prefix {self.run_prefix}] [id {self.run_id}]")
-        self.run_probe()
-        self.run_binradar()
-        self.save_progress(
-            f"[generate-binradar] [done] [prefix {self.run_prefix}] [id {self.run_id}]")
+        with self._replay_listener():
+            self.run_probe()
+            self.run_binradar()
+            if not self.replay_server:
+                self.save_progress(
+                    f"[generate-binradar] [done] [prefix {self.run_prefix}] "
+                    f"[id {self.run_id}]")
         self.done()
 
     def run_generate_concrete(self, run_prefix: str = "run", *,
@@ -2083,6 +2202,8 @@ class BinRadarExecutor:
         self.done()
     
     def run_single_phase(self, run_prefix: str, run_id: str, phase: BinRadarPhase):
+        if self.replay_server and phase != BinRadarPhase.BINRADAR:
+            raise ValueError("--replay-server supports only single-phase binradar")
         if self.generate_binradar:
             _require_binradar_generation_phase(phase)
         if self.generate_concrete:
@@ -2101,6 +2222,12 @@ class BinRadarExecutor:
         mode = ("generate-binradar-" if self.generate_binradar else
                 "generate-concrete-" if self.generate_concrete else "")
         self.write_run_settings(f"{mode}single-phase-{phase_name}")
+        with self._replay_listener():
+            self._execute_single_phase(phase)
+        if phase != BinRadarPhase.PROBE:
+            self.done()
+
+    def _execute_single_phase(self, phase: BinRadarPhase):
         if phase == BinRadarPhase.FINAL:
             probe_file = os.path.join(self.run_dir, "probe-results.sbsv")
             if not os.path.exists(probe_file):
@@ -2155,8 +2282,7 @@ class BinRadarExecutor:
             self._run_optional_phase("feedback", self.run_feedback)
         else:
             raise ValueError(f"Unknown phase: {phase}")
-        self.done()
-    
+
     def run_multithreaded(self, run_prefix: str = "run"):
         self.set_run_dir(run_prefix=run_prefix)
         logger.set_file(os.path.join(self.run_dir, "binradar.log"))
@@ -2232,6 +2358,10 @@ def main():
         "--generate-binradar", action="store_true",
         help=("load generate-binradar.env and capture cached patch-0 "
               "program-state mutation feedback; runs PROBE then BINRADAR"))
+    parser.add_argument(
+        "--replay-server", action="store_true",
+        help=("keep the --generate-binradar snapshot alive for local "
+              "status and predicate replay requests on <rundir>/replay.sock"))
     parser.add_argument(
         "--symbolic-mutation-mode", dest="symbolic_mutation_mode",
         choices=binradar_config.SYMBOLIC_MUTATION_MODES,
@@ -2315,6 +2445,12 @@ def main():
         parser.error(
             "--fuzzer-only cannot be combined with --run-single-phase or --seq")
 
+    if args.replay_server:
+        if not args.generate_binradar:
+            parser.error("--replay-server requires --generate-binradar")
+        if args.run_single_phase and args.run_single_phase != "binradar":
+            parser.error("--replay-server supports only single-phase binradar")
+
     if args.generate_binradar:
         if args.fuzzer_only or args.disable_binradar:
             parser.error("--generate-binradar cannot disable BINRADAR or use --fuzzer-only")
@@ -2349,12 +2485,15 @@ def main():
         if not patch_kind:
             parser.error("generate-binradar.env is missing BINRADAR_PATCH_KIND metadata")
         if patch_kind not in ("generic-erm", "CWE805-erm"):
+            if args.replay_server:
+                parser.error("--replay-server requires a supported ERM generation artifact")
             if not env.get("BINRADAR_GENERATION_PATCH_FORMAT", "").strip():
                 parser.error("generate-binradar.env is missing patch-format metadata")
             return
         if env.get("BINRADAR_DISABLE_BINRADAR", "0") == "1":
             parser.error("--generate-binradar requires the BINRADAR phase")
     env["BINRADAR_GENERATE_BINRADAR"] = "1" if args.generate_binradar else "0"
+    env["BINRADAR_REPLAY_SERVER"] = "1" if args.replay_server else "0"
     env["BINRADAR_GENERATE_CONCRETE"] = "1" if args.generate_concrete else "0"
     env["BINRADAR_CONCRETE_INPUT_SCHEDULE"] = \
         binradar_config.resolve_concrete_input_schedule(

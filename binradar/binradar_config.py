@@ -228,8 +228,11 @@ class RunConfig:
     probe_tracer_timeout: float = binradar_utils.PROBE_TRACER_TIMEOUT_DEFAULT
     generate_concrete: bool = False
     generate_binradar: bool = False
+    replay_server: bool = False
 
     def __post_init__(self) -> None:
+        if self.replay_server and not self.generate_binradar:
+            raise ValueError("--replay-server requires --generate-binradar")
         if not self.generate_binradar:
             return
         if self.generate_concrete:
@@ -332,6 +335,7 @@ class RunConfig:
             feedback_mode=feedback_mode,
             generate_concrete=generate_concrete,
             generate_binradar=generate_binradar,
+            replay_server=env.get("BINRADAR_REPLAY_SERVER", "0") == "1",
             forkserver_child_timeout=child_timeout,
             qemu_exec_timeout=binradar_utils.parse_positive_timeout(
                 "BINRADAR_QEMU_EXEC_TIMEOUT", env.get(
@@ -387,6 +391,7 @@ def build_base_environment(config: RunConfig, plt_info_file: str) -> dict[str, s
     if config.timeout > 0:
         environment["SOLVER_TIMEOUT"] = str(int(config.timeout * 1000))
     environment.update(config.retained_environment)
+    environment["BINRADAR_REPLAY_SERVER"] = "1" if config.replay_server else "0"
     if config.generate_binradar:
         environment.update({
             "BINRADAR_GENERATE_BINRADAR": "1",
@@ -414,6 +419,7 @@ def build_worker_environment(
         "TOTAL_PATCHES": str(config.total_patches),
         "BINRADAR_GENERATE_CONCRETE": "1" if config.generate_concrete else "0",
         "BINRADAR_GENERATE_BINRADAR": "1" if config.generate_binradar else "0",
+        "BINRADAR_REPLAY_SERVER": "0",
         "BINRADAR_FEEDBACK_MODE": "1" if config.feedback_mode else "0",
         "BINRADAR_CONCRETE_INPUT_SCHEDULE": config.concrete_input_schedule,
     })
@@ -450,6 +456,10 @@ def build_phase_environment(
     environment = dict(
         os.environ if inherited_environment is None else inherited_environment)
     environment.update(base_environment)
+    # Only resident BINRADAR startup enables this, after ordinary preflight.
+    environment["BINRADAR_REPLAY_SERVER"] = "0"
+    environment.pop("BINRADAR_REPLAY_CANCEL_FD", None)
+    environment.pop("BINRADAR_REPLAY_DIR", None)
     environment["BINRADAR_OSPREY_ENABLE"] = (
         "1" if mode == "binradar" else "0")
 

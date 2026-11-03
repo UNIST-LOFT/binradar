@@ -33,6 +33,24 @@ SHM_KEY_DRAW_LIMIT = 1024
 # than misreading packet bytes.
 HANDSHAKE_EXPECTED = 0x41464C04
 FORKSERVER_SUMMARY_WORDS = 5
+# Resident replay protocol.  Mirrors BINRADAR_FORKSERVER_PROTOCOL_REPLAY and
+# the command/reply words in tracer/linux-user/binradar-forkserver.h.  The
+# resident handshake word is distinct so a generation-only tracer never
+# interprets a replay command as was-killed.
+REPLAY_HANDSHAKE_EXPECTED = 0x41464C05
+REPLAY_SUMMARY_WORDS = 7
+REPLAY_COMMAND_GENERATE = 0
+REPLAY_COMMAND_FINISH = 1
+REPLAY_COMMAND_CASE = 2
+REPLAY_COMMAND_SHUTDOWN = 3
+REPLAY_COMMAND_LIST = 4
+REPLAY_REPLY_SUMMARY = 1
+REPLAY_REPLY_ACK = 2
+REPLAY_REPLY_CASE = 3
+REPLAY_REPLY_LIST = 4
+# Case reply text carries only a short diagnostic; the capture path itself is
+# bounded by the run directory name.
+REPLAY_CASE_TEXT_MAX = 8192
 
 
 class AttemptResult(enum.IntEnum):
@@ -313,9 +331,11 @@ class SharedMemoryManager:
 class ForkserverTransport:
     """Owned forkserver descriptors plus exact bounded protocol I/O."""
 
-    def __init__(self, env: Dict[str, str], mode: str):
+    def __init__(self, env: Dict[str, str], mode: str,
+                 replay_mode: bool = False):
         self.env = env
         self.mode = mode
+        self.replay_mode = replay_mode
         self.ctrl_r: Optional[int] = None
         self.ctrl_w: Optional[int] = None
         self.stat_r: Optional[int] = None
@@ -324,6 +344,13 @@ class ForkserverTransport:
         self.patch_fd_w: Optional[int] = None
         self.patch_cached_fd_r: Optional[int] = None
         self.patch_cached_fd_w: Optional[int] = None
+        self.cancel_r: Optional[int] = None
+        self.cancel_w: Optional[int] = None
+
+    @property
+    def handshake_expected(self) -> int:
+        return (REPLAY_HANDSHAKE_EXPECTED if self.replay_mode
+                else HANDSHAKE_EXPECTED)
 
     def setup(self) -> None:
         try:
@@ -331,6 +358,9 @@ class ForkserverTransport:
             self.stat_r, self.stat_w = os.pipe()
             self.env["BINRADAR_FORKSERVER_CTRL_R"] = str(self.ctrl_r)
             self.env["BINRADAR_FORKSERVER_STAT_W"] = str(self.stat_w)
+            if self.replay_mode:
+                self.cancel_r, self.cancel_w = os.pipe()
+                self.env["BINRADAR_REPLAY_CANCEL_FD"] = str(self.cancel_r)
             if self.mode != "binradar":
                 return
             self.patch_fd_r, self.patch_fd_w = os.pipe()
@@ -347,6 +377,8 @@ class ForkserverTransport:
 
     def pass_fds(self) -> List[int]:
         descriptors = [self.ctrl_r, self.stat_w]
+        if self.cancel_r is not None:
+            descriptors.append(self.cancel_r)
         if self.mode == "binradar":
             descriptors.extend([self.patch_fd_r, self.patch_fd_w])
             if self.patch_cached_fd_r is not None:
@@ -357,14 +389,38 @@ class ForkserverTransport:
     def close_child_ends(self) -> None:
         for name in (
                 "ctrl_r", "stat_w", "patch_fd_r", "patch_fd_w",
-                "patch_cached_fd_r", "patch_cached_fd_w"):
+                "patch_cached_fd_r", "patch_cached_fd_w", "cancel_r"):
             self._close(name)
 
     def cleanup(self) -> None:
         for name in (
                 "ctrl_r", "ctrl_w", "stat_r", "stat_w", "patch_fd_r",
-                "patch_fd_w", "patch_cached_fd_r", "patch_cached_fd_w"):
+                "patch_fd_w", "patch_cached_fd_r", "patch_cached_fd_w",
+                "cancel_r", "cancel_w"):
             self._close(name)
+
+    def drain_cancel(self) -> None:
+        """Discard cancellation tokens left by a completed request."""
+        if self.cancel_r is None:
+            return
+        while True:
+            try:
+                if not os.read(self.cancel_r, 64):
+                    return
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+
+    def cancel_child(self) -> None:
+        """Signal the tracer to kill and reap the child it is running."""
+        if self.cancel_w is None:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Replay cancel pipe is closed")
+        try:
+            os.write(self.cancel_w, b"c")
+        except (BlockingIOError, BrokenPipeError):
+            pass
 
     def _close(self, name: str) -> None:
         fd = getattr(self, name)
@@ -400,10 +456,62 @@ class ForkserverTransport:
     def read_u32(self, timeout: Optional[float]) -> int:
         return struct.unpack("<I", self.read(4, timeout))[0]
 
-    def read_summary(self, timeout: Optional[float]) -> Tuple[int, int, int, int, int]:
-        """Read the fixed five-word protocol-v5 attempt summary."""
+    def read_summary(self, timeout: Optional[float]) -> Tuple[int, ...]:
+        """Read one attempt summary.
+
+        Ordinary peers reply with the fixed five-word v5 packet.  Resident
+        replay peers prefix a kind word and append retained-mutation count.
+        """
+        if self.replay_mode:
+            words = struct.unpack(
+                "<IIIIIII", self.read(4 * REPLAY_SUMMARY_WORDS, timeout))
+            if words[0] != REPLAY_REPLY_SUMMARY:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Expected a replay summary reply, "
+                    f"got kind {words[0]}")
+            return words[1:]
         return struct.unpack(
             "<IIIII", self.read(4 * FORKSERVER_SUMMARY_WORDS, timeout))
+
+    def send_command(self, command: int) -> None:
+        self.write_u32(command)
+
+    def send_replay_case(self, mutation: int, descriptor: bytes) -> None:
+        self.write(struct.pack("<II", mutation, len(descriptor)))
+        self.write(descriptor)
+
+    def read_ack(self, timeout: Optional[float]) -> int:
+        kind = self.read_u32(timeout)
+        if kind != REPLAY_REPLY_ACK:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Expected an acknowledgement reply, "
+                f"got kind {kind}")
+        return self.read_u32(timeout)
+
+    def read_replay_list(self, timeout: Optional[float]) -> List[int]:
+        kind, count = struct.unpack("<II", self.read(8, timeout))
+        if kind != REPLAY_REPLY_LIST:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Expected a replay list reply, "
+                f"got kind {kind}")
+        if count == 0:
+            return []
+        return list(struct.unpack(f"<{count}I",
+                                  self.read(4 * count, timeout)))
+
+    def read_replay_case(self, timeout: Optional[float]) -> Tuple[int, int, int, str]:
+        kind, source, outcome, reason, length = struct.unpack(
+            "<IIIII", self.read(20, timeout))
+        if kind != REPLAY_REPLY_CASE:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Expected a replay case reply, "
+                f"got kind {kind}")
+        if length > REPLAY_CASE_TEXT_MAX:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Replay case text is {length} bytes, "
+                f"above the {REPLAY_CASE_TEXT_MAX}-byte limit")
+        text = self.read(length, timeout) if length else b""
+        return source, outcome, reason, text.decode("utf-8", errors="replace")
 
     def read(self, size: int, timeout: Optional[float]) -> bytes:
         if self.stat_r is None:
@@ -438,6 +546,42 @@ class ForkserverTransport:
         return bytes(data)
 
 
+class ReplayOutcome(enum.IntEnum):
+    """One resident replay case outcome.
+
+    Mirrors BinradarReplayOutcome in tracer/linux-user/binradar-cache.h.
+    UNAVAILABLE is never a passing observation.
+    """
+
+    NORMAL = 0
+    TARGET_CRASH = 1
+    OTHER_CRASH = 2
+    UNAVAILABLE = 3
+
+
+class ReplayReason(enum.IntEnum):
+    """Why a resident replay case produced no reusable observation."""
+
+    NONE = 0
+    UNKNOWN_MUTATION = 1
+    INVALID_DESCRIPTOR = 2
+    UNSUPPORTED_EXTERNAL_STATE = 3
+    CANCELLED = 4
+    TIMEOUT = 5
+    INCOMPLETE_OBSERVATION = 6
+
+
+@dataclass(frozen=True)
+class ReplayCaseResult:
+    """One replay case reply; capture identity is diagnostic, not a verdict."""
+
+    mutation: int
+    source: str
+    outcome: ReplayOutcome
+    reason: ReplayReason
+    text: str
+
+
 @dataclass(frozen=True)
 class RunSummary:
     """One protocol-v5 attempt reply plus the wall time it took.
@@ -457,6 +601,8 @@ class RunSummary:
     attempt_result: AttemptResult
     stop_reason: StopReason
     collection: CollectionStatus = CollectionStatus()
+    # Resident replay summary word; zero for ordinary v5 peers.
+    retained_mutations: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -479,10 +625,18 @@ class TracerExecutor:
     def __init__(
             self, mode: str, env: Dict[str, str], workdir: str, rundir: str,
             binary: str, test_cmd: str, testcase: str, deadline: Deadline,
-            registry: ProcessRegistry = PROCESS_REGISTRY):
+            registry: ProcessRegistry = PROCESS_REGISTRY,
+            replay_mode: bool = False):
         self.command = [paths.TRACER_BIN, "-symbolic", "-d", "page", binary] + \
             shlex.split(test_cmd.replace("@@", testcase))
         self.mode = mode
+        self.replay_mode = replay_mode
+        self.retained_mutations = 0
+        # Resident generation state: an in-flight command has no reply yet,
+        # and the last observed remaining count is never reused after an
+        # interrupted request.
+        self._generation_inflight = False
+        self._last_remaining_plans: Optional[int] = None
         self.env = env
         self.workdir = workdir
         self.rundir = rundir
@@ -493,6 +647,8 @@ class TracerExecutor:
         self._process_cleanup_started = False
         self._process_cleanup_done = False
         self.forkserver_mode = env.get("BINRADAR_FORKSERVER_ENABLE", "0") == "1"
+        if replay_mode and not self.forkserver_mode:
+            raise ValueError("Resident replay requires the forkserver protocol")
         self.iter = 0
         self.representative_runs = 0
         self.attempt_result = AttemptResult.COMPLETED
@@ -575,7 +731,8 @@ class TracerExecutor:
                 f"{' '.join(self.command)}")
             return
 
-        self.transport = ForkserverTransport(self.env, self.mode)
+        self.transport = ForkserverTransport(self.env, self.mode,
+                                             replay_mode=self.replay_mode)
         self.transport.setup()
         pass_fds = self.transport.pass_fds()
         self.process = subprocess.Popen(
@@ -605,13 +762,14 @@ class TracerExecutor:
             effective_timeout = startup_wait \
                 if startup_wait is not None else startup_timeout
             self._raise_forkserver_startup_failure(exc, effective_timeout)
-        if banner != HANDSHAKE_EXPECTED:
+        expected = self.transport.handshake_expected
+        if banner != expected:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
-        self.transport.write_u32(HANDSHAKE_EXPECTED ^ 0xFFFFFFFF)
+        self.transport.write_u32(expected ^ 0xFFFFFFFF)
         ack = self.transport.read_u32(
             self.deadline.remaining(self.forkserver_timeout))
-        if ack != HANDSHAKE_EXPECTED:
+        if ack != expected:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
         logger.info(
@@ -659,10 +817,17 @@ class TracerExecutor:
         try:
             assert self.transport is not None
             self._clear_collection_status()
-            self.transport.write_u32(0)
+            if self.replay_mode:
+                self._generation_inflight = True
+                self.transport.send_command(REPLAY_COMMAND_GENERATE)
+            else:
+                self.transport.write_u32(0)
+            summary = self.transport.read_summary(
+                self.deadline.remaining(self.forkserver_response_timeout()))
             attempt, representative_runs, remaining_plans, attempt_result, \
-                stop_reason = self.transport.read_summary(
-                    self.deadline.remaining(self.forkserver_response_timeout()))
+                stop_reason = summary[:5]
+            if self.replay_mode:
+                self.retained_mutations = summary[5]
             try:
                 parsed_result = AttemptResult(attempt_result)
                 parsed_stop = StopReason(stop_reason)
@@ -719,16 +884,45 @@ class TracerExecutor:
                     f"failure with {protocol_enum_name(parsed_result)} at "
                     f"attempt {attempt}")
 
+            self._generation_inflight = False
             self.iter = attempt
             self.representative_runs = representative_runs
             self.attempt_result = parsed_result
             self.stop_reason = parsed_stop
+            self._last_remaining_plans = remaining_plans
             if self.mode != "binradar":
                 logger.debug(
                     f"[TRACER] [{self.mode}] Logical attempt {attempt} "
                     f"finished after {representative_runs} child run(s); "
                     f"remaining {remaining_plans}")
-        except Exception as exc:
+        except TimeoutError as exc:
+            if self.replay_mode and self._generation_inflight and \
+                    self.process.poll() is None:
+                # A resident generation cutoff must return the native parent to
+                # a command boundary instead of tearing down the whole session.
+                logger.info(
+                    f"[TRACER] [{self.mode}] Generation deadline reached; "
+                    "cancelling the in-flight child")
+                try:
+                    aborted = self.abort_generation()
+                    return RunSummary(
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        success=True,
+                        attempt=aborted.attempt if aborted else 0,
+                        representative_runs=(
+                            aborted.representative_runs if aborted else 0),
+                        remaining_plans=(
+                            aborted.remaining_plans
+                            if aborted else (self._last_remaining_plans or 0)),
+                        attempt_result=self.attempt_result,
+                        stop_reason=self.stop_reason,
+                        collection=self.collection,
+                        retained_mutations=self.retained_mutations)
+                except Exception as abort_exc:
+                    logger.error(
+                        f"[TRACER] [{self.mode}] Could not recover from the "
+                        f"generation cutoff: {abort_exc}")
+                    exc = abort_exc
             logger.error(
                 f"[TRACER] [{self.mode}] Error while waiting for tracer "
                 f"forkserver: {exc}")
@@ -754,7 +948,137 @@ class TracerExecutor:
             attempt_result=self.attempt_result,
             stop_reason=self.stop_reason,
             collection=self.collection,
+            retained_mutations=self.retained_mutations,
         )
+
+    def finish_generation(self) -> Dict[str, object]:
+        """Leave generation and enter the resident ready state.
+
+        Must be called only after the last generation reply.  The native parent
+        acknowledges only after the attempt's partial capture is dropped and no
+        child is running; an acknowledgement failure is fatal.
+        """
+        if not self.replay_mode:
+            raise RuntimeError("Generation finish requires a resident session")
+        assert self.transport is not None
+        # The generation deadline has already expired by the time the service
+        # becomes resident; only fresh child work keeps a deadline.
+        self.transport.send_command(REPLAY_COMMAND_FINISH)
+        code = self.transport.read_ack(self.forkserver_response_timeout())
+        if code != 0:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Resident finish was refused with "
+                f"code {code}")
+        ids = self.transport.read_replay_list(self.forkserver_response_timeout())
+        info: Dict[str, object] = {
+            "mutation_ids": ids,
+            "retained_mutations": len(ids),
+            "remaining_plans": self.last_remaining_plans,
+        }
+        return info
+
+    @property
+    def last_remaining_plans(self) -> Optional[int]:
+        return self._last_remaining_plans
+
+    def request_replay_case(
+            self, mutation: int, descriptor: str,
+            timeout: Optional[float]) -> ReplayCaseResult:
+        """Run one predicate against one retained mutation.
+
+        Cancellation is the caller's responsibility: it writes the cancel
+        token from another thread, the native parent kills and reaps that
+        child, and this call then returns a CANCELLED unavailable row.
+        """
+        if not self.replay_mode:
+            raise RuntimeError("Replay cases require a resident session")
+        assert self.transport is not None
+        encoded = descriptor.encode("utf-8")
+        self.transport.send_command(REPLAY_COMMAND_CASE)
+        self.transport.send_replay_case(mutation, encoded)
+        source, outcome, reason, text = self.transport.read_replay_case(timeout)
+        try:
+            parsed_outcome = ReplayOutcome(outcome)
+            parsed_reason = ReplayReason(reason)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Resident replay returned unknown "
+                f"outcome {outcome} / reason {reason}") from exc
+        if parsed_outcome == ReplayOutcome.UNAVAILABLE and \
+                parsed_reason == ReplayReason.NONE:
+            raise RuntimeError(
+                "[TRACER] Resident replay returned unavailable without a reason")
+        if parsed_outcome != ReplayOutcome.UNAVAILABLE and \
+                parsed_reason != ReplayReason.NONE:
+            raise RuntimeError(
+                f"[TRACER] Resident replay returned "
+                f"{protocol_enum_name(parsed_outcome)} with reason "
+                f"{protocol_enum_name(parsed_reason)}")
+        source_name = "cache" if source == 1 else "executed"
+        if source not in (0, 1):
+            raise RuntimeError(
+                f"[TRACER] Resident replay returned unknown source {source}")
+        return ReplayCaseResult(mutation, source_name, parsed_outcome,
+                                parsed_reason, text)
+
+    def abort_generation(self, timeout: Optional[float] = None) -> Optional[RunSummary]:
+        """Cancel and reap the in-flight generation child, if any.
+
+        The native parent stays at a command boundary afterwards; the reply it
+        produced for the interrupted attempt is consumed here so the next
+        command can never read a stale summary.
+        """
+        if not self.replay_mode or not self._generation_inflight:
+            return None
+        assert self.transport is not None
+        self.cancel_replay_child()
+        summary = self.transport.read_summary(
+            self.forkserver_response_timeout() if timeout is None else timeout)
+        attempt, representative_runs, remaining_plans, attempt_result, \
+            stop_reason = summary[:5]
+        try:
+            self.attempt_result = AttemptResult(attempt_result)
+            self.stop_reason = StopReason(stop_reason)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Aborted attempt returned unknown "
+                f"attempt result {attempt_result} / stop reason "
+                f"{stop_reason}") from exc
+        self.iter = attempt
+        self.representative_runs = representative_runs
+        self._last_remaining_plans = remaining_plans
+        self.retained_mutations = summary[5]
+        self._generation_inflight = False
+        # An early token must never abort the first replay case.
+        if self.transport is not None:
+            self.transport.drain_cancel()
+        return RunSummary(
+            elapsed_ms=0,
+            success=self.stop_reason != StopReason.RESOURCE_FAILURE,
+            attempt=attempt,
+            representative_runs=representative_runs,
+            remaining_plans=remaining_plans,
+            attempt_result=self.attempt_result,
+            stop_reason=self.stop_reason,
+            collection=self.collection,
+            retained_mutations=self.retained_mutations,
+        )
+
+    def cancel_replay_child(self) -> None:
+        assert self.transport is not None
+        self.transport.cancel_child()
+
+    def shutdown_replay(self, timeout: Optional[float] = None) -> None:
+        """Ask the resident parent to exit after releasing retained state."""
+        if not self.replay_mode or self.transport is None:
+            return
+        try:
+            self.transport.send_command(REPLAY_COMMAND_SHUTDOWN)
+            self.transport.read_ack(self.forkserver_response_timeout()
+                                    if timeout is None else timeout)
+        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+            # Cleanup still owns the process; the caller reaps it.
+            pass
 
     def _cleanup_process_group(
             self, grace: float, wait_before_signal: float = 0.0) -> None:

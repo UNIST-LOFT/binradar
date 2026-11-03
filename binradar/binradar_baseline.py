@@ -190,6 +190,8 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
         if patch_wfd is not None:
             os.close(patch_wfd)
         raise
+    from .binradar_runtime import PROCESS_REGISTRY
+    pgid = PROCESS_REGISTRY.register(process)
     reader = None
     try:
         if patch_wfd is not None:
@@ -200,8 +202,15 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
                                               verbose=False)
         return result
     finally:
-        if reader is not None:
-            reader.join(timeout=5)
+        try:
+            if process.poll() is None:
+                binradar_utils.kill_process_group(pgid, grace=1.0)
+                process.wait(timeout=2.0)
+        finally:
+            if process.poll() is not None:
+                PROCESS_REGISTRY.unregister(process)
+            if reader is not None:
+                reader.join(timeout=5)
 
 
 def _classify(artifact: str, result, reference) -> BaselineCheck:

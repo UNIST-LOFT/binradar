@@ -733,3 +733,47 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
     rows = log_path.read_text(encoding="ascii").splitlines()
     assert "summary:1:1:0" in rows
     assert "extra:none" in rows
+
+
+def test_real_resident_protocol_reports_ready_after_finish(tmp_path, reentered_guest):
+    """Real tracer: GENERATE -> FINISH -> LIST -> SHUTDOWN, no session teardown."""
+    guest, entrypoint = reentered_guest
+    manifest = tmp_path / "brpatches.json"
+    manifest.write_text(
+        '{"version":1,"kind":"generic-erm","predicates":[]}', encoding="ascii")
+    marker = tmp_path / "visits"
+    env = {
+        "PATH": os.environ["PATH"],
+        "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1",
+        "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "5",
+        "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_TRACE_FILE": "none",
+        "BINRADAR_TRACER_LOG_FILE": str(tmp_path / "tracer.log"),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+        "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+        "BINRADAR_PATCH_CNT": "0",
+        "BINRADAR_PATCH_CACHE_ENABLE": "1",
+        "BINRADAR_PATCH_MANIFEST": str(manifest),
+        "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+        "BINRADAR_REPLAY_SERVER": "1",
+        "BINRADAR_REPLAY_DIR": str(tmp_path / "replay"),
+        "BRCACHE_STACK_SIZE": "0",
+    }
+    with binradar_runtime.PhaseSession("binradar", 30) as session:
+        session.shared_memory(env, include_patch_key=True)
+        executor = session.start_tracer(
+            mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
+            binary=str(guest), test_cmd=str(marker), testcase="/dev/null",
+            replay_mode=True)
+        summary = executor.run()
+        assert summary.attempt == 1
+        assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+        # The generation reply is not a service terminal: the parent is alive.
+        info = executor.finish_generation()
+        assert info["retained_mutations"] == len(info["mutation_ids"])
+        assert executor.process is not None and executor.process.poll() is None
+        executor.shutdown_replay()
+        executor.process.wait(timeout=10)
+        assert executor.process.returncode == 0
