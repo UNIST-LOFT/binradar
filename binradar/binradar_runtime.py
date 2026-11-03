@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import BinaryIO, Callable, Dict, List, NoReturn, Optional, Tuple
 
@@ -37,13 +38,15 @@ FORKSERVER_SUMMARY_WORDS = 5
 # the command/reply words in tracer/linux-user/binradar-forkserver.h.  The
 # resident handshake word is distinct so a generation-only tracer never
 # interprets a replay command as was-killed.
-REPLAY_HANDSHAKE_EXPECTED = 0x41464C05
-REPLAY_SUMMARY_WORDS = 7
+REPLAY_HANDSHAKE_EXPECTED = 0x41464C06
+REPLAY_SUMMARY_WORDS = 8
 REPLAY_COMMAND_GENERATE = 0
 REPLAY_COMMAND_FINISH = 1
 REPLAY_COMMAND_CASE = 2
 REPLAY_COMMAND_SHUTDOWN = 3
 REPLAY_COMMAND_LIST = 4
+REPLAY_COMMAND_VALIDATE = 5
+REPLAY_DESCRIPTOR_MAX = 4095
 REPLAY_REPLY_SUMMARY = 1
 REPLAY_REPLY_ACK = 2
 REPLAY_REPLY_CASE = 3
@@ -346,6 +349,12 @@ class ForkserverTransport:
         self.patch_cached_fd_w: Optional[int] = None
         self.cancel_r: Optional[int] = None
         self.cancel_w: Optional[int] = None
+        self._read_buffer = bytearray()
+        self._state_lock = threading.Lock()
+        self.request_id = 0
+        self._active_request_id: Optional[int] = None
+        self._cancel_sent = False
+        self.poisoned = False
 
     @property
     def handshake_expected(self) -> int:
@@ -360,6 +369,7 @@ class ForkserverTransport:
             self.env["BINRADAR_FORKSERVER_STAT_W"] = str(self.stat_w)
             if self.replay_mode:
                 self.cancel_r, self.cancel_w = os.pipe()
+                os.set_blocking(self.cancel_w, False)
                 self.env["BINRADAR_REPLAY_CANCEL_FD"] = str(self.cancel_r)
             if self.mode != "binradar":
                 return
@@ -399,28 +409,35 @@ class ForkserverTransport:
                 "cancel_r", "cancel_w"):
             self._close(name)
 
-    def drain_cancel(self) -> None:
-        """Discard cancellation tokens left by a completed request."""
-        if self.cancel_r is None:
-            return
-        while True:
-            try:
-                if not os.read(self.cancel_r, 64):
-                    return
-            except (BlockingIOError, InterruptedError):
-                return
-            except OSError:
-                return
-
     def cancel_child(self) -> None:
-        """Signal the tracer to kill and reap the child it is running."""
-        if self.cancel_w is None:
+        """Emit at most one atomic, scoped token without taking the I/O lock."""
+        with self._state_lock:
+            if self.poisoned or self._active_request_id is None or self._cancel_sent:
+                return
+            if self.cancel_w is None:
+                raise RuntimeError("Resident cancellation pipe is closed")
+            os.write(self.cancel_w, struct.pack("<I", self._active_request_id))
+            self._cancel_sent = True
+
+    def complete_request(self) -> None:
+        with self._state_lock:
+            self._active_request_id = None
+
+    def poison(self) -> None:
+        with self._state_lock:
+            self.poisoned = True
+            self._active_request_id = None
+
+    def check_healthy(self) -> None:
+        if self.poisoned:
+            raise RuntimeError("Resident transport is poisoned; process cleanup required")
+
+    def _check_reply(self, kind: int, request_id: int, expected: int) -> None:
+        if request_id != self.request_id or kind != expected:
+            self.poison()
             raise RuntimeError(
-                f"[TRACER] [{self.mode}] Replay cancel pipe is closed")
-        try:
-            os.write(self.cancel_w, b"c")
-        except (BlockingIOError, BrokenPipeError):
-            pass
+                f"Resident reply kind/id {kind}/{request_id}; "
+                f"expected {expected}/{self.request_id}")
 
     def _close(self, name: str) -> None:
         fd = getattr(self, name)
@@ -464,53 +481,50 @@ class ForkserverTransport:
         """
         if self.replay_mode:
             words = struct.unpack(
-                "<IIIIIII", self.read(4 * REPLAY_SUMMARY_WORDS, timeout))
-            if words[0] != REPLAY_REPLY_SUMMARY:
-                raise RuntimeError(
-                    f"[TRACER] [{self.mode}] Expected a replay summary reply, "
-                    f"got kind {words[0]}")
-            return words[1:]
+                "<8I", self.read(4 * REPLAY_SUMMARY_WORDS, timeout))
+            self._check_reply(words[0], words[1], REPLAY_REPLY_SUMMARY)
+            self.complete_request()
+            return words[2:]
         return struct.unpack(
             "<IIIII", self.read(4 * FORKSERVER_SUMMARY_WORDS, timeout))
 
     def send_command(self, command: int) -> None:
-        self.write_u32(command)
+        self.check_healthy()
+        with self._state_lock:
+            if self.request_id == 0xFFFFFFFF:
+                raise RuntimeError("Resident request IDs exhausted")
+            self.request_id += 1
+            self._active_request_id = (self.request_id if command in
+                (REPLAY_COMMAND_GENERATE, REPLAY_COMMAND_CASE) else None)
+            self._cancel_sent = False
+        self.write(struct.pack("<II", command, self.request_id))
 
     def send_replay_case(self, mutation: int, descriptor: bytes) -> None:
         self.write(struct.pack("<II", mutation, len(descriptor)))
         self.write(descriptor)
 
     def read_ack(self, timeout: Optional[float]) -> int:
-        kind = self.read_u32(timeout)
-        if kind != REPLAY_REPLY_ACK:
-            raise RuntimeError(
-                f"[TRACER] [{self.mode}] Expected an acknowledgement reply, "
-                f"got kind {kind}")
-        return self.read_u32(timeout)
+        kind, request_id, code = struct.unpack("<III", self.read(12, timeout))
+        self._check_reply(kind, request_id, REPLAY_REPLY_ACK)
+        return code
 
     def read_replay_list(self, timeout: Optional[float]) -> List[int]:
-        kind, count = struct.unpack("<II", self.read(8, timeout))
-        if kind != REPLAY_REPLY_LIST:
-            raise RuntimeError(
-                f"[TRACER] [{self.mode}] Expected a replay list reply, "
-                f"got kind {kind}")
+        kind, request_id, count = struct.unpack("<III", self.read(12, timeout))
+        self._check_reply(kind, request_id, REPLAY_REPLY_LIST)
         if count == 0:
             return []
-        return list(struct.unpack(f"<{count}I",
-                                  self.read(4 * count, timeout)))
+        return list(struct.unpack(f"<{count}I", self.read(4 * count, timeout)))
 
     def read_replay_case(self, timeout: Optional[float]) -> Tuple[int, int, int, str]:
-        kind, source, outcome, reason, length = struct.unpack(
-            "<IIIII", self.read(20, timeout))
-        if kind != REPLAY_REPLY_CASE:
-            raise RuntimeError(
-                f"[TRACER] [{self.mode}] Expected a replay case reply, "
-                f"got kind {kind}")
+        expires = None if timeout is None else time.monotonic() + timeout
+        kind, request_id, source, outcome, reason, length = struct.unpack(
+            "<6I", self.read(24, timeout))
+        self._check_reply(kind, request_id, REPLAY_REPLY_CASE)
         if length > REPLAY_CASE_TEXT_MAX:
-            raise RuntimeError(
-                f"[TRACER] [{self.mode}] Replay case text is {length} bytes, "
-                f"above the {REPLAY_CASE_TEXT_MAX}-byte limit")
-        text = self.read(length, timeout) if length else b""
+            raise RuntimeError(f"Resident case text exceeds {REPLAY_CASE_TEXT_MAX} bytes")
+        remaining = None if expires is None else max(0, expires - time.monotonic())
+        text = self.read(length, remaining) if length else b""
+        self.complete_request()
         return source, outcome, reason, text.decode("utf-8", errors="replace")
 
     def read(self, size: int, timeout: Optional[float]) -> bytes:
@@ -518,7 +532,7 @@ class ForkserverTransport:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Forkserver status pipe is closed")
         expires_at = None if timeout is None else time.monotonic() + timeout
-        data = bytearray()
+        data = self._read_buffer
         while len(data) < size:
             wait = None
             if expires_at is not None:
@@ -543,7 +557,9 @@ class ForkserverTransport:
                 error.bytes_read = len(data)
                 raise error
             data.extend(chunk)
-        return bytes(data)
+        result = bytes(data[:size])
+        del data[:size]
+        return result
 
 
 class ReplayOutcome(enum.IntEnum):
@@ -609,6 +625,25 @@ class RunSummary:
         return self.stop_reason != StopReason.CONTINUE
 
 
+def _resident_operation(method):
+    @wraps(method)
+    def serialized(self, *args, **kwargs):
+        if not self.replay_mode:
+            return method(self, *args, **kwargs)
+        with self._resident_lock:
+            assert self.transport is not None
+            self.transport.check_healthy()
+            previous_id = self.transport.request_id
+            try:
+                return method(self, *args, **kwargs)
+            except BaseException:
+                if (self.transport.request_id != previous_id or
+                        self.transport._active_request_id is not None):
+                    self.transport.poison()
+                raise
+    return serialized
+
+
 class TracerExecutor:
     forkserver_init_timeout = 1800.0
     forkserver_timeout = 1800.0
@@ -632,6 +667,8 @@ class TracerExecutor:
         self.mode = mode
         self.replay_mode = replay_mode
         self.retained_mutations = 0
+        self._resident_lock = threading.RLock()
+        self.replay_cancel_event: Optional[threading.Event] = None
         # Resident generation state: an in-flight command has no reply yet,
         # and the last observed remaining count is never reused after an
         # interrupted request.
@@ -775,6 +812,7 @@ class TracerExecutor:
         logger.info(
             f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
 
+    @_resident_operation
     def run(self) -> RunSummary:
         if self.process is None:
             raise RuntimeError(
@@ -818,8 +856,12 @@ class TracerExecutor:
             assert self.transport is not None
             self._clear_collection_status()
             if self.replay_mode:
+                if self.replay_cancel_event is not None and self.replay_cancel_event.is_set():
+                    raise InterruptedError("Resident generation cancelled before admission")
                 self._generation_inflight = True
                 self.transport.send_command(REPLAY_COMMAND_GENERATE)
+                if self.replay_cancel_event is not None and self.replay_cancel_event.is_set():
+                    self.cancel_replay_child()
             else:
                 self.transport.write_u32(0)
             summary = self.transport.read_summary(
@@ -951,6 +993,7 @@ class TracerExecutor:
             retained_mutations=self.retained_mutations,
         )
 
+    @_resident_operation
     def finish_generation(self) -> Dict[str, object]:
         """Leave generation and enter the resident ready state.
 
@@ -981,9 +1024,11 @@ class TracerExecutor:
     def last_remaining_plans(self) -> Optional[int]:
         return self._last_remaining_plans
 
+    @_resident_operation
     def request_replay_case(
             self, mutation: int, descriptor: str,
-            timeout: Optional[float]) -> ReplayCaseResult:
+            timeout: Optional[float], *,
+            cancel_event: Optional[threading.Event] = None) -> ReplayCaseResult:
         """Run one predicate against one retained mutation.
 
         Cancellation is the caller's responsibility: it writes the cancel
@@ -994,8 +1039,14 @@ class TracerExecutor:
             raise RuntimeError("Replay cases require a resident session")
         assert self.transport is not None
         encoded = descriptor.encode("utf-8")
+        if len(encoded) > REPLAY_DESCRIPTOR_MAX:
+            raise ValueError("Replay descriptor exceeds native byte limit")
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Resident replay cancelled before admission")
         self.transport.send_command(REPLAY_COMMAND_CASE)
         self.transport.send_replay_case(mutation, encoded)
+        if cancel_event is not None and cancel_event.is_set():
+            self.cancel_replay_child()
         source, outcome, reason, text = self.transport.read_replay_case(timeout)
         try:
             parsed_outcome = ReplayOutcome(outcome)
@@ -1021,6 +1072,7 @@ class TracerExecutor:
         return ReplayCaseResult(mutation, source_name, parsed_outcome,
                                 parsed_reason, text)
 
+    @_resident_operation
     def abort_generation(self, timeout: Optional[float] = None) -> Optional[RunSummary]:
         """Cancel and reap the in-flight generation child, if any.
 
@@ -1049,9 +1101,6 @@ class TracerExecutor:
         self._last_remaining_plans = remaining_plans
         self.retained_mutations = summary[5]
         self._generation_inflight = False
-        # An early token must never abort the first replay case.
-        if self.transport is not None:
-            self.transport.drain_cancel()
         return RunSummary(
             elapsed_ms=0,
             success=self.stop_reason != StopReason.RESOURCE_FAILURE,
@@ -1065,20 +1114,45 @@ class TracerExecutor:
         )
 
     def cancel_replay_child(self) -> None:
+        if self.transport is not None:
+            self.transport.cancel_child()
+
+    @_resident_operation
+    def validate_replay_descriptor(
+            self, descriptor: str, timeout: Optional[float]) -> bool:
+        """Validate against the live native grammar/capture bounds without a child."""
+        if not self.replay_mode:
+            raise RuntimeError("Descriptor validation requires a resident session")
+        encoded = descriptor.encode("utf-8")
+        if len(encoded) > REPLAY_DESCRIPTOR_MAX:
+            return False
         assert self.transport is not None
-        self.transport.cancel_child()
+        self.transport.send_command(REPLAY_COMMAND_VALIDATE)
+        self.transport.send_replay_case(0, encoded)
+        code = self.transport.read_ack(timeout)
+        if code not in (0, 1):
+            raise RuntimeError(f"Resident validation returned unknown code {code}")
+        return code == 0
 
     def shutdown_replay(self, timeout: Optional[float] = None) -> None:
-        """Ask the resident parent to exit after releasing retained state."""
+        """Bound lock acquisition and acknowledgement by the caller's budget."""
         if not self.replay_mode or self.transport is None:
             return
+        budget = self.forkserver_response_timeout() if timeout is None else timeout
+        expires = time.monotonic() + budget
+        if not self._resident_lock.acquire(timeout=max(0, budget)):
+            raise TimeoutError("Resident shutdown timed out waiting for execution owner")
         try:
+            self.transport.check_healthy()
             self.transport.send_command(REPLAY_COMMAND_SHUTDOWN)
-            self.transport.read_ack(self.forkserver_response_timeout()
-                                    if timeout is None else timeout)
-        except (BrokenPipeError, EOFError, OSError, RuntimeError):
-            # Cleanup still owns the process; the caller reaps it.
-            pass
+            code = self.transport.read_ack(max(0, expires - time.monotonic()))
+            if code != 0:
+                raise RuntimeError(f"Resident shutdown refused with code {code}")
+        except BaseException:
+            self.transport.poison()
+            raise
+        finally:
+            self._resident_lock.release()
 
     def _cleanup_process_group(
             self, grace: float, wait_before_signal: float = 0.0) -> None:

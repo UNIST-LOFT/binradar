@@ -3,6 +3,7 @@ import select
 import stat
 import struct
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -253,6 +254,48 @@ if mode == "wrong_ack":
     raise SystemExit(0)
 
 send(version)
+if version == 0x41464c06:
+    cancel = int(os.environ["BINRADAR_REPLAY_CANCEL_FD"])
+    while True:
+        header = read_exact(ctrl, 8)
+        if len(header) != 8:
+            raise SystemExit(0)
+        command, request_id = struct.unpack("<II", header)
+        log("resident:%d:%d" % (command, request_id))
+        if command == 0:
+            summary = struct.pack("<8I", 1, request_id, 1, 1, 0, 0, 1, 0)
+            if mode == "resident_partial_summary":
+                os.write(stat, summary[:11])
+                token = struct.unpack("<I", read_exact(cancel, 4))[0]
+                log("cancel:%d" % token)
+                os.write(stat, summary[11:])
+            else:
+                os.write(stat, summary)
+        elif command == 1:
+            os.write(stat, struct.pack("<6I", 2, request_id, 0, 4, request_id, 0))
+        elif command in (2, 5):
+            mutation, length = struct.unpack("<II", read_exact(ctrl, 8))
+            descriptor = read_exact(ctrl, length)
+            log("descriptor:" + descriptor.decode("ascii"))
+            if command == 5:
+                os.write(stat, struct.pack("<3I", 2, request_id,
+                                           0 if descriptor == b"p0" else 1))
+            elif mode == "resident_case_timeout":
+                time.sleep(3)
+            else:
+                if mode == "resident_case_cancel":
+                    token = struct.unpack("<I", read_exact(cancel, 4))[0]
+                    log("cancel:%d" % token)
+                reply_id = request_id + 1 if mode == "resident_wrong_id" else request_id
+                os.write(stat, struct.pack("<6I", 3, reply_id, 0, 3, 4, 0))
+        elif command == 3:
+            if mode == "resident_stall_shutdown":
+                time.sleep(3)
+            else:
+                os.write(stat, struct.pack("<3I", 2, request_id, 0))
+                raise SystemExit(0)
+        else:
+            raise SystemExit(1)
 summaries_text = os.environ.get("FAKE_STATUSES", "1,1,5")
 summaries = []
 for item in summaries_text.split(";"):
@@ -735,9 +778,31 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
     assert "extra:none" in rows
 
 
-def test_real_resident_protocol_reports_ready_after_finish(tmp_path, reentered_guest):
-    """Real tracer: GENERATE -> FINISH -> LIST -> SHUTDOWN, no session teardown."""
-    guest, entrypoint = reentered_guest
+@pytest.fixture
+def zero_plan_guest(tmp_path):
+    """No symbolic planning, external state, or writes after the snapshot."""
+    if not Path(paths.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for resident integration")
+    # A libc main() return reads exit bookkeeping and creates plans.  Enter a
+    # freestanding exit syscall so the first baseline genuinely exhausts.
+    source = tmp_path / "zero-plan.S"
+    source.write_text(".globl _start\n_start:\n"
+                      "xor %edi,%edi\nmov $60,%eax\nsyscall\n", encoding="ascii")
+    guest = tmp_path / "zero-plan"
+    subprocess.run(["cc", "-nostdlib", "-static", "-no-pie", "-o", str(guest),
+                    str(source)], check=True, capture_output=True)
+    symbols = subprocess.run(["nm", str(guest)], check=True,
+                             capture_output=True, text=True)
+    entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
+                      if row.split()[-1] == "_start")
+    return guest, entrypoint
+
+
+@pytest.mark.parametrize("stale_cancel", [False, True])
+def test_real_resident_protocol_reports_ready_after_finish(
+        tmp_path, zero_plan_guest, stale_cancel):
+    """Exhausted zero-plan parent stays resident; a stale cancel cannot kill it."""
+    guest, entrypoint = zero_plan_guest
     manifest = tmp_path / "brpatches.json"
     manifest.write_text(
         '{"version":1,"kind":"generic-erm","predicates":[]}', encoding="ascii")
@@ -767,9 +832,15 @@ def test_real_resident_protocol_reports_ready_after_finish(tmp_path, reentered_g
             mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
             binary=str(guest), test_cmd=str(marker), testcase="/dev/null",
             replay_mode=True)
+        if stale_cancel:
+            # ID 1 belongs to a prior (noncancellable) validation transaction.
+            assert executor.validate_replay_descriptor("invalid", 5) is False
+            os.write(executor.transport.cancel_w, struct.pack("<I", 1))
         summary = executor.run()
         assert summary.attempt == 1
         assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+        assert summary.stop_reason == binradar_runtime.StopReason.EXHAUSTED
+        assert summary.remaining_plans == 0
         # The generation reply is not a service terminal: the parent is alive.
         info = executor.finish_generation()
         assert info["retained_mutations"] == len(info["mutation_ids"])
@@ -777,3 +848,266 @@ def test_real_resident_protocol_reports_ready_after_finish(tmp_path, reentered_g
         executor.shutdown_replay()
         executor.process.wait(timeout=10)
         assert executor.process.returncode == 0
+
+
+
+def make_resident_executor(tmp_path, monkeypatch, fake_script, mode="resident"):
+    executor, log_path = make_executor(tmp_path, monkeypatch, fake_script, mode=mode)
+    executor.replay_mode = True
+    executor.env["FAKE_VERSION"] = "0x41464c06"
+    return executor, log_path
+
+
+def test_resident05_peer_is_rejected(tmp_path, monkeypatch, fake_script):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    executor.env["FAKE_VERSION"] = "0x41464c05"
+    try:
+        with pytest.raises(RuntimeError, match="Unexpected forkserver handshake"):
+            executor.start()
+    finally:
+        stop_executor(executor)
+
+
+def test_resident_partial_summary_recovers_then_finishes(
+        tmp_path, monkeypatch, fake_script):
+    executor, log_path = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_partial_summary")
+    try:
+        executor.start()
+        executor.deadline = binradar_runtime.Deadline.from_timeout(0.05)
+        summary = executor.run()
+        assert summary.attempt == 1 and summary.remaining_plans == 0
+        assert not executor._generation_inflight
+        executor.cancel_replay_child()  # successful boundary has no active ID
+        assert executor.finish_generation()["mutation_ids"] == []
+        executor.shutdown_replay(0.5)
+        rows = log_path.read_text().splitlines()
+        assert rows.count("cancel:1") == 1
+        assert "resident:1:2" in rows and "resident:3:3" in rows
+    finally:
+        stop_executor(executor)
+
+
+def test_generation_cancel_event_before_admission_keeps_channel_healthy(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    event = threading.Event()
+    event.set()
+    executor.replay_cancel_event = event
+    try:
+        executor.start()
+        with pytest.raises(InterruptedError):
+            executor.run()
+        assert executor.transport.request_id == 0
+        assert not executor.transport.poisoned
+        executor.shutdown_replay(0.5)  # shutdown ignores generation cancel event
+    finally:
+        stop_executor(executor)
+
+
+def test_generation_cancel_event_registration_race_is_scoped(
+        tmp_path, monkeypatch, fake_script):
+    executor, log_path = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_partial_summary")
+    event = threading.Event()
+    executor.replay_cancel_event = event
+    try:
+        executor.start()
+        original = executor.transport.send_command
+
+        def publish_then_cancel(command):
+            original(command)
+            if command == binradar_runtime.REPLAY_COMMAND_GENERATE:
+                event.set()
+
+        monkeypatch.setattr(executor.transport, "send_command", publish_then_cancel)
+        summary = executor.run()
+        assert summary.attempt == 1 and not executor._generation_inflight
+        executor.cancel_replay_child()
+        assert executor.finish_generation()["mutation_ids"] == []
+        executor.shutdown_replay(0.5)
+        assert log_path.read_text().splitlines().count("cancel:1") == 1
+    finally:
+        stop_executor(executor)
+
+
+def test_native_validation_rejects_without_case_or_channel_poison(
+        tmp_path, monkeypatch, fake_script):
+    executor, log_path = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    try:
+        executor.start()
+        assert executor.validate_replay_descriptor("x" * 4096, 0.5) is False
+        assert executor.transport.request_id == 0  # rejected before any bytes
+        assert executor.validate_replay_descriptor("invalid", 0.5) is False
+        assert executor.validate_replay_descriptor("p0", 0.5) is True
+        assert not executor.transport.poisoned
+        executor.cancel_replay_child()  # validation is never cancellable
+        executor.shutdown_replay(0.5)
+        assert not any(row.startswith("resident:2:")
+                       for row in log_path.read_text().splitlines())
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("mode,error", [
+    ("resident_wrong_id", RuntimeError),
+    ("resident_case_timeout", TimeoutError),
+])
+def test_uncertain_case_poisons_channel_and_forbids_more_commands(
+        tmp_path, monkeypatch, fake_script, mode, error):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script, mode)
+    try:
+        executor.start()
+        with pytest.raises(error):
+            executor.request_replay_case(7, "p0", 0.05)
+        assert executor.transport.poisoned
+        request_id = executor.transport.request_id
+        with pytest.raises(RuntimeError, match="poisoned"):
+            executor.request_replay_case(8, "p0", 0.05)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            executor.shutdown_replay(0.05)
+        assert executor.transport.request_id == request_id
+    finally:
+        stop_executor(executor)
+
+
+def test_cancel_tokens_are_scoped_idempotent_and_inactive_at_boundary():
+    transport = binradar_runtime.ForkserverTransport({}, "protocol", True)
+    transport.setup()
+    try:
+        transport.cancel_child()
+        assert not select.select([transport.cancel_r], [], [], 0)[0]
+        transport.send_command(binradar_runtime.REPLAY_COMMAND_CASE)
+        callers = [threading.Thread(target=transport.cancel_child) for _ in range(8)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(1)
+        assert read_pipe(transport.cancel_r, 4) == struct.pack("<I", 1)
+        assert not select.select([transport.cancel_r], [], [], 0)[0]
+        transport.complete_request()
+        transport.cancel_child()
+        assert not select.select([transport.cancel_r], [], [], 0)[0]
+        transport.send_command(binradar_runtime.REPLAY_COMMAND_GENERATE)
+        transport.cancel_child()
+        assert read_pipe(transport.cancel_r, 4) == struct.pack("<I", 2)
+    finally:
+        transport.cleanup()
+
+
+def test_cancel_event_admission_and_registration_race(
+        tmp_path, monkeypatch, fake_script):
+    executor, log_path = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_case_cancel")
+    event = threading.Event()
+    try:
+        executor.start()
+        event.set()
+        with pytest.raises(InterruptedError):
+            executor.request_replay_case(7, "p0", 0.5, cancel_event=event)
+        assert executor.transport.request_id == 0 and not executor.transport.poisoned
+        event.clear()
+        original = executor.transport.send_replay_case
+
+        def publish_and_disconnect(mutation, descriptor):
+            original(mutation, descriptor)
+            event.set()
+
+        monkeypatch.setattr(executor.transport, "send_replay_case", publish_and_disconnect)
+        result = executor.request_replay_case(7, "p0", 0.5, cancel_event=event)
+        assert result.outcome == binradar_runtime.ReplayOutcome.UNAVAILABLE
+        assert result.reason == binradar_runtime.ReplayReason.CANCELLED
+        assert not executor.transport.poisoned
+        executor.cancel_replay_child()
+        executor.shutdown_replay(0.5)
+        assert log_path.read_text().splitlines().count("cancel:1") == 1
+    finally:
+        stop_executor(executor)
+
+
+def test_resident_shutdown_ack_timeout_is_bounded_and_not_swallowed(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_stall_shutdown")
+    try:
+        executor.start()
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            executor.shutdown_replay(0.05)
+        assert time.monotonic() - started < 0.5
+        assert executor.transport.poisoned
+    finally:
+        stop_executor(executor)
+
+
+def test_resident_transactions_are_serialized(tmp_path, monkeypatch, fake_script):
+    executor, log_path = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    first_read, release = threading.Event(), threading.Event()
+    errors = []
+    results = []
+    threads = []
+    try:
+        executor.start()
+        original = executor.transport.read_ack
+
+        def paused_ack(timeout):
+            if executor.transport.request_id == 1:
+                first_read.set()
+                assert release.wait(2)
+            return original(timeout)
+
+        monkeypatch.setattr(executor.transport, "read_ack", paused_ack)
+
+        def validate():
+            try:
+                results.append(executor.validate_replay_descriptor("p0", 0.5))
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=validate) for _ in range(2)]
+        threads[0].start()
+        assert first_read.wait(1)
+        threads[1].start()
+        # The first command owns the transaction until its reply is consumed.
+        assert executor.transport.request_id == 1
+        release.set()
+        for thread in threads:
+            thread.join(2)
+            assert not thread.is_alive()
+        assert not errors and results == [True, True]
+        assert executor.transport.request_id == 2
+        executor.shutdown_replay(0.5)
+        rows = log_path.read_text().splitlines()
+        assert rows[:4] == ["resident:5:1", "descriptor:p0",
+                            "resident:5:2", "descriptor:p0"]
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(2)
+        stop_executor(executor)
+
+
+def test_resident_shutdown_lock_wait_is_bounded(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    entered, release = threading.Event(), threading.Event()
+
+    def own_channel():
+        with executor._resident_lock:
+            entered.set()
+            release.wait(2)
+
+    owner = threading.Thread(target=own_channel)
+    try:
+        executor.start()
+        owner.start()
+        assert entered.wait(1)
+        with pytest.raises(TimeoutError, match="execution owner"):
+            executor.shutdown_replay(0.01)
+        assert executor.transport.request_id == 0
+    finally:
+        release.set()
+        owner.join(2)
+        stop_executor(executor)
+

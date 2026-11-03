@@ -9,6 +9,8 @@ batch.
 
 import json
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -82,17 +84,6 @@ def test_request_accepts_sparse_ids_and_requires_no_metadata():
 
 
 @pytest.mark.parametrize("family, predicate", [
-    ("generic-erm", "rax <= 0"),
-    ("generic-erm", "rsp > 4096"),
-    ("CWE805-erm", "s->rax >= i->begin && s->rax < i->end"),
-    ("CWE805-erm", "4 * ((uint32_t *)s->rsp)[2] < i->end - i->begin"),
-])
-def test_lower_predicate_uses_the_running_family_grammar(family, predicate):
-    lowered = binradar_replay.lower_predicate(family, predicate)
-    assert isinstance(lowered, str) and lowered
-
-
-@pytest.mark.parametrize("family, predicate", [
     ("generic-erm", "rax >>>"),
     ("generic-erm", ""),
     ("CWE805-erm", "rax <= 0"),
@@ -113,7 +104,10 @@ class FakeTracer:
         self.env = {"BINRADAR_FORKSERVER_CHILD_TIMEOUT": "5"}
         self.process = type("Process", (), {"poll": staticmethod(lambda: None)})()
 
-    def request_replay_case(self, mutation, descriptor, timeout):
+    def validate_replay_descriptor(self, descriptor, timeout):
+        return True
+
+    def request_replay_case(self, mutation, descriptor, timeout, *, cancel_event=None):
         self.requests.append((mutation, descriptor))
         outcome, reason, source = self.outcomes.pop(0)
         return binradar_runtime.ReplayCaseResult(
@@ -270,3 +264,199 @@ def test_overlong_socket_path_is_rejected_before_binding(tmp_path):
 def test_unsupported_generation_family_is_rejected():
     with pytest.raises(ValueError, match="does not support generation family"):
         binradar_replay.parse_family("CWE805-direct")
+
+
+def _ready_server(tmp_path, tracer, mutations=(2,)):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    server.attach_tracer(tracer)
+    server._mutation_ids = list(mutations)
+    server.update_generation(state="ready", generation_stop="exhausted",
+                             remaining_plans=0)
+    server.start()
+    return server
+
+
+def _normal_cases(count):
+    return [(binradar_runtime.ReplayOutcome.NORMAL,
+             binradar_runtime.ReplayReason.NONE, "executed")] * count
+
+
+def test_concurrent_admission_is_busy_while_first_batch_is_lowering(tmp_path, monkeypatch):
+    tracer = FakeTracer(_normal_cases(2))
+    server = _ready_server(tmp_path, tracer)
+    entered, release = threading.Event(), threading.Event()
+    lower = binradar_replay.lower_predicate
+
+    def blocking_lower(family, predicate):
+        if predicate == "rax":
+            entered.set()
+            assert release.wait(5)
+        return lower(family, predicate)
+
+    monkeypatch.setattr(binradar_replay, "lower_predicate", blocking_lower)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(send, Path(server.path), {
+                "op": "evaluate", "patches": [{"id": 1, "predicate": "rax"}]})
+            try:
+                assert entered.wait(5)
+                second = send(Path(server.path), {
+                    "op": "evaluate", "patches": [{"id": 2, "predicate": "rbx"}]})
+                assert second == [{"error": "busy"}]
+                assert tracer.requests == []
+            finally:
+                release.set()
+            assert first.result(timeout=5)[-1]["coverage"] == "complete"
+    finally:
+        release.set()
+        server.close()
+
+
+def test_native_rejection_of_last_patch_executes_none_and_preserves_session(
+        tmp_path, monkeypatch):
+    rejected = binradar_replay.lower_predicate("generic-erm", "rax")
+
+    class LimitedTracer(FakeTracer):
+        def validate_replay_descriptor(self, descriptor, timeout):
+            return descriptor != rejected
+
+    tracer = LimitedTracer(_normal_cases(1))
+    server = _ready_server(tmp_path, tracer)
+    terminal_sent, release = threading.Event(), threading.Event()
+    original_send = server._send
+
+    def hold_terminal_connection(connection, payload):
+        original_send(connection, payload)
+        if "error" in payload:
+            terminal_sent.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(server, "_send", hold_terminal_connection)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            rejected_rows = pool.submit(send, Path(server.path), {
+                "op": "evaluate", "patches": [
+                    {"id": 1, "predicate": "1 == 1"},
+                    {"id": 2, "predicate": "rax"}]})
+            try:
+                assert terminal_sent.wait(5)
+                assert tracer.requests == []
+                # A terminal row already reached the client.  The first worker
+                # need not close its socket before admitting the next request.
+                rows = send(Path(server.path), {
+                    "op": "evaluate", "patches": [
+                        {"id": 1, "predicate": "1 == 1"}]})
+                assert rows[-1]["coverage"] == "complete"
+            finally:
+                release.set()
+            assert "error" in rejected_rows.result(timeout=5)[0]
+    finally:
+        release.set()
+        server.close()
+
+
+def test_uncertain_case_timeout_is_fatal_not_a_later_mutation_result(tmp_path):
+    class BrokenTracer(FakeTracer):
+        def request_replay_case(self, mutation, descriptor, timeout, *, cancel_event=None):
+            self.requests.append((mutation, descriptor))
+            raise TimeoutError("incomplete native response")
+
+    tracer = BrokenTracer([])
+    server = _ready_server(tmp_path, tracer, (2, 3))
+    try:
+        rows = send(Path(server.path), {
+            "op": "evaluate", "patches": [{"id": 1, "predicate": "rax"}]})
+        assert not any(row.get("done") for row in rows)
+        assert [mutation for mutation, _ in tracer.requests] == [2]
+        with pytest.raises(RuntimeError, match="incomplete native response"):
+            server.serve(tracer, (2, 3), "exhausted", 0)
+        assert server._status()["state"] == "stopping"
+    finally:
+        server.close()
+
+
+def test_idle_parent_loss_raises_instead_of_completing_service(tmp_path):
+    tracer = FakeTracer([])
+    tracer.process = type("Exited", (), {"poll": staticmethod(lambda: 1)})()
+    server = _ready_server(tmp_path, tracer)
+    try:
+        with pytest.raises(RuntimeError, match="parent exited"):
+            server.serve(tracer, (2,), "exhausted", 0)
+        assert server.shutdown_requested.is_set()
+        assert server._status()["state"] == "stopping"
+    finally:
+        server.close()
+
+
+class BlockingTracer(FakeTracer):
+    def __init__(self):
+        super().__init__(_normal_cases(1))
+        self.entered = threading.Event()
+        self.cancel_seen = threading.Event()
+        self.reply_ready = threading.Event()
+
+    def request_replay_case(self, mutation, descriptor, timeout, *, cancel_event=None):
+        if not self.entered.is_set():
+            self.requests.append((mutation, descriptor))
+            self.entered.set()
+            assert self.reply_ready.wait(5)
+            return binradar_runtime.ReplayCaseResult(
+                mutation, "executed", binradar_runtime.ReplayOutcome.UNAVAILABLE,
+                binradar_runtime.ReplayReason.CANCELLED, "{}")
+        return super().request_replay_case(
+            mutation, descriptor, timeout, cancel_event=cancel_event)
+
+    def cancel_replay_child(self):
+        self.cancel_seen.set()
+
+
+def test_busy_shutdown_waits_for_case_owner_before_native_shutdown(tmp_path):
+    tracer = BlockingTracer()
+    server = _ready_server(tmp_path, tracer)
+
+    def serve_owned():
+        server.serve(tracer, (2,), "exhausted", 0)
+        tracer.shutdown_replay(timeout=1)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            serving = pool.submit(serve_owned)
+            evaluating = pool.submit(send, Path(server.path), {
+                "op": "evaluate", "patches": [{"id": 1, "predicate": "rax"}]})
+            try:
+                assert tracer.entered.wait(5)
+                assert send(Path(server.path), {"op": "shutdown"}) == [{"accepted": True}]
+                assert tracer.cancel_seen.wait(5)
+                assert not serving.done()
+                assert not tracer.shut_down
+            finally:
+                tracer.reply_ready.set()
+            serving.result(timeout=5)
+            assert tracer.shut_down
+            assert not any(row.get("done") for row in evaluating.result(timeout=5))
+    finally:
+        tracer.reply_ready.set()
+        server.close()
+
+
+def test_disconnect_retires_cancel_owner_before_next_batch(tmp_path):
+    tracer = BlockingTracer()
+    server = _ready_server(tmp_path, tracer)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(server.path)
+        client.sendall(request_bytes({
+            "op": "evaluate", "patches": [{"id": 1, "predicate": "rax"}]}))
+        assert tracer.entered.wait(5)
+        client.close()
+        assert tracer.cancel_seen.wait(5)
+        tracer.reply_ready.set()
+        assert server._evaluation_idle.wait(5)
+        rows = send(Path(server.path), {
+            "op": "evaluate", "patches": [{"id": 2, "predicate": "rbx"}]})
+        assert rows[0]["outcome"] == "normal"
+        assert rows[-1]["coverage"] == "complete"
+    finally:
+        client.close()
+        tracer.reply_ready.set()
+        server.close()

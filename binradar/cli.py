@@ -1554,11 +1554,35 @@ class BinRadarExecutor:
         service.start()
         logger.info(f"[REPLAY] Listening on {service.path}")
         self._replay_service = service
+        finished = threading.Event()
+
+        def bound_shutdown() -> None:
+            # Before a native command exists, PROBE/preflight/startup cannot
+            # consume a scoped cancel.  Bound their registered cleanup too.
+            while not finished.wait(0.1):
+                if not service.shutdown_requested.is_set():
+                    continue
+                if not finished.wait(service.control_timeout):
+                    binradar_runtime.PROCESS_REGISTRY.stop_all()
+                return
+
+        shutdown_worker = threading.Thread(
+            target=bound_shutdown, name="replay-shutdown", daemon=True)
+        shutdown_worker.start()
         try:
             yield service
+        except Exception:
+            with service._lock:
+                requested = service.shutdown_requested.is_set()
+                failed = service.progress.error is not None
+            if not requested or failed:
+                raise
+            logger.info("[REPLAY] Requested shutdown completed")
         finally:
+            finished.set()
             self._replay_service = None
             service.close()
+            shutdown_worker.join(timeout=service.control_timeout)
 
     def _check_replay_shutdown(self):
         if (self._replay_service is not None and
@@ -1604,7 +1628,11 @@ class BinRadarExecutor:
                 f"[retained-mutations {info['retained_mutations']}]")
             service.serve(tracer, info["mutation_ids"], stop_reason,
                           info["remaining_plans"])
-            tracer.shutdown_replay()
+            try:
+                tracer.shutdown_replay(timeout=service.control_timeout)
+            except (OSError, EOFError, RuntimeError) as exc:
+                service._fail(f"Resident shutdown failed: {exc}")
+                raise
         finally:
             # Tracer/solver/channels/mappings live until the service ends.
             session.close()

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import socket
 import stat
 import threading
@@ -108,7 +109,7 @@ def parse_request(data: bytes) -> dict[str, object]:
         raise ReplayProtocolError("empty request")
     try:
         request = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise ReplayProtocolError(f"malformed JSON: {exc}") from exc
     if not isinstance(request, dict):
         raise ReplayProtocolError("request must be a JSON object")
@@ -202,12 +203,9 @@ def parse_family(name: str) -> binradar_taosc_predicates.PredicateFamily:
 
 
 class ReplayServer:
-    """One serialized evaluation endpoint over a resident tracer session.
+    """Host listener with one evaluation owner and independent status reads."""
 
-    ``serve`` is called only after generation has ended.  ``status`` remains
-    responsive from another thread because it reads the progress snapshot,
-    never the native command channel.
-    """
+    control_timeout = 10.0
 
     def __init__(self, run_dir: str, family: str, stack_size: int = 0):
         self.run_dir = str(run_dir)
@@ -216,9 +214,12 @@ class ReplayServer:
         self.stack_size = stack_size
         self.progress = GenerationProgress()
         self.shutdown_requested = threading.Event()
-        # Re-entrant: the serving thread updates progress while already
-        # holding the lock, and status must keep observing it.
         self._lock = threading.RLock()
+        self._evaluation_idle = threading.Event()
+        self._evaluation_idle.set()
+        self._batch_cancel: threading.Event | None = None
+        self._evaluation_connection: socket.socket | None = None
+        self._connections: set[socket.socket] = set()
         self._socket: socket.socket | None = None
         self._socket_identity: tuple[int, int] | None = None
         self._listener: threading.Thread | None = None
@@ -226,14 +227,12 @@ class ReplayServer:
         self._tracer: binradar_runtime.TracerExecutor | None = None
         self._mutation_ids: list[int] = []
 
-    # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         if len(self.path.encode()) > MAX_SOCKET_PATH:
             raise ValueError(
                 f"replay socket path is longer than {MAX_SOCKET_PATH} bytes: "
                 f"{self.path}")
         if os.path.lexists(self.path):
-            # Never unlink an endpoint another server may still own.
             raise RuntimeError(
                 f"replay socket already exists; a server may be running: "
                 f"{self.path}")
@@ -251,14 +250,35 @@ class ReplayServer:
         self._socket = listener
         self._running = True
         self._listener = threading.Thread(
-            target=self._accept_loop, name="replay-listener", daemon=True)
+            target=self._accept_loop, args=(listener,),
+            name="replay-listener", daemon=True)
         self._listener.start()
 
+    def request_shutdown(self) -> None:
+        """Stop admission and interrupt only the current native request."""
+        with self._lock:
+            self.progress.state = "stopping"
+            self.shutdown_requested.set()
+            if self._batch_cancel is not None:
+                self._batch_cancel.set()
+            tracer = self._tracer
+            connection = self._evaluation_connection
+        if tracer is not None:
+            try:
+                tracer.cancel_replay_child()
+            except (OSError, RuntimeError):
+                # The execution owner propagates channel/parent failure.
+                pass
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def close(self) -> None:
+        self.request_shutdown()
         self._running = False
-        self.shutdown_requested.set()
-        listener = self._socket
-        self._socket = None
+        listener, self._socket = self._socket, None
         if listener is not None:
             try:
                 listener.shutdown(socket.SHUT_RDWR)
@@ -266,13 +286,17 @@ class ReplayServer:
                 pass
             listener.close()
         if self._listener is not None:
-            self._listener.join(timeout=5)
+            self._listener.join(timeout=self.control_timeout)
             self._listener = None
-        # Do not wait for an in-flight evaluation here; the tracer cleanup in
-        # the caller reaps its children and a joined worker would pin the
-        # process to a slow guest exit.  Remove only the endpoint this server
-        # created: another live server may have bound the same name after this
-        # process lost ownership.
+        with self._lock:
+            connections = tuple(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        # PhaseSession owns native cleanup, including exceptional exits.  A
+        # successful serve() has already waited for the evaluation owner.
         try:
             info = os.stat(self.path)
             if self._socket_identity == (info.st_dev, info.st_ino):
@@ -290,6 +314,7 @@ class ReplayServer:
     def attach_tracer(self, tracer: binradar_runtime.TracerExecutor) -> None:
         with self._lock:
             self._tracer = tracer
+            tracer.replay_cancel_event = self.shutdown_requested
 
     @property
     def tracer(self) -> binradar_runtime.TracerExecutor | None:
@@ -300,58 +325,68 @@ class ReplayServer:
         with self._lock:
             return self.progress.snapshot()
 
-    # -- connection framing ------------------------------------------------
-    def _accept_loop(self) -> None:
-        assert self._socket is not None
+    def _fail(self, message: str) -> None:
+        with self._lock:
+            if self.progress.error is None:
+                self.progress.error = message
+        logger.error(f"[REPLAY] {message}")
+        self.request_shutdown()
+
+    def _accept_loop(self, listener: socket.socket) -> None:
         while self._running:
             try:
-                connection, _ = self._socket.accept()
+                connection, _ = listener.accept()
             except OSError:
                 return
-            worker = threading.Thread(
+            with self._lock:
+                self._connections.add(connection)
+            threading.Thread(
                 target=self._connection_thread, args=(connection,),
-                name="replay-connection", daemon=True)
-            worker.start()
+                name="replay-connection", daemon=True).start()
 
     def _connection_thread(self, connection: socket.socket) -> None:
         try:
             self._handle(connection)
-        except BaseException as exc:  # never let one peer end the service
-            logger.error(f"[REPLAY] Connection failed: {exc}")
-        finally:
+        except ReplayProtocolError as exc:
             try:
-                connection.close()
+                self._send(connection, {"error": str(exc)})
             except OSError:
                 pass
+        except OSError:
+            pass
+        except Exception as exc:
+            logger.error(f"[REPLAY] Connection failed: {exc}")
+        finally:
+            with self._lock:
+                self._connections.discard(connection)
+            connection.close()
 
     def _handle(self, connection: socket.socket) -> None:
         connection.settimeout(CLIENT_READ_TIMEOUT)
         data = bytearray()
         while b"\n" not in data:
-            if len(data) > MAX_REQUEST_BYTES:
-                raise ReplayProtocolError("request is too large")
             chunk = connection.recv(4096)
             if not chunk:
                 if not data:
                     return
-                break
+                raise ReplayProtocolError("request must end with a newline")
             data.extend(chunk)
             if len(data) > MAX_REQUEST_BYTES:
                 raise ReplayProtocolError("request is too large")
         line, _, trailing = bytes(data).partition(b"\n")
         if trailing.strip():
             raise ReplayProtocolError("one request per connection is allowed")
-        try:
-            request = parse_request(line)
-        except ReplayProtocolError as exc:
-            self._send(connection, {"error": str(exc)})
-            return
+        request = parse_request(line)
         operation = request["op"]
         if operation == "status":
             self._send(connection, self._status())
         elif operation == "shutdown":
-            self.shutdown_requested.set()
-            self._send(connection, {"accepted": True})
+            with self._lock:
+                self.progress.state = "stopping"
+            try:
+                self._send(connection, {"accepted": True})
+            finally:
+                self.request_shutdown()
         else:
             patches = request["patches"]
             assert isinstance(patches, list)
@@ -362,120 +397,143 @@ class ReplayServer:
         connection.sendall(json.dumps(payload, separators=(",", ":"))
                            .encode("utf-8") + b"\n")
 
-    # -- evaluation --------------------------------------------------------
-    def _evaluate(self, connection: socket.socket,
-                  patches: list[Patch]) -> None:
-        tracer = self.tracer
+    def _evaluate(self, connection: socket.socket, patches: list[Patch]) -> None:
+        # Reservation covers both source/native validation and execution.  No
+        # second request can pass a stale ready check while lowering a batch.
         with self._lock:
             state = self.progress.state
-        if state not in ("ready", "evaluating"):
-            self._send(connection, {"error": f"state {state} cannot evaluate"})
+            tracer = self._tracer
+            if state == "evaluating":
+                error = "busy"
+            elif state != "ready" or self.shutdown_requested.is_set():
+                error = f"state {state} cannot evaluate"
+            elif tracer is None:
+                error = "no resident snapshot"
+            else:
+                error = None
+                self.progress.state = "evaluating"
+                self._evaluation_idle.clear()
+                cancelled = threading.Event()
+                self._batch_cancel = cancelled
+                self._evaluation_connection = connection
+                mutation_ids = self._mutation_ids
+        if error is not None:
+            self._send(connection, {"error": error})
             return
-        if state == "evaluating":
-            self._send(connection, {"error": "busy"})
-            return
-        if tracer is None:
-            self._send(connection, {"error": "no resident snapshot"})
-            return
-        lowered: list[tuple[Patch, str]] = []
-        try:
-            for patch in patches:
-                lowered.append((patch, lower_predicate(self.family.value,
-                                                        patch.predicate)))
-        except (ReplayProtocolError, ValueError) as exc:
-            self._send(connection, {"error": str(exc)})
-            return
-        mutation_ids = list(self._mutation_ids)
-        with self._lock:
-            if not mutation_ids:
-                self._send(connection, {
-                    "error": "no retained mutations; zero coverage"})
-                return
-            self.update_generation(state="evaluating")
-        disconnected = threading.Event()
+        assert tracer is not None
+        stopped = threading.Event()
 
         def watch_disconnect() -> None:
-            while not disconnected.wait(0.1):
-                try:
-                    probe = connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-                except (BlockingIOError, TimeoutError, InterruptedError):
-                    # Still connected with no new bytes.  ``socket.timeout`` is
-                    # an OSError subclass, so it must be matched before the
-                    # generic error that means the peer is gone.
+            poller = select.poll()
+            poller.register(connection, select.POLLIN | select.POLLHUP |
+                            select.POLLERR | select.POLLRDHUP)
+            while not stopped.is_set():
+                if not poller.poll(100):
                     continue
-                except OSError:
-                    probe = b""
-                if not probe:
+                # After the newline there is no more legal client input.
+                # Poll also observes EOF without a timeout-mode recv() which
+                # could keep the old watcher alive after batch completion.
+                with self._lock:
+                    if stopped.is_set() or self._batch_cancel is not cancelled:
+                        return
+                    cancelled.set()
                     try:
                         tracer.cancel_replay_child()
                     except (OSError, RuntimeError):
                         pass
-                    return
+                return
 
         monitor = threading.Thread(
             target=watch_disconnect, name="replay-disconnect", daemon=True)
         monitor.start()
+
+        def release() -> None:
+            stopped.set()
+            monitor.join()
+            with self._lock:
+                if self._batch_cancel is cancelled:
+                    self._batch_cancel = None
+                    self._evaluation_connection = None
+                    if self.progress.state == "evaluating":
+                        self.progress.state = "ready"
+                    self._evaluation_idle.set()
+
+        def terminal(payload: dict[str, object]) -> None:
+            # The client may immediately submit another batch on its terminal
+            # row; retire this cancellation owner before advertising completion.
+            release()
+            self._send(connection, payload)
+
         try:
-            total = 0
-            unavailable = 0
+            try:
+                lowered = [(patch, lower_predicate(self.family.value,
+                                                   patch.predicate))
+                           for patch in patches]
+            except (ValueError, RecursionError) as exc:
+                terminal({"error": str(exc)})
+                return
+            for patch, descriptor in lowered:
+                if cancelled.is_set() or self.shutdown_requested.is_set():
+                    return
+                try:
+                    accepted = tracer.validate_replay_descriptor(
+                        descriptor, self.control_timeout)
+                except (OSError, EOFError, RuntimeError) as exc:
+                    self._fail(f"Resident validation failed: {exc}")
+                    return
+                if not accepted:
+                    terminal({
+                        "error": f"patch {patch.id} exceeds native predicate "
+                                 "or capture limits"})
+                    return
+            if not mutation_ids:
+                terminal({
+                    "error": "no retained mutations; zero coverage"})
+                return
+            total = unavailable = 0
             for patch, descriptor in lowered:
                 for mutation in mutation_ids:
-                    if self.shutdown_requested.is_set():
+                    if cancelled.is_set() or self.shutdown_requested.is_set():
                         return
                     try:
                         result = tracer.request_replay_case(
-                            mutation, descriptor,
-                            self._case_timeout(tracer))
-                    except (BrokenPipeError, EOFError, TimeoutError, OSError,
-                            RuntimeError) as exc:
-                        logger.error(
-                            f"[REPLAY] Case failed for mutation {mutation}: "
-                            f"{exc}")
-                        self._send(connection, {
-                            "mutation": mutation, "patch": patch.id,
-                            "source": "executed", "outcome": "unavailable",
-                            "reason": "engine-error"})
-                        total += 1
-                        unavailable += 1
-                        if not self._recover(tracer):
-                            return
-                        continue
-                    outcome = self._outcome_name(result)
-                    row = {
-                        "mutation": result.mutation,
-                        "patch": patch.id,
-                        "source": result.source,
-                        "outcome": outcome,
-                        "reason": self._reason_name(result),
-                    }
-                    try:
-                        self._send(connection, row)
-                    except OSError:
-                        # The client left; the case already committed and stays
-                        # reusable, but this batch produces no done marker.
-                        disconnected.set()
+                            mutation, descriptor, self._case_timeout(tracer),
+                            cancel_event=cancelled)
+                    except InterruptedError:
+                        if not cancelled.is_set() and not self.shutdown_requested.is_set():
+                            self._fail("Unexpected interruption of resident evaluation")
                         return
+                    except (OSError, EOFError, RuntimeError) as exc:
+                        # A live parent does not prove the wire is synchronized.
+                        self._fail(f"Resident evaluation failed: {exc}")
+                        return
+                    if cancelled.is_set() or self.shutdown_requested.is_set():
+                        return
+                    outcome = self._outcome_name(result)
+                    self._send(connection, {
+                        "mutation": result.mutation, "patch": patch.id,
+                        "source": result.source, "outcome": outcome,
+                        "reason": self._reason_name(result),
+                    })
                     total += 1
-                    if outcome == "unavailable":
-                        unavailable += 1
-            try:
+                    unavailable += outcome == "unavailable"
+            # Retire the watcher before advertising completion.  A normal
+            # client close after done must never cancel the next request.
+            release()
+            if not cancelled.is_set() and not self.shutdown_requested.is_set():
                 self._send(connection, {
-                    "done": True,
-                    "cases": total,
-                    "unavailable": unavailable,
-                    "patches": len(lowered),
-                    "mutations": len(mutation_ids),
-                    "coverage": "zero" if total == 0 else
-                    ("partial" if unavailable else "complete"),
+                    "done": True, "cases": total, "unavailable": unavailable,
+                    "patches": len(lowered), "mutations": len(mutation_ids),
+                    "coverage": "partial" if unavailable else "complete",
                 })
-            except OSError:
-                pass
+        except OSError:
+            # Native I/O is handled at its call site; only the client send can
+            # fail here.  Completed cases stay reusable, with no batch marker.
+            pass
+        except Exception as exc:
+            self._fail(f"Resident evaluation failed: {exc}")
         finally:
-            disconnected.set()
-            monitor.join(timeout=1.0)
-            with self._lock:
-                if self.progress.state == "evaluating":
-                    self.update_generation(state="ready")
+            release()
 
     @staticmethod
     def _outcome_name(result: binradar_runtime.ReplayCaseResult) -> str:
@@ -492,57 +550,31 @@ class ReplayServer:
         child_cap = float(tracer.env.get(
             "BINRADAR_FORKSERVER_CHILD_TIMEOUT",
             binradar_runtime.TracerExecutor.forkserver_timeout))
-        # One child plus native kill/reap and reply framing.
         return child_cap + 120.0
 
-    def _recover(self, tracer: binradar_runtime.TracerExecutor) -> bool:
-        """Return to ``ready`` after a failed case; a dead parent is fatal."""
-        process = tracer.process
-        if process is None or process.poll() is not None:
-            with self._lock:
-                self.update_generation(
-                    state="stopping",
-                    error="resident parent exited during replay")
-            self.shutdown_requested.set()
-            return False
-        return True
-
-    # -- serving -----------------------------------------------------------
     def serve(self, tracer: binradar_runtime.TracerExecutor,
               mutation_ids: Iterable[int], generation_stop: str,
               remaining_plans: int | None) -> None:
-        """Serve until explicit shutdown, signal or fatal engine failure."""
-        self._mutation_ids = [int(value) for value in mutation_ids]
+        self.attach_tracer(tracer)
         with self._lock:
-            self.update_generation(
-                state="ready",
-                generation_stop=generation_stop,
-                remaining_plans=remaining_plans,
-                retained_mutations=len(self._mutation_ids),
-                error=None)
+            self._mutation_ids = [int(value) for value in mutation_ids]
+            if not self.shutdown_requested.is_set():
+                self.update_generation(
+                    state="ready", generation_stop=generation_stop,
+                    remaining_plans=remaining_plans,
+                    retained_mutations=len(self._mutation_ids))
         logger.info(
             f"[REPLAY] Ready: {len(self._mutation_ids)} retained mutation(s), "
             f"generation stop {generation_stop}")
         try:
-            while not self.shutdown_requested.wait(0.2):
-                if tracer.process is not None and tracer.process.poll() is not None:
-                    with self._lock:
-                        self.update_generation(
-                            state="stopping",
-                            error="resident parent exited")
-                    logger.error("[REPLAY] Resident tracer parent exited")
-                    # Fatal engine failure: stop admitting requests so a client
-                    # observes a closed endpoint instead of a frozen "ready".
-                    self._running = False
-                    listener, self._socket = self._socket, None
-                    if listener is not None:
-                        try:
-                            listener.close()
-                        except OSError:
-                            pass
-                    self.shutdown_requested.set()
-                    return
-        finally:
+            while not self.shutdown_requested.wait(0.1):
+                if tracer.process is None or tracer.process.poll() is not None:
+                    self._fail("Resident tracer parent exited")
+            if not self._evaluation_idle.wait(self.control_timeout):
+                self._fail("Resident evaluation did not reach its shutdown boundary")
             with self._lock:
-                if self.progress.state != "stopping":
-                    self.update_generation(state="stopping")
+                error = self.progress.error
+            if error is not None:
+                raise RuntimeError(error)
+        finally:
+            self.update_generation(state="stopping")
