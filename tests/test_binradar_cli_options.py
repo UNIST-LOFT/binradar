@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -429,3 +430,152 @@ def test_run_settings_records_resolved_candidate_scope(tmp_path):
     assert rows[1]["invocation"] == executor.invocation
     assert rows[1]["execution-mode"] == "single-phase-final"
     assert [row["concrete-input-schedule"] for row in rows] == ["novelty", "novelty"]
+
+
+@pytest.fixture
+def output_cli(tmp_path, monkeypatch):
+    """Use real executor initialization/records, replacing only native phases."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    env = ('BINARY="guest"\nPOC_INPUT="poc"\nTEST_CMD="@@"\n'
+           'PATCH_LOC="0x401000"\nTOTAL_PATCHES="1"\n'
+           'BINRADAR_PATCH_KIND="generic-erm"\n')
+    for name in ("binradar.env", "generate-concrete.env", "generate-binradar.env"):
+        (workdir / name).write_text(env)
+    monkeypatch.setattr(binradar, "setlimits", lambda: None)
+    monkeypatch.setattr(binradar.signal, "signal", lambda *args: None)
+    monkeypatch.chdir(tmp_path)
+
+    def prepare_plt(self, filename):
+        Path(filename).write_text("initialized PLT\n")
+        return filename
+
+    monkeypatch.setattr(binradar.BinRadarExecutor, "set_plt_info", prepare_plt)
+    for name in ("run_probe", "run_fuzzolic", "run_directed", "run_fuzzer",
+                 "run_minimizer", "run_minimizer_and_verifier", "run_binradar",
+                 "run_feedback", "run_final"):
+        monkeypatch.setattr(binradar.BinRadarExecutor, name,
+                            lambda self, *args, **kwargs: None)
+    # Logging ownership is unrelated to output selection; avoid leaving the
+    # process-global logger attached to a temporary directory across tests.
+    monkeypatch.setattr(binradar.logger, "set_file", lambda filename: None)
+
+    def invoke(*args):
+        monkeypatch.setattr(sys, "argv", ["binradar", "-w", str(workdir), *args])
+        binradar.main()
+
+    return workdir, invoke
+
+
+@pytest.mark.parametrize("mode", [
+    [], ["--seq"], ["--fuzzer-only"], ["--generate-concrete"],
+    ["--generate-concrete", "--seq"], ["--generate-binradar"],
+    ["--run-single-phase", "probe"],
+    ["--generate-concrete", "--run-single-phase", "probe"],
+    ["--generate-binradar", "--run-single-phase", "probe"],
+])
+@pytest.mark.parametrize("run_id", ["37", "last"])
+def test_explicit_output_is_fresh_exact_leaf_for_every_schedule(
+        tmp_path, output_cli, mode, run_id):
+    workdir, invoke = output_cli
+    output = tmp_path / "requested"
+    output.mkdir()
+    (output / "old-result").write_bytes(b"old")
+    (output / "progress.sbsv").write_text(
+        "[rundir] [set] [prefix ignored] [id 99] [dir stale]\n")
+    invoke("--output", str(output), "--run-prefix", "ignored",
+           "--run-id", run_id, *mode)
+    assert not (output / "old-result").exists()
+    assert not (output / "ignored-00037").exists()
+    assert not (output / "run-00000").exists()
+    assert (output / "plt_info.txt").read_text() == "initialized PLT\n"
+    progress = (output / "progress.sbsv").read_text()
+    assert "[prefix run] [id 0]" in progress
+    assert "stale" not in progress
+    settings = (output / "binradar-setting.sbsv").read_text()
+    assert "[run-prefix run]" in settings or '[run-prefix "run"]' in settings
+    assert not (workdir / "out").exists()
+
+
+def test_omitted_output_preserves_progression_and_last_resume(output_cli):
+    workdir, invoke = output_cli
+    invoke()
+    first = workdir / "out" / "run-00000"
+    (first / "preserved").write_bytes(b"first")
+    invoke()
+    second = workdir / "out" / "run-00001"
+    (second / "preserved").write_bytes(b"second")
+    invoke("--run-single-phase", "probe", "--run-id", "last")
+    assert (first / "preserved").read_bytes() == b"first"
+    assert (second / "preserved").read_bytes() == b"second"
+    assert not (workdir / "out" / "run-00002").exists()
+
+
+def test_relative_output_uses_invocation_cwd_and_preserves_parent_alias(
+        tmp_path, output_cli):
+    workdir, invoke = output_cli
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    invoke("--output", "alias/run")
+    assert (physical / "run" / "binradar-setting.sbsv").is_file()
+    settings = (physical / "run" / "binradar-setting.sbsv").read_text()
+    assert str(alias / "run") in settings
+    assert not (workdir / "alias").exists()
+
+
+@pytest.mark.parametrize("kind", ["workdir", "ancestor", "ancestor-alias", "file"])
+def test_exact_output_rejects_destructive_boundaries_without_deletion(
+        tmp_path, output_cli, kind):
+    workdir, invoke = output_cli
+    marker = workdir / "source"
+    marker.write_bytes(b"source input")
+    output = {"workdir": workdir, "ancestor": tmp_path}.get(kind)
+    if kind == "ancestor-alias":
+        output = tmp_path / "ancestor-alias"
+        output.symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "file":
+        output = tmp_path / "file"
+        output.write_bytes(b"not a directory")
+    with pytest.raises(ValueError, match="--output"):
+        invoke("--output", str(output))
+    assert marker.read_bytes() == b"source input"
+    if kind == "file":
+        assert output.read_bytes() == b"not a directory"
+    if kind == "ancestor-alias":
+        assert output.is_symlink()
+
+
+def test_exact_output_unlinks_final_symlink_without_deleting_target(
+        tmp_path, output_cli):
+    _, invoke = output_cli
+    target = tmp_path / "unrelated"
+    target.mkdir()
+    (target / "source").write_bytes(b"unrelated input")
+    output = tmp_path / "requested"
+    output.symlink_to(target, target_is_directory=True)
+    invoke("--output", str(output))
+    assert not output.is_symlink()
+    assert (output / "plt_info.txt").is_file()
+    assert (target / "source").read_bytes() == b"unrelated input"
+    assert not (target / "plt_info.txt").exists()
+
+
+@pytest.mark.parametrize("flags", [
+    ["--fuzzer-only", "--seq"],
+    ["--generate-binradar", "--disable-binradar"],
+    ["--generate-concrete", "--feedback"],
+    ["--mutation-portfolio", "mixed"],
+])
+def test_invalid_modes_preserve_explicit_existing_output(tmp_path, output_cli, flags):
+    _, invoke = output_cli
+    output = tmp_path / "requested"
+    output.mkdir()
+    marker = output / "existing"
+    marker.write_bytes(b"previous results")
+    with pytest.raises(SystemExit) as failure:
+        invoke("--output", str(output), *flags)
+    assert failure.value.code == 2
+    assert marker.read_bytes() == b"previous results"
+    assert not (output / "plt_info.txt").exists()

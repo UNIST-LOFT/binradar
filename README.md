@@ -135,9 +135,23 @@ just binradar
 Entrypoint is `binradar.py`. It will read the `binradar.env` file in the specified working directory and run the verification process. You can also specify other options as needed.
 Timeout can be given as `-t` or `--timeout` option (default: 3600 seconds).
 
-Output will be saved in the `out` directory in the working directory. You can check the logs and results in the output directory.
+Without `--output`, runs keep the existing `<workdir>/out/<run-prefix>-<run-id:05d>` layout
+and `<workdir>/out/progress.sbsv` progress history.
 
-`out/progress.sbsv` file contains information about the progress of the verification process. 
+`-o DIR` / `--output DIR` instead selects the **exact run directory**. An existing
+directory is deleted and recreated; `--run-prefix` and `--run-id` are ignored,
+with no numbered child directory appended. Relative paths use the invocation cwd.
+Stop processes using the old directory before replacement; this option is never
+a resume request. Workdir itself and its ancestors are rejected to protect inputs.
+
+```sh
+uv run binradar -w benchmarks/loftix/jq/CVE-2023-50246/workdir-0.1.24 \
+  --generate-binradar --replay-server \
+  --output benchmarks/loftix/jq/CVE-2023-50246/workdir-0.1.24/out/br-gen-bin-00000
+```
+
+With explicit output, `progress.sbsv`, `plt_info.txt`, logs and phase results are
+written directly into `DIR`. The progress records use identity `run/0`. 
 `[final] [done] [prefix {run_prefix}] [id {run_id}] [remaining_patches {remaining_patches}] [binradar_remaining_patches {binradar_remaining_patches}]` indicates the final result of the verification process, which is also written to `<run_dir>/final.sbsv`.
 
 `minimizer.sbsv` is streamed: the minimizer appends each row holding `fcntl.flock(LOCK_EX)` across write+flush, and the verifier reads new rows with the same lock, so partial rows are never observed. The `[minimizer] [done] [time N]` row signals the end of the stream. While the producer phases run, the minimizer consumes atomically published testcase files (`.binradar-part` names are ignored) and logs `[minimizer] [done]` only after every producer has ended; a producer failure or a verifier failure leaves the stream without the done marker.

@@ -738,10 +738,14 @@ class BinRadarExecutor:
     probe_result: Optional[binradar_verifier.BinRadarProbeResult]
     filter_result: List[int]
     start_time: float
-    def __init__(self, config: binradar_config.RunConfig):
+    def __init__(self, config: binradar_config.RunConfig, *,
+                 exact_output: bool = False):
         self.run_config = config
         self.workdir = config.workdir
         self.outdir = config.outdir
+        self.exact_output = exact_output
+        if exact_output:
+            self._prepare_exact_output(self.workdir, self.outdir)
         self.timeout = config.timeout
         self.forkserver_child_timeout = config.forkserver_child_timeout
         self.probe_tracer_timeout = config.probe_tracer_timeout
@@ -812,9 +816,26 @@ class BinRadarExecutor:
         return BinRadarExecutor.from_env(workdir, env)
 
     @staticmethod
-    def from_env(workdir: str, env: Dict[str, str]) -> "BinRadarExecutor":
+    def _prepare_exact_output(workdir: str, outdir: str) -> None:
+        """Replace only the requested leaf, before any run files are opened."""
+        canonical_workdir = os.path.realpath(workdir)
+        canonical_output = os.path.realpath(outdir)
+        if os.path.commonpath((canonical_workdir, canonical_output)) == canonical_output:
+            raise ValueError("--output cannot be the workdir or an ancestor of it")
+        if os.path.islink(outdir):
+            os.unlink(outdir)
+        elif os.path.isdir(outdir):
+            shutil.rmtree(outdir)
+        elif os.path.lexists(outdir):
+            raise ValueError("--output must be a directory, not a regular file or other entry")
+        os.makedirs(outdir, exist_ok=True)
+
+    @staticmethod
+    def from_env(workdir: str, env: Dict[str, str], *,
+                 exact_output: bool = False) -> "BinRadarExecutor":
         return BinRadarExecutor(
-            binradar_config.RunConfig.from_environment(workdir, env))
+            binradar_config.RunConfig.from_environment(workdir, env),
+            exact_output=exact_output)
 
     def _worker_environment(self) -> Dict[str, str]:
         return binradar_config.build_worker_environment(
@@ -932,6 +953,14 @@ class BinRadarExecutor:
 
     def set_run_dir(self, run_prefix: str = "run", use_last_run_id: bool = False, resume_phase: BinRadarPhase = BinRadarPhase.ALL):
         del resume_phase
+        if getattr(self, "exact_output", False):
+            self.previous_progress = None
+            self.run_id = 0
+            self.run_dir = self.outdir
+            self.run_prefix = "run"
+            self.save_progress(
+                f"[rundir] [set] [prefix run] [id 0] [dir {self.run_dir}]")
+            return
         previous, run_id, run_dir = self._run_record_store().select_run_directory(run_prefix, use_last_run_id)
         self.previous_progress = previous
         self.run_id = run_id
@@ -2236,7 +2265,7 @@ class BinRadarExecutor:
             _require_binradar_generation_phase(phase)
         if self.generate_concrete:
             _require_original_phase(phase)
-        if run_id in ("n", "new"):
+        if getattr(self, "exact_output", False) or run_id in ("n", "new"):
             self.set_run_dir(run_prefix=run_prefix)
         elif run_id in ("l", "last"):
             self.set_run_dir(run_prefix=run_prefix, use_last_run_id=True)
@@ -2365,7 +2394,9 @@ def main():
         help="set the base timeout in seconds (minimizer/verifier use timeout + 600 seconds; 0 is unlimited)")
     parser.add_argument(
         "-o", "--output", default="",
-        help="set the output directory for fuzzolic (default: workdir/out)")
+        help=("replace DIR and use it as the exact run directory; ignores "
+              "--run-prefix/--run-id and never resumes (default: numbered "
+              "runs under workdir/out; stop live users before replacement)"))
     parser.add_argument("--fuzzy", action="store_true", help="use the Fuzzy-SAT solver")
     parser.add_argument(
         "--feedback-mode", "--feedback", dest="feedback_mode",
@@ -2487,7 +2518,7 @@ def main():
                 _require_binradar_generation_phase(phase_from_name(args.run_single_phase))
             except ValueError as exc:
                 parser.error(str(exc))
-        elif args.run_id not in ("n", "new"):
+        elif not args.output and args.run_id not in ("n", "new"):
             parser.error("--generate-binradar requires --run-single-phase to reuse a run")
 
     if args.generate_concrete:
@@ -2498,7 +2529,7 @@ def main():
                 _require_original_phase(phase_from_name(args.run_single_phase))
             except ValueError as exc:
                 parser.error(str(exc))
-        elif args.run_id not in ("n", "new"):
+        elif not args.output and args.run_id not in ("n", "new"):
             parser.error("--generate-concrete requires --run-single-phase to reuse a run")
 
     workdir = os.path.abspath(args.workdir)
@@ -2630,10 +2661,12 @@ def main():
     if args.output != "":
         outdir = os.path.abspath(args.output)
     env["BINRADAR_OUTDIR"] = outdir
-    os.makedirs(outdir, exist_ok=True)
     os.chdir(workdir)
 
-    executor = BinRadarExecutor.from_env(workdir, env)
+    if args.output:
+        executor = BinRadarExecutor.from_env(workdir, env, exact_output=True)
+    else:
+        executor = BinRadarExecutor.from_env(workdir, env)
     if args.run_single_phase:
         executor.run_single_phase(args.run_prefix, args.run_id, phase_from_name(args.run_single_phase))
     elif args.generate_binradar:
