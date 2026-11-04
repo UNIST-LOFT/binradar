@@ -133,9 +133,15 @@ def main():
             if "libdl.so" not in m:
                 libs.append(m)
 
+    # Two generation runs may prepare the same shared outdir concurrently.
+    # Write the whole table to a private sibling and publish by rename, so a
+    # reader never sees a truncated PLT table and one run cannot interleave
+    # bytes with the other.
+    temporary = None
     outfile = None
     if args.output:
-        outfile = open(args.output, "w")
+        temporary = args.output + f".{os.getpid()}.part"
+        outfile = open(temporary, "w")
 
     binaries = [ args.binary ] + libs
     for b in binaries:
@@ -146,6 +152,14 @@ def main():
 
     if outfile:
         outfile.close()
+        try:
+            os.replace(temporary, args.output)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
 
 if __name__ == "__main__":
