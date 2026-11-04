@@ -1,6 +1,7 @@
 """Local replay service for a resident BinRadar generation snapshot.
 
-The orchestrator owns one Unix-domain stream socket at ``<rundir>/replay.sock``.
+The orchestrator publishes ``<rundir>/replay.sock`` as a symlink to its short,
+private Unix-domain socket under ``/tmp``. Clients resolve it before connecting.
 Requests are newline-delimited JSON, one per connection:
 
     {"op":"status"}
@@ -21,11 +22,14 @@ native parent and keeps a synchronized, host-owned progress view for status.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import secrets
 import select
 import socket
 import stat
+import tempfile
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -35,9 +39,6 @@ from . import binradar_taosc_predicates
 from . import logger
 
 SOCKET_NAME = "replay.sock"
-# A Unix socket path is bounded by sockaddr_un.sun_path, which is 108 bytes on
-# Linux including the terminating NUL.
-MAX_SOCKET_PATH = 107
 MAX_REQUEST_BYTES = 1 << 20
 MAX_PATCHES = 65536
 MAX_IDENTIFIER = 2 ** 63 - 1
@@ -222,37 +223,65 @@ class ReplayServer:
         self._connections: set[socket.socket] = set()
         self._socket: socket.socket | None = None
         self._socket_identity: tuple[int, int] | None = None
+        self._public_identity: tuple[int, int] | None = None
+        self._private_dir: str | None = None
+        self._private_identity: tuple[int, int] | None = None
+        self._socket_path: str | None = None
+        self._lifecycle_lock = threading.RLock()
         self._listener: threading.Thread | None = None
         self._running = False
         self._tracer: binradar_runtime.TracerExecutor | None = None
         self._mutation_ids: list[int] = []
 
     def start(self) -> None:
-        if len(self.path.encode()) > MAX_SOCKET_PATH:
-            raise ValueError(
-                f"replay socket path is longer than {MAX_SOCKET_PATH} bytes: "
-                f"{self.path}")
-        if os.path.lexists(self.path):
-            raise RuntimeError(
-                f"replay socket already exists; a server may be running: "
-                f"{self.path}")
-        os.makedirs(self.run_dir, exist_ok=True)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            listener.bind(self.path)
-            os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
-            info = os.stat(self.path)
-            self._socket_identity = (info.st_dev, info.st_ino)
-            listener.listen(SOCKET_BACKLOG)
-        except BaseException:
-            listener.close()
-            raise
-        self._socket = listener
-        self._running = True
-        self._listener = threading.Thread(
-            target=self._accept_loop, args=(listener,),
-            name="replay-listener", daemon=True)
-        self._listener.start()
+        with self._lifecycle_lock:
+            if os.path.lexists(self.path):
+                raise RuntimeError(
+                    f"replay socket already exists; a server may be running: "
+                    f"{self.path}")
+            try:
+                os.makedirs(self.run_dir, exist_ok=True)
+                # TMPDIR may itself exceed sockaddr_un.sun_path.  Always use
+                # a short, owner-only directory, even for short public paths.
+                self._private_dir = tempfile.mkdtemp(
+                    prefix="binradar-replay-", dir="/tmp")
+                info = os.lstat(self._private_dir)
+                self._private_identity = (info.st_dev, info.st_ino)
+                self._socket_path = os.path.join(self._private_dir, SOCKET_NAME)
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._socket = listener
+                listener.bind(self._socket_path)
+                info = os.lstat(self._socket_path)
+                self._socket_identity = (info.st_dev, info.st_ino)
+                os.chmod(self._socket_path, stat.S_IRUSR | stat.S_IWUSR)
+                listener.listen(SOCKET_BACKLOG)
+                # Record the symlink inode before exposing it.  Hard-linking
+                # the symlink itself publishes atomically without clobbering,
+                # and a concurrent replacement can never become our property.
+                # Stage beside the public endpoint so publication also works
+                # when the run directory and /tmp are on different mounts.
+                staging_path = os.path.join(
+                    self.run_dir, f".replay-{secrets.token_hex(16)}")
+                os.symlink(self._socket_path, staging_path)
+                try:
+                    info = os.lstat(staging_path)
+                    self._public_identity = (info.st_dev, info.st_ino)
+                    try:
+                        os.link(staging_path, self.path, follow_symlinks=False)
+                    except FileExistsError as exc:
+                        raise RuntimeError(
+                            f"replay socket already exists; a server may be running: "
+                            f"{self.path}") from exc
+                finally:
+                    os.unlink(staging_path)
+                self._running = True
+                self._listener = threading.Thread(
+                    target=self._accept_loop, args=(listener,),
+                    name="replay-listener", daemon=True)
+                self._listener.start()
+            except BaseException:
+                self.close()
+                raise
 
     def request_shutdown(self) -> None:
         """Stop admission and interrupt only the current native request."""
@@ -276,33 +305,76 @@ class ReplayServer:
                 pass
 
     def close(self) -> None:
-        self.request_shutdown()
-        self._running = False
-        listener, self._socket = self._socket, None
-        if listener is not None:
+        with self._lifecycle_lock:
+            self.request_shutdown()
+            self._running = False
+            listener, self._socket = self._socket, None
+            if listener is not None:
+                try:
+                    listener.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                listener.close()
+            thread, self._listener = self._listener, None
+            # Thread.start() can fail before a thread exists.  Startup rollback
+            # must still release every filesystem resource in that case.
+            if thread is not None and thread.ident is not None:
+                thread.join(timeout=self.control_timeout)
+            with self._lock:
+                connections = tuple(self._connections)
+            for connection in connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            # PhaseSession owns native cleanup, including exceptional exits.
+            # Public and private ownership are independent: replacing the link
+            # must not prevent retirement of this server's actual socket.
+            public_identity, self._public_identity = self._public_identity, None
+            socket_identity, self._socket_identity = self._socket_identity, None
+            private_identity, self._private_identity = self._private_identity, None
             try:
-                listener.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            listener.close()
-        if self._listener is not None:
-            self._listener.join(timeout=self.control_timeout)
-            self._listener = None
-        with self._lock:
-            connections = tuple(self._connections)
-        for connection in connections:
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        # PhaseSession owns native cleanup, including exceptional exits.  A
-        # successful serve() has already waited for the evaluation owner.
+                self._unlink_owned(
+                    self.path, public_identity, link_target=self._socket_path)
+            finally:
+                try:
+                    self._unlink_owned(self._socket_path, socket_identity)
+                finally:
+                    if self._owns_path(self._private_dir, private_identity):
+                        try:
+                            os.rmdir(self._private_dir)
+                        except OSError as exc:
+                            # Never recurse into unexpected replacement data.
+                            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                                raise
+
+    @staticmethod
+    def _owns_path(path: str | None, identity: tuple[int, int] | None) -> bool:
+        if path is None or identity is None:
+            return False
         try:
-            info = os.stat(self.path)
-            if self._socket_identity == (info.st_dev, info.st_ino):
-                os.unlink(self.path)
+            info = os.lstat(path)
         except FileNotFoundError:
-            pass
+            return False
+        return identity == (info.st_dev, info.st_ino)
+
+    @classmethod
+    def _unlink_owned(cls, path: str | None,
+                      identity: tuple[int, int] | None, *,
+                      link_target: str | None = None) -> None:
+        if not cls._owns_path(path, identity):
+            return
+        if link_target is not None:
+            # An unlinked public symlink's inode can be reused immediately.
+            # Another server's unique private target must still be preserved.
+            try:
+                if os.readlink(path) != link_target:
+                    return
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.EINVAL):
+                    return
+                raise
+        os.unlink(path)
 
     def update_generation(self, **fields: object) -> None:
         with self._lock:

@@ -8,7 +8,9 @@ batch.
 """
 
 import json
+import os
 import socket
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,13 +27,14 @@ def request_bytes(payload) -> bytes:
 
 def send(sock_path: Path, payload, timeout: float = 10.0):
     """Return every newline-delimited reply object for one request."""
+    actual_path = sock_path.resolve(strict=True)
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(timeout)
-    connection.connect(str(sock_path))
-    connection.sendall(request_bytes(payload))
     rows = []
     buffer = b""
     try:
+        connection.settimeout(timeout)
+        connection.connect(str(actual_path))
+        connection.sendall(request_bytes(payload))
         while True:
             chunk = connection.recv(65536)
             if not chunk:
@@ -254,11 +257,255 @@ def test_existing_socket_endpoint_is_never_replaced(tmp_path):
         placeholder.close()
 
 
-def test_overlong_socket_path_is_rejected_before_binding(tmp_path):
-    deep = tmp_path / ("x" * 120)
-    server = binradar_replay.ReplayServer(str(deep), "generic-erm", 0)
-    with pytest.raises(ValueError, match="longer than"):
+@pytest.mark.parametrize("directory", ["short", "x" * 120, "é" * 80])
+def test_public_endpoint_uses_private_short_socket_and_cleans_up(
+        tmp_path, monkeypatch, directory):
+    # A long TMPDIR must not affect the actual socket address.
+    monkeypatch.setenv("TMPDIR", str(tmp_path / ("t" * 120)))
+    run_dir = tmp_path / directory
+    server = binradar_replay.ReplayServer(str(run_dir), "generic-erm", 0)
+    public = Path(server.path)
+    server.start()
+    actual = public.resolve(strict=True)
+    private_dir = actual.parent
+    try:
+        assert public.is_symlink()
+        assert actual.name == "replay.sock"
+        assert private_dir.parent == Path("/tmp")
+        assert private_dir.name.startswith("binradar-replay-")
+        assert len(os.fsencode(actual)) <= 107
+        assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+        assert stat.S_ISSOCK(actual.stat().st_mode)
+        assert stat.S_IMODE(actual.stat().st_mode) == 0o600
+        assert send(public, {"op": "status"})[0]["state"] == "starting"
+    finally:
+        server.close()
+        server.close()
+    assert not os.path.lexists(public)
+    assert not actual.exists()
+    assert not private_dir.exists()
+    assert run_dir.is_dir()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "dangling", "live"])
+def test_preexisting_public_entries_are_preserved(tmp_path, kind):
+    public = tmp_path / "replay.sock"
+    target = tmp_path / "target"
+    if kind == "file":
+        public.write_text("not a socket")
+    elif kind == "directory":
+        public.mkdir()
+    else:
+        if kind == "live":
+            target.write_text("existing target")
+        public.symlink_to(target)
+    identity = public.lstat()
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    with pytest.raises(RuntimeError, match="already exists"):
         server.start()
+    server.close()
+    assert public.lstat().st_ino == identity.st_ino
+    assert public.lstat().st_dev == identity.st_dev
+
+
+@pytest.mark.parametrize("failure", [
+    "socket", "bind", "chmod", "listen", "symlink", "publish", "thread",
+    "thread-started",
+])
+def test_startup_failure_rolls_back_all_owned_resources(
+        tmp_path, monkeypatch, failure):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    sockets = []
+    original_socket = socket.socket
+
+    def fail(*args, **kwargs):
+        raise OSError("injected startup failure")
+
+    class FailingSocket(original_socket):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            sockets.append(self)
+
+        def bind(self, address):
+            assert not os.path.lexists(server.path)
+            if failure == "bind":
+                fail()
+            return super().bind(address)
+
+        def listen(self, backlog):
+            assert not os.path.lexists(server.path)
+            if failure == "listen":
+                fail()
+            return super().listen(backlog)
+
+    monkeypatch.setattr(socket, "socket", fail if failure == "socket" else FailingSocket)
+    if failure == "chmod":
+        monkeypatch.setattr(os, "chmod", fail)
+    elif failure == "symlink":
+        monkeypatch.setattr(os, "symlink", fail)
+    elif failure == "publish":
+        monkeypatch.setattr(os, "link", fail)
+    elif failure in ("thread", "thread-started"):
+        original_start = threading.Thread.start
+
+        def fail_start(thread):
+            if thread.name != "replay-listener":
+                return original_start(thread)
+            if failure == "thread-started":
+                original_start(thread)
+            public = Path(server.path)
+            assert public.is_symlink()
+            # Publication is not visible until the kernel listener is ready.
+            client = original_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                client.settimeout(1)
+                client.connect(str(public.resolve(strict=True)))
+            finally:
+                client.close()
+            fail()
+        monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(OSError, match="injected startup failure"):
+        server.start()
+    server.close()
+    assert not os.path.lexists(server.path)
+    assert not Path(server._private_dir).exists()
+    assert all(listener.fileno() == -1 for listener in sockets)
+    assert list(tmp_path.glob(".replay-*")) == []
+
+
+def test_competing_publication_is_not_overwritten_and_private_socket_is_removed(
+        tmp_path, monkeypatch):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    public = Path(server.path)
+    original_link = os.link
+
+    def race_publication(source, destination, **kwargs):
+        public.symlink_to(tmp_path / "competitor")
+        return original_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(os, "link", race_publication)
+    with pytest.raises(RuntimeError, match="already exists"):
+        server.start()
+    server.close()
+    assert public.is_symlink()
+    assert public.readlink() == tmp_path / "competitor"
+    assert not Path(server._private_dir).exists()
+
+
+def test_old_server_close_preserves_replacement_server_endpoint(tmp_path):
+    old = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    new = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    old.start()
+    old_actual = Path(old.path).resolve(strict=True)
+    Path(old.path).unlink()
+    try:
+        new.start()
+        new_actual = Path(new.path).resolve(strict=True)
+        old.close()
+        old.close()
+        assert not old_actual.parent.exists()
+        assert Path(new.path).resolve(strict=True) == new_actual
+        assert send(Path(new.path), {"op": "status"})[0]["state"] == "starting"
+    finally:
+        old.close()
+        new.close()
+    assert not new_actual.parent.exists()
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "file"])
+def test_public_inode_reuse_does_not_transfer_endpoint_ownership(tmp_path, replacement):
+    old = binradar_replay.ReplayServer(str(tmp_path / "old"), "generic-erm", 0)
+    peer = binradar_replay.ReplayServer(str(tmp_path / "peer"), "generic-erm", 0)
+    old.start()
+    peer.start()
+    public = Path(old.path)
+    target = Path(peer.path).resolve(strict=True)
+    try:
+        # Unlink/recreate can reuse the inode; unlike rename, this must not
+        # make the old server own a link to a different private socket.
+        public.unlink()
+        if replacement == "symlink":
+            public.symlink_to(target)
+        else:
+            public.write_text("new owner")
+        old.close()
+        if replacement == "symlink":
+            assert public.resolve(strict=True) == target
+            assert send(public, {"op": "status"})[0]["state"] == "starting"
+        else:
+            assert public.read_text() == "new owner"
+    finally:
+        old.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+def test_private_socket_replacement_is_not_deleted(tmp_path, kind):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    server.start()
+    actual = Path(server.path).resolve(strict=True)
+    # Rename instead of unlinking, retaining the old inode to avoid reuse.
+    retired = actual.with_name("retired.sock")
+    actual.rename(retired)
+    if kind == "file":
+        actual.write_text("replacement")
+    elif kind == "directory":
+        actual.mkdir()
+    else:
+        actual.symlink_to(tmp_path / "unrelated")
+    try:
+        server.close()
+        server.close()
+        assert os.path.lexists(actual)
+        assert retired.exists()
+        assert not os.path.lexists(server.path)
+    finally:
+        if actual.is_dir():
+            actual.rmdir()
+        else:
+            actual.unlink()
+        retired.unlink()
+        actual.parent.rmdir()
+
+
+def test_cli_watchdog_start_failure_releases_published_listener(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from binradar import cli
+
+    artifact = tmp_path / "cached.elf"
+    header = bytearray(20)
+    header[:6] = b"\x7fELF\x02\x01"
+    header[16:18] = (2).to_bytes(2, "little")
+    artifact.write_bytes(header)
+    executor = cli.BinRadarExecutor.__new__(cli.BinRadarExecutor)
+    executor.replay_server = True
+    executor.run_dir = str(tmp_path / "run")
+    executor.config = {"BINRADAR_PATCH_KIND": "generic-erm"}
+    executor.artifacts = SimpleNamespace(
+        select_tracer=lambda *args, **kwargs: SimpleNamespace(path=artifact))
+    started = []
+    original_start = threading.Thread.start
+
+    def start(thread):
+        if thread.name != "replay-shutdown":
+            return original_start(thread)
+        service = executor._replay_service
+        actual = Path(service.path).resolve(strict=True)
+        assert send(Path(service.path), {"op": "status"})[0]["state"] == "starting"
+        started.append((service, actual, service._socket))
+        raise RuntimeError("watchdog failed to start")
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    with pytest.raises(RuntimeError, match="watchdog failed to start"):
+        with executor._replay_listener():
+            pytest.fail("failed watchdog startup must not enter the session")
+    assert executor._replay_service is None
+    assert len(started) == 1
+    service, actual, listener = started[0]
+    assert listener.fileno() == -1
+    assert not os.path.lexists(service.path)
+    assert not actual.parent.exists()
 
 
 def test_unsupported_generation_family_is_rejected():
@@ -444,7 +691,7 @@ def test_disconnect_retires_cancel_owner_before_next_batch(tmp_path):
     server = _ready_server(tmp_path, tracer)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        client.connect(server.path)
+        client.connect(str(Path(server.path).resolve(strict=True)))
         client.sendall(request_bytes({
             "op": "evaluate", "patches": [{"id": 1, "predicate": "rax"}]}))
         assert tracer.entered.wait(5)

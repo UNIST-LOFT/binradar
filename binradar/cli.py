@@ -1580,9 +1580,6 @@ class BinRadarExecutor:
         service = binradar_replay.ReplayServer(
             self.run_dir, family,
             int(self.config.get("BRCACHE_STACK_SIZE", "0")))
-        service.start()
-        logger.info(f"[REPLAY] Listening on {service.path}")
-        self._replay_service = service
         finished = threading.Event()
 
         def bound_shutdown() -> None:
@@ -1597,21 +1594,28 @@ class BinRadarExecutor:
 
         shutdown_worker = threading.Thread(
             target=bound_shutdown, name="replay-shutdown", daemon=True)
-        shutdown_worker.start()
         try:
-            yield service
-        except Exception:
-            with service._lock:
-                requested = service.shutdown_requested.is_set()
-                failed = service.progress.error is not None
-            if not requested or failed:
-                raise
-            logger.info("[REPLAY] Requested shutdown completed")
+            service.start()
+            logger.info(f"[REPLAY] Listening on {service.path}")
+            self._replay_service = service
+            shutdown_worker.start()
+            try:
+                yield service
+            except Exception:
+                with service._lock:
+                    requested = service.shutdown_requested.is_set()
+                    failed = service.progress.error is not None
+                if not requested or failed:
+                    raise
+                logger.info("[REPLAY] Requested shutdown completed")
         finally:
             finished.set()
             self._replay_service = None
-            service.close()
-            shutdown_worker.join(timeout=service.control_timeout)
+            try:
+                service.close()
+            finally:
+                if shutdown_worker.ident is not None:
+                    shutdown_worker.join(timeout=service.control_timeout)
 
     def _check_replay_shutdown(self):
         if (self._replay_service is not None and
