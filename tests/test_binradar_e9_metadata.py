@@ -446,9 +446,6 @@ def test_cached_build_persists_brcached_metadata(tmp_path, monkeypatch):
     orig = workdir / "imginfo.orig"
     orig.write_bytes(b"\x7fELF" + b"\0" * 100)
     (workdir / "brpatch.c").write_text("/* generated */\n")
-    (workdir / "brpatches.inc").write_text(
-        'case 0: return "p0";\ncase 1: return "p1";\n'
-        'case 2: return "p0";\ndefault: return "p0";\n')
     binradar_env = {
         "BINARY": "imginfo",
         "PATCH_LOC": "0x410735",
@@ -510,9 +507,6 @@ def test_cwe805_cached_build_uses_allocator_hooks(tmp_path, monkeypatch):
     workdir.mkdir()
     (workdir / "destinations").write_text("4106d8\n")
     (workdir / "brpatch.c").write_text("/* generated */\n")
-    (workdir / "brpatches.inc").write_text(
-        'case 0: return "p0";\ncase 1: return "c1p0";\n'
-        'case 2: return "c1p1";\ndefault: return "p0";\n')
     (workdir / "imginfo.orig").write_bytes(b"\x7fELF" + b"\0" * 100)
     env = {"BINARY": "imginfo", "PATCH_LOC": "0x410735"}
     allocator = binradar_setup.AllocatorTrace(

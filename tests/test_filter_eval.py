@@ -210,6 +210,87 @@ def test_predicate_source_and_runtime_ids():
         assert load_filter_passed_ids(sbsv) == {3: 1, 8: 2}
 
 
+def test_logical_truth_precedence_and_parenthesized_scalars():
+    examples = {
+        "7 && -2": 1, "0 || -9": 1, "0 && 9": 0,
+        "1 || 0 && 0": 1, "(1 || 0) && 0": 0,
+        "(rax && rbx) + 2": 2, "2 | 0 && 4": 1,
+        "2 & 1 || 3": 1, "1 == 1 && 2 < 3": 1,
+    }
+    for source, expected in examples.items():
+        assert eval_patch_str(predicate_to_patch_str(source), ZERO_ENV) == expected
+        assert eval_patch_str(predicate_to_branch_patch_str(source), ZERO_ENV) == int(expected == 0)
+
+
+def test_logical_short_circuit_and_sticky_visited_traps():
+    import pytest
+    for source, result in (("0 && 1 / 0", 0), ("9 || 1 % 0", 1),
+                           ("0 && min64 / -1", 0)):
+        assert eval_patch_str(predicate_to_patch_str(source), ZERO_ENV) == result
+    for source in ("1 && 1 / 0", "0 || 1 % 0", "(1 / 0) || 1",
+                   "0 & (1 / 0)", "1 | (1 / 0)"):
+        with pytest.raises(PredicateTrap):
+            eval_patch_str(predicate_to_patch_str(source), ZERO_ENV)
+
+
+def test_logical_cached_branches_and_lazy_register_load():
+    api = binradar_taosc_predicates
+
+    class UnreadRegisters:
+        def __getitem__(self, index):
+            raise AssertionError("short-circuited register must not be loaded")
+
+    assert eval_patch_str("Op1v15", UnreadRegisters()) == 1
+    assert eval_patch_str("Ap0v15", UnreadRegisters()) == 0
+    snapshot = api.CachedSnapshot(1, 0, tuple(ZERO_ENV))
+    assert api.evaluate_cached_branch("O/p1p0p1", snapshot) == 2
+    assert api.evaluate_cached_branch("Op1/p1p0", snapshot) == 1
+    assert api.evaluate_cached_branch("Ap0/p1p0", snapshot) == 0
+
+
+def test_strict_descriptor_validation_in_skipped_operands():
+    import pytest
+    parse = binradar_taosc_predicates.parse_predicate_descriptor
+    for descriptor in ("", "p", "n", "v", "v16", "Op1v16", "Ap0?", "p1p0",
+                       "p18446744073709551616", "c3c1p0", "c3Ac1p0p0",
+                       "c1s64i65536", "c2s64i0q1", "c2p16q1", "c2p0q3"):
+        with pytest.raises(ValueError):
+            parse(descriptor)
+    assert parse("c1s64i65535")
+    assert parse("c3Oc1p0c2s32i65535q8")
+
+
+def test_depth_and_byte_limits_and_wrapped_source_literals():
+    import pytest
+    parse = binradar_taosc_predicates.parse_predicate_descriptor
+    # Python source generation formerly hit its parentheses limit here.
+    assert eval_patch_str("~" * 255 + "p0", ZERO_ENV) == -1
+    assert eval_patch_str("A" * 255 + "p1" + "p1" * 255, ZERO_ENV) == 1
+    with pytest.raises(ValueError):
+        parse("~" * 256 + "p0")
+    assert predicate_to_patch_str("(" * 256 + "1" + ")" * 256) == "p1"
+    with pytest.raises(ValueError):
+        predicate_to_patch_str("(" * 257 + "1" + ")" * 257)
+    with pytest.raises(ValueError):
+        predicate_to_patch_str("1+" * 256 + "1")
+    with pytest.raises(ValueError):
+        predicate_to_branch_patch_str("~" * 255 + "0")
+    assert predicate_to_patch_str("1" + " " * 4095) == "p1"
+    with pytest.raises(ValueError):
+        predicate_to_patch_str("1" + " " * 4096)
+    assert predicate_to_patch_str(str(1 << 64)) == "p0"
+    assert predicate_to_patch_str(str((1 << 64) - 1)) == "n1"
+    assert eval_patch_str("p18446744073709551615", ZERO_ENV) == -1
+    leaves = ["p" + "0" * 14] * 256
+    while len(leaves) > 1:
+        leaves = ["O" + left + right for left, right in zip(leaves[::2], leaves[1::2])]
+    assert len(leaves[0]) == 4095
+    assert parse(leaves[0]) == leaves[0]
+    assert eval_patch_str("p" + "0" * 4094, ZERO_ENV) == 0
+    with pytest.raises(ValueError):
+        parse(leaves[0] + "0")
+
+
 def _main():
     failed = 0
     for name in sorted(globals()):

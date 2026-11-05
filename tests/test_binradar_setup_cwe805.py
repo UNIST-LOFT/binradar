@@ -476,44 +476,68 @@ def test_parse_allocator_trace_calloc_fixture():
     assert allocator.returns[0] == "406761"
 
 
-def test_emit_brpatches_inc_generic_and_CWE805(tmp_path):
-    emit = binradar_setup._emit_brpatches_inc
-    PredicateRecord = binradar_setup.PredicateRecord
-    RegisterCell = binradar_setup.RegisterCell
-    StackCell = binradar_setup.StackCell
-    CWE805PointerPredicate = binradar_setup.CWE805PointerPredicate
-    CWE805SizePredicate = binradar_setup.CWE805SizePredicate
 
-    records = [
-        PredicateRecord(1, 3, "max1 - rdx == ~max1",
-                        "==-p0v3~p0p0"),
-        PredicateRecord(2, 7, "s->rax >= i->begin && s->rax < i->end",
-                        CWE805PointerPredicate(RegisterCell(0))),
-        PredicateRecord(3, 9, "((uint64_t *)s->rsp)[2] >= i->begin && "
-                        "((uint64_t *)s->rsp)[2] < i->end",
-                        CWE805PointerPredicate(StackCell(64, 2))),
-        PredicateRecord(4, 30, "1 * s->rbx < i->end - i->begin",
-                        CWE805SizePredicate(1, RegisterCell(1))),
-        PredicateRecord(5, 42, "2 * ((uint8_t *)s->rsp)[40] < i->end - "
-                        "i->begin",
-                        CWE805SizePredicate(2, StackCell(8, 40))),
-    ]
-    out = tmp_path / "brpatches.inc"
-    emit(out, records)
-    text = out.read_text()
-    assert 'case 0:\n\treturn "p0";\n' in text
-    assert 'case 1:\n\treturn "==-p0v3~p0p0"; /* predicate line 3 */' in text
-    assert 'case 2:\n\treturn "c1p0"; /* predicate line 7: pointer register */' \
-        in text
-    assert 'case 3:\n\treturn "c1s64i2"; /* predicate line 9: pointer stack cell */' \
-        in text
-    assert 'case 4:\n\treturn "c2p1q1"; /* predicate line 30: size register */' \
-        in text
-    assert 'case 5:\n\treturn "c2s8i40q2"; /* predicate line 42: size stack cell */' \
-        in text
-    assert 'default:\n\treturn "p0";\n' in text
-    # No CWE-119 source text may leak into the generated table.
-    assert "i->begin" not in text and "i->end" not in text
+def test_CWE805_logical_tree_codec_scope_and_precedence():
+    api = binradar_taosc_predicates
+    pointer = "s->rax >= i->begin && s->rax < i->end"
+    size = "1 * s->rbx < i->end - i->begin"
+    predicate = api.parse_CWE805_predicate(f"({pointer}) && ({size})")
+    assert api.predicate_descriptor(predicate) == "c3Ac1p0c2p1q1"
+    assert api.parse_predicate_descriptor(api.predicate_descriptor(predicate)) == predicate
+    # Different allocations satisfy the leaves separately, but no same clamp does.
+    regs = [110, 20] + [0] * 14
+    clamps = [(100, 115), (200, 300)]
+    assert api.CWE805_branch_taken(predicate, regs, b"", clamps) == 1
+    disjunction = api.parse_CWE805_predicate(f"{pointer} || {size}")
+    assert api.CWE805_branch_taken(disjunction, regs, b"", clamps) == 0
+    ordered = api.parse_CWE805_predicate(f"{pointer} || {size} && ({pointer})")
+    assert api.predicate_descriptor(ordered) == "c3Oc1p0Ac2p1q1c1p0"
+
+
+def test_CWE805_reverse_clamp_order_skips_and_sticky_overflow():
+    api = binradar_taosc_predicates
+    predicate = api.parse_predicate_descriptor("c3Oc1p0c2p1q8")
+    regs = [110, 1 << 63] + [0] * 14
+    # Highest raw clamp is safe, so overflowing RHS is never visited.
+    assert api.CWE805_branch_taken(predicate, regs, b"", [(0, 0), (100, 200)]) == 0
+    # Reverse order reaches overflow first; a later safe clamp cannot erase it.
+    assert api.CWE805_branch_taken(predicate, regs, b"", [(100, 200), (0, 0)]) == 2
+    conjunction = api.parse_predicate_descriptor("c3Ac1p0c2p1q8")
+    assert api.CWE805_branch_taken(conjunction, regs, b"", [(0, 0)]) == 1
+    assert api.CWE805_branch_taken(conjunction, regs, b"", [(100, 200)]) == 2
+
+
+def test_CWE805_full_tree_stack_admission_and_lazy_loads():
+    import pytest
+    api = binradar_taosc_predicates
+    predicate = api.parse_predicate_descriptor("c3Oc1p0c2s32i7q8")
+    assert api.predicate_stack_bytes(predicate) == 32
+    with pytest.raises(ValueError, match="insufficient captured stack"):
+        api.CWE805_branch_taken(predicate, [110] + [0] * 15, b"", [(100, 200)])
+    with pytest.raises(ValueError, match="insufficient captured stack"):
+        api.CWE805_branch_taken(api.parse_predicate_descriptor("c1s64i0"), [0] * 16, b"x", [(0, 100)])
+
+    class UnreadStack(bytes):
+        def __getitem__(self, key):
+            raise AssertionError("short-circuited stack must not be loaded")
+
+    assert api.CWE805_branch_taken(predicate, [110] + [0] * 15, UnreadStack(bytes(32)), [(100, 200)]) == 0
+
+
+def test_CWE805_source_descriptor_bounds():
+    import pytest
+    api = binradar_taosc_predicates
+    pointer = "s->rax >= i->begin && s->rax < i->end"
+    for source in (pointer + " || INVALID", "(" * 257 + pointer + ")" * 257,
+                   "((uint64_t *)s->rsp)[65536] >= i->begin && ((uint64_t *)s->rsp)[65536] < i->end",
+                   pointer + " " * 4096):
+        with pytest.raises(ValueError):
+            api.parse_CWE805_predicate(source)
+    assert api.parse_CWE805_predicate("(" * 256 + pointer + ")" * 256) == api.parse_CWE805_predicate(pointer)
+    descriptor = "c3" + "A" * 255 + "c1p0" * 256
+    assert api.parse_predicate_descriptor(descriptor)
+    with pytest.raises(ValueError):
+        api.parse_predicate_descriptor("c3" + "A" * 256 + "c1p0" * 257)
 
 
 def test_filter_meta_identity(tmp_path):
@@ -611,25 +635,18 @@ JNZ_SCENARIOS = [
 
 
 def _build_brpatches_inc(tmp_path):
-    """Write the brpatches.inc used by the C runtime test.
-
-    Descriptor ids must match the scenario ids in test_brpatch_dest.c:
-      0: "p0" (false)            1: "=p1p1" (generic, always true)
-      2: "c1p0"                  3: "c1s64i0"
-      4: "c2p1q1"                5: "c2s16i0q2"
-      6: "c2p1q8"                7: "c1s32i0" (malformed descriptor)
-    """
+    """Use the real static emitter, plus one intentionally invalid metadata row."""
+    api = binradar_taosc_predicates
+    descriptors = ["=p1p1", "c1p0", "c1s64i0", "c2p1q1", "c2s16i0q2", "c2p1q8"]
     out = tmp_path / "brpatches.inc"
-    out.write_text(
-        'case 0:\n\treturn "p0";\n'
-        'case 1:\n\treturn "=p1p1";\n'
-        'case 2:\n\treturn "c1p0";\n'
-        'case 3:\n\treturn "c1s64i0";\n'
-        'case 4:\n\treturn "c2p1q1";\n'
-        'case 5:\n\treturn "c2s16i0q2";\n'
-        'case 6:\n\treturn "c2p1q8";\n'
-        'case 7:\n\treturn "c1s32i0";\n'
-        'default:\n\treturn "p0";\n')
+    api._emit_brpatches_inc(out, [
+        api.PredicateRecord(index, index, descriptor, api.parse_predicate_descriptor(descriptor))
+        for index, descriptor in enumerate(descriptors, 1)
+    ])
+    text = out.read_text()
+    text = text.replace("    default:",
+                        "    case 7: *out = (struct br_predicate){ .kind = (enum br_predicate_kind)99 }; return;\n    default:")
+    out.write_text(text)
     return out
 
 
@@ -700,8 +717,8 @@ def test_c_runtime_parity():
     assert results["tracker-record"] == ["PASS"]
     assert results["tracker-ring"] == ["PASS"]
 
-    # Malformed descriptor and unknown id follow the original path (br 0).
-    assert results["malformed-descriptor"] == ["0", "0"]
+    # Invalid static metadata reports br2 without jumping; unknown ids are neutral.
+    assert results["malformed-descriptor"] == ["2", "0"]
     assert results["unknown-id"] == ["0", "0"]
     # Generic entry still evaluates: "=p1p1" is always true.
     assert results["generic-always-true"] == ["1", "1"]
@@ -710,19 +727,6 @@ def test_c_runtime_parity():
 
 
 def _run_cached_runtime_test(tmp_path, cwe805):
-    if cwe805:
-        descriptors = (
-            'case 0: return "p0";\n'
-            'case 1: return "c1p0";\n'
-            'case 2: return "c1p1";\n'
-            'default: return "p0";\n')
-    else:
-        descriptors = (
-            'case 0: return "p0";\n'
-            'case 1: return "=p1p0";\n'
-            'case 2: return "=p0p0";\n'
-            'default: return "p0";\n')
-    (tmp_path / "brpatches.inc").write_text(descriptors)
     executable = tmp_path / ("cached-cwe805" if cwe805 else "cached-generic")
     cmd = [
         "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",

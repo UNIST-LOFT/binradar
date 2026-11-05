@@ -80,15 +80,6 @@ static int64_t i64_from_bits(uint64_t bits)
 	return value;
 }
 
-/* Parse *p as an unsigned bit pattern. */
-uint64_t scani(const char **p)
-{
-	uint64_t i = 0;
-	for (; **p >= '0' && **p <= '9'; ++*p)
-		i = i * 10 + **p - '0';
-	return i;
-}
-
 static int64_t shift_right_arithmetic(int64_t value, uint64_t amount)
 {
 	if (amount == 0)
@@ -123,69 +114,6 @@ static int64_t shift_right(int64_t value, int64_t amount)
 	return i64_from_bits((uint64_t)value << (uint64_t)-amount);
 }
 
-/* Parse and evaluate *ptr in a prefix Polish notation, recursively. */
-int64_t eval(const char **ptr, const int64_t *env, int *crashed)
-{
-	const char op = *(*ptr)++;
-	switch (op) {
-	case 'n': /* negative integer */
-		return i64_from_bits(0 - scani(ptr));
-	case 'p': /* positive integer */
-		return i64_from_bits(scani(ptr));
-	case 'v': /* variable look up */
-		return env[scani(ptr)];
-	case '~': /* bitwise not */
-		return ~eval(ptr, env, crashed);
-	}
-
-	const bool eq = (**ptr == '=' && (op == '>' || op == '<'));
-	*ptr += eq;
-
-	const int64_t a = eval(ptr, env, crashed);
-	const int64_t b = eval(ptr, env, crashed);
-
-	switch (op) {
-	case '=':
-		return a == b;
-	case '!':
-		return a != b;
-	case '>':
-		return eq ? (a >= b) : (a > b);
-	case '<':
-		return eq ? (a <= b) : (a < b);
-	case '+':
-		return i64_from_bits((uint64_t)a + (uint64_t)b);
-	case '-':
-		return i64_from_bits((uint64_t)a - (uint64_t)b);
-	case '*':
-		return i64_from_bits((uint64_t)a * (uint64_t)b);
-	case '/':
-		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			*crashed = 1;
-			return 0;
-		}
-		return a / b;
-	case '%':
-		if (b == 0 || (a == INT64_MIN && b == -1)) {
-			*crashed = 1;
-			return 0;
-		}
-		return a % b;
-	case '&':
-		return a & b;
-	case '|':
-		return a | b;
-	case '^':
-		return a ^ b;
-	case 'l': /* << */
-		return shift_left(a, b);
-	case 'r': /* >> */
-		return shift_right(a, b);
-	default:
-		__builtin_unreachable();
-	}
-}
-
 static void state_to_env(const struct STATE *state, int64_t env[16])
 {
 	const int64_t values[] = {
@@ -197,108 +125,212 @@ static void state_to_env(const struct STATE *state, int64_t env[16])
 	memcpy(env, values, sizeof(values));
 }
 
-/*
- * Typed predicate table (generated in brpatches.inc by
- * binradar/binradar_setup.py).  Entry 0 is BR_PRED_FALSE ("p0").  Generic
- * entries are the encoded ``predicate == 0`` prefix strings; CWE-805
- * entries are compact descriptors containing only validated enum/integer
- * fields, never source text:
- *
- *   c1p<reg>          pointer predicate, register cell
- *   c1s<w>i<idx>      pointer predicate, stack cell of width w at index idx
- *   c2p<reg>q<scale>  size predicate, register cell, scale 1/2/4/8
- *   c2s<w>i<idx>q<scale>  size predicate, stack cell, scale 1/2/4/8
- */
-enum br_predicate_kind {
-	BR_PRED_FALSE,
-	BR_PRED_GENERIC,
-	BR_PRED_CWE805_POINTER,
-	BR_PRED_CWE805_SIZE,
-};
+/* Shared immutable execution ABI, also emitted by binradar_setup.py. */
+#define BR_MAX_DESCRIPTOR_BYTES 4095u
+#define BR_MAX_EXPR_DEPTH 256u
+/* Every node consumes at least one descriptor byte. */
+#define BR_MAX_NODES BR_MAX_DESCRIPTOR_BYTES
 
+enum br_predicate_kind { BR_PRED_FALSE, BR_PRED_GENERIC, BR_PRED_CWE805 };
 enum br_cell_kind {
-	BR_CELL_REGISTER,
-	BR_CELL_STACK8,
-	BR_CELL_STACK16,
-	BR_CELL_STACK32,
-	BR_CELL_STACK64,
+	BR_CELL_REGISTER, BR_CELL_STACK8, BR_CELL_STACK16,
+	BR_CELL_STACK32, BR_CELL_STACK64,
 };
-
+struct br_node {
+	uint8_t op, cell_kind, scale;
+	uint16_t left, right, cell_index;
+	uint64_t literal;
+};
 struct br_predicate {
 	enum br_predicate_kind kind;
-	enum br_cell_kind cell_kind;
-	uint16_t cell_index;
-	uint8_t scale;
-	const char *generic_branch_expression;
+	const struct br_node *nodes;
+	uint16_t count, root;
+	uint32_t stack_bytes;
+};
+struct br_parser {
+	const char *cursor;
+	struct br_node *nodes;
+	uint16_t count, capacity;
+	uint32_t stack_bytes;
 };
 
-static int parse_num(const char **p)
+/* Bounds are checked before arithmetic, including skipped operands. */
+static int br_number(const char **cursor, uint64_t bound, uint64_t *out)
 {
-	int value = 0;
-	while (**p >= '0' && **p <= '9') {
-		value = value * 10 + (**p - '0');
-		++*p;
-	}
-	return value;
+	const char *p = *cursor;
+	uint64_t value = 0;
+	if (*p < '0' || *p > '9')
+		return -1;
+	do {
+		const unsigned digit = *p++ - '0';
+		if (value > bound / 10 || (value == bound / 10 && digit > bound % 10))
+			return -1;
+		value = value * 10 + digit;
+	} while (*p >= '0' && *p <= '9');
+	*cursor = p;
+	*out = value;
+	return 0;
 }
 
-static int parse_predicate(const char *s, struct br_predicate *out)
+static int br_parse_node(struct br_parser *p, unsigned depth, int cwe,
+                         uint16_t *index)
 {
-	if (s[0] == 'c') {
-		if (s[1] == '1')
-			out->kind = BR_PRED_CWE805_POINTER;
-		else if (s[1] == '2')
-			out->kind = BR_PRED_CWE805_SIZE;
-		else
+	if (depth > BR_MAX_EXPR_DEPTH || p->count >= p->capacity)
+		return -1;
+	struct br_node node = {0};
+	char op = *p->cursor;
+	if (!op)
+		return -1;
+	++p->cursor;
+	uint64_t value;
+	if (cwe && op == 'c') {
+		char family = *p->cursor++;
+		if (family != '1' && family != '2')
 			return -1;
-		const char *p = s + 2;
-		if (*p == 'p') {
-			++p;
-			out->cell_kind = BR_CELL_REGISTER;
-			out->cell_index = (uint16_t)parse_num(&p);
-			if (out->cell_index > 15)
+		node.op = family == '1' ? 'P' : 'S';
+		char cell = *p->cursor;
+		if (!cell)
+			return -1;
+		++p->cursor;
+		if (cell == 'p') {
+			if (br_number(&p->cursor, 15, &value) < 0)
 				return -1;
-		} else if (*p == 's') {
-			++p;
-			const int width = parse_num(&p);
-			if (*p != 'i')
+			node.cell_index = value;
+		} else if (cell == 's') {
+			if (br_number(&p->cursor, 64, &value) < 0 || *p->cursor != 'i')
 				return -1;
-			++p;
+			++p->cursor;
+			unsigned width = value;
 			switch (width) {
-			case 8: out->cell_kind = BR_CELL_STACK8; break;
-			case 16: out->cell_kind = BR_CELL_STACK16; break;
-			case 32: out->cell_kind = BR_CELL_STACK32; break;
-			case 64: out->cell_kind = BR_CELL_STACK64; break;
+			case 8: node.cell_kind = BR_CELL_STACK8; break;
+			case 16: node.cell_kind = BR_CELL_STACK16; break;
+			case 32: node.cell_kind = BR_CELL_STACK32; break;
+			case 64: node.cell_kind = BR_CELL_STACK64; break;
 			default: return -1;
 			}
-			out->cell_index = (uint16_t)parse_num(&p);
+			if (br_number(&p->cursor, 65535, &value) < 0)
+				return -1;
+			node.cell_index = value;
+			uint32_t extent = (value + 1) * (width / 8);
+			if (extent > p->stack_bytes)
+				p->stack_bytes = extent;
 		} else {
 			return -1;
 		}
-		if (out->kind == BR_PRED_CWE805_POINTER
-				&& out->cell_kind != BR_CELL_REGISTER
-				&& out->cell_kind != BR_CELL_STACK64)
-			return -1; /* pointer cells are registers or uint64_t stack */
-		if (out->kind == BR_PRED_CWE805_SIZE
-				&& out->cell_kind == BR_CELL_STACK64)
-			return -1; /* size cells are registers or uint{8,16,32}_t */
-		if (out->kind == BR_PRED_CWE805_SIZE) {
-			if (*p != 'q')
+		if (node.op == 'P' && node.cell_kind != BR_CELL_REGISTER
+		    && node.cell_kind != BR_CELL_STACK64)
+			return -1;
+		if (node.op == 'S') {
+			if (node.cell_kind == BR_CELL_STACK64 || *p->cursor != 'q')
 				return -1;
-			++p;
-			out->scale = (uint8_t)parse_num(&p);
-			if (out->scale != 1 && out->scale != 2
-					&& out->scale != 4 && out->scale != 8)
+			++p->cursor;
+			if (br_number(&p->cursor, 8, &value) < 0
+			    || (value != 1 && value != 2 && value != 4 && value != 8))
 				return -1;
+			node.scale = value;
 		}
-		return *p == '\0' ? 0 : -1;
+	} else if (!cwe && (op == 'p' || op == 'n' || op == 'v')) {
+		if (br_number(&p->cursor, op == 'v' ? 15 : UINT64_MAX, &value) < 0)
+			return -1;
+		node.op = op == 'n' ? 'p' : op;
+		if (op == 'v') node.cell_index = value;
+		else node.literal = op == 'n' ? 0 - value : value;
+	} else {
+		if (cwe ? (op != 'A' && op != 'O')
+		        : (strchr("~=!><+-*/%&|^lrAO", op) == NULL))
+			return -1;
+		node.op = op;
+		if (!cwe && (op == '>' || op == '<') && *p->cursor == '=') {
+			++p->cursor;
+			node.op = op == '>' ? 'G' : 'L';
+		}
+		if (br_parse_node(p, depth + 1, cwe, &node.left) < 0)
+			return -1;
+		if (op != '~' && br_parse_node(p, depth + 1, cwe, &node.right) < 0)
+			return -1;
 	}
-	out->kind = BR_PRED_GENERIC;
-	out->cell_kind = BR_CELL_REGISTER;
-	out->cell_index = 0;
-	out->scale = 0;
-	out->generic_branch_expression = s;
+	if (p->count >= p->capacity)
+		return -1;
+	*index = p->count;
+	p->nodes[p->count++] = node;
 	return 0;
+}
+
+static int parse_predicate(const char *s, struct br_predicate *out,
+                           struct br_node *arena, uint16_t capacity)
+{
+	*out = (struct br_predicate){0};
+	if (s == NULL)
+		return -1;
+	unsigned length = 0;
+	while (length <= BR_MAX_DESCRIPTOR_BYTES && s[length]) ++length;
+	if (!length || length > BR_MAX_DESCRIPTOR_BYTES)
+		return -1;
+	if (strcmp(s, "p0") == 0)
+		return 0;
+	int cwe = s[0] == 'c';
+	const char *cursor = s;
+	if (cwe && s[1] == '3') {
+		cursor += 2;
+		if (*cursor != 'A' && *cursor != 'O')
+			return -1;
+	}
+	struct br_parser parser = {
+		.cursor = cursor, .nodes = arena, .capacity = capacity,
+	};
+	uint16_t root;
+	if (br_parse_node(&parser, 1, cwe, &root) < 0 || *parser.cursor)
+		return -1;
+	*out = (struct br_predicate){
+		.kind = cwe ? BR_PRED_CWE805 : BR_PRED_GENERIC,
+		.nodes = arena, .count = parser.count, .root = root,
+		.stack_bytes = parser.stack_bytes,
+	};
+	return 0;
+}
+
+static int64_t br_eval_node(const struct br_predicate *pred, uint16_t index,
+                           const int64_t env[16], int *crashed)
+{
+	if (*crashed) return 0;
+	if (index >= pred->count) { *crashed = 1; return 0; }
+	const struct br_node *node = &pred->nodes[index];
+	if (node->op == 'p') return i64_from_bits(node->literal);
+	if (node->op == 'v') {
+		if (node->cell_index > 15) { *crashed = 1; return 0; }
+		return env[node->cell_index];
+	}
+	int64_t a = br_eval_node(pred, node->left, env, crashed);
+	if (*crashed) return 0;
+	if (node->op == '~') return ~a;
+	if (node->op == 'A' && !a) return 0;
+	if (node->op == 'O' && a) return 1;
+	int64_t b = br_eval_node(pred, node->right, env, crashed);
+	if (*crashed) return 0;
+	switch (node->op) {
+	case 'A': case 'O': return b != 0;
+	case '=': return a == b;
+	case '!': return a != b;
+	case '>': return a > b;
+	case '<': return a < b;
+	case 'G': return a >= b;
+	case 'L': return a <= b;
+	case '+': return i64_from_bits((uint64_t)a + (uint64_t)b);
+	case '-': return i64_from_bits((uint64_t)a - (uint64_t)b);
+	case '*': return i64_from_bits((uint64_t)a * (uint64_t)b);
+	case '/': case '%':
+		if (!b || (a == INT64_MIN && b == -1)) {
+			*crashed = 1;
+			return 0;
+		}
+		return node->op == '/' ? a / b : a % b;
+	case '&': return a & b;
+	case '|': return a | b;
+	case '^': return a ^ b;
+	case 'l': return shift_left(a, b);
+	case 'r': return shift_right(a, b);
+	default: *crashed = 1; return 0;
+	}
 }
 
 /*
@@ -390,11 +422,26 @@ static uint64_t read_cell(const struct STATE *state,
                           enum br_cell_kind kind, uint16_t index)
 {
 	switch (kind) {
-	case BR_CELL_REGISTER: {
-		int64_t env[16];
-		state_to_env(state, env);
-		return (uint64_t)env[index];
-	}
+	case BR_CELL_REGISTER:
+		switch (index) {
+		case 0: return (uint64_t)state->rax;
+		case 1: return (uint64_t)state->rbx;
+		case 2: return (uint64_t)state->rcx;
+		case 3: return (uint64_t)state->rdx;
+		case 4: return (uint64_t)state->rsi;
+		case 5: return (uint64_t)state->rdi;
+		case 6: return (uint64_t)state->rsp;
+		case 7: return (uint64_t)state->rbp;
+		case 8: return (uint64_t)state->r8;
+		case 9: return (uint64_t)state->r9;
+		case 10: return (uint64_t)state->r10;
+		case 11: return (uint64_t)state->r11;
+		case 12: return (uint64_t)state->r12;
+		case 13: return (uint64_t)state->r13;
+		case 14: return (uint64_t)state->r14;
+		case 15: return (uint64_t)state->r15;
+		}
+		return 0;
 	case BR_CELL_STACK8:
 		return ((const uint8_t *)state->rsp)[index];
 	case BR_CELL_STACK16:
@@ -407,30 +454,68 @@ static uint64_t read_cell(const struct STATE *state,
 	return 0;
 }
 
-/*
- * Evaluate one CWE-805 descriptor against the tracked clamps.
- * Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
- * 2 (checked-multiply overflow: conservative no-jump, reported as br 2).
- * Zero-initialized clamps never match.
- */
+/* Values are cached only after first visit, and only for this hit. */
+static int br_cwe_node(const struct STATE *state, const struct br_predicate *pred,
+                       uint16_t index, const struct clamp *clamp,
+                       uint64_t *values, uint8_t *visited, int *crashed)
+{
+	if (*crashed) return 0;
+	if (index >= pred->count) { *crashed = 1; return 0; }
+	const struct br_node *node = &pred->nodes[index];
+	if (node->op == 'A' || node->op == 'O') {
+		int left = br_cwe_node(state, pred, node->left, clamp, values,
+		                       visited, crashed);
+		if (*crashed) return 0;
+		if (node->op == 'A' && !left) return 0;
+		if (node->op == 'O' && left) return 1;
+		return br_cwe_node(state, pred, node->right, clamp, values,
+		                   visited, crashed);
+	}
+	if (node->op != 'P' && node->op != 'S') {
+		*crashed = 1;
+		return 0;
+	}
+	if (!visited[index]) {
+		if (node->cell_kind > BR_CELL_STACK64
+		    || (node->cell_kind == BR_CELL_REGISTER && node->cell_index > 15)
+		    || (node->op == 'P' && node->cell_kind != BR_CELL_REGISTER
+		        && node->cell_kind != BR_CELL_STACK64)
+		    || (node->op == 'S' && (node->cell_kind == BR_CELL_STACK64
+		        || (node->scale != 1 && node->scale != 2
+		            && node->scale != 4 && node->scale != 8)))) {
+			*crashed = 1;
+			return 0;
+		}
+		uint64_t value = read_cell(state, node->cell_kind, node->cell_index);
+		if (node->op == 'S' && __builtin_mul_overflow(value,
+		                                            node->scale, &value)) {
+			*crashed = 1;
+			return 0;
+		}
+		values[index] = value;
+		visited[index] = 1;
+	}
+	uint64_t value = values[index];
+	return node->op == 'P' ? value >= clamp->begin && value < clamp->end
+	                       : value < clamp->end - clamp->begin;
+}
+
 static int CWE805_branch_taken(const struct STATE *state,
                                const struct br_predicate *pred)
 {
-	const uint64_t value = read_cell(state, pred->cell_kind,
-	                                 pred->cell_index);
-	struct clamp *i = buffers + 256;
-	if (pred->kind == BR_PRED_CWE805_POINTER) {
-		while (i-- > buffers)
-			if (value >= i->begin && value < i->end)
-				return 0;
-		return 1;
-	}
-	uint64_t size;
-	if (__builtin_mul_overflow(value, pred->scale, &size))
+	if (!pred->count || pred->count > BR_MAX_NODES || pred->root >= pred->count)
 		return 2;
-	while (i-- > buffers)
-		if (size < i->end - i->begin)
-			return 0;
+	/* Actual-node scratch only; never a maximum generic arena per hit. */
+	uint64_t values[pred->count];
+	uint8_t visited[pred->count];
+	memset(visited, 0, sizeof(visited));
+	int crashed = 0;
+	for (int i = 255; i >= 0; --i) {
+		int safe = br_cwe_node(state, pred, pred->root, &buffers[i],
+		                       values, visited, &crashed);
+		if (crashed) return 2;
+		if (safe) return 0;
+	}
 	return 1;
 }
 
@@ -461,44 +546,42 @@ const void *jnz(uint64_t base, uint64_t index, uint8_t scale, uint32_t disp,
 }
 #endif /* BRPATCH_CWE805 */
 
-#ifndef BINRADAR_EVAL_ONLY
-const char *get_patch_str(int id) {
-	switch (id) {
-#include "brpatches.inc"
+static int evaluate_predicate(const struct STATE *state,
+                              const struct br_predicate *pred, int *invalid)
+{
+	if (pred == NULL) { *invalid = 1; return 2; }
+	if (pred->kind == BR_PRED_FALSE) return 0;
+	if (!pred->nodes || !pred->count || pred->count > BR_MAX_NODES
+	    || pred->root >= pred->count) {
+		*invalid = 1;
+		return 2;
 	}
+	if (pred->kind == BR_PRED_GENERIC) {
+		int64_t env[16];
+		state_to_env(state, env);
+		int crashed = 0;
+		int branch = br_eval_node(pred, pred->root, env, &crashed) != 0;
+		return crashed ? 2 : branch;
+	}
+#ifdef BRPATCH_CWE805
+	if (pred->kind == BR_PRED_CWE805)
+		return CWE805_branch_taken(state, pred);
+#endif
+	*invalid = 1;
+	return 2;
 }
+
+#ifndef BINRADAR_EVAL_ONLY
+#include "brpatches.inc"
 
 const void *dest(const struct STATE *state)
 {
 	uint32_t v = 0;
 	const uint32_t patch_id = select_patch_id(&v);
-	const char *tmp = get_patch_str(patch_id);
-	struct br_predicate pred = {0};
-	int branch_taken;
-	if (parse_predicate(tmp, &pred) < 0) {
-		/* Unknown descriptor: BR_PRED_FALSE, follow the original path. */
-		branch_taken = 0;
-	} else if (pred.kind == BR_PRED_GENERIC) {
-		int64_t env[16];
-		state_to_env(state, env);
-		int patch_crashed = 0;
-		const char *cursor = pred.generic_branch_expression;
-		branch_taken = eval(&cursor, env, &patch_crashed) != 0;
-		if (patch_crashed) {
-			/* The patch itself would crash (div/mod by zero,
-			 * INT64_MIN / -1).  Report `br 2` and follow the
-			 * original path (no jump) so the patch is rejected
-			 * downstream. */
-			branch_taken = 2;
-		}
-	} else {
-#ifdef BRPATCH_CWE805
-		branch_taken = CWE805_branch_taken(state, &pred);
-#else
-		/* A CWE-805 descriptor cannot occur without the tracker. */
-		branch_taken = 0;
-#endif
-	}
+	int invalid = 0;
+	struct br_predicate predicate;
+	get_patch_pred(patch_id, &predicate);
+	const int branch_taken = evaluate_predicate(state, &predicate, &invalid);
 	log_patch(patch_id, branch_taken, v);
 	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
 }

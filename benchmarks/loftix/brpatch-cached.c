@@ -87,19 +87,8 @@ static uint32_t selected_patch_id;
 static uint32_t selected_iteration;
 static struct br_predicate selected_predicate;
 
-static uint64_t predicate_stack_bytes(const struct br_predicate *predicate)
-{
-	uint64_t width;
-	switch (predicate->cell_kind) {
-	case BR_CELL_REGISTER: return 0;
-	case BR_CELL_STACK8: width = 1; break;
-	case BR_CELL_STACK16: width = 2; break;
-	case BR_CELL_STACK32: width = 4; break;
-	case BR_CELL_STACK64: width = 8; break;
-	default: return ~(uint64_t)0;
-	}
-	return ((uint64_t)predicate->cell_index + 1) * width;
-}
+/* Selected descriptor is compiled once in this child-owned bounded arena. */
+static struct br_node selected_nodes[BR_MAX_NODES];
 
 static void attach_cache_selector(void)
 {
@@ -277,30 +266,6 @@ static const char *select_descriptor(uint32_t *patch_id,
 	return cache_selector->descriptor;
 }
 
-static int evaluate_selected(const struct STATE *state,
-                             const struct br_predicate *predicate,
-                             int *invalid)
-{
-	if (predicate->kind == BR_PRED_GENERIC) {
-		int64_t env[16];
-		state_to_env(state, env);
-		int crashed = 0;
-		const char *cursor = predicate->generic_branch_expression;
-		const int branch = eval(&cursor, env, &crashed) != 0;
-		if (*cursor != '\0') {
-			*invalid = 1;
-			return 0;
-		}
-		return crashed ? 2 : branch;
-	}
-#ifdef BRPATCH_CWE805
-	return CWE805_branch_taken(state, predicate);
-#else
-	*invalid = 1;
-	return 0;
-#endif
-}
-
 /* E9 action: if dest(state)@brpatch-cached goto */
 const void *dest(const struct STATE *state)
 {
@@ -314,16 +279,25 @@ const void *dest(const struct STATE *state)
 			return NULL;
 		if (!selected_invalid &&
 		    (encoded == NULL ||
-		     parse_predicate(encoded, &selected_predicate) < 0))
+		     parse_predicate(encoded, &selected_predicate, selected_nodes,
+		                     BR_MAX_NODES) < 0))
 			selected_invalid = 1;
 		if (!selected_invalid &&
-		    predicate_stack_bytes(&selected_predicate) > cache_stack_size)
+		    selected_predicate.stack_bytes > cache_stack_size)
 			selected_invalid = 1;
+#ifndef BRPATCH_CWE805
+		if (!selected_invalid && selected_predicate.kind == BR_PRED_CWE805)
+			selected_invalid = 1;
+#else
+		/* The reserved p0 parses as BR_PRED_FALSE in either family. */
+		if (!selected_invalid && selected_predicate.kind == BR_PRED_GENERIC)
+			selected_invalid = 1;
+#endif
 		selected_initialized = 1;
 	}
 	int invalid = selected_invalid;
 	const int branch = invalid ? 0
-		: evaluate_selected(state, &selected_predicate, &invalid);
+		: evaluate_predicate(state, &selected_predicate, &invalid);
 
 	log_patch(selected_patch_id, branch, selected_iteration);
 	capture_snapshot(state, selected_patch_id, branch, invalid);

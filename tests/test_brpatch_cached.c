@@ -62,8 +62,50 @@ static int forward_pipe(int fd, int output_fd)
 	}
 }
 
+static int check_cached_admission(void)
+{
+#ifdef BRPATCH_CWE805
+	const char *family_invalid = "Ap0p0";
+	const char *extent_invalid = "c3Oc1p0c1s64i65535";
+	const char *trap = "c2p0q8";
+#else
+	const char *family_invalid = "c1p0";
+	const char *extent_invalid = "c3Oc1p0c1s64i65535";
+	const char *trap = "A/p1p0p0";
+#endif
+	const char *descriptors[] = {"p0", "Op1v16", trap, family_invalid, extent_invalid};
+	const int expected_branch[] = {0, 0, 2, 0, 0};
+	const int expected_invalid[] = {0, 1, 0, 1, 1};
+	struct STATE state = {.rax = -1};
+	patch_fd = -1;
+	for (unsigned i = 0; i < sizeof(descriptors) / sizeof(*descriptors); ++i) {
+		int fds[2];
+		if (pipe(fds) < 0 || setenv_checked("TAOSC_PRED", descriptors[i]) < 0)
+			return 1;
+		cache_fd = fds[1];
+		selected_initialized = selected_invalid = 0;
+		cache_stack_size = 0;
+		if (dest(&state) != NULL)
+			return 2;
+		close(fds[1]);
+		struct brcache_snapshot_header header;
+		if (read(fds[0], &header, sizeof(header)) != (ssize_t)sizeof(header))
+			return 3;
+		close(fds[0]);
+		if (header.branch != (uint32_t)expected_branch[i]
+		    || !!(header.flags & BRCACHE_FLAG_INVALID) != expected_invalid[i])
+			return 4;
+	}
+	cache_fd = -1;
+	selected_initialized = selected_invalid = 0;
+	cache_hit_count = cache_captured_bytes = 0;
+	return 0;
+}
+
 int main(void)
 {
+	if (check_cached_admission())
+		return 90;
 	uint8_t stack[8] = {0};
 	struct STATE state = {0};
 	state.rsp = (int64_t)(uintptr_t)stack;

@@ -123,8 +123,45 @@ static void run_jnz(const char *name, uint32_t patch_id,
 	printf("RESULT %s %d %d\n", name, br, ret == (const void *)TAOSC_DEST);
 }
 
+static int check_composite_predicates(void)
+{
+	struct br_node nodes[BR_MAX_NODES];
+	struct br_predicate pred;
+	struct STATE state = {.rax = 105, .rbx = 75};
+	memset(buffers, 0, sizeof(buffers));
+	buffers[0] = (struct clamp){100, 110};
+	buffers[1] = (struct clamp){300, 400};
+	if (parse_predicate("c3Ac1p0c2p1q1", &pred, nodes, BR_MAX_NODES) < 0
+	    || CWE805_branch_taken(&state, &pred) != 1)
+		return 1; /* Different clamps must not satisfy separate operands. */
+	state.rax = 150;
+	state.rbx = 0x2000000000000000ULL;
+	buffers[255] = (struct clamp){100, 200};
+	if (parse_predicate("c3Oc1p0c2p1q8", &pred, nodes, BR_MAX_NODES) < 0
+	    || CWE805_branch_taken(&state, &pred) != 0)
+		return 2; /* First true stops before overflow, including lower clamps. */
+	if (parse_predicate("c3Ac1p0c2p1q8", &pred, nodes, BR_MAX_NODES) < 0
+	    || CWE805_branch_taken(&state, &pred) != 2)
+		return 3;
+	state.rax = 500;
+	if (CWE805_branch_taken(&state, &pred) != 1)
+		return 4; /* Values and visited flags cannot leak between hits. */
+	state.rax = 150;
+	state.rsp = 0;
+	if (parse_predicate("c3Oc1p0c1s64i65535", &pred, nodes, BR_MAX_NODES) < 0
+	    || pred.stack_bytes != 524288
+	    || CWE805_branch_taken(&state, &pred) != 0)
+		return 5; /* Whole-tree extent, but no skipped stack load. */
+	if (parse_predicate("p0", &pred, nodes, BR_MAX_NODES) < 0
+	    || pred.kind != BR_PRED_FALSE)
+		return 6;
+	return 0;
+}
+
 int main(void)
 {
+	if (check_composite_predicates())
+		return 90;
 	/* Shared scenario vectors (keep in sync with the Python test). */
 	static const int64_t regs0[16] = {0};
 	static const int64_t regs_ptr_inside[16] = {0x1000};
@@ -152,7 +189,7 @@ int main(void)
 	 *   0: "p0" (false)            1: "=p1p1" (generic, always true)
 	 *   2: "c1p0"                  3: "c1s64i0"
 	 *   4: "c2p1q1"                5: "c2s16i0q2"
-	 *   6: "c2p1q8"                7: "c1s32i0" (malformed descriptor)
+	 *   6: "c2p1q8"                7: invalid static metadata (br 2)
 	 */
 	run_dest("ptr-reg-inside", 2, regs_ptr_inside, NULL, clamp1, 1);
 	run_dest("ptr-reg-outside", 2, regs_ptr_outside, NULL, clamp1, 1);

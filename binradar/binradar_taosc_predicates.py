@@ -6,6 +6,7 @@ families (generic ERM, CWE-805 ERM, CWE-805 direct, taosc-specialized),
 plus the allocator-trace instrumentation spec shared by patched artifacts.  Shared with binradar.binradar_setup.
 """
 
+import ast
 import enum
 import functools
 import hashlib
@@ -22,6 +23,14 @@ from . import paths
 
 INT64_MIN = -(1 << 63)
 _MASK64 = (1 << 64) - 1
+MAX_SOURCE_BYTES = 4096
+MAX_DESCRIPTOR_BYTES = 4095
+MAX_EXPR_DEPTH = 256
+
+
+def _check_source(source: str) -> None:
+    if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+        raise ValueError("predicate source exceeds 4096 UTF-8 bytes")
 
 CONSTANTS: Dict[str, int] = {
     "max1": 0,
@@ -135,15 +144,45 @@ class CWE805SizePredicate:
     cell: StateCell
 
 
-CWE805Predicate = Union[CWE805PointerPredicate, CWE805SizePredicate]
+@dataclass(frozen=True)
+class CWE805LogicalPredicate:
+    op: str
+    left: "CWE805Predicate"
+    right: "CWE805Predicate"
+
+
+CWE805Predicate = Union[CWE805PointerPredicate, CWE805SizePredicate,
+                        CWE805LogicalPredicate]
 ParsedPredicate = Union[str, CWE805Predicate]
 
 
 def predicate_stack_bytes(predicate: ParsedPredicate) -> int:
-    """Minimum captured stack bytes needed to evaluate ``predicate``."""
-    if isinstance(predicate, str) or isinstance(predicate.cell, RegisterCell):
+    """Minimum captured stack bytes, including every skipped subtree."""
+    if isinstance(predicate, str):
         return 0
-    return (predicate.cell.index + 1) * (predicate.cell.width_bits // 8)
+    pending = [(predicate, 1)]
+    required = 0
+    while pending:
+        node, depth = pending.pop()
+        if depth > MAX_EXPR_DEPTH:
+            raise ValueError("predicate depth exceeds 256")
+        if isinstance(node, CWE805LogicalPredicate):
+            if node.op not in ("&&", "||"):
+                raise ValueError("invalid CWE-805 logical operator")
+            pending.extend(((node.left, depth + 1), (node.right, depth + 1)))
+            continue
+        cell = node.cell
+        if isinstance(cell, RegisterCell):
+            if not 0 <= cell.register_index <= 15:
+                raise ValueError("register index out of range")
+        else:
+            widths = (64,) if isinstance(node, CWE805PointerPredicate) else (8, 16, 32)
+            if cell.width_bits not in widths or not 0 <= cell.index <= 65535:
+                raise ValueError("invalid CWE-805 stack cell")
+            required = max(required, (cell.index + 1) * (cell.width_bits // 8))
+        if isinstance(node, CWE805SizePredicate) and node.scale not in (1, 2, 4, 8):
+            raise ValueError("invalid CWE-805 size scale")
+    return required
 
 
 @dataclass(frozen=True)
@@ -179,7 +218,7 @@ def _parse_CWE805_cell(text: str) -> StateCell:
     return StackCell(int(match.group("width")), int(match.group("index")))
 
 
-def parse_CWE805_predicate(line: str) -> CWE805Predicate:
+def _parse_CWE805_atom(line: str) -> CWE805Predicate:
     """Parse one CWE-805 predicate line into a typed descriptor.
 
     Raises ValueError with a reason on any line outside the closed
@@ -201,6 +240,71 @@ def parse_CWE805_predicate(line: str) -> CWE805Predicate:
     raise ValueError("not a CWE-805 predicate")
 
 
+def parse_CWE805_predicate(line: str) -> CWE805Predicate:
+    """Parse typed leaves before interpreting their internal pointer &&."""
+    _check_source(line)
+    # Regexes retain the closed atom grammar; remove only their end anchor
+    # so a leaf can precede a logical operator or grouping delimiter.
+    pointer = re.compile(_CWE805_POINTER_RE.pattern[:-1])
+    size = re.compile(_CWE805_SIZE_RE.pattern[:-1])
+    pos = 0
+
+    def whitespace() -> None:
+        nonlocal pos
+        while pos < len(line) and line[pos].isspace():
+            pos += 1
+
+    def primary(depth: int) -> CWE805Predicate:
+        nonlocal pos
+        if depth > MAX_EXPR_DEPTH:
+            raise ValueError("predicate source nesting exceeds 256")
+        whitespace()
+        for regex in (pointer, size):
+            match = regex.match(line[pos:])
+            if match is not None:
+                pos += match.end()
+                return _parse_CWE805_atom(match.group(0))
+        if pos < len(line) and line[pos] == "(":
+            pos += 1
+            result = logical_or(depth + 1)
+            whitespace()
+            if pos >= len(line) or line[pos] != ")":
+                raise ValueError("expected closing CWE-805 parenthesis")
+            pos += 1
+            return result
+        raise ValueError("not a CWE-805 predicate")
+
+    def logical_and(depth: int) -> CWE805Predicate:
+        nonlocal pos
+        node = primary(depth)
+        whitespace()
+        while line.startswith("&&", pos):
+            pos += 2
+            node = CWE805LogicalPredicate("&&", node, primary(depth))
+            whitespace()
+        return node
+
+    def logical_or(depth: int) -> CWE805Predicate:
+        nonlocal pos
+        node = logical_and(depth)
+        whitespace()
+        while line.startswith("||", pos):
+            pos += 2
+            node = CWE805LogicalPredicate("||", node, logical_and(depth))
+            whitespace()
+        return node
+
+    try:
+        result = logical_or(0)
+    except RecursionError as e:
+        raise ValueError("predicate source nesting exceeds parser limit") from e
+    whitespace()
+    if pos != len(line):
+        raise ValueError("trailing CWE-805 source data")
+    predicate_descriptor(result)  # Entire tree admission, not just visited leaves.
+    return result
+
+
 
 
 
@@ -211,12 +315,13 @@ def predicates_sha256(predicates_file: Path) -> str:
 # Strict generic lexer: every input byte must be consumed as a token or
 # whitespace.  Unknown punctuation is an error, never silently skipped.
 _GENERIC_TOKEN_RE = re.compile(
-    r"\s+|<=|>=|==|!=|<<|>>|[()~+\-*/%&|^<>]|[A-Za-z_][A-Za-z0-9_]*|\d+"
+    r"\s+|&&|\|\||<=|>=|==|!=|<<|>>|[()~+\-*/%&|^<>]|[A-Za-z_][A-Za-z0-9_]*|[0-9]+"
 )
 
 
 def tokenize_generic(predicate: str) -> List[str]:
     """Tokenize a generic predicate, rejecting any unrecognized byte."""
+    _check_source(predicate)
     tokens: List[str] = []
     pos = 0
     while pos < len(predicate):
@@ -238,113 +343,82 @@ AstNode = Union[
 
 
 class Parser:
+    """Iterative precedence parser; source nesting never consumes Python stack."""
+    _precedence = {op: level for level, group in enumerate((
+        ("||",), ("&&",), ("|",), ("^",), ("&",), ("==", "!="),
+        ("<", "<=", ">", ">="), ("<<", ">>"), ("+", "-"),
+        ("*", "/", "%"), ("u+", "u-", "u~"))) for op in group}
+
     def __init__(self, tokens: List[str]):
         self.tokens = tokens
-        self.pos = 0
-
-    def peek(self) -> Optional[str]:
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
-
-    def pop(self, expected: Optional[str] = None) -> str:
-        tok = self.peek()
-        if tok is None:
-            raise ValueError("unexpected end of predicate")
-        if expected is not None and tok != expected:
-            raise ValueError(f"expected {expected!r}, got {tok!r}")
-        self.pos += 1
-        return tok
 
     def parse(self) -> AstNode:
-        node = self.parse_bitor()
-        if self.peek() is not None:
-            raise ValueError(f"unexpected trailing token: {self.peek()!r}")
+        values = []
+        operators = []
+        expect_value = True
+        nesting = 0
+
+        def reduce() -> None:
+            op = operators.pop()
+            arity = 1 if op.startswith("u") else 2
+            if len(values) < arity:
+                raise ValueError("missing predicate operand")
+            if arity == 1:
+                values.append((op, values.pop()))
+            else:
+                right, left = values.pop(), values.pop()
+                values.append((op, left, right))
+
+        for token in self.tokens:
+            if token == "(" and expect_value:
+                nesting += 1
+                if nesting > MAX_EXPR_DEPTH:
+                    raise ValueError("predicate source nesting exceeds 256")
+                operators.append(token)
+            elif token == ")" and not expect_value:
+                while operators and operators[-1] != "(":
+                    reduce()
+                if not operators:
+                    raise ValueError("unexpected closing parenthesis")
+                operators.pop()
+                nesting -= 1
+            elif expect_value:
+                if token in ("+", "-", "~"):
+                    operators.append("u" + token)
+                    if len(operators) > MAX_SOURCE_BYTES:
+                        raise ValueError("predicate operator budget exceeded")
+                    continue
+                if token.isdigit():
+                    values.append(("const", int(token)))
+                elif token in CONSTANTS:
+                    values.append(("const", CONSTANTS[token]))
+                elif token in REGISTER_TO_VAR:
+                    values.append(("var", REGISTER_TO_VAR[token]))
+                else:
+                    raise ValueError(f"unknown identifier or operand: {token}")
+                expect_value = False
+            elif token in self._precedence and not token.startswith("u"):
+                while operators and operators[-1] != "(" and self._precedence[operators[-1]] >= self._precedence[token]:
+                    reduce()
+                operators.append(token)
+                expect_value = True
+            else:
+                raise ValueError(f"unexpected token: {token}")
+        if expect_value or nesting:
+            raise ValueError("incomplete predicate")
+        while operators:
+            reduce()
+        if len(values) != 1:
+            raise ValueError("invalid predicate")
+        node = values[0]
+        pending = [(node, 1)]
+        while pending:
+            current, depth = pending.pop()
+            if depth > MAX_EXPR_DEPTH:
+                raise ValueError("predicate depth exceeds 256")
+            if current[0] not in ("const", "var"):
+                pending.extend((child, depth + 1) for child in current[1:])
         return node
-
-    def parse_bitor(self) -> AstNode:
-        node = self.parse_xor()
-        while self.peek() == "|":
-            self.pop("|")
-            node = ("|", node, self.parse_xor())
-        return node
-
-    def parse_xor(self) -> AstNode:
-        node = self.parse_bitand()
-        while self.peek() == "^":
-            self.pop("^")
-            node = ("^", node, self.parse_bitand())
-        return node
-
-    def parse_bitand(self) -> AstNode:
-        node = self.parse_equality()
-        while self.peek() == "&":
-            self.pop("&")
-            node = ("&", node, self.parse_equality())
-        return node
-
-    def parse_equality(self) -> AstNode:
-        node = self.parse_relational()
-        while self.peek() in ("==", "!="):
-            op = self.pop()
-            node = (op, node, self.parse_relational())
-        return node
-
-    def parse_relational(self) -> AstNode:
-        node = self.parse_shift()
-        while self.peek() in ("<", "<=", ">", ">="):
-            op = self.pop()
-            node = (op, node, self.parse_shift())
-        return node
-
-    def parse_shift(self) -> AstNode:
-        node = self.parse_additive()
-        while self.peek() in ("<<", ">>"):
-            op = self.pop()
-            node = (op, node, self.parse_additive())
-        return node
-
-    def parse_additive(self) -> AstNode:
-        node = self.parse_multiplicative()
-        while self.peek() in ("+", "-"):
-            op = self.pop()
-            node = (op, node, self.parse_multiplicative())
-        return node
-
-    def parse_multiplicative(self) -> AstNode:
-        node = self.parse_unary()
-        while self.peek() in ("*", "/", "%"):
-            op = self.pop()
-            node = (op, node, self.parse_unary())
-        return node
-
-    def parse_unary(self) -> AstNode:
-        tok = self.peek()
-        if tok == "+":
-            self.pop("+")
-            return ("u+", self.parse_unary())
-        if tok == "-":
-            self.pop("-")
-            return ("u-", self.parse_unary())
-        if tok == "~":
-            self.pop("~")
-            return ("u~", self.parse_unary())
-        return self.parse_primary()
-
-    def parse_primary(self) -> AstNode:
-        tok = self.peek()
-        if tok == "(":
-            self.pop("(")
-            node = self.parse_bitor()
-            self.pop(")")
-            return node
-
-        tok = self.pop()
-        if tok.isdigit():
-            return ("const", int(tok))
-        if tok in CONSTANTS:
-            return ("const", CONSTANTS[tok])
-        if tok in REGISTER_TO_VAR:
-            return ("var", REGISTER_TO_VAR[tok])
-        raise ValueError(f"unknown identifier: {tok}")
 
 
 def emit_patch(node: AstNode) -> str:
@@ -354,6 +428,7 @@ def emit_patch(node: AstNode) -> str:
         value = node[1]
         if type(value) != int:
             raise ValueError(f"invalid constant value: {value!r}")
+        value = wrap64(value)
         return f"p{value}" if value >= 0 else f"n{-value}"
 
     if kind == "var":
@@ -372,6 +447,8 @@ def emit_patch(node: AstNode) -> str:
         return f"~{emit_patch(cast(AstNode, node[1]))}"
 
     op_map = {
+        "&&": "A",
+        "||": "O",
         "+": "+",
         "-": "-",
         "*": "*",
@@ -401,8 +478,10 @@ def predicate_to_patch_str(predicate: str) -> str:
     tokens = tokenize_generic(predicate)
     if not tokens:
         raise ValueError("empty predicate")
-    ast = Parser(tokens).parse()
-    return emit_patch(ast)
+    node = Parser(tokens).parse()
+    descriptor = emit_patch(node)
+    _parse_generic_descriptor(descriptor)
+    return descriptor
 
 
 def predicate_to_branch_patch_str(predicate: str) -> str:
@@ -411,7 +490,9 @@ def predicate_to_branch_patch_str(predicate: str) -> str:
     Taosc's generic patch jumps when its generated predicate is zero, while
     brpatch.c jumps when the encoded expression is non-zero.
     """
-    return f"={predicate_to_patch_str(predicate)}p0"
+    descriptor = f"={predicate_to_patch_str(predicate)}p0"
+    _parse_generic_descriptor(descriptor)
+    return descriptor
 
 
 def load_predicates(file: Path) -> List[Tuple[int, str]]:
@@ -688,16 +769,6 @@ def wrap64(v: int) -> int:
     return v - (1 << 64) if v >= (1 << 63) else v
 
 
-def _parse_int(s: str, pos: List[int]) -> int:
-    """Parse decimal digits; accumulate with the same wraparound as the
-    int64_t arithmetic in brpatch.c::scani."""
-    i = 0
-    n = len(s)
-    while pos[0] < n and "0" <= s[pos[0]] <= "9":
-        i = wrap64(i * 10 + (ord(s[pos[0]]) - 48))
-        pos[0] += 1
-    return i
-
 
 def _trunc_div(a: int, b: int) -> int:
     """C truncating division (round toward zero), not Python floor division."""
@@ -757,48 +828,98 @@ _PATCH_EVAL_GLOBALS = {
 }
 
 
+def _check_descriptor(s: str) -> None:
+    if not s or len(s.encode("utf-8")) > MAX_DESCRIPTOR_BYTES:
+        raise ValueError("empty or oversized predicate descriptor")
+
+
+@functools.cache
+def _parse_generic_descriptor(s: str) -> AstNode:
+    """Validate the entire prefix tree, including unreachable operands."""
+    _check_descriptor(s)
+    pos = 0
+
+    def parse(depth: int) -> AstNode:
+        nonlocal pos
+        if depth > MAX_EXPR_DEPTH:
+            raise ValueError("predicate depth exceeds 256")
+        if pos >= len(s):
+            raise ValueError("unexpected end of encoded predicate")
+        op = s[pos]
+        pos += 1
+        if op in "pnv":
+            start = pos
+            while pos < len(s) and "0" <= s[pos] <= "9":
+                pos += 1
+            if start == pos:
+                raise ValueError("missing encoded integer digits")
+            digits = s[start:pos].lstrip("0") or "0"
+            if len(digits) > 20:
+                raise ValueError("encoded integer out of range")
+            value = int(digits)
+            if op == "v":
+                if value > 15:
+                    raise ValueError("register index out of range")
+                return ("var", value)
+            if value > _MASK64:
+                raise ValueError("encoded integer out of range")
+            return ("const", wrap64(-value if op == "n" else value))
+        if op == "~":
+            return ("u~", parse(depth + 1))
+        if op in "<>" and pos < len(s) and s[pos] == "=":
+            pos += 1
+            op += "="
+        if op not in ("=", "!", ">", "<", ">=", "<=", "+", "-", "*", "/", "%", "&", "|", "^", "l", "r", "A", "O"):
+            raise ValueError(f"unknown patch operator {op!r}")
+        return (op, parse(depth + 1), parse(depth + 1))
+
+    node = parse(1)
+    if pos != len(s):
+        raise ValueError("trailing data in encoded predicate")
+    return node
+
+
 @functools.cache
 def _compile_patch_str(s: str) -> PatchEvaluator:
-    """Compile one validated prefix predicate for repeated evaluation."""
-    pos = [0]
+    """Compile Python AST directly, avoiding the source-parentheses limit."""
+    tree = _parse_generic_descriptor(s)
 
-    def parse() -> str:
-        if pos[0] >= len(s):
-            raise ValueError("unexpected end of encoded predicate")
-        op = s[pos[0]]
-        pos[0] += 1
-        if op == "n":
-            return str(wrap64(-_parse_int(s, pos)))
-        if op == "p":
-            return str(_parse_int(s, pos))
-        if op == "v":
-            return f"env[{_parse_int(s, pos)}]"
-        if op == "~":
-            return f"_w(~({parse()}))"
-        if op in "<>" and pos[0] < len(s) and s[pos[0]] == "=":
-            pos[0] += 1
-            op += "="
+    def call(name: str, *args: ast.expr) -> ast.expr:
+        return ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=list(args), keywords=[])
 
-        left = parse()
-        right = parse()
-        comparison = {
-            "=": "==", "!": "!=", ">": ">", ">=": ">=",
-            "<": "<", "<=": "<=",
-        }.get(op)
+    def compile_node(node: AstNode) -> ast.expr:
+        op = node[0]
+        if op == "const":
+            return ast.Constant(value=node[1])
+        if op == "var":
+            return ast.Subscript(value=ast.Name(id="env", ctx=ast.Load()), slice=ast.Constant(value=node[1]), ctx=ast.Load())
+        left = compile_node(node[1])
+        if op == "u~":
+            return call("_w", ast.UnaryOp(op=ast.Invert(), operand=left))
+        right = compile_node(node[2])
+        if op in ("A", "O"):
+            return call("int", ast.BoolOp(op=ast.And() if op == "A" else ast.Or(), values=[
+                ast.Compare(left=left, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)]),
+                ast.Compare(left=right, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])]))
+        comparison = {"=": ast.Eq, "!": ast.NotEq, ">": ast.Gt, "<": ast.Lt, ">=": ast.GtE, "<=": ast.LtE}.get(op)
         if comparison is not None:
-            return f"int(({left}) {comparison} ({right}))"
-        if op in "+-*&|^":
-            return f"_w(({left}) {op} ({right}))"
-        helper = {"l": "_sl", "r": "_sr", "/": "_div", "%": "_mod"}.get(op)
-        if helper is not None:
-            return f"{helper}(({left}), ({right}))"
-        raise ValueError(f"unknown patch operator {op!r}")
+            return call("int", ast.Compare(left=left, ops=[comparison()], comparators=[right]))
+        binary = {"+": ast.Add, "-": ast.Sub, "*": ast.Mult, "&": ast.BitAnd, "|": ast.BitOr, "^": ast.BitXor}.get(op)
+        if binary is not None:
+            return call("_w", ast.BinOp(left=left, op=binary(), right=right))
+        return call({"l": "_sl", "r": "_sr", "/": "_div", "%": "_mod"}[op], left, right)
 
-    expression = parse()
-    if pos[0] != len(s):
-        raise ValueError(f"trailing data in encoded predicate {s!r}")
-    code = compile(f"lambda env: {expression}", "<taosc-predicate>", "eval",
-                   optimize=2)
+    try:
+        expression = ast.Expression(body=ast.Lambda(
+            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="env")], kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=compile_node(tree)))
+        for item in ast.walk(expression):
+            if "lineno" in item._attributes:
+                item.lineno = item.end_lineno = 1
+                item.col_offset = item.end_col_offset = 0
+        code = compile(expression, "<taosc-predicate>", "eval", optimize=2)
+    except (RecursionError, SyntaxError) as e:
+        raise ValueError("predicate exceeds Python compilation limit") from e
     return cast(PatchEvaluator, eval(code, _PATCH_EVAL_GLOBALS))
 
 
@@ -817,26 +938,36 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
     Cells use the unsigned 64-bit bit-domain; stack loads are x86-64
     little-endian.  Zero-initialized clamps never match.
     """
-    cell = predicate.cell
-    if isinstance(cell, RegisterCell):
-        value = registers[cell.register_index] & _MASK64
-    else:
-        width = cell.width_bits // 8
-        offset = cell.index * width
-        value = int.from_bytes(stack[offset:offset + width], "little")
+    required = predicate_stack_bytes(predicate)
+    if len(stack) < required:
+        raise ValueError(f"insufficient captured stack: need {required} bytes")
 
-    if isinstance(predicate, CWE805PointerPredicate):
-        for begin, end in clamps:
-            if begin <= value < end:
+    def evaluate(node: CWE805Predicate, begin: int, end: int) -> bool:
+        if isinstance(node, CWE805LogicalPredicate):
+            left = evaluate(node.left, begin, end)
+            if node.op == "&&":
+                return left and evaluate(node.right, begin, end)
+            return left or evaluate(node.right, begin, end)
+        cell = node.cell
+        if isinstance(cell, RegisterCell):
+            value = registers[cell.register_index] & _MASK64
+        else:
+            width = cell.width_bits // 8
+            offset = cell.index * width
+            value = int.from_bytes(stack[offset:offset + width], "little")
+        if isinstance(node, CWE805PointerPredicate):
+            return begin <= value < end
+        size = node.scale * value
+        if size > _MASK64:
+            raise PredicateTrap("CWE-805 size multiplication overflow")
+        return size < ((end - begin) & _MASK64)
+
+    try:
+        for begin, end in reversed(clamps):
+            if evaluate(predicate, begin, end):
                 return 0
-        return 1
-
-    size = predicate.scale * value
-    if size > _MASK64:
+    except PredicateTrap:
         return 2
-    for begin, end in clamps:
-        if size < (end - begin) & _MASK64:
-            return 0
     return 1
 
 
@@ -1120,50 +1251,61 @@ RUNTIME_PREDICATES_VERSION = 1
 
 
 def predicate_descriptor(predicate: ParsedPredicate) -> str:
-    """Encode one validated runtime predicate for brpatches.inc/JSON."""
+    """Encode one fully validated predicate, retaining ordered tree shape."""
     if isinstance(predicate, str):
+        _parse_generic_descriptor(predicate)
         return predicate
-    cell = predicate.cell
-    if isinstance(cell, RegisterCell):
-        encoded_cell = f"p{cell.register_index}"
-    else:
-        encoded_cell = f"s{cell.width_bits}i{cell.index}"
-    if isinstance(predicate, CWE805PointerPredicate):
-        return f"c1{encoded_cell}"
-    return f"c2{encoded_cell}q{predicate.scale}"
+    predicate_stack_bytes(predicate)
+
+    def encode(node: CWE805Predicate) -> str:
+        if isinstance(node, CWE805LogicalPredicate):
+            return ("A" if node.op == "&&" else "O") + encode(node.left) + encode(node.right)
+        cell = node.cell
+        encoded_cell = (f"p{cell.register_index}" if isinstance(cell, RegisterCell)
+                        else f"s{cell.width_bits}i{cell.index}")
+        if isinstance(node, CWE805PointerPredicate):
+            return f"c1{encoded_cell}"
+        return f"c2{encoded_cell}q{node.scale}"
+
+    descriptor = ("c3" if isinstance(predicate, CWE805LogicalPredicate) else "") + encode(predicate)
+    _check_descriptor(descriptor)
+    return descriptor
 
 
 def parse_predicate_descriptor(descriptor: str) -> ParsedPredicate:
-    """Parse the compact descriptor accepted by brpatch.c."""
+    """Parse the closed descriptor grammar, validating skipped subtrees too."""
+    _check_descriptor(descriptor)
     if not descriptor.startswith("c"):
-        if not descriptor:
-            raise ValueError("empty generic predicate descriptor")
+        _parse_generic_descriptor(descriptor)
         return descriptor
+    pos = 2 if descriptor.startswith("c3") else 0
+    composite = pos == 2
 
-    match = re.fullmatch(r"c1p([0-9]+)", descriptor)
-    if match is not None:
-        index = int(match.group(1))
-        if index > 15:
-            raise ValueError(f"register index out of range: {index}")
-        return CWE805PointerPredicate(RegisterCell(index))
-    match = re.fullmatch(r"c1s64i([0-9]+)", descriptor)
-    if match is not None:
-        return CWE805PointerPredicate(StackCell(64, int(match.group(1))))
-    match = re.fullmatch(r"c2p([0-9]+)q([0-9]+)", descriptor)
-    if match is not None:
-        index, scale = int(match.group(1)), int(match.group(2))
-        if index > 15:
-            raise ValueError(f"register index out of range: {index}")
-        if scale not in (1, 2, 4, 8):
-            raise ValueError(f"invalid size scale: {scale}")
-        return CWE805SizePredicate(scale, RegisterCell(index))
-    match = re.fullmatch(r"c2s(8|16|32)i([0-9]+)q([0-9]+)", descriptor)
-    if match is not None:
-        width, index, scale = map(int, match.groups())
-        if scale not in (1, 2, 4, 8):
-            raise ValueError(f"invalid size scale: {scale}")
-        return CWE805SizePredicate(scale, StackCell(width, index))
-    raise ValueError(f"invalid CWE-805 predicate descriptor: {descriptor!r}")
+    def parse(depth: int) -> CWE805Predicate:
+        nonlocal pos
+        if depth > MAX_EXPR_DEPTH:
+            raise ValueError("predicate depth exceeds 256")
+        if pos < len(descriptor) and descriptor[pos] in "AO":
+            op = descriptor[pos]
+            pos += 1
+            return CWE805LogicalPredicate("&&" if op == "A" else "||", parse(depth + 1), parse(depth + 1))
+        match = re.match(r"c([12])(?:p([0-9]+)|s(8|16|32|64)i([0-9]+))(?:q([0-9]+))?", descriptor[pos:])
+        if match is None:
+            raise ValueError("invalid CWE-805 predicate descriptor")
+        kind, register, width, index, scale = match.groups()
+        pos += match.end()
+        cell = RegisterCell(int(register)) if register is not None else StackCell(int(width), int(index))
+        if kind == "1" and scale is None:
+            return CWE805PointerPredicate(cell)
+        if kind == "2" and scale is not None:
+            return CWE805SizePredicate(int(scale), cell)
+        raise ValueError("invalid CWE-805 atom scale")
+
+    result = parse(1)
+    if pos != len(descriptor) or composite != isinstance(result, CWE805LogicalPredicate):
+        raise ValueError("invalid CWE-805 descriptor envelope or trailing data")
+    predicate_stack_bytes(result)
+    return result
 
 
 def write_runtime_predicates(
@@ -1231,23 +1373,59 @@ def load_runtime_predicates(
 
 def _emit_brpatches_inc(brpatches_inc: Path,
                         selected: List[PredicateRecord]) -> None:
-    """Write the compact predicate table included by the C runtimes."""
-    with brpatches_inc.open("w") as f:
-        f.write("case 0:\n\treturn \"p0\";\n")
-        for record in selected:
-            descriptor = predicate_descriptor(record.parsed)
-            detail = ""
-            if isinstance(record.parsed, CWE805PointerPredicate):
-                detail = "pointer register" if isinstance(
-                    record.parsed.cell, RegisterCell) else "pointer stack cell"
-            elif isinstance(record.parsed, CWE805SizePredicate):
-                detail = "size register" if isinstance(
-                    record.parsed.cell, RegisterCell) else "size stack cell"
-            suffix = f": {detail}" if detail else ""
-            f.write(f"case {record.runtime_id}:\n"
-                    f"\treturn \"{descriptor}\"; "
-                    f"/* predicate line {record.source_line}{suffix} */\n")
-        f.write("default:\n\treturn \"p0\";\n")
+    """Emit immutable file-scope ASTs; no parsing or allocation on a hit."""
+    # E9 call plugins cannot contain relocations: construct node pointers in
+    # the dispatch function, never in file-scope pointer-bearing metadata.
+    lines = []
+    cases = []
+    for record in selected:
+        predicate = record.parsed
+        # Admission is shared with the JSON/cached runtime descriptor boundary.
+        parsed = parse_predicate_descriptor(predicate_descriptor(predicate))
+        nodes = []
+
+        def add(node) -> int:
+            fields = {}
+            if isinstance(node, tuple):
+                op = node[0]
+                if op == "const":
+                    fields = {"op": "'p'", "literal": f"UINT64_C({node[1] & _MASK64})"}
+                elif op == "var":
+                    fields = {"op": "'v'", "cell_index": node[1]}
+                elif op == "u~":
+                    fields = {"op": "'~'", "left": add(node[1])}
+                else:
+                    fields = {"op": repr({">=": "G", "<=": "L"}.get(op, op)),
+                              "left": add(node[1]), "right": add(node[2])}
+            elif isinstance(node, CWE805LogicalPredicate):
+                fields = {"op": "'A'" if node.op == "&&" else "'O'",
+                          "left": add(node.left), "right": add(node.right)}
+            else:
+                cell = node.cell
+                fields = {"op": "'P'" if isinstance(node, CWE805PointerPredicate) else "'S'"}
+                if isinstance(cell, RegisterCell):
+                    fields.update(cell_kind=0, cell_index=cell.register_index)
+                else:
+                    fields.update(cell_kind={8: 1, 16: 2, 32: 3, 64: 4}[cell.width_bits], cell_index=cell.index)
+                if isinstance(node, CWE805SizePredicate):
+                    fields["scale"] = node.scale
+            index = len(nodes)
+            nodes.append("    { " + ", ".join(f".{key} = {value}" for key, value in fields.items()) + " },\n")
+            return index
+
+        root = add(_parse_generic_descriptor(parsed) if isinstance(parsed, str) else parsed)
+        name = f"br_pred_{record.runtime_id}"
+        lines.append(f"static const struct br_node {name}_nodes[] = {{\n")
+        lines.extend(nodes)
+        lines.append("};\n")
+        kind = "BR_PRED_GENERIC" if isinstance(parsed, str) else "BR_PRED_CWE805"
+        cases.append(f"    case {record.runtime_id}: *out = (struct br_predicate){{ .kind = {kind}, "
+                     f".nodes = {name}_nodes, .count = {len(nodes)}, .root = {root}, "
+                     f".stack_bytes = {predicate_stack_bytes(parsed)} }}; return; /* predicate line {record.source_line} */\n")
+    lines.append("static void get_patch_pred(uint32_t id, struct br_predicate *out)\n{\n    switch (id) {\n")
+    lines.extend(cases)
+    lines.append("    default: *out = (struct br_predicate){ .kind = BR_PRED_FALSE }; return;\n    }\n}\n")
+    brpatches_inc.write_text("".join(lines), encoding="utf-8")
 
 
 def _parse_predicate_records(text: str, family: PredicateFamily) -> List[PredicateRecord]:
