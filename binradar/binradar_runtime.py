@@ -38,7 +38,7 @@ FORKSERVER_SUMMARY_WORDS = 5
 # the command/reply words in tracer/linux-user/binradar-forkserver.h.  The
 # resident handshake word is distinct so a generation-only tracer never
 # interprets a replay command as was-killed.
-REPLAY_HANDSHAKE_EXPECTED = 0x41464C06
+REPLAY_HANDSHAKE_EXPECTED = 0x41464C07
 REPLAY_SUMMARY_WORDS = 8
 REPLAY_COMMAND_GENERATE = 0
 REPLAY_COMMAND_FINISH = 1
@@ -51,9 +51,8 @@ REPLAY_REPLY_SUMMARY = 1
 REPLAY_REPLY_ACK = 2
 REPLAY_REPLY_CASE = 3
 REPLAY_REPLY_LIST = 4
-# Case reply text carries only a short diagnostic; the capture path itself is
-# bounded by the run directory name.
-REPLAY_CASE_TEXT_MAX = 8192
+# Bounded capture identity JSON; BRCH state bytes never cross the pipe.
+REPLAY_CASE_TEXT_MAX = 32768
 
 
 class AttemptResult(enum.IntEnum):
@@ -525,7 +524,11 @@ class ForkserverTransport:
         remaining = None if expires is None else max(0, expires - time.monotonic())
         text = self.read(length, remaining) if length else b""
         self.complete_request()
-        return source, outcome, reason, text.decode("utf-8", errors="replace")
+        try:
+            decoded = text.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("Resident case metadata is not UTF-8") from exc
+        return source, outcome, reason, decoded
 
     def read(self, size: int, timeout: Optional[float]) -> bytes:
         if self.stat_r is None:
@@ -595,7 +598,7 @@ class ReplayCaseResult:
     source: str
     outcome: ReplayOutcome
     reason: ReplayReason
-    text: str
+    capture: dict | None
 
 
 @dataclass(frozen=True)
@@ -1069,8 +1072,46 @@ class TracerExecutor:
         if source not in (0, 1):
             raise RuntimeError(
                 f"[TRACER] Resident replay returned unknown source {source}")
+        try:
+            metadata = json.loads(text)
+        except (ValueError, RecursionError) as exc:
+            raise RuntimeError("Resident case metadata is malformed") from exc
+        if not isinstance(metadata, dict) or set(metadata) != {"mutation", "capture"} \
+                or type(metadata["mutation"]) is not int or metadata["mutation"] != mutation:
+            raise RuntimeError("Resident case metadata has another mutation identity")
+        capture = metadata["capture"]
+        if parsed_outcome == ReplayOutcome.UNAVAILABLE:
+            if capture is not None:
+                raise RuntimeError("Unavailable resident case carries a capture")
+        else:
+            fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse"}
+            if not isinstance(capture, dict) or set(capture) != fields:
+                raise RuntimeError("Resident capture identity is missing or malformed")
+            if type(capture["mutation"]) is not int or capture["mutation"] != mutation:
+                raise RuntimeError("Resident capture belongs to another mutation")
+            if type(capture["patch_id"]) is not int or capture["patch_id"] not in (0, 1):
+                raise RuntimeError("Resident capture has an unknown selector")
+            digest = capture["sha256"]
+            representative = capture["descriptor"]
+            if not isinstance(digest, str) or len(digest) != 64 or \
+                    any(c not in "0123456789abcdef" for c in digest):
+                raise RuntimeError("Resident capture has an invalid digest")
+            if not isinstance(representative, str) or not representative or \
+                    len(representative.encode("utf-8")) > REPLAY_DESCRIPTOR_MAX:
+                raise RuntimeError("Resident capture has an invalid descriptor")
+            if capture["reuse"] not in ("fresh", "exact-descriptor", "full-vector-equivalent") or \
+                    (source_name == "executed") != (capture["reuse"] == "fresh"):
+                raise RuntimeError("Resident capture has inconsistent reuse provenance")
+            if source_name == "executed" and (capture["patch_id"] != 1 or representative != descriptor):
+                raise RuntimeError("Resident fresh capture does not identify the executed predicate")
+            path = capture["path"]
+            root = self.env.get("BINRADAR_REPLAY_DIR")
+            if not isinstance(path, str) or len(path.encode("utf-8")) > 8192 or \
+                    not Path(path).is_absolute() or not root or \
+                    not Path(path).resolve().is_relative_to(Path(root).resolve()):
+                raise RuntimeError("Resident capture is outside the owned replay directory")
         return ReplayCaseResult(mutation, source_name, parsed_outcome,
-                                parsed_reason, text)
+                                parsed_reason, capture)
 
     @_resident_operation
     def abort_generation(self, timeout: Optional[float] = None) -> Optional[RunSummary]:

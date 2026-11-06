@@ -586,6 +586,7 @@ class ReplayServer:
                         "mutation": result.mutation, "patch": patch.id,
                         "source": result.source, "outcome": outcome,
                         "reason": self._reason_name(result),
+                        "capture": result.capture,
                     })
                     total += 1
                     unavailable += outcome == "unavailable"

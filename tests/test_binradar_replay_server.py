@@ -113,8 +113,12 @@ class FakeTracer:
     def request_replay_case(self, mutation, descriptor, timeout, *, cancel_event=None):
         self.requests.append((mutation, descriptor))
         outcome, reason, source = self.outcomes.pop(0)
+        capture = None if outcome == binradar_runtime.ReplayOutcome.UNAVAILABLE else {
+            "mutation": mutation, "path": f"/private/replay/capture-{mutation}.brch",
+            "sha256": "0" * 64, "descriptor": descriptor, "patch_id": 1,
+            "reuse": "fresh" if source == "executed" else "exact-descriptor"}
         return binradar_runtime.ReplayCaseResult(
-            mutation, source, outcome, reason, "{}")
+            mutation, source, outcome, reason, capture)
 
     def cancel_replay_child(self):
         self.cancelled += 1
@@ -649,7 +653,7 @@ class BlockingTracer(FakeTracer):
             assert self.reply_ready.wait(5)
             return binradar_runtime.ReplayCaseResult(
                 mutation, "executed", binradar_runtime.ReplayOutcome.UNAVAILABLE,
-                binradar_runtime.ReplayReason.CANCELLED, "{}")
+                binradar_runtime.ReplayReason.CANCELLED, None)
         return super().request_replay_case(
             mutation, descriptor, timeout, cancel_event=cancel_event)
 

@@ -254,7 +254,7 @@ if mode == "wrong_ack":
     raise SystemExit(0)
 
 send(version)
-if version == 0x41464c06:
+if version == 0x41464c07:
     cancel = int(os.environ["BINRADAR_REPLAY_CANCEL_FD"])
     while True:
         header = read_exact(ctrl, 8)
@@ -280,6 +280,9 @@ if version == 0x41464c06:
             if command == 5:
                 os.write(stat, struct.pack("<3I", 2, request_id,
                                            0 if descriptor == b"p0" else 1))
+            elif mode == "resident_capture_identity":
+                text = os.environ["FAKE_CASE_TEXT"].encode()
+                os.write(stat, struct.pack("<6I", 3, request_id, 1, 0, 0, len(text)) + text)
             elif mode == "resident_case_timeout":
                 time.sleep(3)
             else:
@@ -287,7 +290,8 @@ if version == 0x41464c06:
                     token = struct.unpack("<I", read_exact(cancel, 4))[0]
                     log("cancel:%d" % token)
                 reply_id = request_id + 1 if mode == "resident_wrong_id" else request_id
-                os.write(stat, struct.pack("<6I", 3, reply_id, 0, 3, 4, 0))
+                text = ('{"mutation":%d,"capture":null}' % mutation).encode()
+                os.write(stat, struct.pack("<6I", 3, reply_id, 0, 3, 4, len(text)) + text)
         elif command == 3:
             if mode == "resident_stall_shutdown":
                 time.sleep(3)
@@ -854,13 +858,53 @@ def test_real_resident_protocol_reports_ready_after_finish(
 def make_resident_executor(tmp_path, monkeypatch, fake_script, mode="resident"):
     executor, log_path = make_executor(tmp_path, monkeypatch, fake_script, mode=mode)
     executor.replay_mode = True
-    executor.env["FAKE_VERSION"] = "0x41464c06"
+    executor.env["FAKE_VERSION"] = "0x41464c07"
     return executor, log_path
 
 
-def test_resident05_peer_is_rejected(tmp_path, monkeypatch, fake_script):
+@pytest.mark.parametrize("invalid", [None, "mutation", "selector", "path", "digest", "reuse", "malformed"])
+def test_resident_capture_identity_is_bounded_and_owned(
+        tmp_path, monkeypatch, fake_script, invalid):
+    import json
+    executor, _ = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_capture_identity")
+    root = tmp_path / "replay"
+    root.mkdir()
+    executor.env["BINRADAR_REPLAY_DIR"] = str(root)
+    identity = {"mutation": 7, "path": str(root / "capture.brch"),
+                "sha256": "a" * 64, "descriptor": "p0", "patch_id": 0,
+                "reuse": "full-vector-equivalent"}
+    if invalid == "mutation":
+        identity["mutation"] = 8
+    elif invalid == "selector":
+        identity["patch_id"] = 2
+    elif invalid == "path":
+        identity["path"] = str(tmp_path / "outside.brch")
+    elif invalid == "digest":
+        identity["sha256"] = "bad"
+    elif invalid == "reuse":
+        identity["reuse"] = "fresh"
+    executor.env["FAKE_CASE_TEXT"] = "{" if invalid == "malformed" else json.dumps(
+        {"mutation": 7, "capture": identity})
+    try:
+        executor.start()
+        if invalid is not None:
+            with pytest.raises(RuntimeError):
+                executor.request_replay_case(7, "p0", 0.5)
+            assert executor.transport.poisoned
+        else:
+            result = executor.request_replay_case(7, "p0", 0.5)
+            assert result.capture == identity
+            assert result.capture["patch_id"] == 0
+            executor.shutdown_replay(0.5)
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("version", ["0x41464c05", "0x41464c06"])
+def test_old_resident_peer_is_rejected(tmp_path, monkeypatch, fake_script, version):
     executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
-    executor.env["FAKE_VERSION"] = "0x41464c05"
+    executor.env["FAKE_VERSION"] = version
     try:
         with pytest.raises(RuntimeError, match="Unexpected forkserver handshake"):
             executor.start()
