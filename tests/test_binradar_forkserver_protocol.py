@@ -782,6 +782,324 @@ def test_child_timeout_status_has_no_analysis_word(monkeypatch, tmp_path, fake_s
     assert "extra:none" in rows
 
 
+def _audit_guest_syscall(number, *args, result=None):
+    """Issue a real x86-64 syscall and trap if its observed return differs."""
+    registers = ("rdi", "rsi", "rdx", "r10", "r8", "r9")
+    instructions = [f"mov {value}, %{register}"
+                    for register, value in zip(registers, args)]
+    instructions.extend((f"mov ${number}, %eax", "syscall"))
+    if result is not None:
+        instructions.extend((f"cmp ${result}, %rax", "jne audit_fail"))
+    return "\n".join(instructions) + "\n"
+
+
+def _audit_log_events(text, *event):
+    """Decode scalar bracket records rather than matching diagnostic prose."""
+    records = []
+    for line in text.splitlines():
+        fields = [part.split("]", 1)[0] for part in line.split("[")[1:]]
+        if fields[:len(event)] == list(event):
+            records.append(dict(field.split(" ", 1)
+                                for field in fields[len(event):]
+                                if " " in field))
+    return records
+
+
+def _assert_resident_audit_supported(text):
+    audits = _audit_log_events(text, "replay", "audit")
+    assert len(audits) == 1, text
+    assert audits[0]["unsupported"] == "false", text
+    assert not _audit_log_events(text, "replay", "unsupported-syscall"), text
+
+
+@pytest.fixture
+def resident_audit_guest(tmp_path):
+    """Run freestanding native generation without E9, providers or a solver.
+
+    Guest assertions trap on incorrect syscall results.  No payload/output
+    channel is added: the normal-exit observation proves those assertions ran.
+    The intentionally unpatched guest has no useful retained mutations; patched
+    CASE/cache coverage belongs to the independent artifact integration gate.
+    """
+    if not Path(paths.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for resident syscall integration")
+
+    def run(prefix, body, *, resident=True, testcase="/dev/null"):
+        source = tmp_path / "audit-guest.S"
+        source.write_text(
+            ".text\n.globl _start, audit_entry\n_start:\n" + prefix +
+            "\njmp audit_entry\naudit_entry:\n" + body +
+            _audit_guest_syscall(60, "$0") +
+            "audit_fail:\nud2\n"
+            ".data\n.balign 8\n"
+            "null_path: .asciz \"/dev/null\"\n"
+            "input_path: .asciz \"input\"\n"
+            "output_path: .asciz \"output\"\n"
+            "iov: .quad buffer, 1\n"
+            "\n.bss\n.balign 8\nbuffer: .skip 256\n"
+            "before_stat: .skip 144\nafter_stat: .skip 144\n"
+            "pipe_fds: .skip 8\n", encoding="ascii")
+        guest = tmp_path / "audit-guest"
+        subprocess.run(
+            ["cc", "-nostdlib", "-static", "-no-pie", "-o", str(guest),
+             str(source)], check=True, capture_output=True, timeout=20)
+        symbols = subprocess.run(
+            ["nm", str(guest)], check=True, capture_output=True, text=True,
+            timeout=10)
+        entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
+                          if row.split()[-1] == "audit_entry")
+        manifest = tmp_path / "brpatches.json"
+        manifest.write_text(
+            '{"version":1,"kind":"generic-erm","predicates":[]}',
+            encoding="ascii")
+        log = tmp_path / "audit-tracer.log"
+        env = {
+            "PATH": os.environ["PATH"],
+            "NO_EXTERNAL_SOLVER": "1",
+            "BINRADAR_FORKSERVER_ENABLE": "1",
+            "BINRADAR_ENTRYPOINT": entrypoint,
+            "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "5",
+            "BINRADAR_OSPREY_ENABLE": "0",
+            "BINRADAR_TRACE_FILE": "none",
+            "BINRADAR_TRACER_LOG_FILE": str(log),
+            "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+            "SYMBOLIC_TESTCASE_NAME": testcase,
+            "BINRADAR_PATCH_CNT": "0",
+            "BINRADAR_PATCH_CACHE_ENABLE": "1",
+            "BINRADAR_PATCH_MANIFEST": str(manifest),
+            "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+            "BINRADAR_REPLAY_SERVER": "1" if resident else "0",
+            "BINRADAR_REPLAY_DIR": str(tmp_path / "replay"),
+            "BRCACHE_STACK_SIZE": "0",
+        }
+        with binradar_runtime.PhaseSession("binradar", 30) as session:
+            session.shared_memory(env, include_patch_key=True)
+            executor = session.start_tracer(
+                mode="binradar", env=env, workdir=str(tmp_path),
+                rundir=str(tmp_path), binary=str(guest), test_cmd="",
+                testcase=testcase, replay_mode=resident)
+            summary = executor.run()
+            assert summary.attempt == 1
+            assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+            assert summary.representative_runs == 1
+            if resident:
+                info = executor.finish_generation()
+                assert info["retained_mutations"] == 0
+                assert info["mutation_ids"] == []
+                assert executor.process.poll() is None
+                executor.shutdown_replay()
+            executor.process.wait(timeout=10)
+            assert executor.process.returncode == 0
+        text = log.read_text(encoding="utf-8")
+        # Nonzero guest exits are normal too, so check the recorded exit value;
+        # a trap must not accidentally pass as a completed baseline crash.
+        assert [int(row["exit"]) for row in
+                _audit_log_events(text, "analyze", "normal")] == [0], text
+        assert not _audit_log_events(text, "analyze", "crash"), text
+        return text
+
+    return run
+
+
+def _audit_open(path, flags=0):
+    return (_audit_guest_syscall(2, f"${path}", f"${flags}", "$384") +
+            "test %rax, %rax\njs audit_fail\nmov %rax, %r12\n")
+
+
+@pytest.mark.parametrize("number,args", [
+    (0, ("$buffer", "$1")),             # read
+    (1, ("$buffer", "$1")),             # write
+    (5, ("$after_stat",)),               # fstat
+    (8, ("$0", "$0")),                 # lseek
+    (16, ("$0x5401", "$buffer")),        # ioctl(TCGETS)
+    (17, ("$buffer", "$1", "$0")),      # pread64
+    (19, ("$iov", "$1")),               # readv
+    (20, ("$iov", "$1")),               # writev
+])
+def test_real_resident_audit_accepts_invalid_negative_fd_ebadf(
+        resident_audit_guest, number, args):
+    text = resident_audit_guest(
+        "", _audit_guest_syscall(number, "$-1", *args, result=-9))
+    _assert_resident_audit_supported(text)
+
+
+@pytest.mark.parametrize("number", [0, 1])
+def test_real_resident_audit_rejects_negative_fd_efault(
+        resident_audit_guest, number):
+    # QEMU validates these guest buffers before issuing host IO.  A negative
+    # fd must not turn the actual EFAULT into an admitted/fabricated EBADF.
+    text = resident_audit_guest(
+        "", _audit_guest_syscall(number, "$-1", "$0", "$1", result=-14))
+    violations = _audit_log_events(text, "replay", "unsupported-syscall")
+    assert len(violations) == 1, text
+    assert int(violations[0]["nr"]) == number
+    assert int(violations[0]["ret"]) == -14
+    assert int(violations[0]["errno"]) == 14
+
+
+@pytest.mark.parametrize("flags,number", [(1, 0), (0, 1)])
+def test_real_resident_audit_accepts_wrong_access_only_on_stable_null(
+        resident_audit_guest, flags, number):
+    text = resident_audit_guest(
+        _audit_open("null_path", flags),
+        _audit_guest_syscall(number, "%r12", "$buffer", "$1", result=-9))
+    _assert_resident_audit_supported(text)
+
+
+def test_real_resident_failed_read_preserves_symbolic_input(
+        tmp_path, resident_audit_guest):
+    (tmp_path / "input").write_bytes(b"immutable input")
+    prefix = (_audit_open("input_path") +
+              _audit_guest_syscall(0, "%r12", "$buffer", "$1", result=1) +
+              _audit_open("null_path", 1))
+    body = (_audit_guest_syscall(0, "%r12", "$buffer", "$1", result=-9) +
+            "cmpb $105, buffer(%rip)\njne audit_fail\n")
+    text = resident_audit_guest(prefix, body, testcase="input")
+    _assert_resident_audit_supported(text)
+
+
+def test_real_resident_audit_accepts_null_io_metadata_and_tcgets(
+        resident_audit_guest):
+    body = (
+        _audit_guest_syscall(0, "%r12", "$buffer", "$1", result=0) +
+        _audit_guest_syscall(5, "%r12", "$after_stat", result=0) +
+        "mov after_stat+24(%rip), %eax\nand $0xf000, %eax\n"
+        "cmp $0x2000, %eax\njne audit_fail\n" +
+        _audit_guest_syscall(16, "%r12", "$0x5401", "$buffer", result=-25) +
+        _audit_guest_syscall(8, "%r12", "$0", "$0", result=0) +
+        # TracerExecutor's inherited stdout/stderr really are /dev/null.
+        _audit_guest_syscall(5, "$1", "$after_stat", result=0) +
+        _audit_guest_syscall(16, "$2", "$0x5401", "$buffer", result=-25))
+    text = resident_audit_guest(_audit_open("null_path"), body)
+    _assert_resident_audit_supported(text)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("resident", [False, True])
+def test_real_resident_audit_regular_stat_snapshot_includes_atime(
+        tmp_path, resident_audit_guest, duplicate, resident):
+    input_path = tmp_path / "input"
+    input_path.write_bytes(b"immutable input")
+    # Force relatime filesystems to update atime on the actual guest read.
+    os.utime(input_path, ns=(1_000_000_000, 2_000_000_000))
+    before_atime = input_path.stat().st_atime_ns
+    with input_path.open("rb") as stream:
+        stream.read(1)
+    if input_path.stat().st_atime_ns == before_atime:
+        pytest.skip("filesystem does not advance input atime on reads")
+    os.utime(input_path, ns=(1_000_000_000, 2_000_000_000))
+    prefix = _audit_open("input_path")
+    if duplicate:
+        # An inherited guest fd acquired through fcntl must not evade tracking.
+        prefix += (_audit_guest_syscall(72, "%r12", "$1030", "$64") +
+                   "test %rax, %rax\njs audit_fail\nmov %rax, %r14\n" +
+                   _audit_guest_syscall(3, "%r12", result=0) +
+                   "mov %r14, %r12\n")
+    prefix += _audit_guest_syscall(5, "%r12", "$before_stat", result=0)
+    body = (
+        _audit_guest_syscall(0, "%r12", "$buffer", "$1", result=1) +
+        "cmpb $105, buffer(%rip)\njne audit_fail\n" +
+        _audit_guest_syscall(5, "%r12", "$after_stat", result=0))
+    if resident:
+        body += ("mov $before_stat, %rsi\nmov $after_stat, %rdi\n"
+                 "mov $18, %ecx\ncld\nrepe cmpsq\njne audit_fail\n")
+    else:
+        # Ordinary mode must keep the real host atime instead of projecting
+        # the resident-only metadata snapshot.
+        body += ("mov before_stat+72(%rip), %rax\n"
+                 "cmp after_stat+72(%rip), %rax\nje audit_fail\n")
+    body += _audit_guest_syscall(8, "%r12", "$0", "$0", result=0)
+    text = resident_audit_guest(prefix, body, resident=resident)
+    assert input_path.stat().st_atime_ns != before_atime
+    if resident:
+        _assert_resident_audit_supported(text)
+
+
+def test_real_resident_audit_failed_prefix_shared_mmap_is_not_shared_state(
+        resident_audit_guest):
+    # A failed zero-length MAP_SHARED mapping creates no inherited state.
+    prefix = _audit_guest_syscall(
+        9, "$0", "$0", "$3", "$0x21", "$-1", "$0", result=-22)
+    text = resident_audit_guest(prefix, "")
+    _assert_resident_audit_supported(text)
+
+
+@pytest.mark.parametrize("change", ["flags", "binding"])
+def test_real_resident_audit_rejects_changed_input_capability(
+        tmp_path, resident_audit_guest, change):
+    (tmp_path / "input").write_bytes(b"immutable input")
+    prefix = _audit_open("null_path") + "mov %r12, %r14\n"
+    prefix += _audit_open("input_path")
+    if change == "flags":
+        body = _audit_guest_syscall(72, "%r12", "$4", "$0x800", result=0)
+        expected_read = 1
+    else:
+        body = (_audit_guest_syscall(33, "%r14", "%r12") +
+                "cmp %r12, %rax\njne audit_fail\n")
+        expected_read = 0
+    body += _audit_guest_syscall(
+        0, "%r12", "$buffer", "$1", result=expected_read)
+    text = resident_audit_guest(prefix, body)
+    audits = _audit_log_events(text, "replay", "audit")
+    assert len(audits) == 1 and audits[0]["unsupported"] == "false", text
+    violations = _audit_log_events(text, "replay", "unsupported-syscall")
+    reads = [row for row in violations if int(row["nr"]) == 0]
+    assert len(reads) == 1, text
+    assert int(reads[0]["ret"]) == expected_read
+    assert int(reads[0]["errno"]) == 0
+
+
+@pytest.mark.parametrize("kind,number,expected", [
+    ("output-stat", 5, 0),
+    ("output-read", 0, -9),
+    ("output-seek", 8, 0),
+    ("null-bad-stat-pointer", 5, -14),
+    ("null-other-ioctl", 16, -25),
+    ("pipe-read", 0, 0),
+    ("pipe-seek", 8, -29),
+    ("socket-stat", 5, 0),
+    ("entropy", 318, 1),
+])
+def test_real_resident_audit_rejects_external_fd_state_and_entropy(
+        tmp_path, resident_audit_guest, kind, number, expected):
+    (tmp_path / "output").write_bytes(b"mutable output")
+    if kind.startswith("output"):
+        prefix = _audit_open("output_path", 1)
+    elif kind.startswith("null"):
+        prefix = _audit_open("null_path")
+    elif kind.startswith("pipe"):
+        prefix = (_audit_guest_syscall(22, "$pipe_fds", result=0) +
+                  "mov pipe_fds(%rip), %r12d\n")
+    elif kind.startswith("socket"):
+        prefix = (_audit_guest_syscall(41, "$1", "$1", "$0") +
+                  "test %rax, %rax\njs audit_fail\nmov %rax, %r12\n")
+    else:
+        prefix = ""
+    if number == 5:
+        address = "$0" if kind == "null-bad-stat-pointer" else "$after_stat"
+        body = _audit_guest_syscall(5, "%r12", address, result=expected)
+    elif number == 8:
+        body = _audit_guest_syscall(8, "%r12", "$0", "$0", result=expected)
+    elif number == 16:
+        body = _audit_guest_syscall(
+            16, "%r12", "$0x5413", "$buffer", result=expected)
+    elif number == 0:
+        # Zero-length pipe IO proves rejection without depending on a peer or
+        # blocking. Wrong-access output IO must remain an unaudited EBADF.
+        count = "$0" if kind == "pipe-read" else "$1"
+        body = _audit_guest_syscall(
+            0, "%r12", "$buffer", count, result=expected)
+    else:
+        body = _audit_guest_syscall(318, "$buffer", "$1", "$0", result=1)
+    text = resident_audit_guest(prefix, body)
+    violations = _audit_log_events(text, "replay", "unsupported-syscall")
+    matched = [row for row in violations if int(row["nr"]) == number]
+    assert len(matched) == 1, text
+    assert int(matched[0]["ret"]) == expected
+    assert int(matched[0]["errno"]) == max(0, -expected)
+    assert matched[0].get("reason"), text
+
+
 @pytest.fixture
 def zero_plan_guest(tmp_path):
     """No symbolic planning, external state, or writes after the snapshot."""
