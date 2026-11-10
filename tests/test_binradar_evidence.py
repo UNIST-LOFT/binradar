@@ -29,8 +29,7 @@ def _uleb(value: int) -> bytes:
             return bytes(encoded)
 
 
-def _frame(record_type: int, payload: bytes) -> bytes:
-    flags = 0
+def _frame(record_type: int, payload: bytes, *, flags: int = 0) -> bytes:
     checksum = zlib.crc32(
         payload, zlib.crc32(struct.pack("<HH", record_type, flags)))
     return (struct.pack("<IHH", len(payload), record_type, flags)
@@ -114,6 +113,33 @@ def test_binradar_reader_expands_groups_and_ignores_truncated_tail(tmp_path):
     assert iterations[1].groups[0].branches == [0, 1, 2, 1]
     assert iterations[1].groups[1].members == [1, 2, 300]
     assert iterations[1].groups[1].fault_addr == 0x1234
+
+
+@pytest.mark.parametrize("flags,certified", [(0, False), (1, True)])
+def test_v4_timeout_exclusion_is_authenticated_not_inferred_from_crash(tmp_path, flags, certified):
+    path = tmp_path / "proof.br"
+    payload = (struct.pack("<II", 1, 1)
+               + _group(0, 2, 0x1234, [0], [0], source="provenance-access"))
+    path.write_bytes(struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0)
+                     + _frame(4, payload, flags=flags))
+    frame, = binradar_evidence.read_binradar(path)
+    assert frame.timeout_excluded is certified
+    assert frame.groups[0].outcome == "crash"
+    tampered = bytearray(path.read_bytes())
+    tampered[22] ^= 1  # Change only the frame flag, without its CRC.
+    path.write_bytes(tampered)
+    with pytest.raises(binradar_evidence.EvidenceError, match="checksum"):
+        list(binradar_evidence.read_binradar(path))
+
+
+@pytest.mark.parametrize("version,flags", [(4, 2), (3, 1), (2, 1), (1, 1)])
+def test_timeout_exclusion_flag_rejects_unknown_or_historical_semantics(tmp_path, version, flags):
+    path = tmp_path / "bad-proof.br"
+    payload = struct.pack("<II", 1, 1) + _group(0, 1, 0, [0], [0])
+    path.write_bytes(struct.pack("<8sHHI", b"BRDATAB1", version, 3, 0)
+                     + _frame(4, payload, flags=flags))
+    with pytest.raises(binradar_evidence.EvidenceError, match="unexpected BINRADAR"):
+        list(binradar_evidence.read_binradar(path))
 
 
 def test_binradar_v2_accepts_gaps_but_rejects_bad_ids(tmp_path):

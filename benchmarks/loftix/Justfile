@@ -62,7 +62,7 @@ success command out="success.list":
       > {{out}}
     echo "Successes ({{out}}): $(wc -l < {{out}})"
 
-run cmd argfile="exp.list" jobs="30" workdir="workdir":
+run cmd argfile="exp.list" jobs="50" workdir="workdir":
     just _run-from-file {{cmd}} {{argfile}} {{jobs}} "{{cmd}} RUN" {{workdir}}
 
 resume cmd argfile="exp.list" jobs="30" workdir="workdir":

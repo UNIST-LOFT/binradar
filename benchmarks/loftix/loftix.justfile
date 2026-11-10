@@ -22,6 +22,26 @@ taosc workdir="workdir":
 taosc-prebuilt workdir="workdir":
     uv run {{BENCHMARK_PATH}}/scripts/taosc-prebuilt.py -w {{workdir}} --substitute-urls=http://10.20.26.21:2425
 
+taosc-llm workdir="workdir":
+    uv run --project {{FUZZOLIC_ROOT}}/utils/taosc-llm taosc-llm-run \
+        --subject $(pwd) \
+        --workdir {{workdir}} \
+        --concrete-run {{workdir}}/out/br-gen-con \
+        --mode provider \
+        --session-feedback \
+        --rea /gnu/store/mwqz9kghrpy1jh2ny7xj2p3yw5m4slsj-taosc-llm-rea-6.8.0/bin/rea \
+        --provider-env {{FUZZOLIC_ROOT}}/utils/taosc-llm/.env \
+        --pi-sdk-root "{{FUZZOLIC_ROOT}}/utils/taosc-llm/thirdparty/pi"
+
+taosc-llm-no-llm workdir="workdir":
+    uv run --project {{FUZZOLIC_ROOT}}/utils/taosc-llm taosc-llm-run \
+        --subject $(pwd) \
+        --workdir {{workdir}} \
+        --mode no-llm \
+        --rea /gnu/store/mwqz9kghrpy1jh2ny7xj2p3yw5m4slsj-taosc-llm-rea-6.8.0/bin/rea \
+        --concrete-run {{workdir}}/out/br-gen-con
+
+
 setup workdir="workdir":
     [ -f {{workdir}}/{{binary}}.orig ] || cp $(python3 {{BENCHMARK_PATH}}/scripts/binradar_get_binary.py) {{workdir}}/{{binary}}.orig
     uv run {{FUZZOLIC_ROOT}}/binradar-setup.py setup -w {{workdir}}

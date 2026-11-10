@@ -65,6 +65,9 @@ VERIFIER_FLAG_HAS_FEEDBACK = 1 << 1
 VERIFIER_FLAG_FEEDBACK_ACCEPTED = 1 << 2
 VERIFIER_FLAG_SECURITY_REJECTED = 1 << 3
 BINRADAR_GROUP_BRANCH_NULL = 1 << 0
+# v4 iteration frame flags certify the native timeout-discard commit gate.
+# Historical unflagged frames remain readable, but cannot authorize reuse.
+BINRADAR_ITERATION_TIMEOUT_EXCLUDED = 1 << 0
 
 OUTCOME_NORMAL = 1
 OUTCOME_CRASH = 2
@@ -129,6 +132,7 @@ class BinradarGroup:
 class BinradarIteration:
     iteration: int
     groups: list[BinradarGroup]
+    timeout_excluded: bool = False
 
 
 def _frame_crc(record_type: int, flags: int, payload: bytes) -> int:
@@ -511,9 +515,12 @@ def read_binradar(path: os.PathLike[str] | str) -> Generator[BinradarIteration, 
     previous_iteration = 0
     for record_type, flags, payload in _open_frames(
             path, EvidenceKind.BINRADAR, allow_truncated_tail=True):
-        if record_type != RecordType.BINRADAR_ITERATION or flags != 0:
+        allowed_flags = BINRADAR_ITERATION_TIMEOUT_EXCLUDED if version == 4 else 0
+        if record_type != RecordType.BINRADAR_ITERATION or flags & ~allowed_flags:
             raise EvidenceError("unexpected BINRADAR evidence frame")
-        iteration = _parse_binradar_iteration(payload, version)
+        iteration = dataclasses.replace(
+            _parse_binradar_iteration(payload, version),
+            timeout_excluded=bool(flags & BINRADAR_ITERATION_TIMEOUT_EXCLUDED))
         if contiguous:
             if iteration.iteration != previous_iteration + 1:
                 raise EvidenceError("BINRADAR iterations are not contiguous")
