@@ -31,10 +31,11 @@ from binradar import binradar_verifier
 
 
 REFERENCE = binradar_verifier.TracerFaultReference(0x44eced, "provenance-access")
-def _identity_runner(tmp_path):
+def _identity_runner(tmp_path, *, entry=0x400100):
     original = tmp_path / "guest.orig"
     header = bytearray(64)
     header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 24, entry)
     struct.pack_into("<Q", header, 32, 64)
     struct.pack_into("<HH", header, 54, 56, 1)
     original.write_bytes(bytes(header) + struct.pack(
@@ -332,12 +333,16 @@ def test_preflight_uses_each_executed_artifacts_exact_map(tmp_path, monkeypatch)
 
     monkeypatch.setattr(binradar_baseline, "_run_tracer", run)
     binradar_baseline.validate_patch_zero_baseline(
-        str(tmp_path), {"E9_RELOCATED_INSTRUCTIONS": "dead:beef"},
+        str(tmp_path), {"E9_RELOCATED_INSTRUCTIONS": "dead:beef",
+                        "E9_ORIGINAL_ENTRYPOINT": "deadbeef"},
         original=str(tmp_path / "guest.orig"), probe_reference=REFERENCE,
         selected_binary=str(tmp_path / "guest.brcached"), test_cmd="@@",
         testcase="poc", timeout=1, identity_runner=runner,
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert environments[".orig"]["E9_RELOCATED_INSTRUCTIONS"] == ""
+    assert environments[".orig"]["E9_ORIGINAL_ENTRYPOINT"] == ""
+    assert environments[".brpatched"]["E9_ORIGINAL_ENTRYPOINT"] == "400100"
+    assert environments[".brcached"]["E9_ORIGINAL_ENTRYPOINT"] == "400100"
     assert environments[".brpatched"]["E9_RELOCATED_INSTRUCTIONS"] == (
         "600010:401000,600020:4585dd")
     assert environments[".brcached"]["E9_RELOCATED_INSTRUCTIONS"] == (
@@ -404,6 +409,46 @@ def test_bad_artifact_map_rejects_before_any_preflight_launch(
             test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
             probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert calls == []
+
+
+def test_signal_root_uses_authenticated_original_entry_not_patch_site(tmp_path):
+    cached = tmp_path / "guest.brcached"
+    cached.touch()
+    runner = _identity_runner(tmp_path, entry=0x402345)
+    assert runner.tracer_original_entrypoint(str(cached)) == "402345"
+    assert runner.tracer_original_entrypoint(str(tmp_path / "guest.orig")) == ""
+
+    # Changing e_entry without regenerating the bound map cannot redirect the root.
+    original = tmp_path / "guest.orig"
+    data = bytearray(original.read_bytes())
+    struct.pack_into("<Q", data, 24, 0x403456)
+    original.write_bytes(data)
+    fresh = binradar_verifier.BinRadarQemuRunner(
+        str(tmp_path), "guest", "@@", "0x401000", e9_metadata=runner.e9_metadata)
+    with pytest.raises(ValueError, match="original-sha256 mismatch"):
+        fresh.tracer_original_entrypoint(str(cached))
+
+
+@pytest.mark.parametrize("entry,extra_ranges", [
+    (0, ""), (0x300000, ""), (0x500000, ""),
+    (0x404000, ",404000-405000"),
+])
+def test_unusable_original_signal_root_rejects_before_preflight(
+        tmp_path, monkeypatch, entry, extra_ranges):
+    cached = tmp_path / "guest.brcached"
+    cached.touch()
+    runner = _identity_runner(tmp_path, entry=entry)
+    ranges, calls = runner.e9_metadata["brcached"]
+    runner.e9_metadata["brcached"] = (ranges + extra_ranges, calls)
+    launches = []
+    monkeypatch.setattr(binradar_baseline, "_run_tracer", lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match="original ELF entrypoint is not executable"):
+        binradar_baseline.validate_patch_zero_baseline(
+            str(tmp_path), {}, original=str(tmp_path / "guest.orig"),
+            probe_reference=REFERENCE, selected_binary=str(cached),
+            test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
+            probe_policy=binradar_verifier.MEMCHECK_POLICY, selected_only=True)
+    assert launches == []
 
 
 def test_selected_check_tracks_the_artifact_the_phase_executes():

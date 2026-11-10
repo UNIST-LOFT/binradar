@@ -620,6 +620,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
     proc_env["E9_EXCLUDE_RANGES"] = ""
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
+    proc_env["E9_ORIGINAL_ENTRYPOINT"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     proc_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
     # Set PLT_INFO_FILE for heap allocation tracking (memcheck).
@@ -708,6 +709,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
     proc_env["E9_EXCLUDE_RANGES"] = ""
     proc_env["E9_RELOCATED_CALL_JUMPS"] = ""
     proc_env["E9_RELOCATED_INSTRUCTIONS"] = ""
+    proc_env["E9_ORIGINAL_ENTRYPOINT"] = ""
     proc_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
     proc_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
     if entrypoint:

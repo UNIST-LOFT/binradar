@@ -1022,14 +1022,16 @@ class BinRadarExecutor:
         exclude_ranges = ""
         relocated_calls = ""
         relocated_instructions = ""
+        original_entrypoint = ""
         if mode == "binradar":
             if artifact is None:
                 raise RuntimeError(
                     "BinRadar phase environment requires an artifact selection")
             exclude_ranges, relocated_calls = binradar_utils.get_e9_metadata(
                 self.config, artifact.metadata_prefix)
-            relocated_instructions = self._identity_runner().tracer_instruction_pairs(
-                artifact.path)
+            identity_runner = self._identity_runner()
+            relocated_instructions = identity_runner.tracer_instruction_pairs(artifact.path)
+            original_entrypoint = identity_runner.tracer_original_entrypoint(artifact.path)
 
         log_file = binradar_config.phase_log_file(mode, run_dir)
         if os.path.exists(log_file):
@@ -1047,6 +1049,7 @@ class BinRadarExecutor:
                 e9_exclude_ranges=exclude_ranges,
                 e9_relocated_calls=relocated_calls,
                 e9_relocated_instructions=relocated_instructions,
+                e9_original_entrypoint=original_entrypoint,
             ),
             forkserver_read_timeout=(
                 binradar_runtime.TracerExecutor.forkserver_response_timeout()),
@@ -1202,6 +1205,7 @@ class BinRadarExecutor:
         tracer_env["E9_EXCLUDE_RANGES"] = ""
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["E9_RELOCATED_INSTRUCTIONS"] = ""
+        tracer_env["E9_ORIGINAL_ENTRYPOINT"] = ""
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")

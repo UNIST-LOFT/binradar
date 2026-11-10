@@ -985,6 +985,7 @@ class BinRadarQemuRunner:
         self.run_results = None
         self._instruction_maps: Dict[str, Dict[int, int]] = {}
         self._instruction_native_ranges: Dict[str, List[Tuple[int, int]]] = {}
+        self._instruction_entrypoints: Dict[str, int] = {}
     
     @staticmethod
     def from_workdir(dir: str) -> "BinRadarQemuRunner":
@@ -1042,7 +1043,7 @@ class BinRadarQemuRunner:
             for key in ("AFL_QEMU_INST_RANGES", "AFL_QEMU_EXCLUDE_RANGES",
                         "AFL_QEMU_INST_START", "AFL_QEMU_INST_END",
                         "E9_EXCLUDE_RANGES", "E9_RELOCATED_CALL_JUMPS",
-                        "E9_RELOCATED_INSTRUCTIONS", "PATCH_FD",
+                        "E9_RELOCATED_INSTRUCTIONS", "E9_ORIGINAL_ENTRYPOINT", "PATCH_FD",
                         "PATCH_CACHED_FD", "TAOSC_PRED", "BRCACHE_STACK_SIZE",
                         "__AFL_SHM_ID"):
                 env.pop(key, None)
@@ -1064,8 +1065,8 @@ class BinRadarQemuRunner:
             env["AFL_QEMU_INST_RANGES"] = ranges
         return env
 
-    def _original_executable_ranges(self) -> List[Tuple[int, int]]:
-        """Read original ELF load segments once per loaded patched artifact."""
+    def _original_executable_metadata(self) -> Tuple[List[Tuple[int, int]], int]:
+        """Read executable segments and entry from the authenticated original ELF."""
         with open(self.original_binary(), "rb") as stream:
             header = stream.read(64)
             if len(header) < 52 or header[:4] != b"\x7fELF" or header[5] not in (1, 2):
@@ -1074,10 +1075,12 @@ class BinRadarQemuRunner:
             if header[4] == 2:
                 if len(header) != 64:
                     raise ValueError("truncated ELF64 header")
+                entry = struct.unpack_from(endian + "Q", header, 24)[0]
                 phoff = struct.unpack_from(endian + "Q", header, 32)[0]
                 size, count = struct.unpack_from(endian + "HH", header, 54)
                 fmt = endian + "IIQQQQQQ"
             elif header[4] == 1:
+                entry = struct.unpack_from(endian + "I", header, 24)[0]
                 phoff = struct.unpack_from(endian + "I", header, 28)[0]
                 size, count = struct.unpack_from(endian + "HH", header, 42)
                 fmt = endian + "IIIIIIII"
@@ -1102,7 +1105,7 @@ class BinRadarQemuRunner:
                     ranges.append((address, address + length))
             if not ranges:
                 raise ValueError("original binary has no executable segments")
-            return ranges
+            return ranges, entry
 
     def load_instruction_map(self, binary: str) -> Dict[int, int]:
         """Validate each artifact and its original once, before any execution."""
@@ -1135,7 +1138,7 @@ class BinRadarQemuRunner:
                     actual = hasher.hexdigest()
                 if actual != digest:
                     raise ValueError(f"{field} mismatch")
-            native_ranges = self._original_executable_ranges()
+            native_ranges, original_entrypoint = self._original_executable_metadata()
             entries = data.get("instructions")
             if not isinstance(entries, list):
                 raise ValueError("instructions must be a list")
@@ -1169,6 +1172,7 @@ class BinRadarQemuRunner:
                 f"E9 instruction identity metadata unavailable for {binary}: {exc}; "
                 "rerun binradar-setup to regenerate the artifact and its .e9map.json") from exc
         self._instruction_native_ranges[key] = native_ranges
+        self._instruction_entrypoints[key] = original_entrypoint
         self._instruction_maps[key] = mapping
         return mapping
 
@@ -1178,6 +1182,25 @@ class BinRadarQemuRunner:
             return ""
         return ",".join(f"{raw:x}:{original:x}" for raw, original in
                         sorted(self.load_instruction_map(binary).items()))
+
+    def tracer_original_entrypoint(self, binary: str) -> str:
+        """Bind the signal root to the original ELF, not E9's loader entry.
+
+        The native tracer installs the root only after this exact PC executes.
+        Instruction maps already authenticate both ELF files; no new sidecar
+        field or guessed patch-site/function address is needed.
+        """
+        if not binary.endswith((".brpatched", ".brcached")):
+            return ""
+        self.load_instruction_map(binary)
+        key = os.path.abspath(binary)
+        entry = self._instruction_entrypoints[key]
+        ranges, _ = self.e9_metadata_for_binary(binary)
+        if (entry == 0 or addr_in_e9_ranges(entry, ranges)
+                or not any(start <= entry < end
+                           for start, end in self._instruction_native_ranges[key])):
+            raise ValueError("original ELF entrypoint is not executable outside E9 ranges")
+        return f"{entry:x}"
 
     def concrete_fault_identity(self, fault_addr: int,
                                 binary: Optional[str] = None) -> Tuple[int, str]:

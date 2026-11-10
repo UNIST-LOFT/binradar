@@ -820,6 +820,7 @@ def _write_bound_identity_artifacts(tmp_path, binary="nm"):
     original = tmp_path / f"{binary}.orig"
     header = bytearray(64)
     header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 24, 0x400100)
     struct.pack_into("<Q", header, 32, 64)
     struct.pack_into("<HH", header, 54, 56, 1)
     original.write_bytes(bytes(header) + struct.pack(
@@ -884,6 +885,7 @@ def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
         "BRPATCHED_E9_EXCLUDE_RANGES": "0x54b000-0x54c000,0x2cc7000-0x2cc9000",
         "BRPATCHED_E9_RELOCATED_CALL_JUMPS": RECORDS,
         "E9_RELOCATED_INSTRUCTIONS": "dead:beef",
+        "E9_ORIGINAL_ENTRYPOINT": "deadbeef",
     }
     executor = _stub_executor(tmp_path, config=config)
     for mode in ("fuzzolic", "directed"):
@@ -891,7 +893,9 @@ def test_get_env_scopes_e9_metadata_to_patched_mode(tmp_path):
         assert env["E9_RELOCATED_CALL_JUMPS"] == ""
         assert env["E9_EXCLUDE_RANGES"] == ""
         assert env["E9_RELOCATED_INSTRUCTIONS"] == ""
+        assert env["E9_ORIGINAL_ENTRYPOINT"] == ""
     env = _phase_env(executor, "binradar", tmp_path)
+    assert env["E9_ORIGINAL_ENTRYPOINT"] == "400100"
     assert env["E9_RELOCATED_CALL_JUMPS"] == RECORDS
     assert env["E9_EXCLUDE_RANGES"] == \
         "0x54b000-0x54c000,0x2cc7000-0x2cc9000"

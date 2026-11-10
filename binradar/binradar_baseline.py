@@ -122,6 +122,7 @@ def _controlled_environment(config: Dict[str, str], *,
                             e9_ranges: str = "",
                             relocated_calls: str = "",
                             relocated_instructions: str = "",
+                            original_entrypoint: str = "",
                             patch_fd: Optional[int] = None) -> Dict[str, str]:
     """Environment for one baseline tracer run."""
     environment = dict(config)
@@ -151,6 +152,7 @@ def _controlled_environment(config: Dict[str, str], *,
     environment["E9_EXCLUDE_RANGES"] = e9_ranges
     environment["E9_RELOCATED_CALL_JUMPS"] = relocated_calls
     environment["E9_RELOCATED_INSTRUCTIONS"] = relocated_instructions
+    environment["E9_ORIGINAL_ENTRYPOINT"] = original_entrypoint
     if patch_fd is not None:
         environment["PATCH_FD"] = str(patch_fd)
     return environment
@@ -301,9 +303,11 @@ def validate_patch_zero_baseline(
         original[:-len(".orig")] + suffix
         for suffix in (".brpatched", ".brcached")])
     instruction_pairs = {original: ""}
+    original_entrypoints = {original: ""}
     for path in patched_paths:
         if os.path.exists(path):
             instruction_pairs[path] = identity_runner.tracer_instruction_pairs(path)
+            original_entrypoints[path] = identity_runner.tracer_original_entrypoint(path)
 
     def metadata_for(path: str) -> Tuple[str, Sequence[str]]:
         return identity_runner.e9_metadata_for_binary(path)
@@ -325,6 +329,7 @@ def validate_patch_zero_baseline(
             _controlled_environment(config, e9_ranges=ranges,
                                     relocated_calls=",".join(records),
                                     relocated_instructions=instruction_pairs[path],
+                                    original_entrypoint=original_entrypoints[path],
                                     patch_fd=-1 if patched else None),
             test_cmd, testcase, remaining)
 

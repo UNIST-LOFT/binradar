@@ -437,6 +437,7 @@ class PhaseEnvironmentConfig:
     e9_exclude_ranges: str = ""
     e9_relocated_calls: str = ""
     e9_relocated_instructions: str = ""
+    e9_original_entrypoint: str = ""
 
 
 def phase_log_file(mode: str, run_dir: str) -> str:
@@ -510,10 +511,12 @@ def build_phase_environment(
     environment["E9_EXCLUDE_RANGES"] = ""
     environment["E9_RELOCATED_CALL_JUMPS"] = ""
     environment["E9_RELOCATED_INSTRUCTIONS"] = ""
+    environment["E9_ORIGINAL_ENTRYPOINT"] = ""
     if mode == "binradar":
         environment["E9_EXCLUDE_RANGES"] = phase.e9_exclude_ranges
         environment["E9_RELOCATED_CALL_JUMPS"] = phase.e9_relocated_calls
         environment["E9_RELOCATED_INSTRUCTIONS"] = phase.e9_relocated_instructions
+        environment["E9_ORIGINAL_ENTRYPOINT"] = phase.e9_original_entrypoint
 
     environment["BINRADAR_REVERSE_DIRECTED"] = "0"
     if mode == "fuzzolic":
