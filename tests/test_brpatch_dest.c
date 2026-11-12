@@ -158,10 +158,50 @@ static int check_composite_predicates(void)
 	return 0;
 }
 
+static int check_direct_zero_action(void)
+{
+	for (int scenario = 0; scenario < 3; ++scenario) {
+		int fds[2];
+		if (pipe(fds) < 0)
+			return 1;
+		const pid_t child = fork();
+		if (child == 0) {
+			close(fds[0]);
+			patch_fd = fds[1];
+			env_patch_id = scenario == 0 ? 0 : 1;
+			patch_shm = NULL;
+			const uint64_t clamps[][2] = {{0x1000, 0x2000}};
+			set_clamps(clamps, 1);
+			const void *ret = jnz(scenario == 1 ? 0x1000 : 0x3000,
+			                      0, 1, 0, 1, NULL);
+			exit(ret == NULL ? 17 : 99);
+		}
+		close(fds[1]);
+		char log[128] = {0};
+		const ssize_t count = read(fds[0], log, sizeof(log) - 1);
+		close(fds[0]);
+		int status = 0;
+		if (child < 0 || waitpid(child, &status, 0) != child || count <= 0)
+			return 2;
+		unsigned int id = 0, iteration = 0;
+		int branch = -1;
+		const int expected_branch = scenario == 2 ? 1 : 0;
+		if (status != ((expected_branch ? 128 : 17) << 8)
+		    || sscanf(log, "[patch] [id %u] [br %d] [v %u]",
+		              &id, &branch, &iteration) != 3
+		    || id != (scenario == 0 ? 0u : 1u)
+		    || branch != expected_branch || iteration != 0)
+			return 3;
+	}
+	return 0;
+}
+
 int main(void)
 {
 	if (check_composite_predicates())
 		return 90;
+	if (check_direct_zero_action())
+		return 91;
 	/* Shared scenario vectors (keep in sync with the Python test). */
 	static const int64_t regs0[16] = {0};
 	static const int64_t regs_ptr_inside[16] = {0x1000};

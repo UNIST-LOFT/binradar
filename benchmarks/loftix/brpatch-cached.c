@@ -301,5 +301,5 @@ const void *dest(const struct STATE *state)
 
 	log_patch(selected_patch_id, branch, selected_iteration);
 	capture_snapshot(state, selected_patch_id, branch, invalid);
-	return branch == 1 ? (const void *)TAOSC_DEST : NULL;
+	return repair_action(branch, (const void *)TAOSC_DEST);
 }

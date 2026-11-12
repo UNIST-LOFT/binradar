@@ -360,6 +360,16 @@ static void log_patch(uint32_t patch_id, int branch_taken, uint32_t v)
 	write(patch_fd, buf, n);
 }
 
+/* Call only after logging/capture: zero is Taosc's exit(128) action. */
+static const void *repair_action(int branch, const void *destination)
+{
+	if (branch != 1)
+		return NULL;
+	if (destination == NULL)
+		exit(128);
+	return destination;
+}
+
 #ifdef BRPATCH_CWE805
 #if !defined(BRPATCH_ALLOC_MALLOC) && !defined(BRPATCH_ALLOC_CALLOC) \
 		&& !defined(BRPATCH_ALLOC_REALLOC)
@@ -522,8 +532,8 @@ static int CWE805_branch_taken(const struct STATE *state,
 /*
  * CWE-805 direct call-site decision: match Taosc's joob($mem0,
  * mem[0].size,dest).  A clamp accepts the complete memory access only when
- * address >= begin and address + access_size < end.  Candidate id 1 jumps
- * when no clamp accepts it; patch id 0 never jumps.
+ * address >= begin and address + access_size < end. Candidate id 1 repairs
+ * when no clamp accepts it (zero dest exits 128); patch id 0 preserves flow.
  */
 const void *jnz(uint64_t base, uint64_t index, uint8_t scale, uint32_t disp,
                 uint64_t access_size, const void *dest)
@@ -542,7 +552,7 @@ const void *jnz(uint64_t base, uint64_t index, uint8_t scale, uint32_t disp,
 			branch_taken = 1;
 	}
 	log_patch(patch_id, branch_taken, v);
-	return branch_taken ? dest : NULL;
+	return repair_action(branch_taken, dest);
 }
 #endif /* BRPATCH_CWE805 */
 
@@ -583,6 +593,6 @@ const void *dest(const struct STATE *state)
 	get_patch_pred(patch_id, &predicate);
 	const int branch_taken = evaluate_predicate(state, &predicate, &invalid);
 	log_patch(patch_id, branch_taken, v);
-	return branch_taken == 1 ? (const void *)TAOSC_DEST : NULL;
+	return repair_action(branch_taken, (const void *)TAOSC_DEST);
 }
 #endif
