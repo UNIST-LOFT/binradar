@@ -963,7 +963,14 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
         return size < ((end - begin) & _MASK64)
 
     try:
-        for begin, end in reversed(clamps):
+        previous = None
+        for clamp in reversed(clamps):
+            # Empty allocator slots repeat. Evaluate the first occurrence,
+            # including its lazy overflow checks, before skipping duplicates.
+            if clamp == previous:
+                continue
+            previous = clamp
+            begin, end = clamp
             if evaluate(predicate, begin, end):
                 return 0
     except PredicateTrap:
