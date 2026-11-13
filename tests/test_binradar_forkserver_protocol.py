@@ -1,4 +1,5 @@
 import os
+import re
 import select
 import stat
 import struct
@@ -429,6 +430,79 @@ def test_real_empty_manifest_executes_patch_zero(tmp_path, reentered_guest, fami
         assert marker.read_bytes() == b"\x01\x02\x03"
         assert summary.attempt == 1 and summary.representative_runs == 1
         assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
+
+
+def test_real_child_timeout_records_killed_child_cpu(tmp_path):
+    """A killed child must report its own CPU time, not a shared total.
+
+    Without this row a CPU-saturated child and a blocked child produce the
+    identical `timeout` record, which is what made the TIFF-8128 incident
+    ambiguous.  The guest spins forever inside the baseline child, so the
+    timeout branch runs and `wait4()` must yield nonzero used CPU.
+    """
+    if not Path(paths.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for timeout integration")
+    source = tmp_path / "spinner.c"
+    source.write_text(r'''
+static volatile unsigned long spins;
+
+int main(void)
+{
+    for (;;) {
+        spins += 1;
+    }
+    return 0;
+}
+''', encoding="ascii")
+    guest = tmp_path / "spinner"
+    subprocess.run(
+        ["cc", "-O0", "-fno-pie", "-no-pie", "-o", str(guest), str(source)],
+        check=True, capture_output=True)
+    symbols = subprocess.run(
+        ["nm", str(guest)], check=True, capture_output=True, text=True)
+    entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
+                      if row.split()[-1] == "main")
+    manifest = tmp_path / "brpatches.json"
+    manifest.write_text(
+        '{"version":1,"kind":"generic-erm","predicates":[]}', encoding="ascii")
+    log = tmp_path / "tracer.log"
+    env = {
+        "PATH": os.environ["PATH"],
+        "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1",
+        "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "1",
+        "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_TRACE_FILE": "none",
+        "BINRADAR_TRACER_LOG_FILE": str(log),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+        "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+        "BINRADAR_PATCH_CNT": "0",
+        "BINRADAR_PATCH_CACHE_ENABLE": "1",
+        "BINRADAR_PATCH_MANIFEST": str(manifest),
+        "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+        "BRCACHE_STACK_SIZE": "0",
+    }
+    with binradar_runtime.PhaseSession("binradar", 120) as session:
+        session.shared_memory(env, include_patch_key=True)
+        executor = session.start_tracer(
+            mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
+            binary=str(guest), test_cmd="", testcase="/dev/null")
+        summary = executor.run()
+        assert summary.attempt == 1
+        assert summary.attempt_result == binradar_runtime.AttemptResult.TIMEOUT
+        assert summary.stop_reason == \
+            binradar_runtime.StopReason.BASELINE_UNAVAILABLE
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert "[forkserver] [child-timeout]" in text
+    cpu_rows = [line for line in text.splitlines()
+                if "[forkserver] [child-cpu]" in line]
+    assert len(cpu_rows) == 1, text
+    fields = {}
+    for match in re.finditer(r"\[(\S+) ([^\]]*)\]", cpu_rows[0]):
+        fields[match.group(1)] = match.group(2).strip()
+    assert int(fields["pid"]) > 0
+    assert int(fields["user-ms"]) + int(fields["sys-ms"]) > 0
 
 
 @pytest.fixture
