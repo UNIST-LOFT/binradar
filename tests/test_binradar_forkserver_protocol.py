@@ -255,7 +255,7 @@ if mode == "wrong_ack":
     raise SystemExit(0)
 
 send(version)
-if version == 0x41464c07:
+if version == 0x41464c08:
     cancel = int(os.environ["BINRADAR_REPLAY_CANCEL_FD"])
     while True:
         header = read_exact(ctrl, 8)
@@ -283,7 +283,10 @@ if version == 0x41464c07:
                                            0 if descriptor == b"p0" else 1))
             elif mode == "resident_capture_identity":
                 text = os.environ["FAKE_CASE_TEXT"].encode()
-                os.write(stat, struct.pack("<6I", 3, request_id, 1, 0, 0, len(text)) + text)
+                source = int(os.environ.get("FAKE_CASE_SOURCE", "1"))
+                outcome = int(os.environ.get("FAKE_CASE_OUTCOME", "0"))
+                reason = int(os.environ.get("FAKE_CASE_REASON", "0"))
+                os.write(stat, struct.pack("<6I", 3, request_id, source, outcome, reason, len(text)) + text)
             elif mode == "resident_case_timeout":
                 time.sleep(3)
             else:
@@ -292,7 +295,10 @@ if version == 0x41464c07:
                     log("cancel:%d" % token)
                 reply_id = request_id + 1 if mode == "resident_wrong_id" else request_id
                 text = ('{"mutation":%d,"capture":null}' % mutation).encode()
-                os.write(stat, struct.pack("<6I", 3, reply_id, 0, 3, 4, len(text)) + text)
+                source = int(os.environ.get("FAKE_CASE_SOURCE", "0"))
+                outcome = int(os.environ.get("FAKE_CASE_OUTCOME", "3"))
+                reason = int(os.environ.get("FAKE_CASE_REASON", "4"))
+                os.write(stat, struct.pack("<6I", 3, reply_id, source, outcome, reason, len(text)) + text)
         elif command == 3:
             if mode == "resident_stall_shutdown":
                 time.sleep(3)
@@ -1247,10 +1253,150 @@ def test_real_resident_protocol_reports_ready_after_finish(
 
 
 
+@pytest.mark.parametrize("failure", ["unsupported-external-state", "timeout"])
+def test_real_resident_ignored_observations_never_admit_capture_or_cache(tmp_path, failure):
+    """A harmless instrumented normal guest retains a real global mutation.
+
+    Generation emits its actual constant-zero branch through both native
+    observation channels. Replay either encounters its audited getpid or
+    intentionally spins under the unchanged per-child deadline. No E9 target,
+    provider, solver or vulnerability fixture is involved.
+    """
+    if not Path(paths.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for resident ignored integration")
+    source = tmp_path / "ignored-replay.c"
+    source.write_text(r'''
+typedef unsigned long word;
+/* Concrete nonzero scalars are not primitive mutation sources without taint.
+ * A zero word is admitted by the existing null-pointer observation lane. */
+volatile word observed_value = 0;
+static long host_call(long number, long a, long b, long c) {
+    long result;
+    __asm__ volatile("syscall" : "=a"(result)
+                     : "a"(number), "D"(a), "S"(b), "d"(c)
+                     : "rcx", "r11", "memory");
+    return result;
+}
+static word env_number(char **environment, const char *name) {
+    for (; *environment; ++environment) {
+        const char *p = *environment, *n = name;
+        while (*n && *p == *n) { ++p; ++n; }
+        if (*n || *p++ != '=') continue;
+        unsigned base = 10;
+        if (p[0] == '0' && p[1] == 'x') { base = 16; p += 2; }
+        word value = 0;
+        for (; *p; ++p) {
+            unsigned digit = *p >= 'a' ? *p - 'a' + 10 : *p - '0';
+            if (digit >= base) return 0;
+            value = value * base + digit;
+        }
+        return value;
+    }
+    return 0;
+}
+extern void replay_entry(long, long, void *);
+void prepare(char **environment) {
+    long patch_fd = env_number(environment, "PATCH_FD");
+    long capture_fd = env_number(environment, "PATCH_CACHED_FD");
+    long key = env_number(environment, "BINRADAR_PATCH_SHM_KEY");
+    long id = host_call(29, key, 1, 0); /* shmget: the host-owned selector */
+    long selector = id < 0 ? -1 : host_call(30, id, 0, 4096); /* read-only shmat */
+    if (patch_fd < 3 || capture_fd < 3 || selector < 0)
+        host_call(60, 91, 0, 0);
+    replay_entry(patch_fd, capture_fd, (void *)selector);
+}
+__asm__(
+    ".text\n.globl _start, replay_entry\n"
+    "_start:\nmov (%rsp),%rdi\nlea 16(%rsp,%rdi,8),%rdi\ncall prepare\nud2\n"
+    "replay_entry:\nmov %rdi,%r12\nmov %rsi,%r13\nmov %rdx,%r14\n"
+    "mov observed_value(%rip),%r15\n"
+    "mov %rax,branch_record+32(%rip)\nmov %rbx,branch_record+40(%rip)\n"
+    "mov %rcx,branch_record+48(%rip)\nmov %rdx,branch_record+56(%rip)\n"
+    "mov %rsi,branch_record+64(%rip)\nmov %rdi,branch_record+72(%rip)\n"
+    "mov %rbp,branch_record+80(%rip)\nmov %rsp,branch_record+88(%rip)\n"
+    "mov %r8,branch_record+96(%rip)\nmov %r9,branch_record+104(%rip)\n"
+    "mov %r10,branch_record+112(%rip)\nmov %r11,branch_record+120(%rip)\n"
+    "mov %r12,branch_record+128(%rip)\nmov %r13,branch_record+136(%rip)\n"
+    "mov %r14,branch_record+144(%rip)\nmov %r15,branch_record+152(%rip)\n"
+#ifdef REPLAY_TIMEOUT
+    "cmpl $0,(%r14)\njne replay_spin\n"
+#else
+    "mov $39,%eax\nsyscall\n" /* real unsupported external-state observation */
+#endif
+    "mov 4(%r14),%eax\nadd $48,%al\nmov %al,patch_row+25(%rip)\n"
+    "mov $1,%eax\nmov %r12,%rdi\nlea patch_row(%rip),%rsi\nmov $28,%edx\nsyscall\n"
+    "cmp $28,%rax\njne replay_fail\n"
+    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $160,%edx\nsyscall\n"
+    "cmp $160,%rax\njne replay_fail\n"
+    "xor %edi,%edi\nmov $60,%eax\nsyscall\n"
+    "replay_spin:\njmp replay_spin\n"
+    "replay_fail:\nmov $92,%edi\nmov $60,%eax\nsyscall\n"
+    ".data\npatch_row: .ascii \"[patch] [id 0] [br 0] [v 0]\\n\"\n"
+    ".balign 8\nbranch_record: .long 0x48435242,1,0,0\n.quad 0,0\n.zero 128\n"
+    ".section .note.GNU-stack,\"\",@progbits\n");
+''', encoding="ascii")
+    guest = tmp_path / "ignored-replay"
+    command = ["cc", "-nostdlib", "-static", "-no-pie", "-fno-stack-protector",
+               "-fno-builtin", "-O0", "-o", str(guest), str(source)]
+    if failure == "timeout":
+        command.insert(1, "-DREPLAY_TIMEOUT")
+    subprocess.run(command, check=True, capture_output=True, timeout=20)
+    symbols = subprocess.run(["nm", str(guest)], check=True,
+                             capture_output=True, text=True, timeout=10)
+    entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
+                      if row.split()[-1] == "replay_entry")
+    manifest = tmp_path / "brpatches.json"
+    manifest.write_text('{"version":1,"kind":"generic-erm","predicates":[]}',
+                        encoding="ascii")
+    log = tmp_path / "tracer.log"
+    replay_dir = tmp_path / "replay"
+    env = {
+        "PATH": os.environ["PATH"], "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1", "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "1", "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_MEMCHECK_ENABLE": "1",
+        "BINRADAR_TRACE_FILE": "none", "BINRADAR_TRACER_LOG_FILE": str(log),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE", "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+        "BINRADAR_PATCH_CNT": "0", "BINRADAR_PATCH_CACHE_ENABLE": "1",
+        "BINRADAR_PATCH_MANIFEST": str(manifest),
+        "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+        "BINRADAR_FEEDBACK_DIR": str(tmp_path / "feedback"),
+        "BINRADAR_REPLAY_SERVER": "1", "BINRADAR_REPLAY_DIR": str(replay_dir),
+        "BRCACHE_STACK_SIZE": "0",
+    }
+    (tmp_path / "feedback").mkdir()
+    with binradar_runtime.PhaseSession("binradar", 30) as session:
+        session.shared_memory(env, include_patch_key=True)
+        executor = session.start_tracer(
+            mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
+            binary=str(guest), test_cmd="", testcase="/dev/null", replay_mode=True)
+        for _ in range(8):
+            summary = executor.run()
+            if summary.retained_mutations:
+                break
+            assert not summary.terminal, log.read_text()
+        info = executor.finish_generation()
+        assert info["mutation_ids"], log.read_text()
+        before = set(replay_dir.iterdir()) if replay_dir.exists() else set()
+        for _ in range(2):
+            result = executor.request_replay_case(info["mutation_ids"][0], "p1", 5)
+            assert result.outcome == binradar_runtime.ReplayOutcome.IGNORED
+            assert binradar_runtime.protocol_enum_name(result.reason) == failure
+            assert result.source == "executed" and result.capture is None
+        assert (set(replay_dir.iterdir()) if replay_dir.exists() else set()) == before
+        executor.shutdown_replay()
+        executor.process.wait(timeout=10)
+        assert executor.process.returncode == 0
+    if failure == "unsupported-external-state":
+        assert _audit_log_events(log.read_text(), "replay", "unsupported-syscall")
+    else:
+        assert len(_audit_log_events(log.read_text(), "forkserver", "child-timeout")) == 2
+
+
 def make_resident_executor(tmp_path, monkeypatch, fake_script, mode="resident"):
     executor, log_path = make_executor(tmp_path, monkeypatch, fake_script, mode=mode)
     executor.replay_mode = True
-    executor.env["FAKE_VERSION"] = "0x41464c07"
+    executor.env["FAKE_VERSION"] = "0x41464c08"
     return executor, log_path
 
 
@@ -1293,7 +1439,52 @@ def test_resident_capture_identity_is_bounded_and_owned(
         stop_executor(executor)
 
 
-@pytest.mark.parametrize("version", ["0x41464c05", "0x41464c06"])
+@pytest.mark.parametrize("reason", [3, 5])
+def test_resident_ignored_has_reason_without_capture_or_cache(
+        tmp_path, monkeypatch, fake_script, reason):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    executor.env.update(FAKE_CASE_OUTCOME="4", FAKE_CASE_REASON=str(reason))
+    try:
+        executor.start()
+        for _ in range(2):
+            result = executor.request_replay_case(7, "p0", 0.5)
+            assert result.outcome == binradar_runtime.ReplayOutcome.IGNORED
+            assert result.reason == binradar_runtime.ReplayReason(reason)
+            assert result.source == "executed" and result.capture is None
+        executor.shutdown_replay(0.5)
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("outcome,reason,source,capture", [
+    (4, 0, 0, None),  # ignored needs an explicit supported reason
+    (4, 4, 0, None),  # cancellation is unavailable, never ignored
+    (4, 6, 0, None),  # incomplete observation is unavailable too
+    (3, 3, 0, None),  # old unsupported/timeout rows are not the new protocol
+    (3, 5, 0, None),
+    (4, 5, 1, None),  # ignored results cannot be cached
+    (4, 5, 0, {"unexpected": True}),
+    (9, 5, 0, None),
+    (4, 99, 0, None),
+])
+def test_resident_rejects_invalid_ignored_contract(
+        tmp_path, monkeypatch, fake_script, outcome, reason, source, capture):
+    import json
+    executor, _ = make_resident_executor(
+        tmp_path, monkeypatch, fake_script, "resident_capture_identity")
+    executor.env.update(FAKE_CASE_OUTCOME=str(outcome), FAKE_CASE_REASON=str(reason),
+                        FAKE_CASE_SOURCE=str(source), FAKE_CASE_TEXT=json.dumps(
+                            {"mutation": 7, "capture": capture}))
+    try:
+        executor.start()
+        with pytest.raises(RuntimeError):
+            executor.request_replay_case(7, "p0", 0.5)
+        assert executor.transport.poisoned
+    finally:
+        stop_executor(executor)
+
+
+@pytest.mark.parametrize("version", ["0x41464c05", "0x41464c06", "0x41464c07"])
 def test_old_resident_peer_is_rejected(tmp_path, monkeypatch, fake_script, version):
     executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
     executor.env["FAKE_VERSION"] = version

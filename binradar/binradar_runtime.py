@@ -38,7 +38,7 @@ FORKSERVER_SUMMARY_WORDS = 5
 # the command/reply words in tracer/linux-user/binradar-forkserver.h.  The
 # resident handshake word is distinct so a generation-only tracer never
 # interprets a replay command as was-killed.
-REPLAY_HANDSHAKE_EXPECTED = 0x41464C07
+REPLAY_HANDSHAKE_EXPECTED = 0x41464C08
 REPLAY_SUMMARY_WORDS = 8
 REPLAY_COMMAND_GENERATE = 0
 REPLAY_COMMAND_FINISH = 1
@@ -569,13 +569,14 @@ class ReplayOutcome(enum.IntEnum):
     """One resident replay case outcome.
 
     Mirrors BinradarReplayOutcome in tracer/linux-user/binradar-cache.h.
-    UNAVAILABLE is never a passing observation.
+    UNAVAILABLE and IGNORED never provide a trusted observation.
     """
 
     NORMAL = 0
     TARGET_CRASH = 1
     OTHER_CRASH = 2
     UNAVAILABLE = 3
+    IGNORED = 4
 
 
 class ReplayReason(enum.IntEnum):
@@ -1058,15 +1059,20 @@ class TracerExecutor:
             raise RuntimeError(
                 f"[TRACER] [{self.mode}] Resident replay returned unknown "
                 f"outcome {outcome} / reason {reason}") from exc
-        if parsed_outcome == ReplayOutcome.UNAVAILABLE and \
-                parsed_reason == ReplayReason.NONE:
-            raise RuntimeError(
-                "[TRACER] Resident replay returned unavailable without a reason")
-        if parsed_outcome != ReplayOutcome.UNAVAILABLE and \
-                parsed_reason != ReplayReason.NONE:
+        ignored_reasons = (ReplayReason.UNSUPPORTED_EXTERNAL_STATE, ReplayReason.TIMEOUT)
+        unavailable_reasons = (ReplayReason.UNKNOWN_MUTATION,
+                               ReplayReason.INVALID_DESCRIPTOR,
+                               ReplayReason.CANCELLED,
+                               ReplayReason.INCOMPLETE_OBSERVATION)
+        valid_reason = (parsed_reason in ignored_reasons
+                        if parsed_outcome == ReplayOutcome.IGNORED else
+                        parsed_reason in unavailable_reasons
+                        if parsed_outcome == ReplayOutcome.UNAVAILABLE else
+                        parsed_reason == ReplayReason.NONE)
+        if not valid_reason:
             raise RuntimeError(
                 f"[TRACER] Resident replay returned "
-                f"{protocol_enum_name(parsed_outcome)} with reason "
+                f"{protocol_enum_name(parsed_outcome)} with invalid reason "
                 f"{protocol_enum_name(parsed_reason)}")
         source_name = "cache" if source == 1 else "executed"
         if source not in (0, 1):
@@ -1080,9 +1086,9 @@ class TracerExecutor:
                 or type(metadata["mutation"]) is not int or metadata["mutation"] != mutation:
             raise RuntimeError("Resident case metadata has another mutation identity")
         capture = metadata["capture"]
-        if parsed_outcome == ReplayOutcome.UNAVAILABLE:
-            if capture is not None:
-                raise RuntimeError("Unavailable resident case carries a capture")
+        if parsed_outcome in (ReplayOutcome.UNAVAILABLE, ReplayOutcome.IGNORED):
+            if capture is not None or source_name != "executed":
+                raise RuntimeError("Unobserved resident case carries a capture or cache source")
         else:
             fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse"}
             if not isinstance(capture, dict) or set(capture) != fields:

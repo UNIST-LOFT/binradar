@@ -113,7 +113,8 @@ class FakeTracer:
     def request_replay_case(self, mutation, descriptor, timeout, *, cancel_event=None):
         self.requests.append((mutation, descriptor))
         outcome, reason, source = self.outcomes.pop(0)
-        capture = None if outcome == binradar_runtime.ReplayOutcome.UNAVAILABLE else {
+        capture = None if outcome in (binradar_runtime.ReplayOutcome.UNAVAILABLE,
+                                      binradar_runtime.ReplayOutcome.IGNORED) else {
             "mutation": mutation, "path": f"/private/replay/capture-{mutation}.brch",
             "sha256": "0" * 64, "descriptor": descriptor, "patch_id": 1,
             "reuse": "fresh" if source == "executed" else "exact-descriptor"}
@@ -160,9 +161,49 @@ def test_evaluate_streams_case_rows_and_a_terminal_coverage_row(tmp_path):
         server.close()
     assert [row.get("patch") for row in rows if "patch" in row] == [5, 5]
     assert rows[-1] == {
-        "done": True, "cases": 2, "unavailable": 0, "patches": 1,
+        "done": True, "cases": 2, "unavailable": 0, "ignored": 0, "patches": 1,
         "mutations": 2, "coverage": "complete"}
     assert [row["mutation"] for row in rows if "mutation" in row] == [2, 3]
+
+
+@pytest.mark.parametrize("all_ignored", [False, True])
+def test_ignored_cases_are_separate_partial_coverage_without_captures(tmp_path, all_ignored):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    outcomes = [
+        (binradar_runtime.ReplayOutcome.IGNORED,
+         binradar_runtime.ReplayReason.UNSUPPORTED_EXTERNAL_STATE, "executed"),
+        (binradar_runtime.ReplayOutcome.IGNORED,
+         binradar_runtime.ReplayReason.TIMEOUT, "executed"),
+    ]
+    if not all_ignored:
+        outcomes.append((binradar_runtime.ReplayOutcome.UNAVAILABLE,
+                         binradar_runtime.ReplayReason.INCOMPLETE_OBSERVATION,
+                         "executed"))
+        outcomes.append((binradar_runtime.ReplayOutcome.NORMAL,
+                         binradar_runtime.ReplayReason.NONE, "executed"))
+    tracer = FakeTracer(outcomes)
+    server._tracer = tracer
+    server._mutation_ids = list(range(2, 2 + len(outcomes)))
+    with server._lock:
+        server.update_generation(state="ready", generation_stop="exhausted",
+                                 remaining_plans=0)
+    server.start()
+    try:
+        result = send(Path(server.path), {
+            "op": "evaluate", "patches": [{"id": 1, "predicate": "1"}]})
+        assert send(Path(server.path), {"op": "status"})[0]["state"] == "ready"
+    finally:
+        server.close()
+    terminal = result[-1]
+    assert terminal == {
+        "done": True, "cases": len(outcomes), "ignored": 2,
+        "unavailable": 0 if all_ignored else 1, "patches": 1,
+        "mutations": len(outcomes), "coverage": "partial"}
+    assert [row["reason"] for row in result[:2]] == [
+        "unsupported-external-state", "timeout"]
+    assert all(row["outcome"] == "ignored" and row["capture"] is None
+               and row["source"] == "executed" for row in result[:2])
+    assert len(tracer.requests) == len(outcomes)
 
 
 def test_non_ready_state_refuses_evaluation_without_running_a_case(tmp_path):

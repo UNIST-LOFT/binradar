@@ -562,7 +562,7 @@ class ReplayServer:
                 terminal({
                     "error": "no retained mutations; zero coverage"})
                 return
-            total = unavailable = 0
+            total = unavailable = ignored = 0
             for patch, descriptor in lowered:
                 for mutation in mutation_ids:
                     if cancelled.is_set() or self.shutdown_requested.is_set():
@@ -590,14 +590,16 @@ class ReplayServer:
                     })
                     total += 1
                     unavailable += outcome == "unavailable"
+                    ignored += outcome == "ignored"
             # Retire the watcher before advertising completion.  A normal
             # client close after done must never cancel the next request.
             release()
             if not cancelled.is_set() and not self.shutdown_requested.is_set():
                 self._send(connection, {
                     "done": True, "cases": total, "unavailable": unavailable,
+                    "ignored": ignored,
                     "patches": len(lowered), "mutations": len(mutation_ids),
-                    "coverage": "partial" if unavailable else "complete",
+                    "coverage": "partial" if unavailable or ignored else "complete",
                 })
         except OSError:
             # Native I/O is handled at its call site; only the client send can
