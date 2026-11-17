@@ -38,7 +38,7 @@ FORKSERVER_SUMMARY_WORDS = 5
 # the command/reply words in tracer/linux-user/binradar-forkserver.h.  The
 # resident handshake word is distinct so a generation-only tracer never
 # interprets a replay command as was-killed.
-REPLAY_HANDSHAKE_EXPECTED = 0x41464C08
+REPLAY_HANDSHAKE_EXPECTED = 0x41464C09
 REPLAY_SUMMARY_WORDS = 8
 REPLAY_COMMAND_GENERATE = 0
 REPLAY_COMMAND_FINISH = 1
@@ -589,6 +589,7 @@ class ReplayReason(enum.IntEnum):
     CANCELLED = 4
     TIMEOUT = 5
     INCOMPLETE_OBSERVATION = 6
+    PREDICATE_TRAP = 7
 
 
 @dataclass(frozen=True)
@@ -1063,7 +1064,8 @@ class TracerExecutor:
         unavailable_reasons = (ReplayReason.UNKNOWN_MUTATION,
                                ReplayReason.INVALID_DESCRIPTOR,
                                ReplayReason.CANCELLED,
-                               ReplayReason.INCOMPLETE_OBSERVATION)
+                               ReplayReason.INCOMPLETE_OBSERVATION,
+                               ReplayReason.PREDICATE_TRAP)
         valid_reason = (parsed_reason in ignored_reasons
                         if parsed_outcome == ReplayOutcome.IGNORED else
                         parsed_reason in unavailable_reasons

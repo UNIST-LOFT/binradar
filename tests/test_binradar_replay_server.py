@@ -166,6 +166,31 @@ def test_evaluate_streams_case_rows_and_a_terminal_coverage_row(tmp_path):
     assert [row["mutation"] for row in rows if "mutation" in row] == [2, 3]
 
 
+def test_predicate_trap_reason_survives_public_translation(tmp_path):
+    server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)
+    tracer = FakeTracer([
+        (binradar_runtime.ReplayOutcome.UNAVAILABLE,
+         binradar_runtime.ReplayReason.PREDICATE_TRAP, "executed"),
+    ])
+    server._tracer = tracer
+    server._mutation_ids = [2]
+    with server._lock:
+        server.update_generation(state="ready", generation_stop="exhausted",
+                                 remaining_plans=0)
+    server.start()
+    try:
+        result = send(Path(server.path), {
+            "op": "evaluate", "patches": [{"id": 1, "predicate": "1 / rax"}]})
+    finally:
+        server.close()
+    assert result[0] == {
+        "mutation": 2, "patch": 1, "source": "executed",
+        "outcome": "unavailable", "reason": "predicate-trap", "capture": None}
+    assert result[1] == {
+        "done": True, "cases": 1, "unavailable": 1, "ignored": 0,
+        "patches": 1, "mutations": 1, "coverage": "partial"}
+
+
 @pytest.mark.parametrize("all_ignored", [False, True])
 def test_ignored_cases_are_separate_partial_coverage_without_captures(tmp_path, all_ignored):
     server = binradar_replay.ReplayServer(str(tmp_path), "generic-erm", 0)

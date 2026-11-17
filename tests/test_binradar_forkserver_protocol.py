@@ -255,7 +255,7 @@ if mode == "wrong_ack":
     raise SystemExit(0)
 
 send(version)
-if version == 0x41464c08:
+if version == 0x41464c09:
     cancel = int(os.environ["BINRADAR_REPLAY_CANCEL_FD"])
     while True:
         header = read_exact(ctrl, 8)
@@ -1253,14 +1253,17 @@ def test_real_resident_protocol_reports_ready_after_finish(
 
 
 
-@pytest.mark.parametrize("failure", ["unsupported-external-state", "timeout"])
+@pytest.mark.parametrize("failure", [
+    "unsupported-external-state", "timeout", "predicate-trap",
+    "predicate-trap-timeout", "predicate-trap-unsupported", "corrupt-predicate-trap",
+    "corrupt-text-predicate-trap",
+])
 def test_real_resident_ignored_observations_never_admit_capture_or_cache(tmp_path, failure):
     """A harmless instrumented normal guest retains a real global mutation.
 
-    Generation emits its actual constant-zero branch through both native
-    observation channels. Replay either encounters its audited getpid or
-    intentionally spins under the unchanged per-child deadline. No E9 target,
-    provider, solver or vulnerability fixture is involved.
+    The trap variants emit the actual constant-division descriptor's br=2 in
+    both channels, optionally followed by a deadline, unsupported operation or
+    corrupt trailing capture. No provider, solver or vulnerability is involved.
     """
     if not Path(paths.TRACER_BIN).is_file():
         pytest.skip("built tracer required for resident ignored integration")
@@ -1318,7 +1321,14 @@ __asm__(
     "mov %r10,branch_record+112(%rip)\nmov %r11,branch_record+120(%rip)\n"
     "mov %r12,branch_record+128(%rip)\nmov %r13,branch_record+136(%rip)\n"
     "mov %r14,branch_record+144(%rip)\nmov %r15,branch_record+152(%rip)\n"
-#ifdef REPLAY_TIMEOUT
+#ifdef REPLAY_TRAP
+    "mov (%r14),%eax\nmov %eax,branch_record+8(%rip)\n"
+    "add $48,%al\nmov %al,patch_row+12(%rip)\n"
+    "cmpl $0,(%r14)\nje replay_emit\n"
+    "cmpb $47,16(%r14)\njne replay_emit\n" /* /p1p0, not guard-first AND */
+    "movl $2,branch_record+12(%rip)\nmovb $50,patch_row+19(%rip)\n"
+    "replay_emit:\n"
+#elif defined(REPLAY_TIMEOUT)
     "cmpl $0,(%r14)\njne replay_spin\n"
 #else
     "mov $39,%eax\nsyscall\n" /* real unsupported external-state observation */
@@ -1328,6 +1338,20 @@ __asm__(
     "cmp $28,%rax\njne replay_fail\n"
     "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $160,%edx\nsyscall\n"
     "cmp $160,%rax\njne replay_fail\n"
+#ifdef REPLAY_TRAP
+    "cmpl $0,(%r14)\nje replay_exit\n"
+#ifdef REPLAY_CORRUPT
+    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $1,%edx\nsyscall\n"
+#elif defined(REPLAY_CORRUPT_TEXT)
+    "movb $48,patch_row+12(%rip)\n"
+    "mov $1,%eax\nmov %r12,%rdi\nlea patch_row(%rip),%rsi\nmov $28,%edx\nsyscall\n"
+#elif defined(REPLAY_LATE_TIMEOUT)
+    "jmp replay_spin\n"
+#elif defined(REPLAY_LATE_UNSUPPORTED)
+    "mov $39,%eax\nsyscall\n"
+#endif
+    "replay_exit:\n"
+#endif
     "xor %edi,%edi\nmov $60,%eax\nsyscall\n"
     "replay_spin:\njmp replay_spin\n"
     "replay_fail:\nmov $92,%edi\nmov $60,%eax\nsyscall\n"
@@ -1340,6 +1364,14 @@ __asm__(
                "-fno-builtin", "-O0", "-o", str(guest), str(source)]
     if failure == "timeout":
         command.insert(1, "-DREPLAY_TIMEOUT")
+    if "predicate-trap" in failure:
+        command.insert(1, "-DREPLAY_TRAP")
+        extra = {"predicate-trap-timeout": "REPLAY_LATE_TIMEOUT",
+                 "predicate-trap-unsupported": "REPLAY_LATE_UNSUPPORTED",
+                 "corrupt-predicate-trap": "REPLAY_CORRUPT",
+                 "corrupt-text-predicate-trap": "REPLAY_CORRUPT_TEXT"}.get(failure)
+        if extra:
+            command.insert(1, f"-D{extra}")
     subprocess.run(command, check=True, capture_output=True, timeout=20)
     symbols = subprocess.run(["nm", str(guest)], check=True,
                              capture_output=True, text=True, timeout=10)
@@ -1378,25 +1410,42 @@ __asm__(
         info = executor.finish_generation()
         assert info["mutation_ids"], log.read_text()
         before = set(replay_dir.iterdir()) if replay_dir.exists() else set()
-        for _ in range(2):
-            result = executor.request_replay_case(info["mutation_ids"][0], "p1", 5)
-            assert result.outcome == binradar_runtime.ReplayOutcome.IGNORED
-            assert binradar_runtime.protocol_enum_name(result.reason) == failure
+        trapping = failure.startswith("predicate-trap")
+        corrupt = failure.startswith("corrupt-")
+        descriptor = "/p1p0" if trapping or corrupt else "p1"
+        # An unsupported operation permanently retires the plan's execution
+        # capability; the first authenticated trap still wins over that audit.
+        repeats = 1 if failure == "predicate-trap-unsupported" else 2
+        for _ in range(repeats):
+            result = executor.request_replay_case(info["mutation_ids"][0], descriptor, 5)
+            assert result.outcome == (binradar_runtime.ReplayOutcome.UNAVAILABLE
+                                      if trapping or corrupt else binradar_runtime.ReplayOutcome.IGNORED)
+            expected_reason = ("predicate-trap" if trapping else
+                               "incomplete-observation" if corrupt else failure)
+            assert binradar_runtime.protocol_enum_name(result.reason) == expected_reason
             assert result.source == "executed" and result.capture is None
+        if failure in ("predicate-trap", "predicate-trap-timeout"):
+            guarded = executor.request_replay_case(info["mutation_ids"][0], "Ap0/p1p0", 5)
+            # This harmless baseline has no target-crash oracle: a normal
+            # guarded run is unavailable, never a fabricated repair verdict.
+            expected = "timeout" if failure.endswith("timeout") else "incomplete-observation"
+            assert binradar_runtime.protocol_enum_name(guarded.reason) == expected
+            assert guarded.capture is None
         assert (set(replay_dir.iterdir()) if replay_dir.exists() else set()) == before
         executor.shutdown_replay()
         executor.process.wait(timeout=10)
         assert executor.process.returncode == 0
-    if failure == "unsupported-external-state":
+    if failure in ("unsupported-external-state", "predicate-trap-unsupported"):
         assert _audit_log_events(log.read_text(), "replay", "unsupported-syscall")
-    else:
-        assert len(_audit_log_events(log.read_text(), "forkserver", "child-timeout")) == 2
+    elif failure in ("timeout", "predicate-trap-timeout"):
+        assert len(_audit_log_events(log.read_text(), "forkserver", "child-timeout")) == (
+            3 if failure == "predicate-trap-timeout" else 2)
 
 
 def make_resident_executor(tmp_path, monkeypatch, fake_script, mode="resident"):
     executor, log_path = make_executor(tmp_path, monkeypatch, fake_script, mode=mode)
     executor.replay_mode = True
-    executor.env["FAKE_VERSION"] = "0x41464c08"
+    executor.env["FAKE_VERSION"] = "0x41464c09"
     return executor, log_path
 
 
@@ -1456,10 +1505,30 @@ def test_resident_ignored_has_reason_without_capture_or_cache(
         stop_executor(executor)
 
 
+def test_resident_predicate_trap_is_unavailable_without_capture_or_cache(
+        tmp_path, monkeypatch, fake_script):
+    executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
+    executor.env.update(FAKE_CASE_OUTCOME="3", FAKE_CASE_REASON="7")
+    try:
+        executor.start()
+        for _ in range(2):
+            result = executor.request_replay_case(7, "/p1p0", 0.5)
+            assert result.outcome == binradar_runtime.ReplayOutcome.UNAVAILABLE
+            assert result.reason == binradar_runtime.ReplayReason.PREDICATE_TRAP
+            assert result.source == "executed" and result.capture is None
+        executor.shutdown_replay(0.5)
+    finally:
+        stop_executor(executor)
+
+
 @pytest.mark.parametrize("outcome,reason,source,capture", [
     (4, 0, 0, None),  # ignored needs an explicit supported reason
     (4, 4, 0, None),  # cancellation is unavailable, never ignored
     (4, 6, 0, None),  # incomplete observation is unavailable too
+    (4, 7, 0, None),  # a known predicate trap is unavailable, never ignored
+    (0, 7, 0, None),  # a trap cannot accompany a normal outcome
+    (3, 7, 1, None),  # trap reasons never come from the reusable cache
+    (3, 7, 0, {"unexpected": True}),
     (3, 3, 0, None),  # old unsupported/timeout rows are not the new protocol
     (3, 5, 0, None),
     (4, 5, 1, None),  # ignored results cannot be cached
@@ -1484,7 +1553,7 @@ def test_resident_rejects_invalid_ignored_contract(
         stop_executor(executor)
 
 
-@pytest.mark.parametrize("version", ["0x41464c05", "0x41464c06", "0x41464c07"])
+@pytest.mark.parametrize("version", ["0x41464c05", "0x41464c06", "0x41464c07", "0x41464c08"])
 def test_old_resident_peer_is_rejected(tmp_path, monkeypatch, fake_script, version):
     executor, _ = make_resident_executor(tmp_path, monkeypatch, fake_script)
     executor.env["FAKE_VERSION"] = version
