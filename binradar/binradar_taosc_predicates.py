@@ -980,10 +980,11 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
 
 # Binary records emitted by brpatch-cached.c.  Each record contains the
 # selected predicate's branch plus enough pre-branch state to evaluate every
-# other predicate offline.  CWE-805 records additionally contain all clamps
-# and the measured stack prefix.
+# other predicate offline.  Both families record the measured stack prefix;
+# CWE-805 records additionally contain all clamps.
 CACHED_SNAPSHOT_MAGIC = 0x48435242  # little-endian bytes "BRCH"
-CACHED_SNAPSHOT_VERSION = 1
+CACHED_SNAPSHOT_VERSION = 2
+CACHED_SNAPSHOT_MAX_STACK_SIZE = 0x100000
 CACHED_SNAPSHOT_FLAG_TRUNCATED = 1
 CACHED_SNAPSHOT_FLAG_CWE805 = 2
 CACHED_SNAPSHOT_FLAG_INVALID = 4
@@ -1018,6 +1019,7 @@ def parse_cached_snapshots(
     snapshots: List[CachedSnapshot] = []
     offset = 0
     expected_patch_id: Optional[int] = None
+    expected_stack_size = 0
     known_flags = CACHED_SNAPSHOT_FLAG_TRUNCATED \
         | CACHED_SNAPSHOT_FLAG_CWE805 | CACHED_SNAPSHOT_FLAG_INVALID
     while offset < len(data):
@@ -1038,19 +1040,18 @@ def parse_cached_snapshots(
             return [], "cached runtime rejected the selected predicate"
         if branch not in (0, 1, 2):
             return [], f"invalid cached branch value {branch}"
+        if stack_size > CACHED_SNAPSHOT_MAX_STACK_SIZE:
+            return [], f"cached stack payload too large: {stack_size}"
         if expected_patch_id is None:
             expected_patch_id = patch_id
+            expected_stack_size = stack_size
         elif patch_id != expected_patch_id:
             return [], "cached snapshot patch ids differ within one run"
-
-        is_CWE805 = bool(flags & CACHED_SNAPSHOT_FLAG_CWE805)
-        if not is_CWE805 and stack_size != 0:
-            return [], "generic cached snapshot has a stack payload"
-        if stack_size > 0x100000:
-            return [], f"cached stack payload too large: {stack_size}"
+        elif stack_size != expected_stack_size:
+            return [], "cached snapshot stack sizes differ within one run"
 
         clamps: Tuple[Tuple[int, int], ...] = ()
-        if is_CWE805:
+        if flags & CACHED_SNAPSHOT_FLAG_CWE805:
             if offset + CACHED_SNAPSHOT_CLAMPS.size > len(data):
                 return [], "partial cached clamp payload"
             raw = CACHED_SNAPSHOT_CLAMPS.unpack_from(data, offset)

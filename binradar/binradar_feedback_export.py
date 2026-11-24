@@ -14,7 +14,10 @@ from .binradar_feedback_capture import (
     read_header, unpack_branches,
 )
 from .binradar_feedback_bundle import VERSION, observed_class, write_row
-from .binradar_taosc_predicates import REGISTER_TO_VAR, load_runtime_predicates, parse_cached_snapshots
+from .binradar_taosc_predicates import (
+    CACHED_SNAPSHOT_VERSION, REGISTER_TO_VAR, load_runtime_predicates,
+    parse_cached_snapshots,
+)
 
 
 def _label(trace, reference, *, mutation=False):
@@ -401,7 +404,8 @@ def write_classification(request, root, pairs, reference):
                     "mutation_reference": ({"address": reference.address, "source": reference.source,
                                             "image": reference.image_id, "offset": reference.image_offset}
                                            if reference is not None and reference.valid else None)},
-        "state": {"format": "BRCH", "version": 1, "endianness": "little", "arch": "x86_64",
+        "state": {"format": "BRCH", "version": CACHED_SNAPSHOT_VERSION,
+                  "endianness": "little", "arch": "x86_64",
                   "registers": sorted(REGISTER_TO_VAR, key=REGISTER_TO_VAR.__getitem__),
                   "branches": {"0": "original", "1": "error-handling", "2": "predicate-trap"},
                   "packing": "2-bit-lsb-first;hits=-1:unavailable;hits=0:empty",

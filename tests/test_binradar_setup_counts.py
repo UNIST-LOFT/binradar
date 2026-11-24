@@ -40,6 +40,7 @@ def _prepare_workdir(tmp_path, predicates_text="", extra=None):
     workdir.mkdir(exist_ok=True)
     (workdir / "patch-location").write_text("410735")
     (workdir / "destinations").write_text("4106d8\n")
+    (workdir / "stack-size").write_text("0\n")
     if predicates_text is not None:
         (workdir / "predicates").write_text(predicates_text)
     orig = workdir / "imginfo.orig"
@@ -75,6 +76,24 @@ def test_generic_env_counters_without_filter(tmp_path, monkeypatch):
     assert env["TAOSC_TOTAL_PATCHES"] == "2"
     assert env["FILTER_TOTAL_PATCHES"] == "2"
     assert env["TOTAL_PATCHES"] == "2"
+
+
+@pytest.mark.parametrize("stack_size", [None, "bad", "-1", "1048577"])
+def test_generic_cached_setup_rejects_invalid_stack_size(tmp_path, stack_size, capsys):
+    workdir, env = _prepare_workdir(tmp_path, "rax == +max1\nrbx == +max1\n")
+    stack_file = workdir / "stack-size"
+    if stack_size is None:
+        stack_file.unlink()
+    else:
+        stack_file.write_text(stack_size)
+    loaded = binradar_setup.load_setup_predicates(workdir)
+    with pytest.raises(SystemExit) as exc:
+        binradar_setup.build_cached_artifact(
+            workdir, tmp_path, env, loaded.family, loaded.allocator, loaded.records)
+    assert exc.value.code == 1
+    assert "stack-size" in capsys.readouterr().out
+    assert "BRCACHE_STACK_SIZE" not in env
+    assert not (workdir / "brpatches.json").exists()
 
 
 def test_generic_env_counters_with_survivor_selection(tmp_path, monkeypatch):
@@ -247,6 +266,7 @@ def test_specialized_env_counters(tmp_path, monkeypatch):
 def test_setup_persists_new_env_keys(tmp_path, monkeypatch):
     workdir, _ = _prepare_workdir(
         tmp_path, "max1 - rax == ~max1\nmax1 / rax < +max1\n")
+    (workdir / "stack-size").write_text("32\n")
     configdir = tmp_path
     (configdir / "config.env").write_text(
         'POC_INPUT="poc/x"\nPOC_DIR="poc"\nBINARY="imginfo"\n'
@@ -269,6 +289,7 @@ def test_setup_persists_new_env_keys(tmp_path, monkeypatch):
 
     saved = binradar_setup.load_env(workdir / "binradar.env")
     assert not set(obsolete).intersection(saved)
+    assert saved["BRCACHE_STACK_SIZE"] == "32"
     assert saved["PATCH_TYPE"] == "generic-erm"
     assert saved["TAOSC_TOTAL_PATCHES"] == "2"
     assert saved["FILTER_TOTAL_PATCHES"] == "2"
@@ -554,6 +575,7 @@ def test_generate_concrete_publishes_complete_env_atomically(tmp_path, monkeypat
 
 @pytest.mark.parametrize("patch_format,family,stack_size", [
     ("ERM generic", "generic-erm", 0),
+    ("ERM generic", "generic-erm", 32),
     ("ERM CWE-805", "CWE805-erm", 4096),
     ("ERM CWE-805", "CWE805-erm", 0),
 ])
@@ -572,7 +594,7 @@ def test_generate_binradar_builds_patchless_capture(
         trace.mkdir()
         (trace / "malloc.calls").write_text("0 401010\n")
         (trace / "malloc.returns").write_text("401015\n")
-        (configdir / "stack-size").write_text(str(stack_size))
+    (configdir / "stack-size").write_text(str(stack_size))
     with (configdir / "config.env").open("a") as stream:
         stream.write('BRPATCHED_E9_EXCLUDE_RANGES="stale"\n'
                      'BRCACHED_E9_RELOCATED_CALL_JUMPS="stale"\n'
@@ -660,15 +682,17 @@ def test_generate_binradar_missing_metadata_preserves_published_env(
 
 
 @pytest.mark.parametrize("stack_size", [None, "", "invalid", "-1", "1048577"])
-def test_generate_binradar_cwe805_requires_valid_capture_size(
-        tmp_path, monkeypatch, stack_size):
+@pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
+def test_generate_binradar_requires_valid_capture_size(
+        tmp_path, monkeypatch, stack_size, patch_format):
     configdir, workdir = _concrete_subject(tmp_path)
-    (configdir / "patch-format").write_text("ERM CWE-805")
+    (configdir / "patch-format").write_text(patch_format)
     (configdir / "destinations").write_text("401040\n")
-    trace = workdir / "trace"
-    trace.mkdir()
-    (trace / "malloc.calls").write_text("0 401010\n")
-    (trace / "malloc.returns").write_text("401015\n")
+    if patch_format == "ERM CWE-805":
+        trace = workdir / "trace"
+        trace.mkdir()
+        (trace / "malloc.calls").write_text("0 401010\n")
+        (trace / "malloc.returns").write_text("401015\n")
     if stack_size is not None:
         (workdir / "stack-size").write_text(stack_size)
     _forbid_patch_setup(monkeypatch)

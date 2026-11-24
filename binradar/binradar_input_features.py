@@ -190,8 +190,8 @@ class BaselineFeatureCollector:
                 return None, "nonneutral-brch"
             if snapshot.is_CWE805 != expected_cwe:
                 return None, "brch-family-mismatch"
-            if expected_cwe and (len(snapshot.stack) != self.runner.brcache_stack_size
-                                 or len(snapshot.stack) < self._required_stack_bytes):
+            if (len(snapshot.stack) != self.runner.brcache_stack_size
+                    or len(snapshot.stack) < self._required_stack_bytes):
                 return None, "brch-stack-mismatch"
         return tuple(snapshots), "none"
 

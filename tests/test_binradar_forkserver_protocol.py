@@ -1336,8 +1336,8 @@ __asm__(
     "mov 4(%r14),%eax\nadd $48,%al\nmov %al,patch_row+25(%rip)\n"
     "mov $1,%eax\nmov %r12,%rdi\nlea patch_row(%rip),%rsi\nmov $28,%edx\nsyscall\n"
     "cmp $28,%rax\njne replay_fail\n"
-    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $160,%edx\nsyscall\n"
-    "cmp $160,%rax\njne replay_fail\n"
+    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $168,%edx\nsyscall\n"
+    "cmp $168,%rax\njne replay_fail\n"
 #ifdef REPLAY_TRAP
     "cmpl $0,(%r14)\nje replay_exit\n"
 #ifdef REPLAY_CORRUPT
@@ -1356,7 +1356,8 @@ __asm__(
     "replay_spin:\njmp replay_spin\n"
     "replay_fail:\nmov $92,%edi\nmov $60,%eax\nsyscall\n"
     ".data\npatch_row: .ascii \"[patch] [id 0] [br 0] [v 0]\\n\"\n"
-    ".balign 8\nbranch_record: .long 0x48435242,1,0,0\n.quad 0,0\n.zero 128\n"
+    ".balign 8\nbranch_record: .long 0x48435242,2,0,0\n.quad 8,0\n.zero 128\n"
+    ".byte 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17\n"
     ".section .note.GNU-stack,\"\",@progbits\n");
 ''', encoding="ascii")
     guest = tmp_path / "ignored-replay"
@@ -1394,7 +1395,7 @@ __asm__(
         "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
         "BINRADAR_FEEDBACK_DIR": str(tmp_path / "feedback"),
         "BINRADAR_REPLAY_SERVER": "1", "BINRADAR_REPLAY_DIR": str(replay_dir),
-        "BRCACHE_STACK_SIZE": "0",
+        "BRCACHE_STACK_SIZE": "8",
     }
     (tmp_path / "feedback").mkdir()
     with binradar_runtime.PhaseSession("binradar", 30) as session:

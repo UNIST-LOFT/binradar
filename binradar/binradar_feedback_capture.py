@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 from .binradar_taosc_predicates import (
     CachedSnapshot, CACHED_SNAPSHOT_HEADER, CACHED_SNAPSHOT_MAGIC,
     CACHED_SNAPSHOT_VERSION, CACHED_SNAPSHOT_FLAG_CWE805,
-    CACHED_SNAPSHOT_CLAMPS, CACHED_SNAPSHOT_REGS,
+    CACHED_SNAPSHOT_CLAMPS, CACHED_SNAPSHOT_MAX_STACK_SIZE, CACHED_SNAPSHOT_REGS,
 )
 
 VERSION = 1
@@ -224,6 +224,7 @@ class CaptureJournal:
         digest = hashlib.sha256()
         capture_id = -1
         family = None
+        stack_size = 0
         try:
             with os.fdopen(fd, "wb") as stream:
                 def emit(data):
@@ -235,17 +236,17 @@ class CaptureJournal:
                     if capture_id == -1:
                         capture_id = state.patch_id
                         family = state.is_CWE805
+                        stack_size = len(state.stack)
                     if state.patch_id != capture_id or state.is_CWE805 != family:
                         raise ValueError("feedback capture id/family changed")
-                    if len(state.registers) != 16 or len(state.stack) > 0x100000:
+                    if len(state.registers) != 16 or len(state.stack) != stack_size \
+                            or stack_size > CACHED_SNAPSHOT_MAX_STACK_SIZE:
                         raise ValueError("invalid feedback register/stack capture")
                     if state.is_CWE805 and len(state.clamps) != 256:
                         raise ValueError("feedback CWE805 capture needs all clamps")
-                    if not state.is_CWE805 and state.stack:
-                        raise ValueError("generic feedback capture has stack bytes")
                     emit(CACHED_SNAPSHOT_HEADER.pack(
                         CACHED_SNAPSHOT_MAGIC, CACHED_SNAPSHOT_VERSION,
-                        state.patch_id, state.branch, len(state.stack),
+                        state.patch_id, state.branch, stack_size,
                         CACHED_SNAPSHOT_FLAG_CWE805 if state.is_CWE805 else 0))
                     if state.is_CWE805:
                         emit(CACHED_SNAPSHOT_CLAMPS.pack(

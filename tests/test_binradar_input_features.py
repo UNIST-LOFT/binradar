@@ -23,7 +23,7 @@ from binradar.binradar_taosc_predicates import (
 
 
 def _record(*, flags=0, branch=0, patch_id=0, stack=b""):
-    return (HEADER.pack(MAGIC, 1, patch_id, branch, len(stack), flags)
+    return (HEADER.pack(MAGIC, 2, patch_id, branch, len(stack), flags)
             + (CLAMPS.pack(*([0] * 512)) if flags & 2 else b"")
             + REGS.pack(*range(16)) + stack)
 
@@ -55,7 +55,7 @@ def runner(tmp_path, monkeypatch):
     return verifier.BinRadarQemuRunner(
         str(tmp_path), "target", "@@", "1000",
         {suffix: ("0x9000-0xa000", []) for suffix in ("brpatched", "brcached")},
-        patch_kind="generic-erm")
+        patch_kind="generic-erm", brcache_stack_size=0)
 
 
 def _child(runner, monkeypatch, *, capture=None, slot=42, crash=False, cancel=False, hits=1):
@@ -256,21 +256,26 @@ def test_partial_maps_are_not_complete_on_failed_execution(
     assert result.patch_reason == result.coverage_reason == reason
 
 
+@pytest.mark.parametrize("kind,descriptor,flags", [
+    ("generic-erm", "p0", 0), ("CWE805-erm", "c1s64i0", 2),
+])
 @pytest.mark.parametrize("stack,reason", [(b"12345678", "none"),
                                           (b"1234", "brch-stack-mismatch")])
-def test_cwe805_neutral_capture_requires_family_and_exact_stack(
-        runner, monkeypatch, stack, reason):
-    runner.patch_kind = "CWE805-erm"
+def test_neutral_capture_requires_family_and_exact_stack(
+        runner, monkeypatch, kind, descriptor, flags, stack, reason):
+    runner.patch_kind = kind
     runner.brcache_stack_size = 8
     (Path(runner.dir) / "brpatches.json").write_text(json.dumps({
-        "version": 1, "kind": "CWE805-erm", "predicates": [
-            {"id": 1, "source_line": 1, "descriptor": "c1s64i0"}],
+        "version": 1, "kind": kind, "predicates": [
+            {"id": 1, "source_line": 1, "descriptor": descriptor}],
     }))
-    _child(runner, monkeypatch, capture=_record(flags=2, stack=stack))
+    _child(runner, monkeypatch, capture=_record(flags=flags, stack=stack))
     with features.BaselineFeatureCollector(runner, [1]) as collector:
         result = collector.run("input")
     assert result.patch_reason == reason
     assert (result.snapshots is not None) == (reason == "none")
+    if result.snapshots is not None:
+        assert result.snapshots[0].stack == stack
     assert result.probe is not None and result.coverage_reason == "none"
 
 

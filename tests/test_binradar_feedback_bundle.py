@@ -21,15 +21,18 @@ def _probe(outcome="normal", fault=0):
         raw_fault_addr=fault if outcome == "crash" else 0)
 
 
-def _states(patch, values, branches):
+def _states(patch, values, branches, stack_size=0):
     return [CachedSnapshot(patch_id=patch, branch=branch,
-                           registers=(value & ((1 << 64) - 1),) + (0,) * 15)
-            for value, branch in zip(values, branches)]
+                           registers=(value & ((1 << 64) - 1),) + (0,) * 15,
+                           stack=bytes([index & 0xff]) * stack_size)
+            for index, (value, branch) in enumerate(zip(values, branches))]
 
 
 class _CaptureRun:
-    def __init__(self, tmp_path, candidates=(1, 2)):
-        self.executor, self.run_dir, self.progress = _feedback_executor(tmp_path)
+    def __init__(self, tmp_path, candidates=(1, 2), *, stack_size=0):
+        self.executor, self.run_dir, self.progress = _feedback_executor(
+            tmp_path, stack_size=stack_size)
+        self.stack_size = stack_size
         self.candidates = tuple(candidates)
         self.executor.filter_result = list(candidates)
         self.workdir = tmp_path / "workdir"
@@ -58,7 +61,7 @@ class _CaptureRun:
         self.baseline.record(case, filename, representative=0, members=[],
                              probe=_probe(outcome, fault), branches=branches,
                              artifact=str(self.workdir / "target.orig"),
-                             snapshots=_states(0, values, branches))
+                             snapshots=_states(0, values, branches, self.stack_size))
         self.verifier.start(case, filename)
         return filename
 
@@ -72,7 +75,7 @@ class _CaptureRun:
             members=[patch] if members is None else members,
             probe=_probe(outcome, fault), branches=branches,
             artifact=str(self.workdir / "target.orig"),
-            snapshots=_states(patch, values, branches) if captured else None,
+            snapshots=_states(patch, values, branches, self.stack_size) if captured else None,
             observation=observation)
 
     def export(self):
@@ -84,7 +87,7 @@ class _CaptureRun:
 
 
 def test_normalized_round_trip_preserves_order_repetition_and_executed_trace_lengths(tmp_path):
-    run = _CaptureRun(tmp_path)
+    run = _CaptureRun(tmp_path, stack_size=4)
     run.case(0, branches=(0, 0, 0, 0), values=[8, 4, 8, -1])
     first = run.trace(0, 1, branches=(1, 0, 1, 0), values=[8, 4, 8, -1],
                       observation="no-crash-confidence-diff-br")
@@ -94,7 +97,11 @@ def test_normalized_round_trip_preserves_order_repetition_and_executed_trace_len
 
     assert bundle.selected == {1, 2}
     assert set(bundle.traces) == {"c0-b1", first, second}
-    assert [state.registers[0] for state in bundle.states(first)] == [8, 4, 8, (1 << 64) - 1]
+    states = bundle.states(first)
+    assert [state.registers[0] for state in states] == [8, 4, 8, (1 << 64) - 1]
+    assert [state.stack for state in states] == [b"\x00" * 4, b"\x01" * 4, b"\x02" * 4, b"\x03" * 4]
+    assert all(not state.clamps for state in states)
+    assert bundle.metadata["state"]["version"] == 2
     assert bundle.evaluate(1, first) == [1, 0, 1, 0]
     assert bundle.evaluate(2, first) == [1, 0, 1, 0]
     assert bundle.evaluate(1, second) == [0, 1]

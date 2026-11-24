@@ -26,6 +26,7 @@ from .binradar_config import (
 from . import binradar_verifier
 from .binradar_taosc_predicates import (
     AllocatorTrace,
+    CACHED_SNAPSHOT_MAX_STACK_SIZE,
     CWE805PointerPredicate,
     CWE805SizePredicate,
     CWE805_branch_taken,
@@ -231,6 +232,17 @@ def _remove_cached_artifact(workdir: Path,
     binradar_env.pop("BRCACHE_STACK_SIZE", None)
 
 
+def _read_cached_stack_size(stack_file: Path) -> int:
+    try:
+        stack_size = int(stack_file.read_text().strip(), 0)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid stack-size in {stack_file}: {exc}") from exc
+    if not 0 <= stack_size <= CACHED_SNAPSHOT_MAX_STACK_SIZE:
+        raise ValueError(f"invalid stack-size in {stack_file}: "
+                         f"expected 0..{CACHED_SNAPSHOT_MAX_STACK_SIZE}")
+    return stack_size
+
+
 def build_cached_artifact(
     workdir: Path,
     configdir: Path,
@@ -254,26 +266,22 @@ def build_cached_artifact(
         return
 
     manifest_records = survived if survived is not None else selected
+    try:
+        stack_size = _read_cached_stack_size(workdir / "stack-size")
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
     if family == PredicateFamily.CWE805_ERM:
-        stack_size_file = workdir / "stack-size"
-        try:
-            stack_size = int(stack_size_file.read_text().strip(), 0)
-        except (OSError, ValueError) as e:
-            print(f"Error: CWE-805 cache needs a valid {stack_size_file.name}: "
-                  f"{e}")
-            exit(1)
         required_stack_size = max(
             (predicate_stack_bytes(record.parsed)
              for record in manifest_records),
             default=0,
         )
-        if stack_size < required_stack_size or stack_size > 0x100000:
+        if stack_size < required_stack_size:
             print(f"Error: invalid CWE-805 cache stack size {stack_size}; "
                   f"predicates require {required_stack_size} byte(s)")
             exit(1)
-        binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
-    else:
-        binradar_env["BRCACHE_STACK_SIZE"] = "0"
+    binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
     write_runtime_predicates(
         workdir / "brpatches.json", family, manifest_records)
     try:
@@ -1673,7 +1681,6 @@ def _generate_binradar(configdir: Path, workdir: Path) -> None:
     if destination is None or not destination.read_text().strip():
         raise ValueError("patch-destination (or destinations) is required for --generate-binradar")
     allocator = None
-    stack_size = 0
     if family == PredicateFamily.CWE805_ERM:
         trace = workdir / "trace"
         if not trace.exists():
@@ -1681,13 +1688,8 @@ def _generate_binradar(configdir: Path, workdir: Path) -> None:
         allocator = parse_allocator_trace(trace)
         if allocator is None:
             raise ValueError(f"ERM CWE-805 requires a complete allocator trace in {trace}")
-        stack_file = _generation_metadata_file(configdir, workdir, "stack-size")
-        try:
-            stack_size = int(stack_file.read_text().strip(), 0)
-        except ValueError as exc:
-            raise ValueError(f"invalid stack-size in {stack_file}: expected 0..1048576") from exc
-        if not 0 <= stack_size <= 0x100000:
-            raise ValueError(f"invalid stack-size in {stack_file}: expected 0..1048576")
+    stack_size = _read_cached_stack_size(
+        _generation_metadata_file(configdir, workdir, "stack-size"))
 
     workdir.mkdir(parents=True, exist_ok=True)
     _prepare_original_settings(configdir, workdir, env, location)

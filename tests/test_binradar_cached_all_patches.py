@@ -196,7 +196,18 @@ def test_cwe805_coverage_requires_only_the_used_stack_bytes(
     assert (coverage.reason == "") if expected else bool(coverage.reason)
 
 
-@pytest.mark.parametrize("kind,stack_size", [("generic-erm", 0), ("CWE805-erm", 64)])
+@pytest.mark.parametrize("stack_size", [-1, 0x100001])
+def test_generic_cache_manifest_rejects_out_of_bounds_stack(tmp_path, stack_size):
+    (tmp_path / "bin.brcached").write_bytes(b"cached")
+    _write_manifest(tmp_path, ["p0"], kind="generic-erm")
+    coverage = binradar_verifier.load_cached_predicate_set(
+        tmp_path / "brpatches.json", tmp_path / "bin.brcached",
+        "generic-erm", stack_size, [1])
+    assert coverage.predicates is None
+    assert "invalid cache stack size" in coverage.reason
+
+
+@pytest.mark.parametrize("kind,stack_size", [("generic-erm", 8), ("CWE805-erm", 64)])
 def test_baseline_capture_accepts_empty_manifest(tmp_path, kind, stack_size):
     artifacts = binradar_artifacts.ArtifactSet(
         str(tmp_path), "bin", kind, stack_size, 0)

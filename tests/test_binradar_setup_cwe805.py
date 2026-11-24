@@ -747,8 +747,11 @@ def _run_cached_runtime_test(tmp_path, cwe805):
 def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
     predicates = binradar_setup.binradar_taosc_predicates
 
+    expected_stack = [bytes.fromhex(first + " 11 12 13 14 15 16 17")
+                      for first in ("10", "20", "30")]
     generic_run = _run_cached_runtime_test(tmp_path, False)
-    generic_record_size = len(generic_run.stdout) // 3
+    generic_record_size = 32 + 16 * 8 + 8
+    assert len(generic_run.stdout) == 3 * generic_record_size
     snapshots, error = predicates.parse_cached_snapshots(
         generic_run.stdout[:2 * generic_record_size])
     dynamic_snapshots, dynamic_error = predicates.parse_cached_snapshots(
@@ -764,12 +767,14 @@ def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
         "[patch] [id 0] [br 1] [v 0]",
         "[patch] [id 7] [br 1] [v 11]",
     ]
-    assert all(not snapshot.is_CWE805 for snapshot in snapshots)
+    assert all(not snapshot.is_CWE805 for snapshot in snapshots + dynamic_snapshots)
+    assert [snapshot.stack for snapshot in snapshots + dynamic_snapshots] == expected_stack
     assert predicates.evaluate_cached_predicate(
         "=p1p0", [snapshots[0]]) == [0]
 
     cwe805_run = _run_cached_runtime_test(tmp_path, True)
-    cwe805_record_size = len(cwe805_run.stdout) // 3
+    cwe805_record_size = generic_record_size + 256 * 16
+    assert len(cwe805_run.stdout) == 3 * cwe805_record_size
     snapshots, error = predicates.parse_cached_snapshots(
         cwe805_run.stdout[:2 * cwe805_record_size])
     dynamic_snapshots, dynamic_error = predicates.parse_cached_snapshots(
@@ -785,10 +790,9 @@ def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
         "[patch] [id 0] [br 1] [v 0]",
         "[patch] [id 7] [br 1] [v 11]",
     ]
-    assert all(snapshot.is_CWE805 for snapshot in snapshots)
-    assert all(len(snapshot.clamps) == 256 for snapshot in snapshots)
-    assert all(snapshot.stack == b"" for snapshot in snapshots)
-    assert all(snapshot.stack == b"" for snapshot in dynamic_snapshots)
+    assert all(snapshot.is_CWE805 for snapshot in snapshots + dynamic_snapshots)
+    assert all(len(snapshot.clamps) == 256 for snapshot in snapshots + dynamic_snapshots)
+    assert [snapshot.stack for snapshot in snapshots + dynamic_snapshots] == expected_stack
     assert snapshots[0].clamps[0] == (0x1000, 0x2000)
 
 
@@ -808,6 +812,34 @@ def test_runtime_predicate_manifest_round_trip(tmp_path):
     family, loaded = predicates.load_runtime_predicates(path)
     assert family is predicates.PredicateFamily.CWE805_ERM
     assert loaded == {record.runtime_id: record.parsed for record in selected}
+
+
+@pytest.mark.parametrize("defect,error_text", [
+    ("version", "unsupported cached snapshot version 1"),
+    ("flags", "unknown cached snapshot flags"),
+    ("truncated-stack", "partial cached state payload"),
+    ("mixed-stack-sizes", "cached snapshot stack sizes differ"),
+    ("oversize", "cached stack payload too large"),
+])
+def test_generic_cached_snapshot_rejects_malformed_stream(defect, error_text):
+    predicates = binradar_setup.binradar_taosc_predicates
+    header = predicates.CACHED_SNAPSHOT_HEADER
+    registers = predicates.CACHED_SNAPSHOT_REGS.pack(*range(16))
+    stack = b"\x00\xff\x33\x44"
+    good = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 2, 1, 0, len(stack), 0) + registers + stack
+    size = 0x100001 if defect == "oversize" else len(stack)
+    if defect == "mixed-stack-sizes":
+        stack += b"\x55"
+        size = len(stack)
+    if defect == "truncated-stack":
+        stack = stack[:-1]
+    if defect == "version":
+        size, stack = 0, b""
+    bad = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 1 if defect == "version" else 2,
+                      1, 1, size, 8 if defect == "flags" else 0) + registers + stack
+    snapshots, error = predicates.parse_cached_snapshots(good + bad)
+    assert snapshots == []
+    assert error_text in error
 
 
 def test_cached_snapshot_truncation_disables_inference():

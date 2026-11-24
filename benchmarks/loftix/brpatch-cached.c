@@ -9,10 +9,10 @@
  * branch on the separate binary PATCH_CACHED_FD channel.  Other predicates
  * may reuse the process result only when their complete branch vectors match.
  *
- * Generic ERM records contain the 16 register slots.  BRPATCH_CWE805 builds
- * also contain the 256 allocation clamps and BRCACHE_STACK_SIZE bytes from
- * state->rsp, populated by the same mark/set_size/set_base instrumentation as
- * the final .brpatched artifact.
+ * Both ERM families record the 16 register slots and BRCACHE_STACK_SIZE bytes
+ * from state->rsp.  BRPATCH_CWE805 builds additionally record the 256 allocation
+ * clamps populated by the same mark/set_size/set_base instrumentation as the
+ * final .brpatched artifact.
  */
 
 #define BINRADAR_EVAL_ONLY
@@ -39,7 +39,7 @@ _Static_assert(sizeof(struct shmid_ds) == 112,
 #endif
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u /* little-endian bytes "BRCH" */
-#define BRCACHE_SNAPSHOT_VERSION 1u
+#define BRCACHE_SNAPSHOT_VERSION 2u
 #define BRCACHE_FLAG_TRUNCATED 1u
 #define BRCACHE_FLAG_CWE805 2u
 #define BRCACHE_FLAG_INVALID 4u
@@ -176,9 +176,9 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 	}
 
 	uint64_t record_size = sizeof(struct brcache_snapshot_header)
-		+ 16 * sizeof(uint64_t);
+		+ 16 * sizeof(uint64_t) + cache_stack_size;
 #ifdef BRPATCH_CWE805
-	record_size += sizeof(buffers) + cache_stack_size;
+	record_size += sizeof(buffers);
 #endif
 	if (cache_hit_count >= cache_max_hits
 			|| record_size > cache_max_bytes -
@@ -195,11 +195,7 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 		.version = BRCACHE_SNAPSHOT_VERSION,
 		.patch_id = patch_id,
 		.branch = (uint32_t)branch,
-#ifdef BRPATCH_CWE805
 		.stack_size = cache_stack_size,
-#else
-		.stack_size = 0,
-#endif
 		.flags = flags,
 	};
 	int64_t signed_regs[16];
@@ -214,11 +210,9 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 #endif
 	if (!failed)
 		failed = write_all(cache_fd, regs, sizeof(regs));
-#ifdef BRPATCH_CWE805
 	if (!failed)
 		failed = write_all(cache_fd, (const void *)state->rsp,
 		                   cache_stack_size);
-#endif
 	if (failed) {
 		cache_truncated = 1;
 	} else {

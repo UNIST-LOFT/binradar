@@ -259,12 +259,13 @@ def test_historical_probe_cannot_claim_current_concrete_oracle(version):
         restored.serialize()
 
 
-@pytest.mark.parametrize("defect", ["raw-id", "family", "partial", "hit-count", "text-id"])
+@pytest.mark.parametrize("defect", ["raw-id", "family", "partial", "hit-count", "text-id", "stack-size"])
 def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, monkeypatch, defect):
     from binradar import binradar_taosc_predicates as predicates
 
     runner = binradar_verifier.BinRadarQemuRunner(
-        str(tmp_path), "target", "@@", "0x1000", patch_kind="generic-erm")
+        str(tmp_path), "target", "@@", "0x1000", patch_kind="generic-erm",
+        brcache_stack_size=8 if defect == "stack-size" else 0)
     flags = predicates.CACHED_SNAPSHOT_FLAG_CWE805 if defect == "family" else 0
     raw = predicates.CACHED_SNAPSHOT_HEADER.pack(
         predicates.CACHED_SNAPSHOT_MAGIC, predicates.CACHED_SNAPSHOT_VERSION,

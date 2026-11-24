@@ -26,6 +26,7 @@ from . import binradar_utils
 from .binradar_feedback_capture import CaptureJournal
 from .binradar_input_schedule import InputScore, split_score
 from .binradar_taosc_predicates import (
+    CACHED_SNAPSHOT_MAX_STACK_SIZE,
     CachedSnapshot,
     GenericEnvironments,
     ParsedPredicate,
@@ -481,13 +482,15 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
             None, None,
             f"missing runtime patch ids {missing[:8]}"
             + (" (truncated)" if len(missing) > 8 else ""))
+    if not 0 <= brcache_stack_size <= CACHED_SNAPSHOT_MAX_STACK_SIZE:
+        return CachedPredicateSet(
+            None, None, f"invalid cache stack size {brcache_stack_size}")
     if family == PredicateFamily.CWE805_ERM:
         required_stack_size = max(
             (predicate_stack_bytes(predicates[patch]) for patch in patches),
             default=0,
         )
-        if brcache_stack_size < required_stack_size \
-                or brcache_stack_size > 0x100000:
+        if brcache_stack_size < required_stack_size:
             return CachedPredicateSet(
                 None, None,
                 f"CWE-805 cache stack size {brcache_stack_size} does not "
@@ -1425,6 +1428,10 @@ class BinRadarQemuRunner:
                or snapshot.is_CWE805 != (not isinstance(predicate, str))
                for snapshot in snapshots):
             logger.warning("Cached capture runtime id or predicate family mismatch")
+            return probe, None
+        if any(len(snapshot.stack) != self.brcache_stack_size
+               for snapshot in snapshots):
+            logger.warning("Cached capture stack size mismatch")
             return probe, None
         if probe.patch_hit_cnt != len(snapshots):
             logger.warning(

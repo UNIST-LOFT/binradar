@@ -14,13 +14,14 @@ from binradar import binradar_taosc_predicates as predicates
 from test_binradar_evidence import _frame, _group
 
 
-def _feedback_executor(tmp_path):
+def _feedback_executor(tmp_path, *, stack_size=0):
     workdir = tmp_path / "workdir"
     run_dir = workdir / "out" / "run-00000"
     (run_dir / "minimized").mkdir(parents=True)
     (workdir / "poc").mkdir()
     (workdir / "poc" / "input").write_bytes(b"poc")
-    (workdir / "binradar.env").write_text("BINARY=target\n")
+    (workdir / "binradar.env").write_text(
+        f"BINARY=target\nBRCACHE_STACK_SIZE={stack_size}\n")
     (workdir / "brpatches.json").write_text(json.dumps({"version": 1, "kind": "generic-erm",
         "predicates": [{"id": 1, "source_line": 2, "descriptor": "p0"},
                        {"id": 2, "source_line": 4, "descriptor": "p1"}]}))

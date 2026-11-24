@@ -106,7 +106,7 @@ int main(void)
 {
 	if (check_cached_admission())
 		return 90;
-	uint8_t stack[8] = {0};
+	uint8_t stack[8] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17};
 	struct STATE state = {0};
 	state.rsp = (int64_t)(uintptr_t)stack;
 	int patch_fds[2], cache_fds[2];
@@ -114,11 +114,11 @@ int main(void)
 		return 1;
 	patch_fd = patch_fds[1];
 	cache_fd = cache_fds[1];
+	cache_stack_size = sizeof(stack);
 
 #ifdef BRPATCH_CWE805
 	if (setenv_checked("TAOSC_PRED", "c1p0") < 0)
 		return 2;
-	cache_stack_size = 0;
 	memset(buffers, 0, sizeof(buffers));
 	buffers[0].begin = 0x1000;
 	buffers[0].end = 0x2000;
@@ -126,6 +126,7 @@ int main(void)
 	state.rax = 0x1500;
 	if (dest(&state) != NULL)
 		return 3;
+	stack[0] = 0x20;
 
 	if (setenv_checked("TAOSC_PRED", "c1p1") < 0)
 		return 4;
@@ -140,6 +141,7 @@ int main(void)
 		return 6;
 	if (dest(&state) != NULL)
 		return 7;
+	stack[0] = 0x20;
 
 	if (setenv_checked("TAOSC_PRED", "=p0p0") < 0)
 		return 8;
@@ -171,6 +173,7 @@ int main(void)
 	if (dest(&state) != NULL)
 		return 10;
 
+	stack[0] = 0x30;
 	selector->patch_id = 7;
 	selector->iteration = 11;
 	selector->descriptor_length = strlen(dynamic_descriptor);
