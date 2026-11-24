@@ -2,7 +2,7 @@ import "../../Justfile"
 import? 'dev.justfile'
 
 poc_input := env("POC_INPUT")
-poc_dir := env("POC_DIR", "poc")
+poc_dir := env("POC_DIR", "input/poc")
 binary := env("BINARY")
 guix_spec := env("GUIX_SPEC")
 test_cmd := env("TEST_CMD")

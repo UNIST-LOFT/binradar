@@ -23,7 +23,7 @@ just build
 # guix build binutils@2.29
 just taosc
 # Or run directly
-guix shell taosc -- taosc-fix 10 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
+guix shell taosc -- taosc-fix 10 workdir input/poc "$(guix build binutils@2.29)/bin/nm" -l @@
 ```
 
 ## Patch families

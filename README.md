@@ -60,7 +60,7 @@ cd benchmarks/loftix/binutils/CVE-2017-14940
 just build
 # guix build binutils@2.29 # build buggy program
 just taosc
-# guix shell taosc -- taosc-fix 1 workdir poc "$(guix build binutils@2.29)/bin/nm" -l @@
+# guix shell taosc -- taosc-fix 1 workdir input/poc "$(guix build binutils@2.29)/bin/nm" -l @@
 just setup
 # uv run /path/to/binradar/binradar-setup.py setup -w workdir
 just binradar-fo
@@ -83,8 +83,8 @@ uv run ../../binradar-collect-results.py binradar --run-prefix br-fo --format ts
 ### Configuration
 Binradar requires `binradar.env` file in work directory.
 ```
-POC_INPUT="poc/nullderef"
-POC_DIR="poc"
+POC_INPUT="input/poc/nullderef"
+POC_DIR="input/poc"
 BINARY="nm"
 TEST_CMD="-l @@"
 PATCH_LOC="0x4585dd"
@@ -103,8 +103,8 @@ If you want to add more configuration,
 you need to provide `config.env` file.
 For example, `benchmarks/loftix/binutils/CVE-2017-14940/config.env` contains:
 ```
-POC_INPUT="poc/nullderef"
-POC_DIR="poc"
+POC_INPUT="input/poc/nullderef"
+POC_DIR="input/poc"
 BINARY="nm"
 TEST_CMD="-l @@"
 GUIX_SPEC="binutils@2.29"
