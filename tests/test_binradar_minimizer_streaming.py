@@ -8,6 +8,8 @@ and keeps standalone snapshot behavior.
 """
 
 import os
+import hashlib
+import json
 import queue
 import subprocess
 import sys
@@ -87,11 +89,27 @@ def _publish(path: Path, data: bytes) -> None:
     partial.replace(path)
 
 
+def _original_settings(tmp_path):
+    (tmp_path / "nm.orig").write_bytes(b"actual original")
+    (tmp_path / "poc").write_bytes(b"authenticated poc")
+    return {"BINARY": "nm", "TEST_CMD": "-l @@", "PATCH_LOC": "0x1000",
+            "POC_INPUT": "poc"}
+
+
+def _original_runner(workdir, original):
+    runner = binradar_verifier.BinRadarQemuRunner(
+        dir=str(workdir), binary="nm", test_cmd='-l "@@"', patch_loc="0x1000")
+    runner.test_with_original = original
+    return runner
+
+
 def _make_minimizer(tmp_path, testcase_dirs, **kwargs):
     run_dir = tmp_path / "run"
     run_dir.mkdir(exist_ok=True)
+    config = (_original_settings(tmp_path)
+              if kwargs.get("baseline") is binradar_config.ConcreteBaseline.ORIGINAL else {})
     return binradar_minimizer.BinRadarMinimizer(
-        str(tmp_path), str(run_dir), _probe(), testcase_dirs, {}, **kwargs)
+        str(tmp_path), str(run_dir), _probe(), testcase_dirs, config, **kwargs)
 
 
 def _make_verifier(tmp_path, patches=(1,)):
@@ -148,7 +166,7 @@ def test_original_minimizer_retains_unique_reached_bytes_and_real_observations(
 
     monkeypatch.setattr(
         binradar_verifier.BinRadarQemuRunner, "from_env",
-        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+        staticmethod(lambda workdir, env: _original_runner(workdir, original)))
     # No patched/cached artifact, map, manifest, capture, or novelty machinery
     # may be consulted, even when stale candidate configuration is nonzero.
     def forbidden(*args, **kwargs):
@@ -161,7 +179,11 @@ def test_original_minimizer_retains_unique_reached_bytes_and_real_observations(
     run_dir.mkdir()
     minimizer = binradar_minimizer.BinRadarMinimizer(
         str(tmp_path), str(run_dir), _probe("crash"), [str(inputs)],
-        {"TOTAL_PATCHES": str(total_patches)},
+        {**_original_settings(tmp_path), "TOTAL_PATCHES": str(total_patches),
+         # Caller claims are not execution evidence: the actual fake runner
+         # still executes nm.orig at 0x1000 with -l @@.
+         "BINARY": "claimed", "TEST_CMD": "--claimed @@", "PATCH_LOC": "0x9999",
+         "original_sha256": "f" * 64},
         baseline=binradar_config.ConcreteBaseline.ORIGINAL)
     assert not minimizer.run_testcases()
     retained = {p.name: p.read_bytes() for p in (run_dir / "minimized").iterdir()}
@@ -189,6 +211,11 @@ def test_original_minimizer_retains_unique_reached_bytes_and_real_observations(
     assert "[pid " not in text and "[br [" not in text
     assert "[minimizer] [done]" in text
     assert not (run_dir / "feedback-capture").exists()
+    identity = json.loads((run_dir / "original-identity.json").read_text())
+    assert identity == {"schema_version": 1, "kind": "original-only-minimizer", "binary": "nm",
+                        "original_sha256": hashlib.sha256(b"actual original").hexdigest(),
+                        "invocation": ["-l", "@@"], "patch_location": "0x1000",
+                        "poc": {"path": "poc", "sha256": hashlib.sha256(b"authenticated poc").hexdigest()}}
 
 
 def test_original_stream_drains_final_atomic_publication(tmp_path, monkeypatch):
@@ -209,7 +236,7 @@ def test_original_stream_drains_final_atomic_publication(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         binradar_verifier.BinRadarQemuRunner, "from_env",
-        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+        staticmethod(lambda workdir, env: _original_runner(workdir, original)))
     minimizer = _make_minimizer(
         tmp_path, [str(inputs)], min_file_age=0,
         baseline=binradar_config.ConcreteBaseline.ORIGINAL)
@@ -239,7 +266,7 @@ def test_original_minimizer_deadline_preserves_only_completed_evidence(tmp_path,
 
     monkeypatch.setattr(
         binradar_verifier.BinRadarQemuRunner, "from_env",
-        staticmethod(lambda workdir, env: SimpleNamespace(test_with_original=original)))
+        staticmethod(lambda workdir, env: _original_runner(workdir, original)))
     minimizer = _make_minimizer(
         tmp_path, [str(inputs)], baseline=binradar_config.ConcreteBaseline.ORIGINAL)
     assert minimizer.run_testcases(timeout=1)
@@ -250,6 +277,71 @@ def test_original_minimizer_deadline_preserves_only_completed_evidence(tmp_path,
     assert text.count("[original-result]") == 1
     assert "[minimizer] [stopped] [reason wall-time-reached]" in text
     assert "[minimizer] [done]" not in text
+
+
+@pytest.mark.parametrize("damage", ["original", "poc", "command", "site"])
+def test_original_producer_never_completes_with_changed_execution_identity(
+        tmp_path, monkeypatch, damage):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    _publish(inputs / "a", b"input")
+    def original(testcase, verbose=False):
+        if damage in ("original", "poc"):
+            path = tmp_path / ("nm.orig" if damage == "original" else "poc")
+            path.write_bytes(b"changed executed identity")
+        elif damage == "command":
+            runner.test_cmd = "--different @@"
+        else:
+            runner.patch_loc = "0x2000"
+        return _probe()
+    runner = _original_runner(tmp_path, original)
+    monkeypatch.setattr(binradar_verifier.BinRadarQemuRunner, "from_env",
+                        staticmethod(lambda workdir, env: runner))
+    minimizer = _make_minimizer(tmp_path, [str(inputs)],
+                                baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    with pytest.raises(RuntimeError, match="identity changed"):
+        minimizer.run_testcases()
+    text = (tmp_path / "run/minimizer.sbsv").read_text()
+    assert "[original-result]" not in text
+    assert "[minimizer] [done]" not in text and "[minimizer] [stopped]" not in text
+
+
+@pytest.mark.parametrize("damage", ["original", "poc"])
+def test_original_producer_checks_identity_even_when_no_cases_execute(
+        tmp_path, monkeypatch, damage):
+    runner = _original_runner(tmp_path, lambda *args, **kwargs: pytest.fail("unexpected execution"))
+    monkeypatch.setattr(binradar_verifier.BinRadarQemuRunner, "from_env",
+                        staticmethod(lambda workdir, env: runner))
+    minimizer = _make_minimizer(tmp_path, [], baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    def mutate_at_final_scan(**kwargs):
+        (tmp_path / ("nm.orig" if damage == "original" else "poc")).write_bytes(b"changed")
+    monkeypatch.setattr(minimizer, "scan_testcases", mutate_at_final_scan)
+    with pytest.raises(RuntimeError, match="identity changed"):
+        minimizer.run_testcases()
+    assert "[minimizer] [done]" not in (tmp_path / "run/minimizer.sbsv").read_text()
+
+
+@pytest.mark.parametrize("damage", ["original", "poc", "manifest"])
+def test_original_producer_rechecks_identity_before_graceful_cutoff(
+        tmp_path, monkeypatch, damage):
+    runner = _original_runner(tmp_path, lambda *args, **kwargs: pytest.fail("unexpected execution"))
+    monkeypatch.setattr(binradar_verifier.BinRadarQemuRunner, "from_env",
+                        staticmethod(lambda workdir, env: runner))
+    minimizer = _make_minimizer(tmp_path, [], baseline=binradar_config.ConcreteBaseline.ORIGINAL)
+    def cutoff(deadline):
+        if damage == "manifest":
+            path = tmp_path / "run/original-identity.json"
+            value = json.loads(path.read_text())
+            value["invocation"] = ["--different", "@@"]
+            path.write_text(json.dumps(value))
+        else:
+            (tmp_path / ("nm.orig" if damage == "original" else "poc")).write_bytes(b"changed")
+        raise binradar_minimizer._MinimizerTimeout()
+    monkeypatch.setattr(minimizer, "_raise_if_timed_out", cutoff)
+    with pytest.raises(RuntimeError, match="identity changed"):
+        minimizer.run_testcases(timeout=1)
+    text = (tmp_path / "run/minimizer.sbsv").read_text()
+    assert "[minimizer] [done]" not in text and "[minimizer] [stopped]" not in text
 
 
 @pytest.mark.parametrize("config", [

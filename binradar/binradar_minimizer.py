@@ -7,6 +7,9 @@ import subprocess
 import tempfile
 import shutil
 import hashlib
+import json
+from pathlib import Path
+import shlex
 import heapq
 import time
 from contextlib import ExitStack
@@ -235,6 +238,8 @@ class BinRadarMinimizer:
         returned.
         """
         runner = binradar_verifier.BinRadarQemuRunner.from_env(self.work_dir, self.config)
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            self._record_original_identity(runner)
         deadline = (time.monotonic() + timeout
                     if timeout is not None and timeout > 0 else None)
         id = 0
@@ -294,6 +299,8 @@ class BinRadarMinimizer:
                              f"[patch-signatures {counts['patch_signatures']}] "
                              f"[edges {counts['edges']}]")
         except _MinimizerTimeout:
+            if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+                self._check_original_identity(runner, final=True)
             if self._capture_journal is not None:
                 self._capture_journal.finish(binradar_utils.WALL_TIME_REACHED)
             self.log(f"[minimizer] [stopped] "
@@ -312,6 +319,8 @@ class BinRadarMinimizer:
             self._scorer = None
         if self._capture_journal is not None:
             self._capture_journal.finish("done")
+        if self.baseline is binradar_config.ConcreteBaseline.ORIGINAL:
+            self._check_original_identity(runner, final=True)
         self.log("[minimizer] [done]")
         return False
 
@@ -363,9 +372,58 @@ class BinRadarMinimizer:
             stream.write(testcase.data)
         return save_file
 
+    def _original_identity(self, runner) -> dict:
+        original = Path(runner.original_binary())
+        poc = Path(self.work_dir) / self.config["POC_INPUT"]
+        for path in (original, poc):
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(f"original-only identity requires a regular file: {path}")
+        def digest(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+        return {"schema_version": 1, "kind": "original-only-minimizer",
+                "binary": runner.binary, "original_sha256": digest(original),
+                "invocation": shlex.split(runner.test_cmd),
+                "patch_location": f"0x{int(runner.patch_loc, 16):x}",
+                "poc": {"path": str(Path(self.config["POC_INPUT"])),
+                        "sha256": digest(poc)}}
+
+    def _record_original_identity(self, runner) -> None:
+        # Read the runner, not a caller's claimed artifact hash or invocation.
+        self._original_execution_identity = self._original_identity(runner)
+        self._original_execution_settings = (runner.binary, runner.test_cmd, runner.patch_loc,
+                                             self.config["POC_INPUT"])
+        self._original_execution_files = {
+            path: self._file_version(path.stat()) for path in (
+                Path(runner.original_binary()), Path(self.work_dir) / self.config["POC_INPUT"])}
+        path = Path(self.run_dir) / "original-identity.json"
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            with temporary.open("w") as stream:
+                json.dump(self._original_execution_identity, stream, sort_keys=True)
+                stream.write("\n")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _check_original_identity(self, runner, *, final: bool = False) -> None:
+        if ((runner.binary, runner.test_cmd, runner.patch_loc, self.config["POC_INPUT"])
+                != self._original_execution_settings
+                or any(path.is_symlink() or self._file_version(path.stat()) != version
+                       for path, version in self._original_execution_files.items())
+                or (final and (self._original_identity(runner) != self._original_execution_identity
+                               or json.loads((Path(self.run_dir) / "original-identity.json").read_text())
+                               != self._original_execution_identity))):
+            raise RuntimeError("original-only execution identity changed during minimization")
+
     def _process_original(self, runner, testcase: TestcaseInfo, id: int,
                           current_testcase: str, check) -> int:
+        self._check_original_identity(runner)
         run_res = runner.test_with_original(current_testcase, verbose=False)
+        self._check_original_identity(runner)
         check()
         if run_res is None:
             self.log(f"Failed {testcase.filename} with error.")
