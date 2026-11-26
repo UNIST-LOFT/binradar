@@ -1,10 +1,12 @@
-#!/usr/bin/python3 -u
+#!/usr/bin/env python3
 
-import os
-import sys
-import subprocess
 import argparse
+from contextlib import closing
+import os
 import re
+import subprocess
+import sys
+import tempfile
 
 MODELS_LIBC = ["malloc", "free", "realloc", "calloc", "printf", "fprintf", "vfprintf", "fputc", "_IO_printf"]
 MODELS = [
@@ -34,132 +36,134 @@ MODELS = [
     "strtoull",
 ]
 
-def run(args):
-    try:
-        p = subprocess.Popen(args, stdout=subprocess.PIPE)
-        data = p.communicate()
-        stdout = str(data[0].decode('ascii'))
-        return stdout
-    except Exception as e:
-        print("Error when running the program: %s" % e)
-    return None
+_LABEL = re.compile(r"^([0-9a-fA-F]+) <([^>]+)>:$")
 
 
-def process_plt_libc(binary, outfile=None):
-    # base_address = subprocess.check_output (
-    #     "readelf -l %s | grep LOAD | head -n 1" % binary, shell=True )
-    # base_address = base_address.decode('ascii')
-    # base_address = int(list(filter(lambda x: x != '', base_address.split(" ")))[2], 16)
+def _labels(binary, objdump):
+    """Stream labels once; closing early stops disassembly after the base PC."""
+    command = [objdump, "-d", "--", binary]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True,
+                          encoding="utf-8", errors="replace",
+                          env={**os.environ, "LC_ALL": "C"}) as process:
+        try:
+            for line in process.stdout:
+                match = _LABEL.match(line.strip())
+                if match:
+                    yield int(match[1], 16), match[2]
+            status = process.wait()
+            if status:
+                raise subprocess.CalledProcessError(status, command)
+        finally:
+            # libc needs only the first label. Close the pipe so the producer
+            # gets SIGPIPE, then let Popen reap it; explicit kill is forbidden
+            # in the observation sandbox.
+            process.stdout.close()
 
-    base_address = subprocess.check_output ("objdump -d %s | head | grep 0000" % binary, shell=True )
-    base_address = base_address.decode('ascii')
-    base_address = int(base_address.split(' ')[0], 16)
 
-    try:
-        res = subprocess.check_output (
-            "nm -D %s" % binary, shell=True )
-        res = res.decode('ascii')
-        # print(res)
-    except:
-        res = ""
-    for el in res.split("\n"):
-        if el == "":
+def process_plt_libc(binary, outfile=None, *, objdump, nm):
+    with closing(_labels(binary, objdump)) as labels:
+        first = next(labels, None)
+    if first is None:
+        raise ValueError(f"No disassembly base found: {binary}")
+    base_address = first[0]
+    symbols = subprocess.check_output(
+        [nm, "-D", "--", binary], text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "LC_ALL": "C"})
+    for line in symbols.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or fields[1] not in ("T", "W"):
             continue
-        split = el.split(" ")
-        if len(split) != 3:
-            continue
-        addr = int(split[0], 16) - base_address
-        name = split[2].split('@', 1)[0]
-        type = split[1]
-        if type not in ["T", "W"]:
-            continue
-        # print(name)
-        # Only ordinary defined entries are dispatch PCs.  GNU IFUNC ('i')
-        # values designate resolvers, not implementations; the tracer learns
-        # actual implementations from completed guest PLT/GOT resolution.
+        name = fields[2].split("@", 1)[0]
+        # GNU IFUNC values designate resolvers, not implementations. The
+        # tracer learns actual implementations from guest PLT/GOT resolution.
         if name in MODELS_LIBC or name in MODELS:
-            if outfile is None:
-                print("%s,%s,0x%x" % (os.path.basename(binary), name, addr))
-            else:
-                outfile.write("%s,%s,0x%x\n" % (os.path.basename(binary), name, addr))
+            address = int(fields[0], 16) - base_address
+            print(f"{os.path.basename(binary)},{name},0x{address:x}", file=outfile)
 
-def process_plt(binary, outfile=None):
-    # base_address = subprocess.check_output (
-    #     "readelf -l %s | grep LOAD | head -n 1" % binary, shell=True )
-    # base_address = base_address.decode('ascii')
-    # base_address = int(list(filter(lambda x: x != '', base_address.split(" ")))[2], 16)
 
-    base_address = subprocess.check_output ("objdump -d %s | head | grep 0000" % binary, shell=True )
-    base_address = base_address.decode('ascii')
-    base_address = int(base_address.split(' ')[0], 16)
+def process_plt(binary, outfile=None, *, objdump):
+    base_address = None
+    with closing(_labels(binary, objdump)) as labels:
+        for address, label in labels:
+            if base_address is None:
+                base_address = address
+            if not label.endswith("@plt"):
+                continue
+            name = label.split("@", 1)[0]
+            if name in MODELS or name in MODELS_LIBC:
+                print(f"{os.path.basename(binary)},{name},0x{address - base_address:x}",
+                      file=outfile)
+    if base_address is None:
+        raise ValueError(f"No disassembly base found: {binary}")
 
-    try:
-        res = subprocess.check_output (
-            "objdump -d %s | grep \@plt\>\:" % binary, shell=True )
-        res = res.decode('ascii')
-    except:
-        res = ""
-    for el in res.split("\n"):
-        if el == "":
-            continue
-        split = el.split(" ")
-        addr = int(split[0], 16) - base_address
-        name = split[1][1:split[1].find("@")]
-        if name in MODELS or name in MODELS_LIBC:
-            if outfile is None:
-                print("%s,%s,0x%x" % (os.path.basename(binary), name, addr))
-            else:
-                outfile.write("%s,%s,0x%x\n" % (os.path.basename(binary), name, addr))
+
+def _libraries(binary, ldd):
+    command = [ldd, binary]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            env={**os.environ, "LC_ALL": "C"})
+    diagnostic = result.stdout + result.stderr
+    if result.returncode and not any(message in diagnostic for message in (
+            "not a dynamic executable", "statically linked")):
+        raise subprocess.CalledProcessError(
+            result.returncode, command, result.stdout, result.stderr)
+    libraries = []
+    for line in result.stdout.splitlines():
+        if "=> not found" in line:
+            raise ValueError(f"Unresolved dependency: {line.strip()}")
+        match = re.match(r"\s*\S+ => (.+) \(0x[0-9a-fA-F]+\)\s*$", line)
+        if match and "libdl.so" not in match[1]:
+            libraries.append(match[1])
+    return libraries
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--output', metavar='<output>',
-                            type=str, help='output path')
-    parser.add_argument('binary', metavar='<binary>',
-                            type=str, help='path to the binary to run')
-
+    parser.add_argument('-o', '--output', help='output path')
+    # Standalone CLI defaults use PATH. BinRadar always supplies paths.py's
+    # tool choices explicitly, including when this file runs under -I -S.
+    parser.add_argument('--objdump', default="objdump", help='objdump executable')
+    parser.add_argument('--nm', default="nm", help='nm executable')
+    parser.add_argument('--ldd', default="ldd", help='ldd executable')
+    parser.add_argument('binary', help='path to the binary to inspect')
     args = parser.parse_args()
-
-    if not os.path.exists(args.binary):
-        print("Invalid binary: %s" % args.binary)
-        sys.exit(1)
-
-    ldd_out = run(["ldd", args.binary])
-    ldd_out = ldd_out.strip("\t").split("\n")
-    libs = []
-    for lib in ldd_out:
-        matches = re.findall(".* => (.+) \(.+\)", lib)
-        for m in matches:
-            if "libdl.so" not in m:
-                libs.append(m)
-
-    # Two generation runs may prepare the same shared outdir concurrently.
-    # Write the whole table to a private sibling and publish by rename, so a
-    # reader never sees a truncated PLT table and one run cannot interleave
-    # bytes with the other.
+    binary = os.path.abspath(args.binary)
     temporary = None
-    outfile = None
-    if args.output:
-        temporary = args.output + f".{os.getpid()}.part"
-        outfile = open(temporary, "w")
+    try:
+        if not os.path.isfile(binary):
+            raise ValueError(f"Invalid binary: {args.binary}")
+        binaries = [binary, *_libraries(binary, args.ldd)]
 
-    binaries = [ args.binary ] + libs
-    for b in binaries:
-        if "libc.so" in b:
-            process_plt_libc(b, outfile)
+        def emit(outfile):
+            for image in binaries:
+                if "libc.so" in os.path.basename(image):
+                    process_plt_libc(image, outfile, objdump=args.objdump, nm=args.nm)
+                else:
+                    process_plt(image, outfile, objdump=args.objdump)
+
+        if args.output:
+            # Publish only the complete table. A failing tool must neither
+            # replace an existing table nor leave a partial one for a reader.
+            destination = os.path.abspath(args.output)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                             dir=os.path.dirname(destination),
+                                             prefix=os.path.basename(destination) + ".",
+                                             suffix=".part", delete=False) as outfile:
+                temporary = outfile.name
+                emit(outfile)
+            os.replace(temporary, destination)
+            temporary = None
         else:
-            process_plt(b, outfile)
-
-    if outfile:
-        outfile.close()
-        try:
-            os.replace(temporary, args.output)
-        except OSError:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+            emit(sys.stdout)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"Failed to find model addresses: {error}", file=sys.stderr)
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr.rstrip(), file=sys.stderr)
+        return 1
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+    return 0
 
 
 if __name__ == "__main__":

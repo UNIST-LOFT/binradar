@@ -7,6 +7,7 @@ Guix. E9TOOL/E9COMPILE select individual executables, never shell commands.
 import os
 import shutil
 import subprocess
+import sys
 from functools import cache
 from pathlib import Path
 
@@ -23,6 +24,9 @@ TARGETED_FUZZER_BIN = str(_CHECKOUT / "LibAFL/fuzzers/binary_only/qemu_targeted_
 LEGACY_AFL_SUPPORT_DIR = str(_CHECKOUT.parent / "AFLplusplus")
 
 FIND_MODELS_SCRIPT = str(_PACKAGE_DIR / "find_models_addrs.py")
+OBJDUMP_BIN = "objdump"
+NM_BIN = "nm"
+LDD_BIN = "ldd"
 OBSERVATION_SANDBOX_SCRIPT = str(_CHECKOUT / "utils/taosc-llm/src/taosc_llm/_sandbox.py")
 LOFTIX_DIR = str(_CHECKOUT / "benchmarks/loftix")
 BENCHMARK_SCRIPTS = _CHECKOUT / "benchmarks/scripts"
@@ -30,6 +34,13 @@ BRPATCH_SOURCE = _CHECKOUT / "benchmarks/loftix/brpatch.c"
 BRPATCH_CACHED_SOURCE = _CHECKOUT / "benchmarks/loftix/brpatch-cached.c"
 
 E9_GUIX_SPEC = "e9patch@1.0.1"
+
+
+def find_models_command(binary: str, output: str, *, isolated: bool = False) -> list[str]:
+    """Launch the stdlib-only helper with the deployment's native tools."""
+    return [sys.executable, *(["-I", "-S"] if isolated else []), FIND_MODELS_SCRIPT,
+            "--objdump", OBJDUMP_BIN, "--nm", NM_BIN, "--ldd", LDD_BIN,
+            "-o", output, "--", binary]
 
 
 @cache

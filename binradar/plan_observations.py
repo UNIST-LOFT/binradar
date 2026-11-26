@@ -252,7 +252,7 @@ def _collect(args, output: Path) -> dict:
         if dynamic:
             environment = {"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C",
                            "HOME": str(scratch), "TMPDIR": str(scratch)}
-            result = _sandbox([sys.executable, "-I", "-S", paths.FIND_MODELS_SCRIPT, "-o", "plt_info.txt", "subject.orig"],
+            result = _sandbox(paths.find_models_command("subject.orig", "plt_info.txt", isolated=True),
                               scratch, environment, args.timeout, output / "models",
                               (Path(paths.FIND_MODELS_SCRIPT),))
             if result != 0 or not plt.is_file():

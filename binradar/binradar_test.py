@@ -640,7 +640,7 @@ def run_tracer_probe(workdir: str, env: Dict[str, str],
         try:
             os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
-                [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, orig_bin],
+                paths.find_models_command(orig_bin, plt_info),
                 cwd=workdir, timeout=30, verbose=False)
         except Exception:
             pass
@@ -731,7 +731,7 @@ def run_memcheck_reach_probe(workdir: str, env: Dict[str, str],
         try:
             os.makedirs(os.path.dirname(plt_info), exist_ok=True)
             regen_result = binradar_utils.execute(
-                [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, orig_bin],
+                paths.find_models_command(orig_bin, plt_info),
                 cwd=workdir, timeout=30, verbose=False)
         except Exception:
             pass
@@ -2372,8 +2372,7 @@ def _run_overhead_subject(exp_dir, display, args):
         if shutil.which(paths.TRACER_BIN) is not None:
             try:
                 prepared = binradar_utils.execute(
-                    [sys.executable, paths.FIND_MODELS_SCRIPT,
-                     "-o", plt_info, binary], env=base_env, cwd=workdir,
+                    paths.find_models_command(binary, plt_info), env=base_env, cwd=workdir,
                     timeout=30, verbose=False)
                 if (not prepared.success or prepared.exit_code != 0
                         or not os.path.isfile(plt_info) or os.path.getsize(plt_info) == 0):

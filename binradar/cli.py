@@ -940,7 +940,7 @@ class BinRadarExecutor:
             logger.info(f"PLT info file already exists: {plt_info}")
             return plt_info
         plt_result = binradar_utils.execute(
-            [sys.executable, paths.FIND_MODELS_SCRIPT, "-o", plt_info, self.artifacts.original])
+            paths.find_models_command(self.artifacts.original, plt_info))
         if not plt_result.success:
             logger.warning("Failed to find PLT info. PLT-based optimizations will be disabled.")
             sys.exit(plt_result.exit_code)
