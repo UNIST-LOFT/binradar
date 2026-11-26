@@ -697,6 +697,8 @@ class TracerExecutor:
         self.stop_reason = StopReason.EXHAUSTED
         self.run_result: Optional[binradar_utils.ExecutionResult] = None
         self.transport: Optional[ForkserverTransport] = None
+        self.stderr_path = str(
+            Path(rundir).resolve() / f"{mode}-tracer-stderr.log")
         self.collection_status_path = str(
             Path(rundir).resolve() / f"{mode}-collection-status.json")
         self.env["SYMBOLIC_COLLECTION_STATUS_FILE"] = self.collection_status_path
@@ -713,24 +715,35 @@ class TracerExecutor:
     def phase_deadline_reached(self) -> bool:
         return self.deadline.expired()
 
+    def _stderr_diagnostics(self) -> str:
+        try:
+            with open(self.stderr_path, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 8192), os.SEEK_SET)
+                tail = stream.read(8192).decode("utf-8", errors="replace").strip()
+        except OSError as exc:
+            return f"tracer stderr {self.stderr_path} unavailable: {exc}"
+        return f"tracer stderr {self.stderr_path}: {tail or '(empty)'}"
+
     def _forkserver_startup_diagnostics(self) -> str:
+        stderr = self._stderr_diagnostics()
         log_path = self.env.get("BINRADAR_TRACER_LOG_FILE")
         if not log_path:
-            return "tracer log not configured"
+            return f"{stderr}; tracer log not configured"
         path = Path(log_path)
         try:
             with path.open("rb") as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
                 stream.seek(max(0, size - 65536), os.SEEK_SET)
-                text = stream.read().decode("utf-8", errors="replace")
+                text = stream.read(65536).decode("utf-8", errors="replace")
         except OSError as exc:
-            return f"tracer log {path} unavailable: {exc}"
+            return f"{stderr}; tracer log {path} unavailable: {exc}"
 
         selected: List[str] = []
         markers = (
             "[snapshot] [crash]", "[snapshot] [exit]",
-            "[forkserver]", "[osprey] [fatal]")
+            "[forkserver]", "[osprey] [fatal]", "[binradar] [attempt-discarded]")
         for line in reversed(text.splitlines()):
             if any(marker in line for marker in markers):
                 selected.append(line.strip())
@@ -742,13 +755,15 @@ class TracerExecutor:
         else:
             selected.reverse()
         if not selected:
-            return f"tracer log {path} is empty"
-        return f"tracer log {path}: " + "; ".join(selected)
+            return f"{stderr}; tracer log {path} is empty"
+        return f"{stderr}; tracer log {path}: " + "; ".join(selected)
 
     def _raise_forkserver_startup_failure(
             self, error: BaseException, timeout: float) -> NoReturn:
         status = self.process.poll() if self.process is not None else None
-        process_state = "still running" if status is None else f"exit status {status}"
+        process_state = ("still running" if status is None else
+                         f"signal {-status}" if status < 0 else
+                         f"exit status {status}")
         message = (
             f"[TRACER] [{self.mode}] Did not reach BINRADAR_ENTRYPOINT/"
             f"forkserver handshake within {timeout:g}s ({process_state}); "
@@ -763,10 +778,16 @@ class TracerExecutor:
         self._process_cleanup_started = False
         self._process_cleanup_done = False
         if not self.forkserver_mode:
-            self.process = subprocess.Popen(
-                self.command, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, cwd=self.workdir, env=self.env,
-                start_new_session=True)
+            try:
+                with open(self.stderr_path, "wb") as stderr_file:
+                    self.process = subprocess.Popen(
+                        self.command, stdout=subprocess.DEVNULL,
+                        stderr=stderr_file, cwd=self.workdir, env=self.env,
+                        start_new_session=True)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"[TRACER] [{self.mode}] Could not start tracer: {exc}; "
+                    f"{self._stderr_diagnostics()}") from exc
             self.pgid = self.registry.register(self.process)
             logger.info(
                 f"[TRACER] [{self.mode}] Started tracer without forkserver mode. "
@@ -777,10 +798,16 @@ class TracerExecutor:
                                              replay_mode=self.replay_mode)
         self.transport.setup()
         pass_fds = self.transport.pass_fds()
-        self.process = subprocess.Popen(
-            self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            cwd=self.workdir, env=self.env, pass_fds=pass_fds,
-            start_new_session=True)
+        try:
+            with open(self.stderr_path, "wb") as stderr_file:
+                self.process = subprocess.Popen(
+                    self.command, stdout=subprocess.DEVNULL, stderr=stderr_file,
+                    cwd=self.workdir, env=self.env, pass_fds=pass_fds,
+                    start_new_session=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"[TRACER] [{self.mode}] Could not start tracer: {exc}; "
+                f"{self._stderr_diagnostics()}") from exc
         self.pgid = self.registry.register(self.process)
         self.transport.close_child_ends()
 
@@ -807,13 +834,18 @@ class TracerExecutor:
         expected = self.transport.handshake_expected
         if banner != expected:
             raise RuntimeError(
-                f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}")
-        self.transport.write_u32(expected ^ 0xFFFFFFFF)
-        ack = self.transport.read_u32(
-            self.deadline.remaining(self.forkserver_timeout))
+                f"[TRACER] [{self.mode}] Unexpected forkserver handshake: {banner:#x}; "
+                f"{self._forkserver_startup_diagnostics()}")
+        try:
+            self.transport.write_u32(expected ^ 0xFFFFFFFF)
+            ack = self.transport.read_u32(
+                self.deadline.remaining(self.forkserver_timeout))
+        except (EOFError, TimeoutError) as exc:
+            self._raise_forkserver_startup_failure(exc, self.forkserver_timeout)
         if ack != expected:
             raise RuntimeError(
-                f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}")
+                f"[TRACER] [{self.mode}] Unexpected forkserver ack: {ack:#x}; "
+                f"{self._forkserver_startup_diagnostics()}")
         logger.info(
             f"[TRACER] [{self.mode}] Tracer forkserver started successfully.")
 
@@ -937,6 +969,10 @@ class TracerExecutor:
             self.attempt_result = parsed_result
             self.stop_reason = parsed_stop
             self._last_remaining_plans = remaining_plans
+            if self.stop_reason == StopReason.RESOURCE_FAILURE:
+                logger.error(
+                    f"[TRACER] [{self.mode}] resource-failure at attempt {attempt}; "
+                    f"{self._forkserver_startup_diagnostics()}")
             if self.mode != "binradar":
                 logger.debug(
                     f"[TRACER] [{self.mode}] Logical attempt {attempt} "

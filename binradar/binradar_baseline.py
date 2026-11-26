@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shlex
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -170,7 +172,8 @@ def _is_normal_exit(log: str) -> bool:
 
 
 def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
-                test_cmd: str, testcase: str, timeout: float):
+                test_cmd: str, testcase: str, timeout: float,
+                stderr_path: str):
     """Run the real tracer once on `binary` and return its execution result.
     """
     command = [paths.TRACER_BIN, "-symbolic", "-d", "page", binary] + shlex.split(
@@ -182,16 +185,20 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
         patch_rfd, patch_wfd = os.pipe()
         env["PATCH_FD"] = str(patch_wfd)
     try:
-        process = subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            cwd=workdir, env=env, start_new_session=True,
-            pass_fds=((patch_wfd,) if patch_wfd is not None else ()))
-    except Exception:
+        # A regular file cannot backpressure a forked tracer child, and the
+        # parent owns no extra descriptor after Popen has inherited it.
+        with open(stderr_path, "wb") as stderr_file:
+            process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=stderr_file,
+                cwd=workdir, env=env, start_new_session=True,
+                pass_fds=((patch_wfd,) if patch_wfd is not None else ()))
+    except Exception as exc:
         if patch_rfd is not None:
             os.close(patch_rfd)
         if patch_wfd is not None:
             os.close(patch_wfd)
-        raise
+        raise RuntimeError(
+            f"Could not start baseline tracer; stderr {stderr_path}: {exc}") from exc
     from .binradar_runtime import PROCESS_REGISTRY
     pgid = PROCESS_REGISTRY.register(process)
     reader = None
@@ -202,6 +209,8 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
                 patch_rfd)
         result = binradar_utils.execute_await(process, timeout=timeout,
                                               verbose=False)
+        # Keep the same complete parser input as the former PIPE capture.
+        result.stderr = binradar_utils.decode_output(Path(stderr_path).read_bytes())
         return result
     finally:
         try:
@@ -215,15 +224,29 @@ def _run_tracer(workdir: str, binary: str, environment: Dict[str, str],
                 reader.join(timeout=5)
 
 
-def _classify(artifact: str, result, reference) -> BaselineCheck:
+def _classify(artifact: str, result, reference, *,
+              stderr_path: Optional[str] = None) -> BaselineCheck:
     """Classify one artifact's patch-0 observation against `reference`."""
+    def unusable(detail: str, observed=None) -> BaselineCheck:
+        code = result.exit_code
+        if code < 0:
+            try:
+                name = signal.Signals(-code).name
+            except ValueError:
+                name = "unknown"
+            termination = f"signal {-code} ({name})"
+        else:
+            termination = f"exit status {code}"
+        diagnostic = f"; stderr {stderr_path}" if stderr_path else ""
+        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, observed,
+                             f"{detail} ({termination}){diagnostic}")
+
     if result is None:
         return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
                              "phase deadline reached before execution")
     if not result.success:
-        reason = "timeout" if result.timed_out else result.decode_status()
-        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
-                             f"execution unusable ({reason})")
+        reason = "timeout" if result.timed_out else "execution unusable"
+        return unusable(reason)
     # `execute_await` reports success for a process killed by an external
     # termination signal, and the tracer's signal path can salvage the
     # interrupted guest pc as a valid-looking fault reference (or emit a
@@ -232,30 +255,24 @@ def _classify(artifact: str, result, reference) -> BaselineCheck:
     # the salvaged rows look usable.  A genuine guest SIGSEGV re-raised by
     # QEMU stays usable.
     if binradar_verifier.tracer_execution_cancelled(result.exit_code):
-        return BaselineCheck(
-            artifact, BaselineStatus.UNUSABLE, None,
-            f"tracer cancelled on signal {-result.exit_code}")
+        return unusable("tracer cancelled")
     log = result.stderr or ""
     if not binradar_verifier.tracer_memcheck_policy_acknowledged(log):
-        return BaselineCheck(
-            artifact, BaselineStatus.UNUSABLE, None,
+        return unusable(
             f"tracer did not acknowledge memcheck policy {binradar_verifier.MEMCHECK_POLICY}")
     try:
         observed = _parse_reference(log)
     except ValueError as exc:
-        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
-                             f"invalid fault identity ({exc})")
+        return unusable(f"invalid fault identity ({exc})")
     if observed is None:
         # Normal is observable even when PROBE has no fault reference.
         if _is_normal_exit(log):
             return BaselineCheck(
                 artifact, BaselineStatus.NORMAL, None,
                 "patch 0 exited normally (POC fault not observed)")
-        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, None,
-                             "no validated fault identity published")
+        return unusable("no validated fault identity published")
     if reference is None:
-        return BaselineCheck(artifact, BaselineStatus.UNUSABLE, observed,
-                             "PROBE has no validated fault identity")
+        return unusable("PROBE has no validated fault identity", observed)
 
     if observed.image_id is not None or reference.image_id is not None:
         status = (BaselineStatus.REPRODUCED
@@ -276,6 +293,7 @@ def validate_patch_zero_baseline(
         workdir: str,
         config: Dict[str, str],
         *,
+        rundir: str,
         original: str,
         probe_reference: Optional[binradar_verifier.TracerFaultReference],
         selected_binary: str,
@@ -318,6 +336,10 @@ def validate_patch_zero_baseline(
                 return suffix
         return ""
 
+    def stderr_for(path: str) -> str:
+        return str(Path(rundir).resolve() /
+                   f"baseline-{Path(path).name}-tracer-stderr.log")
+
     def run_artifact(path: str, ranges: str, records: Sequence[str],
                      patched: bool):
         remaining = (timeout if phase_deadline is None else
@@ -331,7 +353,7 @@ def validate_patch_zero_baseline(
                                     relocated_instructions=instruction_pairs[path],
                                     original_entrypoint=original_entrypoints[path],
                                     patch_fd=-1 if patched else None),
-            test_cmd, testcase, remaining)
+            test_cmd, testcase, remaining, stderr_for(path))
 
     selected_suffix = suffix_of(selected_binary)
     checks: List[BaselineCheck] = []
@@ -343,7 +365,8 @@ def validate_patch_zero_baseline(
     if os.path.exists(original):
         ranges, records = metadata_for(original)
         result = run_artifact(original, ranges, records, False)
-        original_check = _classify(".orig", result, reference)
+        original_check = _classify(".orig", result, reference,
+                                   stderr_path=stderr_for(original))
         checks.append(original_check)
     else:
         return BaselineResult(
@@ -357,13 +380,18 @@ def validate_patch_zero_baseline(
         suffix = suffix_of(path)
         ranges, records = metadata_for(path)
         result = run_artifact(path, ranges, records, True)
-        check = _classify(suffix, result, reference)
+        check = _classify(suffix, result, reference,
+                          stderr_path=stderr_for(path))
         if (check.status is BaselineStatus.REPRODUCED
                 and original_check.status is not BaselineStatus.REPRODUCED):
+            termination = (f"signal {-result.exit_code}" if result.exit_code < 0
+                           else f"exit status {result.exit_code}")
             check = BaselineCheck(
                 suffix, BaselineStatus.UNUSABLE, check.reference,
                 f"artifact matches PROBE but .orig baseline is "
-                f"{original_check.status.value}: {original_check.detail}")
+                f"{original_check.status.value}: {original_check.detail}; "
+                f"artifact {termination}; "
+                f"stderr {stderr_for(path)}")
         checks.append(check)
     return BaselineResult(reference, selected_suffix, tuple(checks))
 

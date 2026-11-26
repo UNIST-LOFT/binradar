@@ -1029,3 +1029,74 @@ def test_stop_row_reports_effective_budgets_and_forkserver_margin(
     assert "[advisor-stop-reason unknown]" in row
     assert "[advisor-would-submit-families unknown]" in row
     assert "[advisor-digest unknown]" in row
+
+
+def _host_stderr_executor(tmp_path, *, forkserver, source):
+    import sys
+
+    workdir = tmp_path / "work"
+    rundir = tmp_path / "run"
+    workdir.mkdir()
+    rundir.mkdir()
+    executor = binradar_runtime.TracerExecutor(
+        "binradar" if forkserver else "fuzzolic",
+        {"BINRADAR_FORKSERVER_ENABLE": "1" if forkserver else "0"},
+        str(workdir), str(rundir), "guest", "", "poc",
+        binradar_runtime.Deadline.from_timeout(5),
+        registry=binradar_runtime.ProcessRegistry())
+    executor.command = [sys.executable, "-c", source]
+    return executor
+
+
+@pytest.mark.parametrize("forkserver", [False, True])
+def test_real_tracer_stderr_survives_host_abort(tmp_path, forkserver):
+    import signal
+    from pathlib import Path
+
+    assertion = "symbolic.c:7804: Assertion `jump_table_finder_curr_instr.addr != to' failed."
+    # More than a pipe buffer, with the diagnostic at the end, exercises both
+    # non-blocking retention and bounded startup error reporting.
+    source = (
+        "import os, resource, signal\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        "os.write(2, b'x' * (256 * 1024))\n"
+        f"os.write(2, {assertion.encode()!r})\n"
+        "os.kill(os.getpid(), signal.SIGABRT)\n")
+    executor = _host_stderr_executor(tmp_path, forkserver=forkserver, source=source)
+    try:
+        if forkserver:
+            with pytest.raises(EOFError) as failure:
+                executor.start()
+            message = str(failure.value)
+            assert assertion in message
+            assert executor.stderr_path in message
+            assert str(int(signal.SIGABRT)) in message
+            assert len(message) < 12000
+        else:
+            executor.start()
+            executor.run()
+            assert executor.run_result.exit_code == -signal.SIGABRT
+        assert executor.process.wait(timeout=1) == -signal.SIGABRT
+        diagnostic = Path(executor.stderr_path)
+        assert diagnostic.parent == tmp_path / "run"
+        assert diagnostic.read_bytes() == b'x' * (256 * 1024) + assertion.encode()
+        assert executor.process.stderr is None
+    finally:
+        executor.stop()
+    assert not executor.registry.snapshot()
+    assert not list((tmp_path / "work").glob("*stderr*"))
+
+
+@pytest.mark.parametrize("forkserver", [False, True])
+def test_tracer_spawn_failure_releases_stderr_and_transport(tmp_path, forkserver):
+    executor = _host_stderr_executor(tmp_path, forkserver=forkserver, source="")
+    executor.command = [str(tmp_path / "missing-tracer")]
+    before = set(os.listdir("/proc/self/fd"))
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            executor.start()
+        assert executor.stderr_path in str(failure.value)
+    finally:
+        executor.stop()
+    assert set(os.listdir("/proc/self/fd")) == before
+    assert not executor.registry.snapshot()

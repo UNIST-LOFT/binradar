@@ -1097,6 +1097,7 @@ class BinRadarExecutor:
             result = binradar_baseline.validate_patch_zero_baseline(
                 self.workdir,
                 dict(phase_environment),
+                rundir=self.run_dir,
                 original=self.artifacts.original,
                 probe_reference=self.probe_result.tracer_fault_reference,
                 probe_policy=self.probe_result.memcheck_policy,

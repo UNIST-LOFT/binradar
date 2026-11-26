@@ -438,6 +438,108 @@ def test_real_empty_manifest_executes_patch_zero(tmp_path, reentered_guest, fami
         assert summary.attempt_result == binradar_runtime.AttemptResult.COMPLETED
 
 
+def test_real_externally_killed_child_remains_resource_failure(tmp_path, monkeypatch):
+    """A successful QEMU parent exit cannot hide its SIGKILLed child."""
+    import signal
+
+    if not Path(paths.TRACER_BIN).is_file():
+        pytest.skip("built tracer required for child termination integration")
+    source = tmp_path / "blocked-child.c"
+    source.write_text(r'''
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+    int fd = open(argv[1], O_WRONLY);
+    uint32_t pid = (uint32_t)getpid();
+    const char diagnostic[] = "forkserver child reached blocking body\n";
+    if (fd < 0 || write(2, diagnostic, sizeof(diagnostic) - 1) < 0 ||
+        write(fd, &pid, sizeof(pid)) != sizeof(pid)) return 1;
+    for (;;) pause();
+}
+''', encoding="ascii")
+    guest = tmp_path / "blocked-child"
+    subprocess.run(
+        ["cc", "-O0", "-fno-pie", "-no-pie", "-o", str(guest), str(source)],
+        check=True, capture_output=True, timeout=20)
+    symbols = subprocess.run(
+        ["nm", str(guest)], check=True, capture_output=True, text=True, timeout=10)
+    entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
+                      if row.split()[-1] == "main")
+    ready = tmp_path / "child-ready"
+    os.mkfifo(ready)
+    ready_fd = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
+    manifest = tmp_path / "brpatches.json"
+    manifest.write_text('{"version":1,"kind":"generic-erm","predicates":[]}',
+                        encoding="ascii")
+    log = tmp_path / "tracer.log"
+    env = {
+        "PATH": os.environ["PATH"],
+        "NO_EXTERNAL_SOLVER": "1",
+        "BINRADAR_FORKSERVER_ENABLE": "1",
+        "BINRADAR_ENTRYPOINT": entrypoint,
+        "BINRADAR_FORKSERVER_CHILD_TIMEOUT": "10",
+        "BINRADAR_OSPREY_ENABLE": "0",
+        "BINRADAR_TRACE_FILE": "none",
+        "BINRADAR_TRACER_LOG_FILE": str(log),
+        "SYMBOLIC_INJECT_INPUT_MODE": "FROM_FILE",
+        "SYMBOLIC_TESTCASE_NAME": "/dev/null",
+        "BINRADAR_PATCH_CNT": "0",
+        "BINRADAR_PATCH_CACHE_ENABLE": "1",
+        "BINRADAR_PATCH_MANIFEST": str(manifest),
+        "BINRADAR_EVIDENCE_FILE": str(tmp_path / "binradar.br"),
+        "BRCACHE_STACK_SIZE": "0",
+    }
+    errors = []
+    reported = []
+    monkeypatch.setattr(binradar_runtime.logger, "error", reported.append)
+
+    def kill_ready_child():
+        try:
+            readable, _, _ = select.select([ready_fd], [], [], 5)
+            if not readable:
+                raise TimeoutError("forkserver child did not announce its PID")
+            pid, = struct.unpack("<I", os.read(ready_fd, 4))
+            assert pid not in (0, 1, os.getpid(), executor.process.pid)
+            os.kill(pid, signal.SIGKILL)
+        except BaseException as exc:
+            errors.append(exc)
+
+    killer = threading.Thread(target=kill_ready_child)
+    try:
+        with binradar_runtime.PhaseSession("binradar", 20) as session:
+            session.shared_memory(env, include_patch_key=True)
+            executor = session.start_tracer(
+                mode="binradar", env=env, workdir=str(tmp_path), rundir=str(tmp_path),
+                binary=str(guest), test_cmd=str(ready), testcase="/dev/null")
+            killer.start()
+            summary = executor.run()
+            killer.join(timeout=6)
+            assert not killer.is_alive()
+            assert not errors, errors
+            assert not summary.success
+            assert summary.attempt_result == binradar_runtime.AttemptResult.UNUSABLE_EXIT
+            assert summary.stop_reason == binradar_runtime.StopReason.RESOURCE_FAILURE
+            assert executor.process.wait(timeout=5) == 0
+            discarded = _audit_log_events(log.read_text(), "binradar", "attempt-discarded")
+            assert len(discarded) == 1
+            assert int(discarded[0]["signal"]) == signal.SIGKILL
+            assert int(discarded[0]["exit-code"]) == -1
+            assert "forkserver child reached blocking body\n" in Path(
+                executor.stderr_path).read_text()
+            assert any(executor.stderr_path in row and str(log) in row for row in reported)
+            evidence = tmp_path / "binradar.br"
+            if evidence.exists() and evidence.stat().st_size:
+                from binradar import binradar_evidence
+                assert list(binradar_evidence.read_binradar(evidence)) == []
+    finally:
+        if killer.ident is not None:
+            killer.join(timeout=6)
+        os.close(ready_fd)
+
+
 def test_real_child_timeout_records_killed_child_cpu(tmp_path):
     """A killed child must report its own CPU time, not a shared total.
 
@@ -1047,9 +1149,9 @@ def test_real_resident_audit_accepts_null_io_metadata_and_tcgets(
         "cmp $0x2000, %eax\njne audit_fail\n" +
         _audit_guest_syscall(16, "%r12", "$0x5401", "$buffer", result=-25) +
         _audit_guest_syscall(8, "%r12", "$0", "$0", result=0) +
-        # TracerExecutor's inherited stdout/stderr really are /dev/null.
+        # Stdout remains /dev/null; stderr is the run-owned diagnostic file.
         _audit_guest_syscall(5, "$1", "$after_stat", result=0) +
-        _audit_guest_syscall(16, "$2", "$0x5401", "$buffer", result=-25))
+        _audit_guest_syscall(16, "$1", "$0x5401", "$buffer", result=-25))
     text = resident_audit_guest(_audit_open("null_path"), body)
     _assert_resident_audit_supported(text)
 

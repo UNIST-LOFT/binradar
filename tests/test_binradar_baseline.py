@@ -106,7 +106,7 @@ def test_stale_probe_policy_prevents_baseline_execution(tmp_path, monkeypatch, p
         binradar_baseline.validate_patch_zero_baseline(
             str(tmp_path), {}, original="guest.orig", probe_reference=REFERENCE,
             selected_binary="guest.brpatched", test_cmd="@@",
-            testcase="poc", timeout=1, identity_runner=_identity_runner(tmp_path),
+            testcase="poc", timeout=1, rundir=str(tmp_path), identity_runner=_identity_runner(tmp_path),
             probe_policy=policy)
     assert calls == []
 
@@ -252,7 +252,7 @@ def test_clean_original_is_normal_not_unusable(tmp_path, monkeypatch):
         str(tmp_path), {}, original=str(original), probe_reference=None,
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        identity_runner=_identity_runner(tmp_path),
+        rundir=str(tmp_path), identity_runner=_identity_runner(tmp_path),
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
 
@@ -270,7 +270,7 @@ def test_matching_artifacts_do_not_override_a_different_probe(tmp_path, monkeypa
         str(tmp_path), {}, original=str(original), probe_reference=REFERENCE,
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        identity_runner=_identity_runner(tmp_path),
+        rundir=str(tmp_path), identity_runner=_identity_runner(tmp_path),
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert result.reference == REFERENCE
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.DIFFERENT_FAULT
@@ -291,7 +291,7 @@ def test_artifact_match_cannot_hide_normal_original(tmp_path, monkeypatch):
         str(tmp_path), {}, original=str(original), probe_reference=REFERENCE,
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=1,
-        identity_runner=_identity_runner(tmp_path),
+        rundir=str(tmp_path), identity_runner=_identity_runner(tmp_path),
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.NORMAL
     assert result.selected.status is binradar_baseline.BaselineStatus.UNUSABLE
@@ -303,7 +303,7 @@ def test_preflight_deadline_skips_later_artifact(tmp_path, monkeypatch):
     original.touch()
     patched.touch()
     calls = []
-    def run(_w, binary, _env, _cmd, _poc, remaining):
+    def run(_w, binary, _env, _cmd, _poc, remaining, _stderr_path):
         calls.append((binary, remaining))
         return _result(stderr=_log(_reference_row(REFERENCE.address), CRASH_ROW))
     ticks = iter((0.0, 2.0))
@@ -314,7 +314,7 @@ def test_preflight_deadline_skips_later_artifact(tmp_path, monkeypatch):
         selected_binary=str(patched),
         test_cmd="@@", testcase=str(tmp_path / "poc"), timeout=10,
         phase_deadline=1.0,
-        identity_runner=_identity_runner(tmp_path),
+        rundir=str(tmp_path), identity_runner=_identity_runner(tmp_path),
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert calls == [(str(original), 1.0)]
     assert result.check(".orig").status is binradar_baseline.BaselineStatus.REPRODUCED
@@ -337,7 +337,7 @@ def test_preflight_uses_each_executed_artifacts_exact_map(tmp_path, monkeypatch)
                         "E9_ORIGINAL_ENTRYPOINT": "deadbeef"},
         original=str(tmp_path / "guest.orig"), probe_reference=REFERENCE,
         selected_binary=str(tmp_path / "guest.brcached"), test_cmd="@@",
-        testcase="poc", timeout=1, identity_runner=runner,
+        testcase="poc", timeout=1, rundir=str(tmp_path), identity_runner=runner,
         probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert environments[".orig"]["E9_RELOCATED_INSTRUCTIONS"] == ""
     assert environments[".orig"]["E9_ORIGINAL_ENTRYPOINT"] == ""
@@ -365,7 +365,7 @@ def test_selected_only_preflight_ignores_stale_patched_artifact(tmp_path, monkey
     result = binradar_baseline.validate_patch_zero_baseline(
         str(tmp_path), {}, original=str(tmp_path / "guest.orig"),
         probe_reference=REFERENCE, selected_binary=str(tmp_path / "guest.brcached"),
-        test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
+        test_cmd="@@", testcase="poc", timeout=1, rundir=str(tmp_path), identity_runner=runner,
         probe_policy=binradar_verifier.MEMCHECK_POLICY, selected_only=True)
     assert result.selected.status is binradar_baseline.BaselineStatus.REPRODUCED
     assert [check.artifact for check in result.checks] == [".orig", ".brcached"]
@@ -406,7 +406,7 @@ def test_bad_artifact_map_rejects_before_any_preflight_launch(
         binradar_baseline.validate_patch_zero_baseline(
             str(tmp_path), {}, original=str(tmp_path / "guest.orig"),
             probe_reference=REFERENCE, selected_binary=str(tmp_path / "guest.brpatched"),
-            test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
+            test_cmd="@@", testcase="poc", timeout=1, rundir=str(tmp_path), identity_runner=runner,
             probe_policy=binradar_verifier.MEMCHECK_POLICY)
     assert calls == []
 
@@ -446,7 +446,7 @@ def test_unusable_original_signal_root_rejects_before_preflight(
         binradar_baseline.validate_patch_zero_baseline(
             str(tmp_path), {}, original=str(tmp_path / "guest.orig"),
             probe_reference=REFERENCE, selected_binary=str(cached),
-            test_cmd="@@", testcase="poc", timeout=1, identity_runner=runner,
+            test_cmd="@@", testcase="poc", timeout=1, rundir=str(tmp_path), identity_runner=runner,
             probe_policy=binradar_verifier.MEMCHECK_POLICY, selected_only=True)
     assert launches == []
 
@@ -487,3 +487,89 @@ def test_baseline_request_source_retained_but_not_site_equality_key(source):
     check = _classify(cancelled.stderr, reference=reference, result=cancelled)
     assert check.status is binradar_baseline.BaselineStatus.UNUSABLE
     assert check.reference is None
+
+
+@pytest.mark.parametrize("guest_fault", [False, True])
+def test_real_baseline_signal_retains_host_stderr_and_guest_evidence(
+        tmp_path, monkeypatch, guest_fault):
+    import sys
+
+    workdir = tmp_path / "work"
+    rundir = tmp_path / "run"
+    workdir.mkdir()
+    rundir.mkdir()
+    tracer = tmp_path / "tracer"
+    assertion = "symbolic.c:7804: Assertion `jump_table_finder_curr_instr.addr != to' failed."
+    output = (_log(_reference_row(REFERENCE.address), CRASH_ROW) if guest_fault
+              else _log(assertion))
+    tracer.write_text(
+        f"#!{sys.executable}\n"
+        "import os, resource, signal\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        f"os.write(2, {output.encode()!r})\n"
+        f"os.kill(os.getpid(), {int(signal.SIGSEGV if guest_fault else signal.SIGABRT)})\n")
+    tracer.chmod(0o700)
+    monkeypatch.setattr(binradar_baseline.paths, "TRACER_BIN", str(tracer))
+    diagnostic = rundir / "baseline-guest.orig-tracer-stderr.log"
+    result = binradar_baseline._run_tracer(
+        str(workdir), "guest.orig", {}, "", "poc", 5, str(diagnostic))
+    assert result.exit_code == -int(signal.SIGSEGV if guest_fault else signal.SIGABRT)
+    assert diagnostic.read_text() == output == result.stderr
+    check = binradar_baseline._classify(
+        ".orig", result, REFERENCE, stderr_path=str(diagnostic))
+    if guest_fault:
+        assert check.status is binradar_baseline.BaselineStatus.REPRODUCED
+        assert check.reference.identity_key == REFERENCE.identity_key
+    else:
+        assert check.status is binradar_baseline.BaselineStatus.UNUSABLE
+        assert check.reference is None
+        assert str(diagnostic) in check.detail
+        assert str(int(signal.SIGABRT)) in check.detail
+        assert "SIGABRT" in check.detail
+
+
+def test_baseline_validation_saves_each_artifact_in_actual_run(tmp_path, monkeypatch):
+    import sys
+
+    workdir = tmp_path / "work"
+    rundir = tmp_path / "run"
+    workdir.mkdir()
+    rundir.mkdir()
+    for suffix in ("orig", "brpatched", "brcached"):
+        (workdir / f"guest.{suffix}").touch()
+    tracer = tmp_path / "tracer"
+    tracer.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        f"os.write(2, {_log(NORMAL_ROW).encode()!r})\n"
+        "os.write(2, sys.argv[4].encode())\n")
+    tracer.chmod(0o700)
+    monkeypatch.setattr(binradar_baseline.paths, "TRACER_BIN", str(tracer))
+    runner = SimpleNamespace(
+        tracer_instruction_pairs=lambda _path: "",
+        tracer_original_entrypoint=lambda _path: "",
+        e9_metadata_for_binary=lambda _path: ("", []))
+    result = binradar_baseline.validate_patch_zero_baseline(
+        str(workdir), {}, rundir=str(rundir), original=str(workdir / "guest.orig"),
+        probe_reference=REFERENCE, selected_binary=str(workdir / "guest.brcached"),
+        test_cmd="", testcase="poc", timeout=5, identity_runner=runner,
+        probe_policy=binradar_verifier.MEMCHECK_POLICY)
+    for suffix in ("orig", "brpatched", "brcached"):
+        assert result.check(f".{suffix}").status is binradar_baseline.BaselineStatus.NORMAL
+        diagnostic = rundir / f"baseline-guest.{suffix}-tracer-stderr.log"
+        assert diagnostic.read_text().endswith(str(workdir / f"guest.{suffix}"))
+    assert not list(workdir.glob("*stderr*"))
+
+
+def test_baseline_spawn_failure_closes_diagnostics_and_patch_fds(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setattr(binradar_baseline.paths, "TRACER_BIN", str(tmp_path / "missing"))
+    diagnostic = tmp_path / "baseline-stderr.log"
+    before = set(os.listdir("/proc/self/fd"))
+    with pytest.raises(RuntimeError) as failure:
+        binradar_baseline._run_tracer(
+            str(tmp_path), "guest", {"PATCH_FD": "-1"}, "", "poc", 5,
+            str(diagnostic))
+    assert str(diagnostic) in str(failure.value)
+    assert set(os.listdir("/proc/self/fd")) == before
+    assert diagnostic.read_bytes() == b""
