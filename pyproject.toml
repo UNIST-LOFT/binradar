@@ -18,6 +18,7 @@ binradar-collect-results = "binradar.binradar_collect_results:main"
 binradar-evidence-to-text = "binradar.binradar_evidence_to_text:main"
 binradar-test = "binradar.binradar_test:main"
 osprey-evaluation = "binradar.osprey_evaluation:main"
+binradar-plan-observations = "binradar.plan_observations:main"
 
 [build-system]
 requires = ["setuptools>=68"]

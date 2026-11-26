@@ -53,6 +53,11 @@ are centralized in `binradar/paths.py` for Guix store-path substitution; E9 uses
 [native deployment contract](agent-docs/BINRADAR.md#native-tool-and-resource-paths)
 and [CLI entrypoints](agent-docs/BINRADAR.md#python-package-and-cli-entrypoints). Rebuild existing Docker images for the new root wrappers.
 
+Offline observation discovery is a separate opt-in command:
+`uv run binradar-plan-observations --help`. It produces `observation-plan.json`
+without changing normal execution or the runtime observation ABI; see the
+[analysis command contract](agent-docs/memo/extended-observation/1_TRACER_ANALYSIS.md#implemented-command).
+
 ## Usage
 ```shell
 cd benchmarks/loftix/binutils/CVE-2017-14940

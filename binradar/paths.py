@@ -23,6 +23,7 @@ TARGETED_FUZZER_BIN = str(_CHECKOUT / "LibAFL/fuzzers/binary_only/qemu_targeted_
 LEGACY_AFL_SUPPORT_DIR = str(_CHECKOUT.parent / "AFLplusplus")
 
 FIND_MODELS_SCRIPT = str(_PACKAGE_DIR / "find_models_addrs.py")
+OBSERVATION_SANDBOX_SCRIPT = str(_CHECKOUT / "utils/taosc-llm/src/taosc_llm/_sandbox.py")
 LOFTIX_DIR = str(_CHECKOUT / "benchmarks/loftix")
 BENCHMARK_SCRIPTS = _CHECKOUT / "benchmarks/scripts"
 BRPATCH_SOURCE = _CHECKOUT / "benchmarks/loftix/brpatch.c"
