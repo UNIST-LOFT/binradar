@@ -92,7 +92,10 @@ static int check_cached_admission(void)
 		if (read(fds[0], &header, sizeof(header)) != (ssize_t)sizeof(header))
 			return 3;
 		close(fds[0]);
-		if (header.branch != (uint32_t)expected_branch[i]
+		if (header.magic != BRCACHE_SNAPSHOT_MAGIC || header.version != 3
+		    || header.obs_count != BROBS_COUNT || header.obs_plan_crc32 != BROBS_PLAN_CRC32
+		    || !!(header.flags & BRCACHE_FLAG_HAS_OBS) != !!BROBS_COUNT
+		    || header.branch != (uint32_t)expected_branch[i]
 		    || !!(header.flags & BRCACHE_FLAG_INVALID) != expected_invalid[i])
 			return 4;
 	}

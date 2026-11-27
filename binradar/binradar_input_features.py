@@ -13,7 +13,7 @@ from . import paths
 from . import binradar_verifier as verifier
 from .binradar_taosc_predicates import (
     CachedSnapshot, ParsedPredicate, PredicateFamily, parse_cached_snapshots,
-    predicate_descriptor, predicate_stack_bytes,
+    predicate_descriptor, predicate_stack_bytes, load_runtime_observation,
 )
 
 MAP_BYTES = 65536  # checked afl-qemu-trace build: MAP_SIZE_POW2=16
@@ -131,6 +131,10 @@ class BaselineFeatureCollector:
             Path(runner.dir) / "brpatches.json", Path(runner.cached_binary()),
             runner.patch_kind, runner.brcache_stack_size, ids)
         self.family = selected.family
+        from .observation_plan import load_observation_binding
+        self.observation = load_observation_binding(Path(runner.dir))
+        if selected.predicates is not None and load_runtime_observation(Path(runner.dir) / "brpatches.json") != self.observation:
+            raise ValueError("baseline observation plan hash mismatch")
         self.predicates = ({patch: selected.predicates[patch] for patch in ids}
                            if selected.predicates is not None else {})
         self._required_stack_bytes = max(
@@ -147,6 +151,7 @@ class BaselineFeatureCollector:
         # Presence-only AFL switches distinguish absent from an empty value.
         settings = {key: self._environment.get(key) for key in _COVERAGE_KEYS}
         self.metadata = {
+            "observation": self.observation,
             "artifact_sha256": _sha256(self.binary),
             "original_sha256": _sha256(runner.original_binary()),
             "qemu_sha256": _sha256(paths.QASAN_QEMU_BIN),
@@ -177,7 +182,9 @@ class BaselineFeatureCollector:
     def _patch_snapshots(self, data, probe, patch):
         if data is None:
             return None, "missing-brch"
-        snapshots, error = parse_cached_snapshots(data)
+        snapshots, error = parse_cached_snapshots(
+            data, expected_observation_count=self.observation["count"],
+            expected_observation_plan_crc32=self.observation["plan_crc32"])
         if error is not None:
             return None, _reason(error)
         if len(snapshots) != probe.patch_hit_cnt:

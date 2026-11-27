@@ -117,7 +117,8 @@ class FakeTracer:
                                       binradar_runtime.ReplayOutcome.IGNORED) else {
             "mutation": mutation, "path": f"/private/replay/capture-{mutation}.brch",
             "sha256": "0" * 64, "descriptor": descriptor, "patch_id": 1,
-            "reuse": "fresh" if source == "executed" else "exact-descriptor"}
+            "reuse": "fresh" if source == "executed" else "exact-descriptor",
+            "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}}
         return binradar_runtime.ReplayCaseResult(
             mutation, source, outcome, reason, capture)
 

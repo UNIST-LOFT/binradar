@@ -23,7 +23,7 @@ from binradar.binradar_taosc_predicates import (
 
 
 def _record(*, flags=0, branch=0, patch_id=0, stack=b""):
-    return (HEADER.pack(MAGIC, 2, patch_id, branch, len(stack), flags)
+    return (HEADER.pack(MAGIC, 3, patch_id, branch, len(stack), flags, 0, 0)
             + (CLAMPS.pack(*([0] * 512)) if flags & 2 else b"")
             + REGS.pack(*range(16)) + stack)
 
@@ -45,10 +45,13 @@ def runner(tmp_path, monkeypatch):
             "instructions": [{"relocated": 0x9000, "original": 0x1000}],
         }))
     (tmp_path / "brpatches.json").write_text(json.dumps({
-        "version": 1, "kind": "generic-erm", "predicates": [
+        "version": 2, "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}, "kind": "generic-erm", "predicates": [
             {"id": 1, "source_line": 1, "descriptor": "p0"},
             {"id": 2, "source_line": 2, "descriptor": "p1"}],
     }))
+    from binradar.observation_plan import publish_artifact_observations
+    for suffix in ("brpatched", "brcached"):
+        publish_artifact_observations(tmp_path / ("target." + suffix), tmp_path / "target.orig")
     qemu = tmp_path / "qemu"
     qemu.write_bytes(b"qemu-build-identity")
     monkeypatch.setattr(paths, "QASAN_QEMU_BIN", str(qemu))
@@ -56,6 +59,28 @@ def runner(tmp_path, monkeypatch):
         str(tmp_path), "target", "@@", "1000",
         {suffix: ("0x9000-0xa000", []) for suffix in ("brpatched", "brcached")},
         patch_kind="generic-erm", brcache_stack_size=0)
+
+
+def test_cached_admission_rejects_full_plan_identity_mismatch(runner):
+    manifest = Path(runner.dir) / "brpatches.json"
+    data = json.loads(manifest.read_text())
+    data["observation"] = {"schema_version": 1, "count": 1, "plan_sha256": "a" * 64, "plan_crc32": 19}
+    manifest.write_text(json.dumps(data))
+    admitted = verifier.load_cached_predicate_set(manifest, Path(runner.cached_binary()),
+        runner.patch_kind, runner.brcache_stack_size, [1])
+    assert admitted.predicates is None
+    assert "observation plan hash mismatch" in admitted.reason
+
+
+def test_cached_admission_rejects_artifact_binding_mismatch(runner):
+    sidecar = Path(runner.cached_binary() + ".brobs.json")
+    data = json.loads(sidecar.read_text())
+    data["artifact_sha256"] = "f" * 64
+    sidecar.write_text(json.dumps(data))
+    admitted = verifier.load_cached_predicate_set(Path(runner.dir) / "brpatches.json",
+        Path(runner.cached_binary()), runner.patch_kind, runner.brcache_stack_size, [1])
+    assert admitted.predicates is None
+    assert "identity mismatch" in admitted.reason
 
 
 def _child(runner, monkeypatch, *, capture=None, slot=42, crash=False, cancel=False, hits=1):
@@ -118,7 +143,7 @@ def test_single_execution_complete_capture_and_exact_fault_identity(runner, monk
     (b"broken", "partial-cached-snapshot-header"),
     (_record(flags=1), "cached-snapshot-capture-truncated"),
     (_record(flags=4), "cached-runtime-rejected-the-selected-predicate"),
-    (_record(flags=8), "unknown-cached-snapshot-flags-0x8"),
+    (_record(flags=16), "unknown-cached-snapshot-flags-0x10"),
     (_record(branch=1), "brch-text-mismatch"),
     (_record(patch_id=1), "nonneutral-brch"),
     (_record(flags=2), "brch-family-mismatch"),
@@ -266,7 +291,7 @@ def test_neutral_capture_requires_family_and_exact_stack(
     runner.patch_kind = kind
     runner.brcache_stack_size = 8
     (Path(runner.dir) / "brpatches.json").write_text(json.dumps({
-        "version": 1, "kind": kind, "predicates": [
+        "version": 2, "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}, "kind": kind, "predicates": [
             {"id": 1, "source_line": 1, "descriptor": descriptor}],
     }))
     _child(runner, monkeypatch, capture=_record(flags=flags, stack=stack))

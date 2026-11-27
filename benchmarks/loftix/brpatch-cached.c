@@ -39,10 +39,11 @@ _Static_assert(sizeof(struct shmid_ds) == 112,
 #endif
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u /* little-endian bytes "BRCH" */
-#define BRCACHE_SNAPSHOT_VERSION 2u
+#define BRCACHE_SNAPSHOT_VERSION 3u
 #define BRCACHE_FLAG_TRUNCATED 1u
 #define BRCACHE_FLAG_CWE805 2u
 #define BRCACHE_FLAG_INVALID 4u
+#define BRCACHE_FLAG_HAS_OBS 8u
 #define BRCACHE_DEFAULT_MAX_HITS 65536u
 #define BRCACHE_DEFAULT_MAX_BYTES (8u * 1024u * 1024u)
 #define BRCACHE_MAX_STACK_SIZE (1024u * 1024u)
@@ -66,9 +67,11 @@ struct brcache_snapshot_header {
 	uint32_t branch;
 	uint64_t stack_size;
 	uint64_t flags;
+	uint32_t obs_count;
+	uint32_t obs_plan_crc32;
 };
 
-_Static_assert(sizeof(struct brcache_snapshot_header) == 32,
+_Static_assert(sizeof(struct brcache_snapshot_header) == 40,
 	"cached snapshot header layout changed");
 
 static uint64_t cache_stack_size;
@@ -149,13 +152,16 @@ static void write_marker(uint32_t patch_id, int branch, uint64_t flags)
 		.patch_id = patch_id,
 		.branch = (uint32_t)branch,
 		.stack_size = 0,
-		.flags = flags,
+		.flags = flags | (BROBS_COUNT ? BRCACHE_FLAG_HAS_OBS : 0),
+		.obs_count = BROBS_COUNT,
+		.obs_plan_crc32 = BROBS_PLAN_CRC32,
 	};
 	(void)write_all(cache_fd, &header, sizeof(header));
 }
 
 static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
-                             int branch, int invalid)
+                             int branch, int invalid,
+                             const struct brobs_capture *observations)
 {
 	if (cache_fd < 0)
 		return;
@@ -176,7 +182,8 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 	}
 
 	uint64_t record_size = sizeof(struct brcache_snapshot_header)
-		+ 16 * sizeof(uint64_t) + cache_stack_size;
+		+ 16 * sizeof(uint64_t) + cache_stack_size
+		+ BROBS_STATUS_BYTES + BROBS_COUNT * sizeof(uint64_t);
 #ifdef BRPATCH_CWE805
 	record_size += sizeof(buffers);
 #endif
@@ -196,7 +203,9 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 		.patch_id = patch_id,
 		.branch = (uint32_t)branch,
 		.stack_size = cache_stack_size,
-		.flags = flags,
+		.flags = flags | (BROBS_COUNT ? BRCACHE_FLAG_HAS_OBS : 0),
+		.obs_count = BROBS_COUNT,
+		.obs_plan_crc32 = BROBS_PLAN_CRC32,
 	};
 	int64_t signed_regs[16];
 	uint64_t regs[16];
@@ -213,6 +222,14 @@ static void capture_snapshot(const struct STATE *state, uint32_t patch_id,
 	if (!failed)
 		failed = write_all(cache_fd, (const void *)state->rsp,
 		                   cache_stack_size);
+#if BROBS_COUNT > 0
+	if (!failed)
+		failed = write_all(cache_fd, observations->status, sizeof(observations->status));
+	if (!failed)
+		failed = write_all(cache_fd, observations->values, sizeof(observations->values));
+#else
+	(void)observations;
+#endif
 	if (failed) {
 		cache_truncated = 1;
 	} else {
@@ -290,10 +307,12 @@ const void *dest(const struct STATE *state)
 		selected_initialized = 1;
 	}
 	int invalid = selected_invalid;
+	struct brobs_capture observations;
+	brobs_capture(state, &observations);
 	const int branch = invalid ? 0
-		: evaluate_predicate(state, &selected_predicate, &invalid);
+		: evaluate_predicate(state, &selected_predicate, &observations, &invalid);
 
 	log_patch(selected_patch_id, branch, selected_iteration);
-	capture_snapshot(state, selected_patch_id, branch, invalid);
+	capture_snapshot(state, selected_patch_id, branch, invalid, &observations);
 	return repair_action(branch, (const void *)TAOSC_DEST);
 }

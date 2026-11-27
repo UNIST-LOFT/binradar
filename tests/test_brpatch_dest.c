@@ -132,25 +132,25 @@ static int check_composite_predicates(void)
 	buffers[0] = (struct clamp){100, 110};
 	buffers[1] = (struct clamp){300, 400};
 	if (parse_predicate("c3Ac1p0c2p1q1", &pred, nodes, BR_MAX_NODES) < 0
-	    || CWE805_branch_taken(&state, &pred) != 1)
+	    || CWE805_branch_taken(&state, &pred, NULL) != 1)
 		return 1; /* Different clamps must not satisfy separate operands. */
 	state.rax = 150;
 	state.rbx = 0x2000000000000000ULL;
 	buffers[255] = (struct clamp){100, 200};
 	if (parse_predicate("c3Oc1p0c2p1q8", &pred, nodes, BR_MAX_NODES) < 0
-	    || CWE805_branch_taken(&state, &pred) != 0)
+	    || CWE805_branch_taken(&state, &pred, NULL) != 0)
 		return 2; /* First true stops before overflow, including lower clamps. */
 	if (parse_predicate("c3Ac1p0c2p1q8", &pred, nodes, BR_MAX_NODES) < 0
-	    || CWE805_branch_taken(&state, &pred) != 2)
+	    || CWE805_branch_taken(&state, &pred, NULL) != 2)
 		return 3;
 	state.rax = 500;
-	if (CWE805_branch_taken(&state, &pred) != 1)
+	if (CWE805_branch_taken(&state, &pred, NULL) != 1)
 		return 4; /* Values and visited flags cannot leak between hits. */
 	state.rax = 150;
 	state.rsp = 0;
 	if (parse_predicate("c3Oc1p0c1s64i65535", &pred, nodes, BR_MAX_NODES) < 0
 	    || pred.stack_bytes != 524288
-	    || CWE805_branch_taken(&state, &pred) != 0)
+	    || CWE805_branch_taken(&state, &pred, NULL) != 0)
 		return 5; /* Whole-tree extent, but no skipped stack load. */
 	if (parse_predicate("p0", &pred, nodes, BR_MAX_NODES) < 0
 	    || pred.kind != BR_PRED_FALSE)

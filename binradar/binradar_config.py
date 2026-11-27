@@ -438,6 +438,7 @@ class PhaseEnvironmentConfig:
     e9_relocated_calls: str = ""
     e9_relocated_instructions: str = ""
     e9_original_entrypoint: str = ""
+    observation_environment: tuple[tuple[str, str], ...] = ()
 
 
 def phase_log_file(mode: str, run_dir: str) -> str:
@@ -507,6 +508,9 @@ def build_phase_environment(
     else:
         environment.pop("BINRADAR_MEMCHECK_POLICY", None)
 
+    # Only the artifact validator may grant a runtime observation capability.
+    from .observation_plan import cleared_observation_environment
+    environment.update(cleared_observation_environment())
     # Original-binary phases must not inherit patched E9 metadata.
     environment["E9_EXCLUDE_RANGES"] = ""
     environment["E9_RELOCATED_CALL_JUMPS"] = ""
@@ -517,6 +521,7 @@ def build_phase_environment(
         environment["E9_RELOCATED_CALL_JUMPS"] = phase.e9_relocated_calls
         environment["E9_RELOCATED_INSTRUCTIONS"] = phase.e9_relocated_instructions
         environment["E9_ORIGINAL_ENTRYPOINT"] = phase.e9_original_entrypoint
+        environment.update(phase.observation_environment)
 
     environment["BINRADAR_REVERSE_DIRECTED"] = "0"
     if mode == "fuzzolic":

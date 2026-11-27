@@ -29,6 +29,19 @@ def score(scorer, seq, snapshots=None, coverage=None, check=lambda: None):
                         check=check)
 
 
+def test_observation_only_changes_retain_exact_outcome_features():
+    states = [CachedSnapshot(0, 0, (0,) * 16, observation_values=(9,), observation_status=(0,)),
+              CachedSnapshot(0, 0, (0,) * 16, observation_values=(0,), observation_status=(3,))]
+    reducer = schedule._Reducer({1: "AV0>o0p5", 2: ">o0p5"}, "observations")
+    outcomes, signatures = reducer.reduce(states + states[-1:])
+    prefix = hashlib.sha256(b"observations").digest()
+    assert outcomes == bytes([3, 6])
+    assert {signatures[i:i + 32] for i in range(0, len(signatures), 32)} == {
+        hashlib.sha256(prefix + bytes([5])).digest(),
+        hashlib.sha256(prefix + bytes([8])).digest(),
+    }
+
+
 def test_score_wire_roundtrip_immutable_and_heap():
     original = schedule.InputScore(7, 3, 2, 11)
     assert original.heap_key == (-3, -2, -11, 7)

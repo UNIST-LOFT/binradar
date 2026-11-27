@@ -1128,9 +1128,22 @@ class TracerExecutor:
             if capture is not None or source_name != "executed":
                 raise RuntimeError("Unobserved resident case carries a capture or cache source")
         else:
-            fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse"}
+            fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse", "observation"}
             if not isinstance(capture, dict) or set(capture) != fields:
                 raise RuntimeError("Resident capture identity is missing or malformed")
+            from .binradar_taosc_predicates import validate_runtime_observation
+            try:
+                binding = validate_runtime_observation(capture["observation"])
+                expected_binding = {
+                    "schema_version": 1,
+                    "count": int(self.env.get("BINRADAR_BROBS_COUNT", "0")),
+                    "plan_crc32": int(self.env.get("BINRADAR_BROBS_CRC32", "0")),
+                    "plan_sha256": self.env.get("BINRADAR_BROBS_SHA256", "0" * 64),
+                }
+                if binding != expected_binding:
+                    raise ValueError("capture observation plan mismatch")
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("Resident capture has invalid observation binding") from exc
             if type(capture["mutation"]) is not int or capture["mutation"] != mutation:
                 raise RuntimeError("Resident capture belongs to another mutation")
             if type(capture["patch_id"]) is not int or capture["patch_id"] not in (0, 1):

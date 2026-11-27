@@ -27,11 +27,26 @@ def test_c_evaluator():
 
     with TemporaryDirectory() as tmp:
         executable = Path(tmp) / "test_brpatch_eval"
+        (Path(tmp) / "brobs_plan.inc").write_text(
+            """/* Canonical empty generated observation plan. */
+#define BROBS_COUNT 0
+#define BROBS_PLAN_CRC32 0u
+#define BROBS_PLAN_SHA256 "0000000000000000000000000000000000000000000000000000000000000000"
+#define BROBS_PATCH_LOCATION 0ull
+#define BROBS_GLOBAL_BEGIN 0ull
+#define BROBS_GLOBAL_END 0ull
+#define BROBS_STACK_SIZE 0ull
+#define BROBS_ALLOC_SITE_COUNT 0
+static const struct brobs_slot brobs_slots[1] = {{0}};
+static const uint64_t brobs_alloc_sites[1] = {0};
+"""
+        )
         subprocess.run([
             "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
             "-Wno-missing-field-initializers", "-Wno-unused-parameter",
             "-Wno-unused-function", "-Wno-implicit-fallthrough",
             f"-I{ROOT / 'utils' / 'e9patch' / 'examples'}",
+            f"-I{tmp}",
             str(ROOT / "tests" / "test_brpatch_eval.c"),
             "-o", str(executable),
         ], check=True)
@@ -289,6 +304,99 @@ def test_depth_and_byte_limits_and_wrapped_source_literals():
     assert eval_patch_str("p" + "0" * 4094, ZERO_ENV) == 0
     with pytest.raises(ValueError):
         parse(leaves[0] + "0")
+
+
+def test_observation_source_and_guarded_trap_vectors():
+    import pytest
+    api = binradar_taosc_predicates
+    assert predicate_to_patch_str("valid(o0) && o0 > 5") == "AV0>o0p5"
+    assert predicate_to_patch_str("o1 + rax") == "+o1v0"
+    states = [api.CachedSnapshot(0, 0, tuple(ZERO_ENV), observation_values=(value,),
+                               observation_status=(status,), observation_plan_crc32=19)
+              for value, status in ((9, 0), (0, 1), (0, 2), (0, 3), (0, 4), (2, 0))]
+    assert api.evaluate_cached_predicate(">o0p5", states) == [1, 2, 2, 2, 2, 0]
+    assert api.evaluate_cached_predicate("AV0>o0p5", states) == [1, 0, 0, 0, 0, 0]
+    assert api.evaluate_cached_predicate("OV0>o0p5", states) == [1, 2, 2, 2, 2, 1]
+    assert api.cached_predicate_matches("AV0>o0p5", states, [1, 0, 0, 0, 0, 0])
+    assert api.eval_patch_str("o0", ZERO_ENV, [(1 << 64) - 1], [0]) == -1
+    with pytest.raises(ValueError, match="bound plan"):
+        api.eval_patch_str("Ap0o1", ZERO_ENV, [1], [0])
+    with pytest.raises(ValueError, match="out of range"):
+        predicate_to_patch_str("valid(o64)")
+
+
+def test_observation_cwe_same_clamp_and_guarded_trap():
+    api = binradar_taosc_predicates
+    parse = api.parse_predicate_descriptor
+    registers = tuple(ZERO_ENV)
+    clamps = ((100, 120), (200, 220))
+    # Each atom matches a different clamp; conjunction must not merge them.
+    state = api.CachedSnapshot(0, 0, registers, clamps,
+                               observation_values=(110, 210), observation_status=(0, 0))
+    predicate = parse("c3Ac1o0c1o1")
+    assert api.evaluate_cached_branch(predicate, state) == 1
+    assert api.predicate_descriptor(predicate) == "c3Ac1o0c1o1"
+    unavailable = api.CachedSnapshot(0, 0, registers, clamps,
+                                     observation_values=(0,), observation_status=(3,))
+    assert api.evaluate_cached_branch(parse("c1o0"), unavailable) == 2
+    assert api.evaluate_cached_branch(parse("c3AV0c1o0"), unavailable) == 1
+    assert api.evaluate_cached_branch(parse("c3OV0c1o0"), unavailable) == 2
+    assert api.predicate_descriptor(api.parse_CWE805_predicate(
+        "valid(o0) && (o0 >= i->begin && o0 < i->end)")) == "c3AV0c1o0"
+    assert api.predicate_descriptor(api.parse_CWE805_predicate(
+        "4 * o0 < i->end - i->begin")) == "c2o0q4"
+
+
+def test_brch_v3_integrity_and_bound_plan_vectors():
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory() as directory:
+        _check_brch_v3_integrity_and_bound_plan_vectors(Path(directory))
+
+
+def _check_brch_v3_integrity_and_bound_plan_vectors(tmp_path):
+    import json
+    import struct
+    import pytest
+    api = binradar_taosc_predicates
+    def capture(*, version=3, count=2, crc=19, flags=8, status=b"\x00\x03", padding=bytes(6), values=(9, 0)):
+        return (api.CACHED_SNAPSHOT_HEADER.pack(api.CACHED_SNAPSHOT_MAGIC, version, 0, 0, 0, flags, count, crc)
+                + api.CACHED_SNAPSHOT_REGS.pack(*ZERO_ENV) + status + padding
+                + struct.pack("<" + "Q" * len(values), *values))
+    raw = capture()
+    states, error = api.parse_cached_snapshots(raw, expected_observation_count=2, expected_observation_plan_crc32=19)
+    assert error is None and len(states) == 1
+    assert states[0].observation_values == (9, 0)
+    assert states[0].observation_status == (0, 3)
+    assert states[0].observation_plan_crc32 == 19
+    assert api.evaluate_cached_predicate("AV1=o1p0", states) == [0]
+    for malformed in (capture(version=2), capture(count=65), capture(flags=0),
+                      capture(status=b"\x00\x05"), capture(padding=b"\x01" + bytes(5)),
+                      capture(values=(9, 1)), raw[:-1], raw + capture(crc=20)):
+        rejected, error = api.parse_cached_snapshots(malformed)
+        assert rejected == [] and error is not None
+    for count, crc in ((1, 19), (2, 20)):
+        assert api.parse_cached_snapshots(raw, expected_observation_count=count,
+            expected_observation_plan_crc32=crc)[1] is not None
+    binding = {"schema_version": 1, "count": 2, "plan_sha256": "a" * 64, "plan_crc32": 19}
+    manifest = tmp_path / "brpatches.json"
+    record = api.PredicateRecord(1, 1, "guard", "AV0>o0p5")
+    api.write_runtime_predicates(manifest, api.PredicateFamily.GENERIC_ERM, [record], binding)
+    assert api.load_runtime_observation(manifest) == binding
+    assert api.load_runtime_predicates(manifest)[1] == {1: record.parsed}
+    data = json.loads(manifest.read_text())
+    data["predicates"][0]["descriptor"] = "Ap0o2"
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="bound plan"):
+        api.load_runtime_predicates(manifest)
+    data["version"] = 1
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="unsupported"):
+        api.load_runtime_predicates(manifest)
+    empty = (api.CACHED_SNAPSHOT_HEADER.pack(api.CACHED_SNAPSHOT_MAGIC, 3, 0, 0, 0, 0, 0, 0)
+             + api.CACHED_SNAPSHOT_REGS.pack(*ZERO_ENV))
+    assert api.parse_cached_snapshots(empty)[1] is None
+    assert api.parse_cached_snapshots(b"", expected_observation_count=2,
+        expected_observation_plan_crc32=19) == ([], None)
 
 
 def _main():

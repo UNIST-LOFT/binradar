@@ -155,6 +155,11 @@ def _identity_runner(tmp_path, entries=None, *, artifact="brpatched"):
     struct.pack_into("<HH", header, 54, 56, 1)
     original.write_bytes(bytes(header) + struct.pack("<IIQQQQQQ", 1, 5, 0, 0x1000, 0x1000, 0, 0x3000, 0x1000))
     binary.write_bytes(artifact.encode())
+    from binradar.observation_plan import publish_artifact_observations
+    from binradar.binradar_taosc_predicates import write_runtime_predicates, PredicateFamily
+    publish_artifact_observations(binary, original)
+    if artifact == "brcached":
+        write_runtime_predicates(tmp_path / "brpatches.json", PredicateFamily.GENERIC_ERM, [])
     data = {"version": 1,
             "artifact-sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             "original-sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
@@ -269,7 +274,7 @@ def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, mo
     flags = predicates.CACHED_SNAPSHOT_FLAG_CWE805 if defect == "family" else 0
     raw = predicates.CACHED_SNAPSHOT_HEADER.pack(
         predicates.CACHED_SNAPSHOT_MAGIC, predicates.CACHED_SNAPSHOT_VERSION,
-        9 if defect == "raw-id" else 0, 0, 0, flags)
+        9 if defect == "raw-id" else 0, 0, 0, flags, 0, 0)
     if flags:
         raw += predicates.CACHED_SNAPSHOT_CLAMPS.pack(*([0] * 512))
     raw += predicates.CACHED_SNAPSHOT_REGS.pack(*([0] * 16))
@@ -281,6 +286,7 @@ def test_cached_runner_rejects_incomplete_or_wrong_identity_capture(tmp_path, mo
     text_id = 1 if defect == "text-id" else 0
     monkeypatch.setattr(runner, "_test_with_capture", lambda *args, **kwargs: (
         observed, f"[patch] [id {text_id}] [br 0]\n".encode(), raw))
+    predicates.write_runtime_predicates(tmp_path / "brpatches.json", predicates.PredicateFamily.GENERIC_ERM, [])
     actual, cached = runner.test_with_cached(5, "=p0p0", "input")
     assert actual is observed
     assert cached is None

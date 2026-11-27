@@ -35,6 +35,7 @@ from binradar import binradar_utils
 
 from binradar import cli as binradar
 from binradar import binradar_artifacts
+from binradar.observation_plan import publish_artifact_observations
 
 @pytest.fixture(autouse=True)
 def _e9_executables(monkeypatch):
@@ -598,6 +599,7 @@ def test_verifier_capture_drains_text_and_cached_channels(tmp_path, monkeypatch)
         + struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, 0, 0x1000, 0x1000))
     binary = tmp_path / "subject.brcached"
     binary.write_bytes(b"cache")
+    publish_artifact_observations(binary, tmp_path / "subject.orig")
     (tmp_path / "subject.brcached.e9map.json").write_text(json.dumps({
         "version": 1,
         "artifact-sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -630,7 +632,10 @@ def test_verifier_cache_runs_one_representative_per_branch_vector(tmp_path):
     run_dir = tmp_path / "run"
     (run_dir / "minimized").mkdir(parents=True)
     workdir.mkdir()
+    (workdir / "imginfo.orig").write_bytes(b"original")
     (workdir / "imginfo.brcached").write_bytes(b"cache")
+    publish_artifact_observations(
+        workdir / "imginfo.brcached", workdir / "imginfo.orig")
 
     # Over zero registers: "=p1p0" and "=v1p0" are both false (branch 0);
     # "=p0p0" is true (branch 1). Patch 3 therefore needs its own run.
@@ -828,6 +833,7 @@ def _write_bound_identity_artifacts(tmp_path, binary="nm"):
     for suffix in ("brpatched", "brcached"):
         artifact = tmp_path / f"{binary}.{suffix}"
         artifact.write_bytes(suffix.encode())
+        publish_artifact_observations(artifact, original)
         artifact.with_name(artifact.name + ".e9map.json").write_text(json.dumps({
             "version": 1,
             "artifact-sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),

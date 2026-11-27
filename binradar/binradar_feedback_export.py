@@ -16,7 +16,7 @@ from .binradar_feedback_capture import (
 from .binradar_feedback_bundle import VERSION, observed_class, write_row
 from .binradar_taosc_predicates import (
     CACHED_SNAPSHOT_VERSION, REGISTER_TO_VAR, load_runtime_predicates,
-    parse_cached_snapshots,
+    parse_cached_snapshots, load_runtime_observation, empty_runtime_observation,
 )
 
 
@@ -94,6 +94,7 @@ class _Writer:
     def __init__(self, request, root, stream, selected):
         self.request, self.root, self.stream = request, Path(root), stream
         self.selected = selected
+        self.observation = load_runtime_observation(self.root / "brpatches.json") if (self.root / "brpatches.json").is_file() else empty_runtime_observation()
         self.counts = {patch: {domain: [0] * len(BINS) for domain in ("concrete", "mutation")}
                        for patch in selected}
         self.totals = {"inputs": 0, "traces": 0, "observations": 0, "predicates": 0, "excluded": 0}
@@ -117,7 +118,9 @@ class _Writer:
             raise ValueError("invalid feedback state digest/availability")
         if file_sha256(source) != digest:
             raise ValueError("feedback state checksum mismatch")
-        snapshots, error = parse_cached_snapshots(Path(source).read_bytes())
+        snapshots, error = parse_cached_snapshots(
+            Path(source).read_bytes(), expected_observation_count=self.observation["count"],
+            expected_observation_plan_crc32=self.observation["plan_crc32"])
         branches = unpack_branches(trace["hits"], trace["branches"])
         if (error is not None or branches is None
                 or [state.branch for state in snapshots] != branches
@@ -350,6 +353,13 @@ def write_classification(request, root, pairs, reference):
             tids[item["id"]] = item["source_line"]
         if not selected <= predicates.keys():
             raise ValueError("feedback selected candidates missing from manifest")
+    from .observation_plan import load_observation_binding
+    observation = load_observation_binding(Path(request.workdir))
+    if manifest.exists() and load_runtime_observation(manifest) != observation:
+        raise ValueError("feedback runtime observation plan mismatch")
+    plan = Path(request.workdir) / "observation-plan.json"
+    if plan.is_file():
+        shutil.copyfile(plan, root / plan.name)
     files = {item.relative_to(root).as_posix(): file_sha256(item)
              for item in root.rglob("*") if item.is_file()}
     # These are Taosc source/lowering inputs, not additional synthesized outputs.
@@ -362,6 +372,8 @@ def write_classification(request, root, pairs, reference):
     terminal = {}
     for channel, header in headers.items():
         if header:
+            if header["context"].get("observation") != observation:
+                raise ValueError("feedback capture observation binding mismatch")
             if set(decode_ids(header["candidates"])) != selected:
                 raise ValueError("feedback capture candidate universe mismatch")
             if any(header.get(name) != files.get(name) for name in ("brpatches.json", "binradar.env")):
@@ -375,6 +387,7 @@ def write_classification(request, root, pairs, reference):
     mutation_context = json.loads(mutation_path.read_text()) if mutation_path.exists() else None
     if mutation_context is not None:
         if (mutation_context.get("version") != VERSION
+                or mutation_context.get("observation") != observation
                 or set(decode_ids(mutation_context["candidates"])) != selected
                 or mutation_context["input_sha256"] != file_sha256(request.poc_source)
                 or any(mutation_context.get(name) != files.get(name)
@@ -404,7 +417,7 @@ def write_classification(request, root, pairs, reference):
                     "mutation_reference": ({"address": reference.address, "source": reference.source,
                                             "image": reference.image_id, "offset": reference.image_offset}
                                            if reference is not None and reference.valid else None)},
-        "state": {"format": "BRCH", "version": CACHED_SNAPSHOT_VERSION,
+        "state": {"format": "BRCH", "version": CACHED_SNAPSHOT_VERSION, "observation": observation,
                   "endianness": "little", "arch": "x86_64",
                   "registers": sorted(REGISTER_TO_VAR, key=REGISTER_TO_VAR.__getitem__),
                   "branches": {"0": "original", "1": "error-handling", "2": "predicate-trap"},

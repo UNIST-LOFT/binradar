@@ -19,6 +19,7 @@
  */
 
 #include "stdlib.c"
+#include "br-observation.h"
 
 #define MAGIC_VALUE_PATCH 123456
 // patch_shm size is 8 bytes: patch_shm[0] is patch_id, patch_shm[1] is for index
@@ -57,6 +58,7 @@ static uint32_t getenvul(const char *name)
 void init(int argc, const char *const *argv, char **envp)
 {
 	environ = envp;
+	brobs_init();
 	env_patch_id = getenvul("PATCH_ID");
 	uint32_t s = getenvul("PATCH_FD");
 	if (s > 2) {
@@ -134,7 +136,7 @@ static void state_to_env(const struct STATE *state, int64_t env[16])
 enum br_predicate_kind { BR_PRED_FALSE, BR_PRED_GENERIC, BR_PRED_CWE805 };
 enum br_cell_kind {
 	BR_CELL_REGISTER, BR_CELL_STACK8, BR_CELL_STACK16,
-	BR_CELL_STACK32, BR_CELL_STACK64,
+	BR_CELL_STACK32, BR_CELL_STACK64, BR_CELL_OBSERVATION,
 };
 struct br_node {
 	uint8_t op, cell_kind, scale;
@@ -183,7 +185,12 @@ static int br_parse_node(struct br_parser *p, unsigned depth, int cwe,
 		return -1;
 	++p->cursor;
 	uint64_t value;
-	if (cwe && op == 'c') {
+	if (op == 'V' || (!cwe && op == 'o')) {
+		if (!BROBS_COUNT || br_number(&p->cursor, BROBS_COUNT ? BROBS_COUNT - 1 : 0, &value) < 0)
+			return -1;
+		node.op = op;
+		node.cell_index = value;
+	} else if (cwe && op == 'c') {
 		char family = *p->cursor++;
 		if (family != '1' && family != '2')
 			return -1;
@@ -195,6 +202,11 @@ static int br_parse_node(struct br_parser *p, unsigned depth, int cwe,
 		if (cell == 'p') {
 			if (br_number(&p->cursor, 15, &value) < 0)
 				return -1;
+			node.cell_index = value;
+		} else if (cell == 'o') {
+			if (!BROBS_COUNT || br_number(&p->cursor, BROBS_COUNT ? BROBS_COUNT - 1 : 0, &value) < 0)
+				return -1;
+			node.cell_kind = BR_CELL_OBSERVATION;
 			node.cell_index = value;
 		} else if (cell == 's') {
 			if (br_number(&p->cursor, 64, &value) < 0 || *p->cursor != 'i')
@@ -218,7 +230,7 @@ static int br_parse_node(struct br_parser *p, unsigned depth, int cwe,
 			return -1;
 		}
 		if (node.op == 'P' && node.cell_kind != BR_CELL_REGISTER
-		    && node.cell_kind != BR_CELL_STACK64)
+		    && node.cell_kind != BR_CELL_STACK64 && node.cell_kind != BR_CELL_OBSERVATION)
 			return -1;
 		if (node.op == 'S') {
 			if (node.cell_kind == BR_CELL_STACK64 || *p->cursor != 'q')
@@ -272,7 +284,7 @@ static int parse_predicate(const char *s, struct br_predicate *out,
 	const char *cursor = s;
 	if (cwe && s[1] == '3') {
 		cursor += 2;
-		if (*cursor != 'A' && *cursor != 'O')
+		if (*cursor != 'A' && *cursor != 'O' && *cursor != 'V')
 			return -1;
 	}
 	struct br_parser parser = {
@@ -290,22 +302,30 @@ static int parse_predicate(const char *s, struct br_predicate *out,
 }
 
 static int64_t br_eval_node(const struct br_predicate *pred, uint16_t index,
-                           const int64_t env[16], int *crashed)
+                           const int64_t env[16], const struct brobs_capture *observations, int *crashed)
 {
 	if (*crashed) return 0;
 	if (index >= pred->count) { *crashed = 1; return 0; }
 	const struct br_node *node = &pred->nodes[index];
 	if (node->op == 'p') return i64_from_bits(node->literal);
+	if (node->op == 'o' || node->op == 'V') {
+		uint64_t value;
+		if (brobs_cell(observations, node->cell_index, node->op == 'V', &value)) {
+			*crashed = 1;
+			return 0;
+		}
+		return i64_from_bits(value);
+	}
 	if (node->op == 'v') {
 		if (node->cell_index > 15) { *crashed = 1; return 0; }
 		return env[node->cell_index];
 	}
-	int64_t a = br_eval_node(pred, node->left, env, crashed);
+	int64_t a = br_eval_node(pred, node->left, env, observations, crashed);
 	if (*crashed) return 0;
 	if (node->op == '~') return ~a;
 	if (node->op == 'A' && !a) return 0;
 	if (node->op == 'O' && a) return 1;
-	int64_t b = br_eval_node(pred, node->right, env, crashed);
+	int64_t b = br_eval_node(pred, node->right, env, observations, crashed);
 	if (*crashed) return 0;
 	switch (node->op) {
 	case 'A': case 'O': return b != 0;
@@ -460,6 +480,7 @@ static uint64_t read_cell(const struct STATE *state,
 		return ((const uint32_t *)state->rsp)[index];
 	case BR_CELL_STACK64:
 		return ((const uint64_t *)state->rsp)[index];
+	case BR_CELL_OBSERVATION: return 0; /* Read from the per-hit capture below. */
 	}
 	return 0;
 }
@@ -467,36 +488,54 @@ static uint64_t read_cell(const struct STATE *state,
 /* Values are cached only after first visit, and only for this hit. */
 static int br_cwe_node(const struct STATE *state, const struct br_predicate *pred,
                        uint16_t index, const struct clamp *clamp,
-                       uint64_t *values, uint8_t *visited, int *crashed)
+                       uint64_t *values, uint8_t *visited,
+                       const struct brobs_capture *observations, int *crashed)
 {
 	if (*crashed) return 0;
 	if (index >= pred->count) { *crashed = 1; return 0; }
 	const struct br_node *node = &pred->nodes[index];
 	if (node->op == 'A' || node->op == 'O') {
 		int left = br_cwe_node(state, pred, node->left, clamp, values,
-		                       visited, crashed);
+		                       visited, observations, crashed);
 		if (*crashed) return 0;
 		if (node->op == 'A' && !left) return 0;
 		if (node->op == 'O' && left) return 1;
 		return br_cwe_node(state, pred, node->right, clamp, values,
-		                   visited, crashed);
+		                   visited, observations, crashed);
+	}
+	if (node->op == 'V') {
+		uint64_t value;
+		if (brobs_cell(observations, node->cell_index, 1, &value)) {
+			*crashed = 1;
+			return 0;
+		}
+		return value != 0;
 	}
 	if (node->op != 'P' && node->op != 'S') {
 		*crashed = 1;
 		return 0;
 	}
 	if (!visited[index]) {
-		if (node->cell_kind > BR_CELL_STACK64
+		if (node->cell_kind > BR_CELL_OBSERVATION
 		    || (node->cell_kind == BR_CELL_REGISTER && node->cell_index > 15)
 		    || (node->op == 'P' && node->cell_kind != BR_CELL_REGISTER
-		        && node->cell_kind != BR_CELL_STACK64)
+		        && node->cell_kind != BR_CELL_STACK64
+		        && node->cell_kind != BR_CELL_OBSERVATION)
 		    || (node->op == 'S' && (node->cell_kind == BR_CELL_STACK64
 		        || (node->scale != 1 && node->scale != 2
 		            && node->scale != 4 && node->scale != 8)))) {
 			*crashed = 1;
 			return 0;
 		}
-		uint64_t value = read_cell(state, node->cell_kind, node->cell_index);
+		uint64_t value;
+		if (node->cell_kind == BR_CELL_OBSERVATION) {
+			if (brobs_cell(observations, node->cell_index, 0, &value)) {
+				*crashed = 1;
+				return 0;
+			}
+		} else {
+			value = read_cell(state, node->cell_kind, node->cell_index);
+		}
 		if (node->op == 'S' && __builtin_mul_overflow(value,
 		                                            node->scale, &value)) {
 			*crashed = 1;
@@ -511,7 +550,8 @@ static int br_cwe_node(const struct STATE *state, const struct br_predicate *pre
 }
 
 static int CWE805_branch_taken(const struct STATE *state,
-                               const struct br_predicate *pred)
+                               const struct br_predicate *pred,
+                               const struct brobs_capture *observations)
 {
 	if (!pred->count || pred->count > BR_MAX_NODES || pred->root >= pred->count)
 		return 2;
@@ -522,7 +562,7 @@ static int CWE805_branch_taken(const struct STATE *state,
 	int crashed = 0;
 	for (int i = 255; i >= 0; --i) {
 		int safe = br_cwe_node(state, pred, pred->root, &buffers[i],
-		                       values, visited, &crashed);
+		                       values, visited, observations, &crashed);
 		if (crashed) return 2;
 		if (safe) return 0;
 	}
@@ -557,7 +597,8 @@ const void *jnz(uint64_t base, uint64_t index, uint8_t scale, uint32_t disp,
 #endif /* BRPATCH_CWE805 */
 
 static int evaluate_predicate(const struct STATE *state,
-                              const struct br_predicate *pred, int *invalid)
+                              const struct br_predicate *pred,
+                              const struct brobs_capture *observations, int *invalid)
 {
 	if (pred == NULL) { *invalid = 1; return 2; }
 	if (pred->kind == BR_PRED_FALSE) return 0;
@@ -570,12 +611,12 @@ static int evaluate_predicate(const struct STATE *state,
 		int64_t env[16];
 		state_to_env(state, env);
 		int crashed = 0;
-		int branch = br_eval_node(pred, pred->root, env, &crashed) != 0;
+		int branch = br_eval_node(pred, pred->root, env, observations, &crashed) != 0;
 		return crashed ? 2 : branch;
 	}
 #ifdef BRPATCH_CWE805
 	if (pred->kind == BR_PRED_CWE805)
-		return CWE805_branch_taken(state, pred);
+		return CWE805_branch_taken(state, pred, observations);
 #endif
 	*invalid = 1;
 	return 2;
@@ -591,7 +632,9 @@ const void *dest(const struct STATE *state)
 	int invalid = 0;
 	struct br_predicate predicate;
 	get_patch_pred(patch_id, &predicate);
-	const int branch_taken = evaluate_predicate(state, &predicate, &invalid);
+	struct brobs_capture observations;
+	brobs_capture(state, &observations);
+	const int branch_taken = evaluate_predicate(state, &predicate, &observations, &invalid);
 	log_patch(patch_id, branch_taken, v);
 	return repair_action(branch_taken, (const void *)TAOSC_DEST);
 }

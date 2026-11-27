@@ -11,7 +11,7 @@ static bool check_eval(const char *expression, const int64_t env[16],
 		return false;
 	int crashed = 0;
 	const int64_t actual = pred.kind == BR_PRED_FALSE ? 0
-		: br_eval_node(&pred, pred.root, env, &crashed);
+		: br_eval_node(&pred, pred.root, env, NULL, &crashed);
 	return actual == expected && crashed == expected_crash;
 }
 

@@ -22,7 +22,7 @@ def _feedback_executor(tmp_path, *, stack_size=0):
     (workdir / "poc" / "input").write_bytes(b"poc")
     (workdir / "binradar.env").write_text(
         f"BINARY=target\nBRCACHE_STACK_SIZE={stack_size}\n")
-    (workdir / "brpatches.json").write_text(json.dumps({"version": 1, "kind": "generic-erm",
+    (workdir / "brpatches.json").write_text(json.dumps({"version": 2, "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}, "kind": "generic-erm",
         "predicates": [{"id": 1, "source_line": 2, "descriptor": "p0"},
                        {"id": 2, "source_line": 4, "descriptor": "p1"}]}))
     (workdir / "target.orig").write_bytes(b"original")
@@ -74,7 +74,7 @@ def _pair(run_dir, iteration=2, patch=1, branches=(1,), *, outcome="normal", fau
     capture = b"".join(
         predicates.CACHED_SNAPSHOT_HEADER.pack(
             predicates.CACHED_SNAPSHOT_MAGIC, predicates.CACHED_SNAPSHOT_VERSION,
-            patch, branch, 0, 0) + predicates.CACHED_SNAPSHOT_REGS.pack(*range(16))
+            patch, branch, 0, 0, 0, 0) + predicates.CACHED_SNAPSHOT_REGS.pack(*range(16))
         for branch in branches or ())
     (directory / (stem + ".brch")).write_bytes(capture)
     same = outcome == "crash" and poc_fault is not None and fault == poc_fault

@@ -19,6 +19,12 @@ from typing import Dict, List, Optional, Set, Tuple
 from . import paths
 from . import binradar_taosc_predicates
 from . import binradar_utils
+from .observation_plan import (
+    load_observation_binding,
+    observation_instrumentation,
+    prepare_observation_plan,
+    publish_artifact_observations,
+)
 from .binradar_config import (
     resolve_concrete_input_schedule,
     validate_original_baseline,
@@ -162,6 +168,7 @@ def build_cached_binary(
     if not (workdir / "brpatch.c").exists():
         raise RuntimeError("brpatch.c must be prepared before building .brcached")
 
+    prepare_observation_plan(workdir, original_binary, int(patch_loc, 0), configdir=configdir)
     shutil.copy(paths.BRPATCH_CACHED_SOURCE, workdir / "brpatch-cached.c")
     destinations_file = workdir / "patch-destination"
     if not destinations_file.exists():
@@ -204,6 +211,7 @@ def build_cached_binary(
     else:
         spec = InstrumentationSpec(
             ((patch_loc, "if dest(state)@brpatch-cached goto"),))
+    spec = observation_instrumentation(workdir, original_binary, spec, "brpatch-cached")
     for output, fmt in ((metadata, "json"), (brcached, None)):
         cmd = e9tool_command(spec, output, original_binary, fmt=fmt)
         print(" ".join(cmd))
@@ -215,6 +223,7 @@ def build_cached_binary(
 
     e9_metadata = extract_e9_runtime_metadata(
         brcached, metadata, original_binary, int(patch_loc, 0))
+    publish_artifact_observations(brcached, original_binary)
     if persist_metadata:
         persist_e9_metadata(workdir, "brcached", e9_metadata)
     return e9_metadata
@@ -224,7 +233,7 @@ def _remove_cached_artifact(workdir: Path,
                             binradar_env: Dict[str, str]) -> None:
     binary = binradar_env["BINARY"]
     for name in (f"{binary}.brcached", f"{binary}.brcached.json",
-                 f"{binary}.brcached.e9map.json",
+                 f"{binary}.brcached.e9map.json", f"{binary}.brcached.brobs.json",
                  "brpatch-cached.c", "brpatches.json"):
         (workdir / name).unlink(missing_ok=True)
     for key in binradar_utils.e9_metadata_keys("brcached"):
@@ -282,14 +291,15 @@ def build_cached_artifact(
                   f"predicates require {required_stack_size} byte(s)")
             exit(1)
     binradar_env["BRCACHE_STACK_SIZE"] = str(stack_size)
-    write_runtime_predicates(
-        workdir / "brpatches.json", family, manifest_records)
     try:
         metadata = build_cached_binary(
             workdir, configdir, binradar_env, family, allocator)
     except RuntimeError as e:
         print(f"Error building cached binary: {e}")
         exit(1)
+    write_runtime_predicates(
+        workdir / "brpatches.json", family, manifest_records,
+        observation=load_observation_binding(workdir))
     binradar_utils.set_e9_metadata(
         binradar_env, "brcached",
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
@@ -1301,6 +1311,12 @@ def prepare_patch(
         exit(1)
 
     family, allocator = predicates.family, predicates.allocator
+    observation = prepare_observation_plan(
+        workdir, original_binary, int(binradar_env["PATCH_LOC"], 0), configdir=configdir)
+    if observation["count"] and family not in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
+        raise ValueError("runtime observations require an ERM family")
+    for record in predicates.records:
+        binradar_taosc_predicates.validate_predicate_observations(record.parsed, observation["count"])
     binradar_env["BINRADAR_PATCH_KIND"] = family.value
     patch_format = read_patch_format(workdir)
     if patch_format is not None:
@@ -1387,6 +1403,7 @@ def prepare_patch(
         binradar_utils.set_e9_metadata(
             binradar_env, "brpatched",
             metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+        publish_artifact_observations(brpatched_binary, original_binary)
         print(f"Using CWE-805 direct call-site patch at "
               f"{binradar_env['PATCH_LOC']} (candidate id 1)")
         build_cached_artifact(
@@ -1411,6 +1428,7 @@ def prepare_patch(
             binradar_utils.set_e9_metadata(
                 binradar_env, "brpatched",
                 metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+            publish_artifact_observations(brpatched_binary, original_binary)
             binradar_env["TOTAL_PATCHES"] = "1"
             print(f"Using existing brpatched binary at {brpatched_binary} to extract trampoline info.")
             build_cached_artifact(
@@ -1512,6 +1530,7 @@ def prepare_patch(
     else:
         spec = InstrumentationSpec(
             ((patch_addr, "if dest(state)@brpatch goto"),))
+    spec = observation_instrumentation(workdir, original_binary, spec, "brpatch")
     # dump metadata
     cmd = e9tool_command(spec, metadata_path, original_binary, fmt="json")
     print(" ".join(cmd))
@@ -1539,6 +1558,7 @@ def prepare_patch(
     binradar_utils.set_e9_metadata(
         binradar_env, "brpatched",
         metadata.exclude_ranges_str(), metadata.relocated_calls_str())
+    publish_artifact_observations(brpatched_binary, original_binary)
     build_cached_artifact(
         workdir, configdir, binradar_env, family, allocator,
         selected_patch_records, survived=patch_records)
@@ -1702,7 +1722,8 @@ def _generate_binradar(configdir: Path, workdir: Path) -> None:
     shutil.copy(paths.BRPATCH_SOURCE, workdir / "brpatch.c")
     metadata = build_cached_binary(
         workdir, configdir, env, family, allocator, persist_metadata=False)
-    write_runtime_predicates(workdir / "brpatches.json", family, [])
+    write_runtime_predicates(workdir / "brpatches.json", family, [],
+                             observation=load_observation_binding(workdir))
     binradar_utils.set_e9_metadata(
         env, "brcached", metadata.exclude_ranges_str(), metadata.relocated_calls_str())
     env.update({

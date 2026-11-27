@@ -469,6 +469,11 @@ def load_cached_predicate_set(manifest: Path, cached_binary: Path,
             None, None, f"{cached_binary.name} missing")
     try:
         family, predicates = load_runtime_predicates(manifest)
+        from .observation_plan import load_observation_binding, artifact_observation_environment
+        from .binradar_taosc_predicates import load_runtime_observation
+        if load_runtime_observation(manifest) != load_observation_binding(manifest.parent):
+            raise ValueError("runtime observation plan hash mismatch")
+        artifact_observation_environment(cached_binary)
     except ValueError as e:
         return CachedPredicateSet(None, None, str(e))
     if patch_kind and patch_kind != family.value:
@@ -1040,6 +1045,9 @@ class BinRadarQemuRunner:
         # env["LC_ALL"] = "C"
         env["AFL_USE_QASAN"] = "1"
         selected_binary = binary if binary is not None else self.patched_binary()
+        from .observation_plan import artifact_observation_environment
+        env.update(artifact_observation_environment(
+            Path(selected_binary), original=Path(self.original_binary())))
         if selected_binary == self.original_binary():
             # Original probes must not borrow instrumentation scope or capture
             # channels from a parent executing an E9-patched/cached artifact.
@@ -1411,6 +1419,12 @@ class BinRadarQemuRunner:
         self, patch_id: int, predicate: ParsedPredicate, testcase: str,
         verbose: bool = False,
     ) -> Tuple[Optional[BinRadarProbeResult], Optional[BinRadarCachedRun]]:
+        from .binradar_taosc_predicates import load_runtime_observation, validate_predicate_observations
+        from .observation_plan import load_observation_binding
+        binding = load_runtime_observation(Path(self.dir) / "brpatches.json")
+        if binding != load_observation_binding(Path(self.dir)):
+            raise ValueError("cached runtime observation plan hash mismatch")
+        validate_predicate_observations(predicate, binding["count"])
         probe, patch_data, cached_data = self._test_with_capture(
             self.cached_binary(), "0", testcase, verbose,
             {
@@ -1420,7 +1434,9 @@ class BinRadarQemuRunner:
             capture_cached=True)
         if probe is None or patch_data is None or cached_data is None:
             return probe, None
-        snapshots, error = parse_cached_snapshots(cached_data)
+        snapshots, error = parse_cached_snapshots(
+            cached_data, expected_observation_count=binding["count"],
+            expected_observation_plan_crc32=binding["plan_crc32"])
         if error is not None:
             logger.warning(f"Cached capture rejected: {error}")
             return probe, None

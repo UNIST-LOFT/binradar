@@ -634,8 +634,26 @@ JNZ_SCENARIOS = [
 ]
 
 
+def _write_empty_observation_plan(tmp_path):
+    (tmp_path / "brobs_plan.inc").write_text(
+        """/* Canonical empty generated observation plan. */
+#define BROBS_COUNT 0
+#define BROBS_PLAN_CRC32 0u
+#define BROBS_PLAN_SHA256 "0000000000000000000000000000000000000000000000000000000000000000"
+#define BROBS_PATCH_LOCATION 0ull
+#define BROBS_GLOBAL_BEGIN 0ull
+#define BROBS_GLOBAL_END 0ull
+#define BROBS_STACK_SIZE 0ull
+#define BROBS_ALLOC_SITE_COUNT 0
+static const struct brobs_slot brobs_slots[1] = {{0}};
+static const uint64_t brobs_alloc_sites[1] = {0};
+"""
+    )
+
+
 def _build_brpatches_inc(tmp_path):
     """Use the real static emitter, plus one intentionally invalid metadata row."""
+    _write_empty_observation_plan(tmp_path)
     api = binradar_taosc_predicates
     descriptors = ["=p1p1", "c1p0", "c1s64i0", "c2p1q1", "c2s16i0q2", "c2p1q8"]
     out = tmp_path / "brpatches.inc"
@@ -727,6 +745,7 @@ def test_c_runtime_parity():
 
 
 def _run_cached_runtime_test(tmp_path, cwe805):
+    _write_empty_observation_plan(tmp_path)
     executable = tmp_path / ("cached-cwe805" if cwe805 else "cached-generic")
     cmd = [
         "cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
@@ -750,7 +769,7 @@ def test_cached_runtime_captures_generic_and_CWE805_states(tmp_path):
     expected_stack = [bytes.fromhex(first + " 11 12 13 14 15 16 17")
                       for first in ("10", "20", "30")]
     generic_run = _run_cached_runtime_test(tmp_path, False)
-    generic_record_size = 32 + 16 * 8 + 8
+    generic_record_size = 40 + 16 * 8 + 8
     assert len(generic_run.stdout) == 3 * generic_record_size
     snapshots, error = predicates.parse_cached_snapshots(
         generic_run.stdout[:2 * generic_record_size])
@@ -826,7 +845,7 @@ def test_generic_cached_snapshot_rejects_malformed_stream(defect, error_text):
     header = predicates.CACHED_SNAPSHOT_HEADER
     registers = predicates.CACHED_SNAPSHOT_REGS.pack(*range(16))
     stack = b"\x00\xff\x33\x44"
-    good = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 2, 1, 0, len(stack), 0) + registers + stack
+    good = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 3, 1, 0, len(stack), 0, 0, 0) + registers + stack
     size = 0x100001 if defect == "oversize" else len(stack)
     if defect == "mixed-stack-sizes":
         stack += b"\x55"
@@ -835,8 +854,8 @@ def test_generic_cached_snapshot_rejects_malformed_stream(defect, error_text):
         stack = stack[:-1]
     if defect == "version":
         size, stack = 0, b""
-    bad = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 1 if defect == "version" else 2,
-                      1, 1, size, 8 if defect == "flags" else 0) + registers + stack
+    bad = header.pack(predicates.CACHED_SNAPSHOT_MAGIC, 1 if defect == "version" else 3,
+                      1, 1, size, 16 if defect == "flags" else 0, 0, 0) + registers + stack
     snapshots, error = predicates.parse_cached_snapshots(good + bad)
     assert snapshots == []
     assert error_text in error
@@ -851,6 +870,7 @@ def test_cached_snapshot_truncation_disables_inference():
         0,
         0,
         predicates.CACHED_SNAPSHOT_FLAG_TRUNCATED,
+        0, 0,
     )
     snapshots, error = predicates.parse_cached_snapshots(marker)
     assert snapshots == []

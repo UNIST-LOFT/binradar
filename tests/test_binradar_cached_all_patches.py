@@ -25,8 +25,15 @@ binradar_verifier = binradar.binradar_verifier
 
 
 def _write_manifest(workdir, descriptors, kind="generic-erm"):
+    from binradar.observation_plan import publish_artifact_observations
+    for artifact in workdir.glob("*.brcached"):
+        original = artifact.with_suffix(".orig")
+        if not original.exists():
+            original.write_bytes(b"original-fixture")
+        publish_artifact_observations(artifact, original)
     (workdir / "brpatches.json").write_text(json.dumps({
-        "version": 1,
+        "version": 2,
+        "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0},
         "kind": kind,
         "predicates": [
             {"id": idx, "source_line": idx, "descriptor": descriptor}

@@ -130,7 +130,17 @@ class StackCell:
     index: int       # element index, not byte offset
 
 
-StateCell = Union[RegisterCell, StackCell]
+@dataclass(frozen=True)
+class ObservationCell:
+    index: int
+
+
+StateCell = Union[RegisterCell, StackCell, ObservationCell]
+
+
+@dataclass(frozen=True)
+class CWE805ValidPredicate:
+    index: int
 
 
 @dataclass(frozen=True)
@@ -152,7 +162,7 @@ class CWE805LogicalPredicate:
 
 
 CWE805Predicate = Union[CWE805PointerPredicate, CWE805SizePredicate,
-                        CWE805LogicalPredicate]
+                        CWE805LogicalPredicate, CWE805ValidPredicate]
 ParsedPredicate = Union[str, CWE805Predicate]
 
 
@@ -171,8 +181,15 @@ def predicate_stack_bytes(predicate: ParsedPredicate) -> int:
                 raise ValueError("invalid CWE-805 logical operator")
             pending.extend(((node.left, depth + 1), (node.right, depth + 1)))
             continue
+        if isinstance(node, CWE805ValidPredicate):
+            if not 0 <= node.index < 64:
+                raise ValueError("observation index out of range")
+            continue
         cell = node.cell
-        if isinstance(cell, RegisterCell):
+        if isinstance(cell, ObservationCell):
+            if not 0 <= cell.index < 64:
+                raise ValueError("observation index out of range")
+        elif isinstance(cell, RegisterCell):
             if not 0 <= cell.register_index <= 15:
                 raise ValueError("register index out of range")
         else:
@@ -198,18 +215,20 @@ class PredicateRecord:
 # occurrences to be identical; size predicates use scales 1/2/4/8.
 _CWE805_POINTER_RE = re.compile(
     r"^(?P<c1>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
-    r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) >= i->begin && "
+    r"|o[0-9]+|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) >= i->begin && "
     r"(?P<c2>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
-    r"|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) < i->end$")
+    r"|o[0-9]+|\(\(uint64_t \*\)s->rsp\)\[[0-9]+\]) < i->end$")
 _CWE805_SIZE_RE = re.compile(
     r"^(?P<scale>[1-9][0-9]*) \* "
     r"(?P<cell>s->(?:rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r8|r9|r10|r11|r12|r13|r14|r15)"
-    r"|\(\(uint(?:8|16|32)_t \*\)s->rsp\)\[[0-9]+\]) < i->end - i->begin$")
+    r"|o[0-9]+|\(\(uint(?:8|16|32)_t \*\)s->rsp\)\[[0-9]+\]) < i->end - i->begin$")
 _CWE805_STACK_CELL_RE = re.compile(r"\(\(uint(?P<width>8|16|32|64)_t \*\)s->rsp\)\[(?P<index>[0-9]+)\]")
 
 
 def _parse_CWE805_cell(text: str) -> StateCell:
     """Parse one CWE-805 cell (register or typed stack cell)."""
+    if re.fullmatch(r"o[0-9]+", text):
+        return ObservationCell(int(text[1:]))
     if text.startswith("s->"):
         return RegisterCell(REGISTER_TO_VAR[text[3:]])
     match = _CWE805_STACK_CELL_RE.match(text)
@@ -259,6 +278,10 @@ def parse_CWE805_predicate(line: str) -> CWE805Predicate:
         if depth > MAX_EXPR_DEPTH:
             raise ValueError("predicate source nesting exceeds 256")
         whitespace()
+        guard = re.match(r"valid\(o([0-9]+)\)", line[pos:])
+        if guard is not None:
+            pos += guard.end()
+            return CWE805ValidPredicate(int(guard.group(1)))
         for regex in (pointer, size):
             match = regex.match(line[pos:])
             if match is not None:
@@ -322,6 +345,7 @@ _GENERIC_TOKEN_RE = re.compile(
 def tokenize_generic(predicate: str) -> List[str]:
     """Tokenize a generic predicate, rejecting any unrecognized byte."""
     _check_source(predicate)
+    predicate = re.sub(r"\bvalid\s*\(\s*o([0-9]+)\s*\)", r"V\1", predicate)
     tokens: List[str] = []
     pos = 0
     while pos < len(predicate):
@@ -394,6 +418,11 @@ class Parser:
                     values.append(("const", CONSTANTS[token]))
                 elif token in REGISTER_TO_VAR:
                     values.append(("var", REGISTER_TO_VAR[token]))
+                elif re.fullmatch(r"[oV][0-9]+", token):
+                    index = int(token[1:])
+                    if index >= 64:
+                        raise ValueError("observation index out of range")
+                    values.append(("obs" if token[0] == "o" else "valid", index))
                 else:
                     raise ValueError(f"unknown identifier or operand: {token}")
                 expect_value = False
@@ -416,7 +445,7 @@ class Parser:
             current, depth = pending.pop()
             if depth > MAX_EXPR_DEPTH:
                 raise ValueError("predicate depth exceeds 256")
-            if current[0] not in ("const", "var"):
+            if current[0] not in ("const", "var", "obs", "valid"):
                 pending.extend((child, depth + 1) for child in current[1:])
         return node
 
@@ -430,6 +459,9 @@ def emit_patch(node: AstNode) -> str:
             raise ValueError(f"invalid constant value: {value!r}")
         value = wrap64(value)
         return f"p{value}" if value >= 0 else f"n{-value}"
+
+    if kind in ("obs", "valid"):
+        return ("o" if kind == "obs" else "V") + str(node[1])
 
     if kind == "var":
         value = node[1]
@@ -798,7 +830,7 @@ def _shift_right(a: int, b: int) -> int:
     return wrap64(a << -b)
 
 
-PatchEvaluator = Callable[[Sequence[int]], int]
+PatchEvaluator = Callable[..., int]
 
 
 def _checked_div(a: int, b: int) -> int:
@@ -817,6 +849,20 @@ def _checked_mod(a: int, b: int) -> int:
     return wrap64(a - _trunc_div(a, b) * b)
 
 
+def _observation_value(values: Sequence[int], status: Sequence[int], index: int) -> int:
+    if index >= len(values) or index >= len(status):
+        raise ValueError("observation index exceeds captured slots")
+    if status[index] != 0:
+        raise PredicateTrap("unavailable observation")
+    return wrap64(values[index])
+
+
+def _observation_valid(status: Sequence[int], index: int) -> int:
+    if index >= len(status):
+        raise ValueError("observation index exceeds captured slots")
+    return int(status[index] == 0)
+
+
 _PATCH_EVAL_GLOBALS = {
     "__builtins__": {},
     "_w": wrap64,
@@ -824,6 +870,8 @@ _PATCH_EVAL_GLOBALS = {
     "_sr": _shift_right,
     "_div": _checked_div,
     "_mod": _checked_mod,
+    "_obs": _observation_value,
+    "_valid": _observation_valid,
     "int": int,
 }
 
@@ -847,7 +895,7 @@ def _parse_generic_descriptor(s: str) -> AstNode:
             raise ValueError("unexpected end of encoded predicate")
         op = s[pos]
         pos += 1
-        if op in "pnv":
+        if op in "pnvoV":
             start = pos
             while pos < len(s) and "0" <= s[pos] <= "9":
                 pos += 1
@@ -857,6 +905,10 @@ def _parse_generic_descriptor(s: str) -> AstNode:
             if len(digits) > 20:
                 raise ValueError("encoded integer out of range")
             value = int(digits)
+            if op in "oV":
+                if value >= 64:
+                    raise ValueError("observation index out of range")
+                return ("obs" if op == "o" else "valid", value)
             if op == "v":
                 if value > 15:
                     raise ValueError("register index out of range")
@@ -891,6 +943,10 @@ def _compile_patch_str(s: str) -> PatchEvaluator:
         op = node[0]
         if op == "const":
             return ast.Constant(value=node[1])
+        if op == "obs":
+            return call("_obs", ast.Name(id="values", ctx=ast.Load()), ast.Name(id="status", ctx=ast.Load()), ast.Constant(value=node[1]))
+        if op == "valid":
+            return call("_valid", ast.Name(id="status", ctx=ast.Load()), ast.Constant(value=node[1]))
         if op == "var":
             return ast.Subscript(value=ast.Name(id="env", ctx=ast.Load()), slice=ast.Constant(value=node[1]), ctx=ast.Load())
         left = compile_node(node[1])
@@ -911,7 +967,7 @@ def _compile_patch_str(s: str) -> PatchEvaluator:
 
     try:
         expression = ast.Expression(body=ast.Lambda(
-            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="env")], kwonlyargs=[], kw_defaults=[], defaults=[]),
+            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="env"), ast.arg(arg="values"), ast.arg(arg="status")], kwonlyargs=[], kw_defaults=[], defaults=[ast.Tuple(elts=[], ctx=ast.Load()), ast.Tuple(elts=[], ctx=ast.Load())]),
             body=compile_node(tree)))
         for item in ast.walk(expression):
             if "lineno" in item._attributes:
@@ -923,14 +979,21 @@ def _compile_patch_str(s: str) -> PatchEvaluator:
     return cast(PatchEvaluator, eval(code, _PATCH_EVAL_GLOBALS))
 
 
-def eval_patch_str(s: str, env: Sequence[int]) -> int:
+def eval_patch_str(s: str, env: Sequence[int],
+                   observation_values: Sequence[int] = (),
+                   observation_status: Sequence[int] = ()) -> int:
     """Evaluate a cached prefix predicate with Taosc's i64 semantics."""
-    return _compile_patch_str(s)(env)
+    validate_predicate_observations(s, len(observation_values))
+    if len(observation_values) != len(observation_status):
+        raise ValueError("observation value/status counts differ")
+    return _compile_patch_str(s)(env, observation_values, observation_status)
 
 
 def CWE805_branch_taken(predicate: CWE805Predicate,
                         registers: Sequence[int], stack: bytes,
-                        clamps: Sequence[Tuple[int, int]]) -> int:
+                        clamps: Sequence[Tuple[int, int]],
+                        observation_values: Sequence[int] = (),
+                        observation_status: Sequence[int] = ()) -> int:
     """Mirror brpatch.c::CWE805_branch_taken (plan §7.3).
 
     Returns 0 (no jump: some clamp matches), 1 (jump: no clamp matches) or
@@ -939,6 +1002,9 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
     little-endian.  Zero-initialized clamps never match.
     """
     required = predicate_stack_bytes(predicate)
+    validate_predicate_observations(predicate, len(observation_values))
+    if len(observation_values) != len(observation_status):
+        raise ValueError("observation value/status counts differ")
     if len(stack) < required:
         raise ValueError(f"insufficient captured stack: need {required} bytes")
 
@@ -948,8 +1014,12 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
             if node.op == "&&":
                 return left and evaluate(node.right, begin, end)
             return left or evaluate(node.right, begin, end)
+        if isinstance(node, CWE805ValidPredicate):
+            return bool(_observation_valid(observation_status, node.index))
         cell = node.cell
-        if isinstance(cell, RegisterCell):
+        if isinstance(cell, ObservationCell):
+            value = _observation_value(observation_values, observation_status, cell.index) & _MASK64
+        elif isinstance(cell, RegisterCell):
             value = registers[cell.register_index] & _MASK64
         else:
             width = cell.width_bits // 8
@@ -983,12 +1053,13 @@ def CWE805_branch_taken(predicate: CWE805Predicate,
 # other predicate offline.  Both families record the measured stack prefix;
 # CWE-805 records additionally contain all clamps.
 CACHED_SNAPSHOT_MAGIC = 0x48435242  # little-endian bytes "BRCH"
-CACHED_SNAPSHOT_VERSION = 2
+CACHED_SNAPSHOT_VERSION = 3
 CACHED_SNAPSHOT_MAX_STACK_SIZE = 0x100000
 CACHED_SNAPSHOT_FLAG_TRUNCATED = 1
 CACHED_SNAPSHOT_FLAG_CWE805 = 2
 CACHED_SNAPSHOT_FLAG_INVALID = 4
-CACHED_SNAPSHOT_HEADER = struct.Struct("<IIIIQQ")
+CACHED_SNAPSHOT_FLAG_HAS_OBS = 8
+CACHED_SNAPSHOT_HEADER = struct.Struct("<IIIIQQII")
 CACHED_SNAPSHOT_CLAMPS = struct.Struct("<" + "QQ" * 256)
 CACHED_SNAPSHOT_REGS = struct.Struct("<" + "Q" * 16)
 
@@ -1001,6 +1072,9 @@ class CachedSnapshot:
     registers: Tuple[int, ...]
     clamps: Tuple[Tuple[int, int], ...] = ()
     stack: bytes = b""
+    observation_values: Tuple[int, ...] = ()
+    observation_status: Tuple[int, ...] = ()
+    observation_plan_crc32: int = 0
 
     @property
     def is_CWE805(self) -> bool:
@@ -1008,7 +1082,9 @@ class CachedSnapshot:
 
 
 def parse_cached_snapshots(
-    data: bytes,
+    data: bytes, *,
+    expected_observation_count: Optional[int] = None,
+    expected_observation_plan_crc32: Optional[int] = None,
 ) -> Tuple[List[CachedSnapshot], Optional[str]]:
     """Parse a complete brpatch-cached binary stream.
 
@@ -1016,22 +1092,42 @@ def parse_cached_snapshots(
     the patch site was not reached.  Any malformed, invalid, truncated, or
     partial record disables cache inference for the run.
     """
+    if (expected_observation_count is not None
+            and (type(expected_observation_count) is not int or not 0 <= expected_observation_count <= 64)):
+        return [], "invalid expected observation count"
+    if (expected_observation_plan_crc32 is not None
+            and (type(expected_observation_plan_crc32) is not int or not 0 <= expected_observation_plan_crc32 <= 0xffffffff)):
+        return [], "invalid expected observation plan CRC32"
     snapshots: List[CachedSnapshot] = []
     offset = 0
     expected_patch_id: Optional[int] = None
     expected_stack_size = 0
+    stream_observation = None
+    stream_family = None
     known_flags = CACHED_SNAPSHOT_FLAG_TRUNCATED \
-        | CACHED_SNAPSHOT_FLAG_CWE805 | CACHED_SNAPSHOT_FLAG_INVALID
+        | CACHED_SNAPSHOT_FLAG_CWE805 | CACHED_SNAPSHOT_FLAG_INVALID | CACHED_SNAPSHOT_FLAG_HAS_OBS
     while offset < len(data):
         if offset + CACHED_SNAPSHOT_HEADER.size > len(data):
             return [], "partial cached snapshot header"
-        magic, version, patch_id, branch, stack_size, flags = \
+        magic, version, patch_id, branch, stack_size, flags, obs_count, obs_crc = \
             CACHED_SNAPSHOT_HEADER.unpack_from(data, offset)
         offset += CACHED_SNAPSHOT_HEADER.size
         if magic != CACHED_SNAPSHOT_MAGIC:
             return [], f"bad cached snapshot magic 0x{magic:x}"
         if version != CACHED_SNAPSHOT_VERSION:
             return [], f"unsupported cached snapshot version {version}"
+        if obs_count > 64 or bool(flags & CACHED_SNAPSHOT_FLAG_HAS_OBS) != bool(obs_count):
+            return [], "invalid cached observation count/flags"
+        if obs_count == 0 and obs_crc != 0:
+            return [], "noncanonical empty cached observation plan"
+        if ((expected_observation_count is not None and obs_count != expected_observation_count)
+                or (expected_observation_plan_crc32 is not None and obs_crc != expected_observation_plan_crc32)):
+            return [], "cached observation plan mismatch"
+        identity = (obs_count, obs_crc)
+        family = bool(flags & CACHED_SNAPSHOT_FLAG_CWE805)
+        if stream_observation is not None and (identity != stream_observation or family != stream_family):
+            return [], "cached observation plan/family differs within one run"
+        stream_observation, stream_family = identity, family
         if flags & ~known_flags:
             return [], f"unknown cached snapshot flags 0x{flags:x}"
         if flags & CACHED_SNAPSHOT_FLAG_TRUNCATED:
@@ -1065,12 +1161,28 @@ def parse_cached_snapshots(
         offset += CACHED_SNAPSHOT_REGS.size
         stack = data[offset:offset + stack_size]
         offset += stack_size
+        padded_status = (obs_count + 7) & ~7
+        if offset + padded_status + obs_count * 8 > len(data):
+            return [], "partial cached observation payload"
+        status = tuple(data[offset:offset + obs_count])
+        if any(value > 4 for value in status):
+            return [], "unknown cached observation status"
+        if any(data[offset + obs_count:offset + padded_status]):
+            return [], "nonzero cached observation padding"
+        offset += padded_status
+        values = struct.unpack_from("<" + "Q" * obs_count, data, offset)
+        offset += obs_count * 8
+        if any(code != 0 and value != 0 for code, value in zip(status, values)):
+            return [], "unavailable cached observation value is nonzero"
         snapshots.append(CachedSnapshot(
             patch_id=patch_id,
             branch=branch,
             registers=registers,
             clamps=clamps,
             stack=stack,
+            observation_values=values,
+            observation_status=status,
+            observation_plan_crc32=obs_crc,
         ))
     return snapshots, None
 
@@ -1099,6 +1211,8 @@ def _evaluate_CWE805_snapshot(
         snapshot.registers,
         snapshot.stack,
         snapshot.clamps,
+        snapshot.observation_values,
+        snapshot.observation_status,
     )
 
 
@@ -1108,6 +1222,7 @@ def evaluate_cached_branch(
     generic_environment: Optional[Sequence[int]] = None,
 ) -> int:
     """Evaluate one predicate at one captured pre-branch state."""
+    validate_predicate_observations(predicate, len(snapshot.observation_values))
     if isinstance(predicate, str):
         if snapshot.is_CWE805:
             raise ValueError("generic predicate with a CWE-805 snapshot")
@@ -1116,7 +1231,7 @@ def evaluate_cached_branch(
             environment = tuple(wrap64(value) for value in snapshot.registers)
         evaluator = _compile_patch_str(predicate)
         try:
-            return int(evaluator(environment) != 0)
+            return int(evaluator(environment, snapshot.observation_values, snapshot.observation_status) != 0)
         except PredicateTrap:
             return 2
     return _evaluate_CWE805_snapshot(predicate, snapshot)
@@ -1138,9 +1253,10 @@ def evaluate_cached_predicate(
             raise ValueError("generic environment count does not match snapshots")
         evaluator = _compile_patch_str(predicate)
         branches = []
-        for environment in environments:
+        for snapshot, environment in zip(snapshots, environments):
+            validate_predicate_observations(predicate, len(snapshot.observation_values))
             try:
-                branches.append(int(evaluator(environment) != 0))
+                branches.append(int(evaluator(environment, snapshot.observation_values, snapshot.observation_status) != 0))
             except PredicateTrap:
                 branches.append(2)
         return branches
@@ -1169,10 +1285,11 @@ def cached_predicate_matches(
         if len(environments) != len(snapshots):
             raise ValueError("generic environment count does not match snapshots")
         evaluator = _compile_patch_str(predicate)
-        for environment, branch in zip(
-                environments[start_index:], expected[start_index:]):
+        for snapshot, environment, branch in zip(
+                snapshots[start_index:], environments[start_index:], expected[start_index:]):
+            validate_predicate_observations(predicate, len(snapshot.observation_values))
             try:
-                actual = int(evaluator(environment) != 0)
+                actual = int(evaluator(environment, snapshot.observation_values, snapshot.observation_status) != 0)
             except PredicateTrap:
                 actual = 2
             if actual != branch:
@@ -1255,7 +1372,60 @@ def write_filter(filter_file: Path, results: List[Tuple[int, bool, str, str]],
           f"[survived {survived}] [time {elapsed:.2f}]")
 
 
-RUNTIME_PREDICATES_VERSION = 1
+RUNTIME_PREDICATES_VERSION = 2
+
+
+def empty_runtime_observation() -> dict:
+    return {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}
+
+
+def validate_runtime_observation(value) -> dict:
+    if (not isinstance(value, dict)
+            or set(value) != {"schema_version", "count", "plan_sha256", "plan_crc32"}
+            or type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or type(value["count"]) is not int or not 0 <= value["count"] <= 64
+            or type(value["plan_crc32"]) is not int or not 0 <= value["plan_crc32"] <= 0xffffffff
+            or not isinstance(value["plan_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["plan_sha256"]) is None):
+        raise ValueError("invalid runtime observation binding")
+    if value["count"] == 0 and value != empty_runtime_observation():
+        raise ValueError("noncanonical empty runtime observation binding")
+    if value["count"] and value["plan_sha256"] == "0" * 64:
+        raise ValueError("nonempty runtime observation binding has no plan hash")
+    return dict(value)
+
+
+def load_runtime_observation(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read runtime predicates: {exc}") from exc
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != RUNTIME_PREDICATES_VERSION:
+        raise ValueError("unsupported runtime predicate manifest")
+    return validate_runtime_observation(data.get("observation"))
+
+
+@functools.cache
+def validate_predicate_observations(predicate: ParsedPredicate, count: int) -> None:
+    """Validate every observation operand, even in unreachable branches."""
+    if type(count) is not int or not 0 <= count <= 64:
+        raise ValueError("invalid observation count")
+    pending = [_parse_generic_descriptor(predicate) if isinstance(predicate, str) else predicate]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, tuple):
+            if node[0] in ("obs", "valid"):
+                if not 0 <= node[1] < count:
+                    raise ValueError("observation index exceeds bound plan")
+            elif node[0] not in ("const", "var"):
+                pending.extend(node[1:])
+        elif isinstance(node, CWE805LogicalPredicate):
+            pending.extend((node.left, node.right))
+        elif isinstance(node, CWE805ValidPredicate):
+            if not 0 <= node.index < count:
+                raise ValueError("observation index exceeds bound plan")
+        elif isinstance(node.cell, ObservationCell) and not 0 <= node.cell.index < count:
+            raise ValueError("observation index exceeds bound plan")
 
 
 def predicate_descriptor(predicate: ParsedPredicate) -> str:
@@ -1268,14 +1438,17 @@ def predicate_descriptor(predicate: ParsedPredicate) -> str:
     def encode(node: CWE805Predicate) -> str:
         if isinstance(node, CWE805LogicalPredicate):
             return ("A" if node.op == "&&" else "O") + encode(node.left) + encode(node.right)
+        if isinstance(node, CWE805ValidPredicate):
+            return f"V{node.index}"
         cell = node.cell
         encoded_cell = (f"p{cell.register_index}" if isinstance(cell, RegisterCell)
+                        else f"o{cell.index}" if isinstance(cell, ObservationCell)
                         else f"s{cell.width_bits}i{cell.index}")
         if isinstance(node, CWE805PointerPredicate):
             return f"c1{encoded_cell}"
         return f"c2{encoded_cell}q{node.scale}"
 
-    descriptor = ("c3" if isinstance(predicate, CWE805LogicalPredicate) else "") + encode(predicate)
+    descriptor = ("c3" if isinstance(predicate, (CWE805LogicalPredicate, CWE805ValidPredicate)) else "") + encode(predicate)
     _check_descriptor(descriptor)
     return descriptor
 
@@ -1297,12 +1470,18 @@ def parse_predicate_descriptor(descriptor: str) -> ParsedPredicate:
             op = descriptor[pos]
             pos += 1
             return CWE805LogicalPredicate("&&" if op == "A" else "||", parse(depth + 1), parse(depth + 1))
-        match = re.match(r"c([12])(?:p([0-9]+)|s(8|16|32|64)i([0-9]+))(?:q([0-9]+))?", descriptor[pos:])
+        guard = re.match(r"V([0-9]+)", descriptor[pos:])
+        if guard is not None:
+            pos += guard.end()
+            return CWE805ValidPredicate(int(guard.group(1)))
+        match = re.match(r"c([12])(?:p([0-9]+)|s(8|16|32|64)i([0-9]+)|o([0-9]+))(?:q([0-9]+))?", descriptor[pos:])
         if match is None:
             raise ValueError("invalid CWE-805 predicate descriptor")
-        kind, register, width, index, scale = match.groups()
+        kind, register, width, index, observation, scale = match.groups()
         pos += match.end()
-        cell = RegisterCell(int(register)) if register is not None else StackCell(int(width), int(index))
+        cell = (RegisterCell(int(register)) if register is not None else
+                ObservationCell(int(observation)) if observation is not None else
+                StackCell(int(width), int(index)))
         if kind == "1" and scale is None:
             return CWE805PointerPredicate(cell)
         if kind == "2" and scale is not None:
@@ -1310,7 +1489,7 @@ def parse_predicate_descriptor(descriptor: str) -> ParsedPredicate:
         raise ValueError("invalid CWE-805 atom scale")
 
     result = parse(1)
-    if pos != len(descriptor) or composite != isinstance(result, CWE805LogicalPredicate):
+    if pos != len(descriptor) or composite != isinstance(result, (CWE805LogicalPredicate, CWE805ValidPredicate)):
         raise ValueError("invalid CWE-805 descriptor envelope or trailing data")
     predicate_stack_bytes(result)
     return result
@@ -1320,6 +1499,7 @@ def write_runtime_predicates(
     path: Path,
     family: PredicateFamily,
     selected: List[PredicateRecord],
+    observation: Optional[dict] = None,
 ) -> None:
     """Persist the exact compact runtime-id mapping used by both binaries."""
     if family not in (PredicateFamily.GENERIC_ERM, PredicateFamily.CWE805_ERM):
@@ -1327,8 +1507,12 @@ def write_runtime_predicates(
     expected_ids = list(range(1, len(selected) + 1))
     if [record.runtime_id for record in selected] != expected_ids:
         raise ValueError("runtime predicate ids must be consecutive from 1")
+    observation = validate_runtime_observation(observation if observation is not None else empty_runtime_observation())
+    for record in selected:
+        validate_predicate_observations(record.parsed, observation["count"])
     data = {
         "version": RUNTIME_PREDICATES_VERSION,
+        "observation": observation,
         "kind": family.value,
         "predicates": [
             {
@@ -1363,14 +1547,16 @@ def load_runtime_predicates(
     if not isinstance(rows, list):
         raise ValueError("runtime predicates must be a list")
 
+    observation = validate_runtime_observation(data.get("observation"))
     predicates: Dict[int, ParsedPredicate] = {}
     for expected_id, row in enumerate(rows, start=1):
-        if not isinstance(row, dict) or row.get("id") != expected_id \
-                or not isinstance(row.get("source_line"), int) \
+        if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] != expected_id \
+                or type(row.get("source_line")) is not int or row["source_line"] < 1 \
                 or not isinstance(row.get("descriptor"), str):
             raise ValueError(
                 f"invalid runtime predicate row at index {expected_id}")
         parsed = parse_predicate_descriptor(row["descriptor"])
+        validate_predicate_observations(parsed, observation["count"])
         if family == PredicateFamily.GENERIC_ERM and not isinstance(parsed, str):
             raise ValueError("CWE-805 descriptor in generic manifest")
         if family == PredicateFamily.CWE805_ERM and isinstance(parsed, str):
@@ -1398,20 +1584,24 @@ def _emit_brpatches_inc(brpatches_inc: Path,
                 op = node[0]
                 if op == "const":
                     fields = {"op": "'p'", "literal": f"UINT64_C({node[1] & _MASK64})"}
-                elif op == "var":
-                    fields = {"op": "'v'", "cell_index": node[1]}
+                elif op in ("var", "obs", "valid"):
+                    fields = {"op": repr({"var": "v", "obs": "o", "valid": "V"}[op]), "cell_index": node[1]}
                 elif op == "u~":
                     fields = {"op": "'~'", "left": add(node[1])}
                 else:
                     fields = {"op": repr({">=": "G", "<=": "L"}.get(op, op)),
                               "left": add(node[1]), "right": add(node[2])}
+            elif isinstance(node, CWE805ValidPredicate):
+                fields = {"op": "'V'", "cell_index": node.index}
             elif isinstance(node, CWE805LogicalPredicate):
                 fields = {"op": "'A'" if node.op == "&&" else "'O'",
                           "left": add(node.left), "right": add(node.right)}
             else:
                 cell = node.cell
                 fields = {"op": "'P'" if isinstance(node, CWE805PointerPredicate) else "'S'"}
-                if isinstance(cell, RegisterCell):
+                if isinstance(cell, ObservationCell):
+                    fields.update(cell_kind=5, cell_index=cell.index)
+                elif isinstance(cell, RegisterCell):
                     fields.update(cell_kind=0, cell_index=cell.register_index)
                 else:
                     fields.update(cell_kind={8: 1, 16: 2, 32: 3, 64: 4}[cell.width_bits], cell_index=cell.index)

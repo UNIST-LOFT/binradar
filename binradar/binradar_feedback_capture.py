@@ -12,12 +12,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import tempfile
 from collections.abc import Mapping, Sequence
 
 from .binradar_taosc_predicates import (
     CachedSnapshot, CACHED_SNAPSHOT_HEADER, CACHED_SNAPSHOT_MAGIC,
-    CACHED_SNAPSHOT_VERSION, CACHED_SNAPSHOT_FLAG_CWE805,
+    CACHED_SNAPSHOT_VERSION, CACHED_SNAPSHOT_FLAG_CWE805, CACHED_SNAPSHOT_FLAG_HAS_OBS,
+    load_runtime_observation,
     CACHED_SNAPSHOT_CLAMPS, CACHED_SNAPSHOT_MAX_STACK_SIZE, CACHED_SNAPSHOT_REGS,
 )
 
@@ -155,7 +157,11 @@ def write_mutation_context(run_dir: str, *, workdir: str, artifact: str,
     """Pin the actual tracer target before its mutation phase starts."""
     root = Path(run_dir) / "feedback-capture"
     root.mkdir(parents=True, exist_ok=True)
-    context = {"version": VERSION, "candidates": encode_ids(candidates),
+    from .observation_plan import load_observation_binding
+    binding = load_observation_binding(Path(workdir))
+    if load_runtime_observation(Path(workdir) / "brpatches.json") != binding:
+        raise ValueError("mutation capture observation plan mismatch")
+    context = {"version": VERSION, "observation": binding, "candidates": encode_ids(candidates),
                "artifact": file_sha256(artifact), "artifact_name": Path(artifact).name,
                "input_sha256": file_sha256(input_file)}
     for name in ("brpatches.json", configuration_file):
@@ -187,6 +193,14 @@ class CaptureJournal:
         self.directory.mkdir()
         (self.root / "states").mkdir(exist_ok=True)
         work = Path(workdir)
+        from .observation_plan import load_observation_binding
+        self.observation = load_observation_binding(work)
+        if (work / "brpatches.json").is_file() and load_runtime_observation(work / "brpatches.json") != self.observation:
+            raise ValueError("feedback capture observation plan mismatch")
+        context = dict(context or {})
+        if "observation" in context and context["observation"] != self.observation:
+            raise ValueError("feedback context observation plan mismatch")
+        context["observation"] = self.observation
         header = {"version": VERSION, "channel": channel,
                   "candidates": candidate_ranges, "context": dict(context or {})}
         for name in ("brpatches.json", "binradar.env"):
@@ -244,15 +258,27 @@ class CaptureJournal:
                         raise ValueError("invalid feedback register/stack capture")
                     if state.is_CWE805 and len(state.clamps) != 256:
                         raise ValueError("feedback CWE805 capture needs all clamps")
+                    count = len(state.observation_values)
+                    if (count != self.observation["count"]
+                            or state.observation_plan_crc32 != self.observation["plan_crc32"]
+                            or len(state.observation_status) != count
+                            or any(type(code) is not int or code not in range(5) for code in state.observation_status)
+                            or any(type(value) is not int or not 0 <= value < (1 << 64) for value in state.observation_values)
+                            or any(code != 0 and value != 0 for code, value in zip(state.observation_status, state.observation_values))):
+                        raise ValueError("invalid feedback observation capture")
                     emit(CACHED_SNAPSHOT_HEADER.pack(
                         CACHED_SNAPSHOT_MAGIC, CACHED_SNAPSHOT_VERSION,
                         state.patch_id, state.branch, stack_size,
-                        CACHED_SNAPSHOT_FLAG_CWE805 if state.is_CWE805 else 0))
+                        (CACHED_SNAPSHOT_FLAG_CWE805 if state.is_CWE805 else 0)
+                        | (CACHED_SNAPSHOT_FLAG_HAS_OBS if count else 0),
+                        count, state.observation_plan_crc32))
                     if state.is_CWE805:
                         emit(CACHED_SNAPSHOT_CLAMPS.pack(
                             *(value for clamp in state.clamps for value in clamp)))
                     emit(CACHED_SNAPSHOT_REGS.pack(*state.registers))
                     emit(state.stack)
+                    emit(bytes(state.observation_status) + bytes((-count) % 8))
+                    emit(struct.pack("<" + "Q" * count, *state.observation_values))
                 stream.flush()
                 os.fsync(stream.fileno())
             hexdigest = digest.hexdigest()

@@ -46,6 +46,8 @@ def _identity_runner(tmp_path, *, entry=0x400100):
         if not artifact.exists():
             continue
         artifact.write_bytes(suffix.encode())
+        from binradar.observation_plan import publish_artifact_observations
+        publish_artifact_observations(artifact, original)
         artifact.with_name(artifact.name + ".e9map.json").write_text(json.dumps({
             "version": 1,
             "artifact-sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
@@ -537,6 +539,9 @@ def test_baseline_validation_saves_each_artifact_in_actual_run(tmp_path, monkeyp
     rundir.mkdir()
     for suffix in ("orig", "brpatched", "brcached"):
         (workdir / f"guest.{suffix}").touch()
+    from binradar.observation_plan import publish_artifact_observations
+    for suffix in ("brpatched", "brcached"):
+        publish_artifact_observations(workdir / f"guest.{suffix}", workdir / "guest.orig")
     tracer = tmp_path / "tracer"
     tracer.write_text(
         f"#!{sys.executable}\nimport os, sys\n"

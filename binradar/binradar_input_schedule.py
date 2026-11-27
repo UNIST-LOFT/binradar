@@ -169,9 +169,11 @@ class _Reducer:
             if self.generic:
                 if snapshot.is_CWE805:
                     raise ValueError("generic predicate with a CWE-805 snapshot")
-                state = tuple(wrap64(value) for value in snapshot.registers)
+                environment = tuple(wrap64(value) for value in snapshot.registers)
+                state = (environment, snapshot.observation_values, snapshot.observation_status)
             else:
-                state = (snapshot.registers, snapshot.clamps, snapshot.stack)
+                state = (snapshot.registers, snapshot.clamps, snapshot.stack,
+                         snapshot.observation_values, snapshot.observation_status)
             if state == previous:
                 continue
             previous = state
@@ -179,7 +181,7 @@ class _Reducer:
             for evaluator, positions in self.groups:
                 if self.generic:
                     try:
-                        outcome = int(evaluator(state) != 0)
+                        outcome = int(evaluator(*state) != 0)
                     except PredicateTrap:
                         outcome = 2
                 else:

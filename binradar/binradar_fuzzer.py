@@ -81,6 +81,8 @@ class TargetedSimpleFuzzer(BinRadarFuzzer):
 
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
+        from .observation_plan import cleared_observation_environment
+        env.update(cleared_observation_environment())
         env["LC_ALL"] = "C"
         command = self.get_qemu_targeted_simple_command(self.get_original_binary_path(), self.poc_input)
         logger.info(f"Running command: {' '.join(command)}")
@@ -106,6 +108,8 @@ class AFLppFuzzer(BinRadarFuzzer):
 
     def start(self) -> subprocess.Popen:
         env = os.environ.copy()
+        from .observation_plan import cleared_observation_environment
+        env.update(cleared_observation_environment())
         # env["LC_ALL"] = "C"
         env["AFL_PATH"] = paths.AFL_SUPPORT_DIR
         env["AFL_NO_UI"] = "1"

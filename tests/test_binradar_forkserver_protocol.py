@@ -408,7 +408,7 @@ def test_real_empty_manifest_executes_patch_zero(tmp_path, reentered_guest, fami
     guest, entrypoint = reentered_guest
     manifest = tmp_path / "brpatches.json"
     manifest.write_text(
-        '{"version":1,"kind":"' + family + '","predicates":[]}', encoding="ascii")
+        '{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"' + family + '","predicates":[]}', encoding="ascii")
     marker = tmp_path / "visits"
     env = {
         "PATH": os.environ["PATH"],
@@ -472,7 +472,7 @@ int main(int argc, char **argv)
     os.mkfifo(ready)
     ready_fd = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
     manifest = tmp_path / "brpatches.json"
-    manifest.write_text('{"version":1,"kind":"generic-erm","predicates":[]}',
+    manifest.write_text('{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"generic-erm","predicates":[]}',
                         encoding="ascii")
     log = tmp_path / "tracer.log"
     env = {
@@ -572,7 +572,7 @@ int main(void)
                       if row.split()[-1] == "main")
     manifest = tmp_path / "brpatches.json"
     manifest.write_text(
-        '{"version":1,"kind":"generic-erm","predicates":[]}', encoding="ascii")
+        '{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"generic-erm","predicates":[]}', encoding="ascii")
     log = tmp_path / "tracer.log"
     env = {
         "PATH": os.environ["PATH"],
@@ -1032,7 +1032,7 @@ def resident_audit_guest(tmp_path):
                           if row.split()[-1] == "audit_entry")
         manifest = tmp_path / "brpatches.json"
         manifest.write_text(
-            '{"version":1,"kind":"generic-erm","predicates":[]}',
+            '{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"generic-erm","predicates":[]}',
             encoding="ascii")
         log = tmp_path / "audit-tracer.log"
         env = {
@@ -1309,7 +1309,7 @@ def test_real_resident_protocol_reports_ready_after_finish(
     guest, entrypoint = zero_plan_guest
     manifest = tmp_path / "brpatches.json"
     manifest.write_text(
-        '{"version":1,"kind":"generic-erm","predicates":[]}', encoding="ascii")
+        '{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"generic-erm","predicates":[]}', encoding="ascii")
     marker = tmp_path / "visits"
     env = {
         "PATH": os.environ["PATH"],
@@ -1415,14 +1415,14 @@ __asm__(
     "_start:\nmov (%rsp),%rdi\nlea 16(%rsp,%rdi,8),%rdi\ncall prepare\nud2\n"
     "replay_entry:\nmov %rdi,%r12\nmov %rsi,%r13\nmov %rdx,%r14\n"
     "mov observed_value(%rip),%r15\n"
-    "mov %rax,branch_record+32(%rip)\nmov %rbx,branch_record+40(%rip)\n"
-    "mov %rcx,branch_record+48(%rip)\nmov %rdx,branch_record+56(%rip)\n"
-    "mov %rsi,branch_record+64(%rip)\nmov %rdi,branch_record+72(%rip)\n"
-    "mov %rbp,branch_record+80(%rip)\nmov %rsp,branch_record+88(%rip)\n"
-    "mov %r8,branch_record+96(%rip)\nmov %r9,branch_record+104(%rip)\n"
-    "mov %r10,branch_record+112(%rip)\nmov %r11,branch_record+120(%rip)\n"
-    "mov %r12,branch_record+128(%rip)\nmov %r13,branch_record+136(%rip)\n"
-    "mov %r14,branch_record+144(%rip)\nmov %r15,branch_record+152(%rip)\n"
+    "mov %rax,branch_record+40(%rip)\nmov %rbx,branch_record+48(%rip)\n"
+    "mov %rcx,branch_record+56(%rip)\nmov %rdx,branch_record+64(%rip)\n"
+    "mov %rsi,branch_record+72(%rip)\nmov %rdi,branch_record+80(%rip)\n"
+    "mov %rsp,branch_record+88(%rip)\nmov %rbp,branch_record+96(%rip)\n"
+    "mov %r8,branch_record+104(%rip)\nmov %r9,branch_record+112(%rip)\n"
+    "mov %r10,branch_record+120(%rip)\nmov %r11,branch_record+128(%rip)\n"
+    "mov %r12,branch_record+136(%rip)\nmov %r13,branch_record+144(%rip)\n"
+    "mov %r14,branch_record+152(%rip)\nmov %r15,branch_record+160(%rip)\n"
 #ifdef REPLAY_TRAP
     "mov (%r14),%eax\nmov %eax,branch_record+8(%rip)\n"
     "add $48,%al\nmov %al,patch_row+12(%rip)\n"
@@ -1438,8 +1438,8 @@ __asm__(
     "mov 4(%r14),%eax\nadd $48,%al\nmov %al,patch_row+25(%rip)\n"
     "mov $1,%eax\nmov %r12,%rdi\nlea patch_row(%rip),%rsi\nmov $28,%edx\nsyscall\n"
     "cmp $28,%rax\njne replay_fail\n"
-    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $168,%edx\nsyscall\n"
-    "cmp $168,%rax\njne replay_fail\n"
+    "mov $1,%eax\nmov %r13,%rdi\nlea branch_record(%rip),%rsi\nmov $176,%edx\nsyscall\n"
+    "cmp $176,%rax\njne replay_fail\n"
 #ifdef REPLAY_TRAP
     "cmpl $0,(%r14)\nje replay_exit\n"
 #ifdef REPLAY_CORRUPT
@@ -1458,7 +1458,7 @@ __asm__(
     "replay_spin:\njmp replay_spin\n"
     "replay_fail:\nmov $92,%edi\nmov $60,%eax\nsyscall\n"
     ".data\npatch_row: .ascii \"[patch] [id 0] [br 0] [v 0]\\n\"\n"
-    ".balign 8\nbranch_record: .long 0x48435242,2,0,0\n.quad 8,0\n.zero 128\n"
+    ".balign 8\nbranch_record: .long 0x48435242,3,0,0\n.quad 8,0\n.long 0,0\n.zero 128\n"
     ".byte 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17\n"
     ".section .note.GNU-stack,\"\",@progbits\n");
 ''', encoding="ascii")
@@ -1481,7 +1481,7 @@ __asm__(
     entrypoint = next(row.split()[0] for row in symbols.stdout.splitlines()
                       if row.split()[-1] == "replay_entry")
     manifest = tmp_path / "brpatches.json"
-    manifest.write_text('{"version":1,"kind":"generic-erm","predicates":[]}',
+    manifest.write_text('{"version":2,"observation":{"schema_version":1,"count":0,"plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000","plan_crc32":0},"kind":"generic-erm","predicates":[]}',
                         encoding="ascii")
     log = tmp_path / "tracer.log"
     replay_dir = tmp_path / "replay"
@@ -1552,7 +1552,7 @@ def make_resident_executor(tmp_path, monkeypatch, fake_script, mode="resident"):
     return executor, log_path
 
 
-@pytest.mark.parametrize("invalid", [None, "mutation", "selector", "path", "digest", "reuse", "malformed"])
+@pytest.mark.parametrize("invalid", [None, "mutation", "selector", "path", "digest", "reuse", "malformed", "observation", "missing-observation"])
 def test_resident_capture_identity_is_bounded_and_owned(
         tmp_path, monkeypatch, fake_script, invalid):
     import json
@@ -1561,9 +1561,11 @@ def test_resident_capture_identity_is_bounded_and_owned(
     root = tmp_path / "replay"
     root.mkdir()
     executor.env["BINRADAR_REPLAY_DIR"] = str(root)
+    observation = {"schema_version": 1, "count": 0,
+                   "plan_sha256": "0" * 64, "plan_crc32": 0}
     identity = {"mutation": 7, "path": str(root / "capture.brch"),
                 "sha256": "a" * 64, "descriptor": "p0", "patch_id": 0,
-                "reuse": "full-vector-equivalent"}
+                "reuse": "full-vector-equivalent", "observation": observation}
     if invalid == "mutation":
         identity["mutation"] = 8
     elif invalid == "selector":
@@ -1574,6 +1576,10 @@ def test_resident_capture_identity_is_bounded_and_owned(
         identity["sha256"] = "bad"
     elif invalid == "reuse":
         identity["reuse"] = "fresh"
+    elif invalid == "observation":
+        identity["observation"] = dict(observation, plan_sha256="b" * 64)
+    elif invalid == "missing-observation":
+        del identity["observation"]
     executor.env["FAKE_CASE_TEXT"] = "{" if invalid == "malformed" else json.dumps(
         {"mutation": 7, "capture": identity})
     try:
@@ -1586,6 +1592,7 @@ def test_resident_capture_identity_is_bounded_and_owned(
             result = executor.request_replay_case(7, "p0", 0.5)
             assert result.capture == identity
             assert result.capture["patch_id"] == 0
+            assert result.capture["observation"] == observation
             executor.shutdown_replay(0.5)
     finally:
         stop_executor(executor)

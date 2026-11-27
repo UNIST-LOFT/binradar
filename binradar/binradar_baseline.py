@@ -138,6 +138,7 @@ def _controlled_environment(config: Dict[str, str], *,
             "BINRADAR_PATCH_CACHE_ENABLE", "BINRADAR_PATCH_MANIFEST",
             "BINRADAR_PATCH_FILTER_FILE", "BINRADAR_EVIDENCE_FILE",
             "BINRADAR_PATCH_CNT", "PATCH_ID", "TAOSC_PRED",
+            "BINRADAR_BROBS_PC", "BINRADAR_BROBS_COUNT", "BINRADAR_BROBS_CRC32", "BINRADAR_BROBS_SHA256",
             "AFL_QEMU_INST_RANGES", "AFL_USE_QASAN",
             # phase-only instrumentation and structured destinations
             "BINRADAR_TRACER_LOG_FILE", "BINRADAR_PROBE_FILE",
@@ -346,14 +347,15 @@ def validate_patch_zero_baseline(
                      min(timeout, phase_deadline - time.monotonic()))
         if remaining <= 0:
             return None
-        return _run_tracer(
-            workdir, path,
-            _controlled_environment(config, e9_ranges=ranges,
+        environment = _controlled_environment(config, e9_ranges=ranges,
                                     relocated_calls=",".join(records),
                                     relocated_instructions=instruction_pairs[path],
                                     original_entrypoint=original_entrypoints[path],
-                                    patch_fd=-1 if patched else None),
-            test_cmd, testcase, remaining, stderr_for(path))
+                                    patch_fd=-1 if patched else None)
+        from .observation_plan import artifact_observation_environment
+        environment.update(artifact_observation_environment(Path(path), original=Path(original)))
+        return _run_tracer(workdir, path, environment,
+                           test_cmd, testcase, remaining, stderr_for(path))
 
     selected_suffix = suffix_of(selected_binary)
     checks: List[BaselineCheck] = []

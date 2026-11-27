@@ -32,6 +32,7 @@ LOFTIX_DIR = str(_CHECKOUT / "benchmarks/loftix")
 BENCHMARK_SCRIPTS = _CHECKOUT / "benchmarks/scripts"
 BRPATCH_SOURCE = _CHECKOUT / "benchmarks/loftix/brpatch.c"
 BRPATCH_CACHED_SOURCE = _CHECKOUT / "benchmarks/loftix/brpatch-cached.c"
+BR_OBSERVATION_SOURCE = _CHECKOUT / "benchmarks/loftix/br-observation.h"
 
 E9_GUIX_SPEC = "e9patch@1.0.1"
 

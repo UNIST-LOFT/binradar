@@ -1023,6 +1023,7 @@ class BinRadarExecutor:
         relocated_calls = ""
         relocated_instructions = ""
         original_entrypoint = ""
+        observation_environment = ()
         if mode == "binradar":
             if artifact is None:
                 raise RuntimeError(
@@ -1032,6 +1033,8 @@ class BinRadarExecutor:
             identity_runner = self._identity_runner()
             relocated_instructions = identity_runner.tracer_instruction_pairs(artifact.path)
             original_entrypoint = identity_runner.tracer_original_entrypoint(artifact.path)
+            from .observation_plan import artifact_observation_environment
+            observation_environment = tuple(artifact_observation_environment(Path(artifact.path)).items())
 
         log_file = binradar_config.phase_log_file(mode, run_dir)
         if os.path.exists(log_file):
@@ -1050,6 +1053,7 @@ class BinRadarExecutor:
                 e9_relocated_calls=relocated_calls,
                 e9_relocated_instructions=relocated_instructions,
                 e9_original_entrypoint=original_entrypoint,
+                observation_environment=observation_environment,
             ),
             forkserver_read_timeout=(
                 binradar_runtime.TracerExecutor.forkserver_response_timeout()),
@@ -1207,6 +1211,8 @@ class BinRadarExecutor:
         tracer_env["E9_RELOCATED_CALL_JUMPS"] = ""
         tracer_env["E9_RELOCATED_INSTRUCTIONS"] = ""
         tracer_env["E9_ORIGINAL_ENTRYPOINT"] = ""
+        from .observation_plan import cleared_observation_environment
+        tracer_env.update(cleared_observation_environment())
         tracer_env["BINRADAR_MEMCHECK_ENABLE"] = "1"
         tracer_env["BINRADAR_MEMCHECK_POLICY"] = binradar_verifier.MEMCHECK_POLICY
         tracer_env["PLT_INFO_FILE"] = self.config.get("PLT_INFO_FILE", "")

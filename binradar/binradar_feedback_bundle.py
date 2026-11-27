@@ -268,7 +268,15 @@ class FeedbackBundle:
         path = _bundle_path(self.root, trace["state"])
         if file_sha256(path) != trace["state-sha256"]:
             raise ValueError("feedback state checksum mismatch")
-        snapshots, error = parse_cached_snapshots(path.read_bytes())
+        from .binradar_taosc_predicates import load_runtime_observation
+        from .observation_plan import load_observation_binding
+        binding = load_runtime_observation(self.root / "brpatches.json")
+        if (binding != self.metadata.get("state", {}).get("observation")
+                or binding != load_observation_binding(self.root)):
+            raise ValueError("feedback observation plan binding mismatch")
+        snapshots, error = parse_cached_snapshots(
+            path.read_bytes(), expected_observation_count=binding["count"],
+            expected_observation_plan_crc32=binding["plan_crc32"])
         branches = unpack_branches(trace["hits"], trace["branches"])
         if (error is not None or branches is None
                 or [state.branch for state in snapshots] != branches

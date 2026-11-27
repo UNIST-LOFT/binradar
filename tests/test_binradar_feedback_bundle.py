@@ -12,6 +12,34 @@ from binradar.binradar_taosc_predicates import CachedSnapshot
 from binradar import binradar_verifier as verifier
 
 
+def test_observation_capture_serialization_preserves_status_and_binding(tmp_path):
+    import hashlib
+    from binradar.observation_plan import load_observation_binding
+    from binradar.binradar_taosc_predicates import parse_cached_snapshots
+    work = tmp_path / "work"
+    work.mkdir()
+    original = b"observation-fixture-original"
+    (work / "target.orig").write_bytes(original)
+    plan = {"schema_version": 1, "analysis_status": "ok",
+            "artifact_orig_sha256": hashlib.sha256(original).hexdigest(),
+            "patch_location": "0x1000", "alloc_hooks": [],
+            "slots": [{"id": 0, "kind": "reg", "width": 8, "signed": False,
+                       "root": {"kind": "reg", "reg": "rax"}, "offsets": []}]}
+    (work / "observation-plan.json").write_text(json.dumps(plan))
+    binding = load_observation_binding(work)
+    journal = CaptureJournal(str(tmp_path / "run"), "baseline", workdir=str(work), candidates=[1])
+    states = [CachedSnapshot(0, 0, (0,) * 16, observation_values=(0,),
+                             observation_status=(4,), observation_plan_crc32=binding["plan_crc32"])]
+    digest, capture_id = journal._states(states, [0])
+    parsed, error = parse_cached_snapshots((journal.root / "states" / (digest + ".brch")).read_bytes(),
+        expected_observation_count=1, expected_observation_plan_crc32=binding["plan_crc32"])
+    assert error is None and parsed == states and capture_id == 0
+    header = json.loads((journal.directory / "header.json").read_text())
+    assert header["context"]["observation"] == binding
+    with pytest.raises(ValueError, match="observation"):
+        journal._states([CachedSnapshot(0, 0, (0,) * 16)], [0])
+
+
 def _probe(outcome="normal", fault=0):
     return SimpleNamespace(
         exit_info={"normal": "ok", "crash": "crash", "timeout": "timeout"}[outcome],
@@ -39,7 +67,7 @@ class _CaptureRun:
         # A real generic expression: signed rax > 5. Physical source lines are
         # deliberately distinct from runtime ids.
         (self.workdir / "brpatches.json").write_text(json.dumps({
-            "version": 1, "kind": "generic-erm", "predicates": [
+            "version": 2, "observation": {"schema_version": 1, "count": 0, "plan_sha256": "0" * 64, "plan_crc32": 0}, "kind": "generic-erm", "predicates": [
                 {"id": patch, "source_line": 2 * patch,
                  "descriptor": ">v0p5"} for patch in range(1, max(candidates, default=0) + 1)]}))
         self.baseline = CaptureJournal(str(self.run_dir), "baseline",
@@ -101,7 +129,7 @@ def test_normalized_round_trip_preserves_order_repetition_and_executed_trace_len
     assert [state.registers[0] for state in states] == [8, 4, 8, (1 << 64) - 1]
     assert [state.stack for state in states] == [b"\x00" * 4, b"\x01" * 4, b"\x02" * 4, b"\x03" * 4]
     assert all(not state.clamps for state in states)
-    assert bundle.metadata["state"]["version"] == 2
+    assert bundle.metadata["state"]["version"] == 3
     assert bundle.evaluate(1, first) == [1, 0, 1, 0]
     assert bundle.evaluate(2, first) == [1, 0, 1, 0]
     assert bundle.evaluate(1, second) == [0, 1]

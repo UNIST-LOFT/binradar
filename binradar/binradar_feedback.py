@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+from pathlib import Path
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -81,7 +82,7 @@ _MUTATION_SCHEMA = (
     "[size: int] [value: str] [target-extent: int]")
 
 
-def _validate_mutation_pair(reference, pair, iteration, group, parser) -> None:
+def _validate_mutation_pair(reference, pair, iteration, group, parser, binding) -> None:
     snapshot_path, sidecar_path = pair
     with open(sidecar_path, "r", encoding="utf-8") as sidecar:
         line = sidecar.readline()
@@ -130,7 +131,9 @@ def _validate_mutation_pair(reference, pair, iteration, group, parser) -> None:
             raise ValueError(f"Incomplete mutation writes: {sidecar_path}")
     with open(snapshot_path, "rb") as snapshot_file:
         capture = snapshot_file.read()
-    snapshots, error = parse_cached_snapshots(capture)
+    snapshots, error = parse_cached_snapshots(
+        capture, expected_observation_count=binding["count"],
+        expected_observation_plan_crc32=binding["plan_crc32"])
     # The sidecar writes `none` both when the representative recorded a null
     # vector and when it recorded an empty one; the committed frame keeps
     # that distinction, so compare the three sources with `none` ≡ empty.
@@ -202,12 +205,17 @@ def _committed_mutation_pairs(
     evidence_path = os.path.join(request.run_dir, "binradar.br")
     if binradar_evidence.evidence_version(evidence_path, binradar_evidence.EvidenceKind.BINRADAR) != 4:
         raise ValueError("Mutation feedback requires canonical BINRADAR v4 evidence; use a fresh run")
+    from .observation_plan import load_observation_binding
+    from .binradar_taosc_predicates import load_runtime_observation
+    binding = load_observation_binding(Path(request.workdir))
+    if binding != load_runtime_observation(Path(request.workdir) / "brpatches.json"):
+        raise ValueError("mutation feedback observation plan binding mismatch")
     pairs = []
     for frame in binradar_evidence.read_binradar(evidence_path):
         for group in frame.groups:
             pair = candidates.pop((frame.iteration, group.representative), None)
             if pair is not None:
-                _validate_mutation_pair(reference, pair, frame.iteration, group, parser)
+                _validate_mutation_pair(reference, pair, frame.iteration, group, parser, binding)
                 pairs.append(pair)
     for pair in candidates.values():
         logger.warning(f"[FEEDBACK] Skipping pair without a committed representative: {pair[1]}")
